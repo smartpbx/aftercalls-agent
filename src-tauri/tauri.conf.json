@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agent",
+  "productName": "callscribe",
   "version": "0.1.0",
   "identifier": "com.callscribe.agent",
   "build": {
@@ -12,7 +12,8 @@
   "app": {
     "windows": [
       {
-        "title": "agent",
+        "label": "main",
+        "title": "callscribe",
         "width": 800,
         "height": 600
       }
