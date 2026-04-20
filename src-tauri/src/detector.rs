@@ -1,8 +1,9 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sysinfo::{ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
 
 use crate::recorder::Recorder;
 
@@ -19,75 +20,204 @@ const MEETING_APP_PATTERNS: &[&str] = &[
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How long the mic must stay idle before we prompt the user to end.
+const MIC_IDLE_BEFORE_END_PROMPT: Duration = Duration::from_secs(20);
 
-pub fn spawn(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let mut sys = System::new();
-        let mut managed: Option<String> = None;
-        let mut suppress_restart_for: Option<String> = None;
+#[derive(Clone, Copy, Debug)]
+pub enum UserDecision {
+    ConfirmStart,
+    DismissStart,
+    ConfirmEnd,
+    KeepRecording,
+}
 
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            sys.refresh_processes(ProcessesToUpdate::All, true);
+pub struct Detector {
+    tx: mpsc::UnboundedSender<UserDecision>,
+}
 
-            let apps: HashSet<String> = sys
-                .processes()
-                .values()
-                .filter_map(|p| matched_app(&p.name().to_string_lossy()))
-                .collect();
+impl Detector {
+    pub fn spawn(app: AppHandle) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(run(app, rx));
+        Self { tx }
+    }
 
-            let state = app.state::<Recorder>();
-            let is_recording = state.is_active();
+    pub fn decide(&self, d: UserDecision) {
+        let _ = self.tx.send(d);
+    }
+}
 
-            // Recording session we were managing ended — figure out how.
-            if let Some(m) = managed.clone() {
-                if !apps.contains(&m) {
-                    // App exited. Stop if still recording, clear all state.
-                    if is_recording {
-                        eprintln!("callscribe: meeting app '{m}' exited, auto-stopping");
-                        emit_event(&app, AutoDetectEvent::Stopped { app: m.clone() });
-                        if let Err(e) = crate::do_stop(&state, &app) {
-                            eprintln!("callscribe: auto-stop failed: {e}");
-                        }
-                    }
-                    managed = None;
-                    suppress_restart_for = None;
-                } else if !is_recording {
-                    // User manually stopped while the app is still running.
-                    // Don't auto-restart while the same app is present.
-                    managed = None;
-                    suppress_restart_for = Some(m);
+#[derive(Debug)]
+enum Phase {
+    Idle,
+    AwaitingStartConfirm { app: String },
+    Recording { app: String, idle_since: Option<Instant> },
+    AwaitingEndConfirm { app: String },
+    Suppressed { app: String },
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AutoDetectEvent {
+    PromptStart { app: String },
+    PromptEnd { app: String },
+    Cleared,
+}
+
+async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
+    let mut sys = System::new();
+    let mut phase = Phase::Idle;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(POLL_INTERVAL) => {
+                phase = tick(&app, &mut sys, phase);
+            }
+            Some(decision) = rx.recv() => {
+                phase = handle_decision(&app, phase, decision).await;
+            }
+        }
+    }
+}
+
+fn tick(app: &AppHandle, sys: &mut System, phase: Phase) -> Phase {
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let apps: HashSet<String> = sys
+        .processes()
+        .values()
+        .filter_map(|p| matched_app(&p.name().to_string_lossy()))
+        .collect();
+    let mic_busy = default_mic_is_active();
+    let state = app.state::<Recorder>();
+    let is_recording = state.is_active();
+
+    // User changed recording state from outside (UI button, hotkey, tray).
+    // Reconcile so we don't re-prompt / re-start against their will.
+    let phase = reconcile_external(phase, is_recording, app);
+
+    match phase {
+        Phase::Idle => {
+            if let Some(hit) = apps.iter().next() {
+                if mic_busy {
+                    let app_name = hit.clone();
+                    eprintln!("callscribe: '{app_name}' + mic busy, prompting to start");
+                    emit(app, AutoDetectEvent::PromptStart { app: app_name.clone() });
+                    show_window(app);
+                    return Phase::AwaitingStartConfirm { app: app_name };
                 }
             }
-
-            // If the suppressed app is gone, allow future auto-starts.
-            if let Some(sup) = suppress_restart_for.clone() {
-                if !apps.contains(&sup) {
-                    suppress_restart_for = None;
-                }
+            Phase::Idle
+        }
+        Phase::AwaitingStartConfirm { app: name } => {
+            if !apps.contains(&name) {
+                emit(app, AutoDetectEvent::Cleared);
+                Phase::Idle
+            } else {
+                Phase::AwaitingStartConfirm { app: name }
             }
-
-            // Consider an auto-start.
-            if !is_recording && managed.is_none() {
-                let candidate = apps
-                    .iter()
-                    .find(|a| suppress_restart_for.as_ref() != Some(*a))
-                    .cloned();
-                if let Some(app_name) = candidate {
-                    if default_mic_is_active() {
-                        eprintln!(
-                            "callscribe: '{app_name}' + mic busy, auto-starting"
-                        );
-                        emit_event(&app, AutoDetectEvent::Started { app: app_name.clone() });
-                        match crate::do_start(&state, &app) {
-                            Ok(_) => managed = Some(app_name),
-                            Err(e) => eprintln!("callscribe: auto-start failed: {e}"),
-                        }
-                    }
+        }
+        Phase::Recording { app: name, idle_since } => {
+            if !apps.contains(&name) {
+                // App exited — stop without asking.
+                if is_recording {
+                    let _ = crate::do_stop(&state, app);
+                }
+                emit(app, AutoDetectEvent::Cleared);
+                return Phase::Idle;
+            }
+            if mic_busy {
+                Phase::Recording { app: name, idle_since: None }
+            } else {
+                let since = idle_since.unwrap_or_else(Instant::now);
+                if since.elapsed() >= MIC_IDLE_BEFORE_END_PROMPT {
+                    eprintln!("callscribe: mic idle, prompting to end");
+                    emit(app, AutoDetectEvent::PromptEnd { app: name.clone() });
+                    show_window(app);
+                    Phase::AwaitingEndConfirm { app: name }
+                } else {
+                    Phase::Recording { app: name, idle_since: Some(since) }
                 }
             }
         }
-    });
+        Phase::AwaitingEndConfirm { app: name } => {
+            if !apps.contains(&name) {
+                if is_recording {
+                    let _ = crate::do_stop(&state, app);
+                }
+                emit(app, AutoDetectEvent::Cleared);
+                Phase::Idle
+            } else if mic_busy {
+                // User rejoined; cancel the end prompt.
+                emit(app, AutoDetectEvent::Cleared);
+                Phase::Recording { app: name, idle_since: None }
+            } else {
+                Phase::AwaitingEndConfirm { app: name }
+            }
+        }
+        Phase::Suppressed { app: name } => {
+            if !apps.contains(&name) {
+                Phase::Idle
+            } else {
+                Phase::Suppressed { app: name }
+            }
+        }
+    }
+}
+
+async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) -> Phase {
+    let state = app.state::<Recorder>();
+    match (phase, decision) {
+        (Phase::AwaitingStartConfirm { app: name }, UserDecision::ConfirmStart) => {
+            match crate::do_start(&state, app) {
+                Ok(_) => {
+                    emit(app, AutoDetectEvent::Cleared);
+                    Phase::Recording { app: name, idle_since: None }
+                }
+                Err(e) => {
+                    eprintln!("callscribe: auto-start failed: {e}");
+                    emit(app, AutoDetectEvent::Cleared);
+                    Phase::Idle
+                }
+            }
+        }
+        (Phase::AwaitingStartConfirm { app: name }, UserDecision::DismissStart) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Suppressed { app: name }
+        }
+        (Phase::AwaitingEndConfirm { app: _ }, UserDecision::ConfirmEnd) => {
+            if state.is_active() {
+                let _ = crate::do_stop(&state, app);
+            }
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Idle
+        }
+        (Phase::AwaitingEndConfirm { app: name }, UserDecision::KeepRecording) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Recording { app: name, idle_since: None }
+        }
+        (phase, _) => phase,
+    }
+}
+
+fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phase {
+    match (phase, is_recording) {
+        // We believed we were recording, but the user stopped. Back off until
+        // the meeting app exits.
+        (Phase::Recording { app: name, .. }, false) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Suppressed { app: name }
+        }
+        (Phase::AwaitingEndConfirm { app: name }, false) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Suppressed { app: name }
+        }
+        // We were prompting to start, but the user hit Start via the UI first.
+        (Phase::AwaitingStartConfirm { app: name }, true) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Recording { app: name, idle_since: None }
+        }
+        (other, _) => other,
+    }
 }
 
 fn matched_app(process_name: &str) -> Option<String> {
@@ -114,25 +244,24 @@ fn default_mic_is_active() -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| {
-        line.contains("RUNNING") && !line.contains(".monitor")
-    })
+    text.lines()
+        .any(|line| line.contains("RUNNING") && !line.contains(".monitor"))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn default_mic_is_active() -> bool {
-    // TODO(windows): check WASAPI IAudioSessionManager2 for active capture streams.
-    // For now, fall through and let process presence alone trigger recording.
+    // TODO(windows): WASAPI IAudioSessionManager2 for active capture streams.
     true
 }
 
-fn emit_event(app: &AppHandle, event: AutoDetectEvent) {
+fn emit(app: &AppHandle, event: AutoDetectEvent) {
     let _ = app.emit("auto-detect", event);
 }
 
-#[derive(serde::Serialize, Clone)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum AutoDetectEvent {
-    Started { app: String },
-    Stopped { app: String },
+fn show_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
 }

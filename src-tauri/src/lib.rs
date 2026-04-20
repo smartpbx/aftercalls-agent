@@ -6,6 +6,7 @@ mod summary;
 mod transcription;
 mod vault;
 
+use detector::{Detector, UserDecision};
 use recorder::Recorder;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -53,6 +54,26 @@ fn start_recording(state: State<Recorder>, app: AppHandle) -> Result<String, Str
 #[tauri::command]
 fn stop_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
     do_stop(&state, &app)
+}
+
+#[tauri::command]
+fn confirm_auto_start(detector: State<Detector>) {
+    detector.decide(UserDecision::ConfirmStart);
+}
+
+#[tauri::command]
+fn dismiss_auto_start(detector: State<Detector>) {
+    detector.decide(UserDecision::DismissStart);
+}
+
+#[tauri::command]
+fn confirm_auto_end(detector: State<Detector>) {
+    detector.decide(UserDecision::ConfirmEnd);
+}
+
+#[tauri::command]
+fn keep_auto_recording(detector: State<Detector>) {
+    detector.decide(UserDecision::KeepRecording);
 }
 
 fn toggle_recording(app: &AppHandle) {
@@ -133,11 +154,19 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Recorder::new())
-        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            confirm_auto_start,
+            dismiss_auto_start,
+            confirm_auto_end,
+            keep_auto_recording,
+        ])
         .setup(|app| {
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;
-            detector::spawn(app.handle().clone());
+            let detector = Detector::spawn(app.handle().clone());
+            app.manage(detector);
             Ok(())
         })
         .on_window_event(|win, event| {

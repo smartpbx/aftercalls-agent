@@ -11,16 +11,23 @@
     | { stage: "done"; session_dir: string; note_path: string }
     | { stage: "failed"; error: string };
 
+  type AutoDetectEvent =
+    | { kind: "prompt_start"; app: string }
+    | { kind: "prompt_end"; app: string }
+    | { kind: "cleared" };
+
   let recording = $state(false);
   let sessionDir = $state("");
   let error = $state("");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
   let notePath = $state("");
+  let prompt = $state<AutoDetectEvent | null>(null);
 
   let unlisten: UnlistenFn | null = null;
 
   let unlistenState: UnlistenFn | null = null;
+  let unlistenAuto: UnlistenFn | null = null;
 
   onMount(async () => {
     unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
@@ -41,11 +48,15 @@
         }
       },
     );
+    unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
+      prompt = evt.payload.kind === "cleared" ? null : evt.payload;
+    });
   });
 
   onDestroy(() => {
     unlisten?.();
     unlistenState?.();
+    unlistenAuto?.();
   });
 
   async function start() {
@@ -79,10 +90,41 @@
     done: "Saved",
     failed: "Failed",
   };
+
+  async function confirmStart() {
+    await invoke("confirm_auto_start");
+  }
+  async function dismissStart() {
+    await invoke("dismiss_auto_start");
+  }
+  async function confirmEnd() {
+    await invoke("confirm_auto_end");
+  }
+  async function keepRecording() {
+    await invoke("keep_auto_recording");
+  }
 </script>
 
 <main class="container">
   <h1>callscribe</h1>
+
+  {#if prompt?.kind === "prompt_start"}
+    <div class="banner prompt">
+      <p>Detected <strong>{prompt.app}</strong> on an active mic — record this call?</p>
+      <div class="banner-actions">
+        <button class="primary" onclick={confirmStart}>Start recording</button>
+        <button onclick={dismissStart}>Dismiss</button>
+      </div>
+    </div>
+  {:else if prompt?.kind === "prompt_end"}
+    <div class="banner prompt">
+      <p>Mic has been idle for a while — end the recording?</p>
+      <div class="banner-actions">
+        <button class="primary" onclick={confirmEnd}>Save + transcribe</button>
+        <button onclick={keepRecording}>Keep recording</button>
+      </div>
+    </div>
+  {/if}
 
   <div class="row">
     {#if !recording}
@@ -198,5 +240,36 @@
     color: #ff6b6b;
     font-size: 0.9rem;
     margin: 0;
+  }
+
+  .banner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid #3a3a3a;
+    border-radius: 12px;
+    background-color: #2a2a2a;
+    max-width: 520px;
+  }
+
+  .banner.prompt {
+    border-color: #e0b050;
+  }
+
+  .banner p {
+    margin: 0;
+    text-align: center;
+  }
+
+  .banner-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  button.primary {
+    border-color: #24c8db;
+    background-color: #24c8db22;
   }
 </style>
