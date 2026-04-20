@@ -1,27 +1,35 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use sysinfo::{ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 use crate::recorder::Recorder;
 
-/// Case-insensitive substring matches against process names. Short patterns
-/// catch variants: "teams" → teams-for-linux / msteams / Teams.exe / ms-teams.
-/// Browser-based meetings are intentionally excluded (process-watching can't
-/// distinguish an active meeting tab from an idle browser).
-const MEETING_APP_PATTERNS: &[&str] = &[
-    "zoom",
-    "teams",
-    "discord",
-    "slack",
-    "webex",
+/// Apps we *don't* want to treat as "a call." The rest — Zoom, Teams, Discord,
+/// Slack, Zoho Cliq, phone softphones, anything with a real name — prompt.
+/// Matched case-insensitively, as substrings, against the `application.name`
+/// reported by `pactl list source-outputs`.
+const MIC_CONSUMER_BLACKLIST: &[&str] = &[
+    // Our own capture path
+    "pipewire alsa [client]",
+    "pw-cat",
+    "pw-record",
+    "parec",
+    // Accessibility / TTS noise
+    "speech-dispatcher",
+    // Browsers (user chose to skip browser-meeting detection for now)
+    "chromium input",
+    "zen",
+    "firefox",
+    "webrtc voiceengine",
+    // Misc background audio
+    "steam voice settings",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the mic must stay idle before we prompt the user to end.
-const MIC_IDLE_BEFORE_END_PROMPT: Duration = Duration::from_secs(20);
+/// How long the mic consumer must be gone before we prompt to end.
+const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug)]
 pub enum UserDecision {
@@ -47,13 +55,15 @@ impl Detector {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Phase {
     Idle,
-    AwaitingStartConfirm { app: String },
-    Recording { app: String, idle_since: Option<Instant> },
-    AwaitingEndConfirm { app: String },
-    Suppressed { app: String },
+    AwaitingStartConfirm { consumer: String },
+    Recording { consumer: String, gone_since: Option<Instant> },
+    AwaitingEndConfirm { consumer: String },
+    /// User explicitly said no to recording this consumer. Release when the
+    /// consumer stops using the mic — they may come back for another call.
+    Suppressed { consumer: String },
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -65,13 +75,11 @@ enum AutoDetectEvent {
 }
 
 async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
-    let mut sys = System::new();
     let mut phase = Phase::Idle;
-
     loop {
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {
-                phase = tick(&app, &mut sys, phase);
+                phase = tick(&app, phase);
             }
             Some(decision) = rx.recv() => {
                 phase = handle_decision(&app, phase, decision).await;
@@ -80,98 +88,100 @@ async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
     }
 }
 
-fn tick(app: &AppHandle, sys: &mut System, phase: Phase) -> Phase {
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-    let apps: HashSet<String> = sys
-        .processes()
-        .values()
-        .filter_map(|p| matched_app(&p.name().to_string_lossy()))
-        .collect();
-    let mic_busy = default_mic_is_active();
+fn tick(app: &AppHandle, phase: Phase) -> Phase {
+    let consumers = interesting_mic_consumers();
     let state = app.state::<Recorder>();
     let is_recording = state.is_active();
 
-    // User changed recording state from outside (UI button, hotkey, tray).
-    // Reconcile so we don't re-prompt / re-start against their will.
     let phase = reconcile_external(phase, is_recording, app);
 
     match phase {
         Phase::Idle => {
-            if let Some(hit) = apps.iter().next() {
-                if mic_busy {
-                    let app_name = hit.clone();
-                    eprintln!("callscribe: '{app_name}' + mic busy, prompting to start");
-                    emit(app, AutoDetectEvent::PromptStart { app: app_name.clone() });
-                    show_window(app);
-                    return Phase::AwaitingStartConfirm { app: app_name };
-                }
+            if let Some(consumer) = consumers.iter().next() {
+                eprintln!("callscribe: '{consumer}' is using the mic — prompting");
+                emit(app, AutoDetectEvent::PromptStart { app: consumer.clone() });
+                show_window(app);
+                Phase::AwaitingStartConfirm { consumer: consumer.clone() }
+            } else {
+                Phase::Idle
             }
-            Phase::Idle
         }
-        Phase::AwaitingStartConfirm { app: name } => {
-            if !apps.contains(&name) {
+        Phase::AwaitingStartConfirm { consumer } => {
+            if !consumers.contains(&consumer) {
                 emit(app, AutoDetectEvent::Cleared);
                 Phase::Idle
             } else {
-                Phase::AwaitingStartConfirm { app: name }
+                Phase::AwaitingStartConfirm { consumer }
             }
         }
-        Phase::Recording { app: name, idle_since } => {
-            if !apps.contains(&name) {
-                // App exited — stop without asking.
-                if is_recording {
-                    let _ = crate::do_stop(&state, app);
-                }
-                emit(app, AutoDetectEvent::Cleared);
-                return Phase::Idle;
-            }
-            if mic_busy {
-                Phase::Recording { app: name, idle_since: None }
+        Phase::Recording { consumer, gone_since } => {
+            if consumers.contains(&consumer) {
+                Phase::Recording { consumer, gone_since: None }
             } else {
-                let since = idle_since.unwrap_or_else(Instant::now);
-                if since.elapsed() >= MIC_IDLE_BEFORE_END_PROMPT {
-                    eprintln!("callscribe: mic idle, prompting to end");
-                    emit(app, AutoDetectEvent::PromptEnd { app: name.clone() });
+                let since = gone_since.unwrap_or_else(Instant::now);
+                if since.elapsed() >= CONSUMER_GONE_BEFORE_END_PROMPT {
+                    eprintln!("callscribe: '{consumer}' stopped using mic — prompting to end");
+                    emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
                     show_window(app);
-                    Phase::AwaitingEndConfirm { app: name }
+                    Phase::AwaitingEndConfirm { consumer }
                 } else {
-                    Phase::Recording { app: name, idle_since: Some(since) }
+                    Phase::Recording { consumer, gone_since: Some(since) }
                 }
             }
         }
-        Phase::AwaitingEndConfirm { app: name } => {
-            if !apps.contains(&name) {
-                if is_recording {
-                    let _ = crate::do_stop(&state, app);
-                }
+        Phase::AwaitingEndConfirm { consumer } => {
+            if consumers.contains(&consumer) {
+                // Consumer came back — user rejoined. Cancel the end prompt.
                 emit(app, AutoDetectEvent::Cleared);
-                Phase::Idle
-            } else if mic_busy {
-                // User rejoined; cancel the end prompt.
-                emit(app, AutoDetectEvent::Cleared);
-                Phase::Recording { app: name, idle_since: None }
+                Phase::Recording { consumer, gone_since: None }
             } else {
-                Phase::AwaitingEndConfirm { app: name }
+                Phase::AwaitingEndConfirm { consumer }
             }
         }
-        Phase::Suppressed { app: name } => {
-            if !apps.contains(&name) {
-                Phase::Idle
+        Phase::Suppressed { consumer } => {
+            // Release suppression once the old consumer is gone.
+            let still_suppressing = consumers.contains(&consumer);
+            // If a different consumer is now on the mic, prompt for it.
+            if let Some(other) = consumers.iter().find(|c| **c != consumer) {
+                eprintln!("callscribe: new mic consumer '{other}' — prompting");
+                emit(app, AutoDetectEvent::PromptStart { app: other.clone() });
+                show_window(app);
+                Phase::AwaitingStartConfirm { consumer: other.clone() }
+            } else if still_suppressing {
+                Phase::Suppressed { consumer }
             } else {
-                Phase::Suppressed { app: name }
+                Phase::Idle
             }
         }
+    }
+}
+
+fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phase {
+    match (phase, is_recording) {
+        (Phase::Recording { consumer, .. }, false) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Suppressed { consumer }
+        }
+        (Phase::AwaitingEndConfirm { consumer }, false) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Suppressed { consumer }
+        }
+        (Phase::AwaitingStartConfirm { consumer }, true) => {
+            emit(app, AutoDetectEvent::Cleared);
+            Phase::Recording { consumer, gone_since: None }
+        }
+        (other, _) => other,
     }
 }
 
 async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) -> Phase {
     let state = app.state::<Recorder>();
     match (phase, decision) {
-        (Phase::AwaitingStartConfirm { app: name }, UserDecision::ConfirmStart) => {
+        (Phase::AwaitingStartConfirm { consumer }, UserDecision::ConfirmStart) => {
             match crate::do_start(&state, app) {
                 Ok(_) => {
                     emit(app, AutoDetectEvent::Cleared);
-                    Phase::Recording { app: name, idle_since: None }
+                    Phase::Recording { consumer, gone_since: None }
                 }
                 Err(e) => {
                     eprintln!("callscribe: auto-start failed: {e}");
@@ -180,78 +190,73 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
                 }
             }
         }
-        (Phase::AwaitingStartConfirm { app: name }, UserDecision::DismissStart) => {
+        (Phase::AwaitingStartConfirm { consumer }, UserDecision::DismissStart) => {
             emit(app, AutoDetectEvent::Cleared);
-            Phase::Suppressed { app: name }
+            Phase::Suppressed { consumer }
         }
-        (Phase::AwaitingEndConfirm { app: _ }, UserDecision::ConfirmEnd) => {
+        (Phase::AwaitingEndConfirm { .. }, UserDecision::ConfirmEnd) => {
             if state.is_active() {
                 let _ = crate::do_stop(&state, app);
             }
             emit(app, AutoDetectEvent::Cleared);
             Phase::Idle
         }
-        (Phase::AwaitingEndConfirm { app: name }, UserDecision::KeepRecording) => {
+        (Phase::AwaitingEndConfirm { consumer }, UserDecision::KeepRecording) => {
             emit(app, AutoDetectEvent::Cleared);
-            Phase::Recording { app: name, idle_since: None }
+            Phase::Recording { consumer, gone_since: None }
         }
         (phase, _) => phase,
     }
 }
 
-fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phase {
-    match (phase, is_recording) {
-        // We believed we were recording, but the user stopped. Back off until
-        // the meeting app exits.
-        (Phase::Recording { app: name, .. }, false) => {
-            emit(app, AutoDetectEvent::Cleared);
-            Phase::Suppressed { app: name }
+/// Apps currently holding a source-output on *any* mic source, filtered
+/// against the blacklist. Deduplicated so a multi-stream app (e.g. WebRTC)
+/// only shows up once.
+fn interesting_mic_consumers() -> Vec<String> {
+    let names = raw_mic_consumers();
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for name in names {
+        let lower = name.to_lowercase();
+        if MIC_CONSUMER_BLACKLIST
+            .iter()
+            .any(|b| lower.contains(&b.to_lowercase()))
+        {
+            continue;
         }
-        (Phase::AwaitingEndConfirm { app: name }, false) => {
-            emit(app, AutoDetectEvent::Cleared);
-            Phase::Suppressed { app: name }
-        }
-        // We were prompting to start, but the user hit Start via the UI first.
-        (Phase::AwaitingStartConfirm { app: name }, true) => {
-            emit(app, AutoDetectEvent::Cleared);
-            Phase::Recording { app: name, idle_since: None }
-        }
-        (other, _) => other,
-    }
-}
-
-fn matched_app(process_name: &str) -> Option<String> {
-    let lower = process_name.to_lowercase();
-    for pat in MEETING_APP_PATTERNS {
-        if lower.contains(pat) {
-            return Some(process_name.to_string());
+        if seen.insert(name.clone()) {
+            result.push(name);
         }
     }
-    None
+    result
 }
 
-/// True if a non-monitor audio source is currently being consumed — i.e. some
-/// app has the mic actively open (not just holding a handle). On PulseAudio /
-/// PipeWire, a source flips to RUNNING only while data is flowing.
 #[cfg(target_os = "linux")]
-fn default_mic_is_active() -> bool {
+fn raw_mic_consumers() -> Vec<String> {
     let output = std::process::Command::new("pactl")
         .arg("list")
-        .arg("sources")
-        .arg("short")
+        .arg("source-outputs")
         .output();
     let Ok(output) = output else {
-        return false;
+        return Vec::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .any(|line| line.contains("RUNNING") && !line.contains(".monitor"))
+    let mut names = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("application.name = \"") {
+            if let Some(end) = rest.find('"') {
+                names.push(rest[..end].to_string());
+            }
+        }
+    }
+    names
 }
 
 #[cfg(not(target_os = "linux"))]
-fn default_mic_is_active() -> bool {
-    // TODO(windows): WASAPI IAudioSessionManager2 for active capture streams.
-    true
+fn raw_mic_consumers() -> Vec<String> {
+    // TODO(windows): enumerate active WASAPI capture sessions and map each
+    // session's ProcessId to its executable name.
+    Vec::new()
 }
 
 fn emit(app: &AppHandle, event: AutoDetectEvent) {
