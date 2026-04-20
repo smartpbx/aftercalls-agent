@@ -1,7 +1,9 @@
 mod config;
 mod pipeline;
 mod recorder;
+mod summary;
 mod transcription;
+mod vault;
 
 use recorder::Recorder;
 use std::path::PathBuf;

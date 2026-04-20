@@ -6,7 +6,9 @@
   type PipelineEvent =
     | { stage: "started"; session_dir: string }
     | { stage: "transcribing" }
-    | { stage: "done"; session_dir: string }
+    | { stage: "summarizing" }
+    | { stage: "writing_note" }
+    | { stage: "done"; session_dir: string; note_path: string }
     | { stage: "failed"; error: string };
 
   let recording = $state(false);
@@ -14,6 +16,7 @@
   let error = $state("");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
+  let notePath = $state("");
 
   let unlisten: UnlistenFn | null = null;
 
@@ -23,6 +26,7 @@
       pipelineError = "";
       pipelineStage = p.stage;
       if (p.stage === "failed") pipelineError = p.error;
+      if (p.stage === "done") notePath = p.note_path;
     });
   });
 
@@ -34,6 +38,7 @@
     error = "";
     pipelineStage = "";
     pipelineError = "";
+    notePath = "";
     try {
       sessionDir = await invoke<string>("start_recording");
       recording = true;
@@ -55,7 +60,9 @@
   const stageLabel: Record<string, string> = {
     started: "Processing…",
     transcribing: "Transcribing…",
-    done: "Transcribed",
+    summarizing: "Summarizing…",
+    writing_note: "Writing note…",
+    done: "Saved",
     failed: "Failed",
   };
 </script>
@@ -81,6 +88,10 @@
     <p class="status {pipelineStage}">
       {stageLabel[pipelineStage] ?? pipelineStage}
     </p>
+  {/if}
+
+  {#if notePath}
+    <p class="status done">Note: {notePath}</p>
   {/if}
 
   {#if pipelineError}
@@ -155,6 +166,8 @@
   }
 
   .status.transcribing,
+  .status.summarizing,
+  .status.writing_note,
   .status.started {
     color: #e0b050;
   }
