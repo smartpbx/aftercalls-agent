@@ -45,6 +45,10 @@
   let applyToAll = $state(false);
   let savingEdit = $state(false);
 
+  let editingSpeaker = $state<string | null>(null);
+  let speakerEditValue = $state("");
+  let savingSpeaker = $state(false);
+
   onMount(async () => {
     try {
       call = await invoke<Call>("get_call", { id: page.params.id });
@@ -189,6 +193,69 @@
     return -1;
   });
 
+  type SpeakerStat = { speaker: string; count: number; totalMs: number };
+
+  let speakers = $derived.by<SpeakerStat[]>(() => {
+    if (!call) return [];
+    const order: string[] = [];
+    const map = new Map<string, SpeakerStat>();
+    for (const u of call.utterances) {
+      const existing = map.get(u.speaker);
+      if (existing) {
+        existing.count++;
+        existing.totalMs += u.end_ms - u.start_ms;
+      } else {
+        order.push(u.speaker);
+        map.set(u.speaker, {
+          speaker: u.speaker,
+          count: 1,
+          totalMs: u.end_ms - u.start_ms,
+        });
+      }
+    }
+    return order.map((s) => map.get(s)!);
+  });
+
+  function fmtSpeakingTime(ms: number) {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}m ${r}s`;
+  }
+
+  function startSpeakerRename(current: string) {
+    editingSpeaker = current;
+    speakerEditValue = current;
+  }
+
+  function cancelSpeakerRename() {
+    editingSpeaker = null;
+    speakerEditValue = "";
+  }
+
+  async function saveSpeakerRename() {
+    if (!call || !editingSpeaker) return;
+    const from = editingSpeaker;
+    const to = speakerEditValue.trim();
+    if (!to || to === from) {
+      cancelSpeakerRename();
+      return;
+    }
+    savingSpeaker = true;
+    try {
+      await invoke<number>("rename_speaker", { id: call.id, from, to });
+      call.utterances = call.utterances.map((u) =>
+        u.speaker === from ? { ...u, speaker: to } : u,
+      );
+      cancelSpeakerRename();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      savingSpeaker = false;
+    }
+  }
+
   function speakerColor(speaker: string): string {
     if (speaker === "You") return "#24c8db";
     const hash = [...speaker].reduce((a, c) => a + c.charCodeAt(0), 0);
@@ -217,6 +284,54 @@
         {#if call.matched_client}· <span class="client">{call.matched_client}</span>{/if}
       </p>
     </header>
+
+    {#if speakers.length > 0}
+      <section class="participants">
+        <h2>Participants</h2>
+        <div class="chips">
+          {#each speakers as p (p.speaker)}
+            {#if editingSpeaker === p.speaker}
+              <div class="chip chip-editing">
+                <input
+                  class="chip-input"
+                  bind:value={speakerEditValue}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") saveSpeakerRename();
+                    if (e.key === "Escape") cancelSpeakerRename();
+                  }}
+                />
+                <button
+                  class="chip-save"
+                  disabled={savingSpeaker}
+                  onclick={saveSpeakerRename}
+                >
+                  {savingSpeaker ? "…" : "Save"}
+                </button>
+                <button class="chip-cancel" onclick={cancelSpeakerRename}>
+                  Cancel
+                </button>
+              </div>
+            {:else}
+              <button
+                type="button"
+                class="chip"
+                style="border-color: {speakerColor(p.speaker)}"
+                title="Rename {p.speaker}"
+                onclick={() => startSpeakerRename(p.speaker)}
+              >
+                <span class="chip-name" style="color: {speakerColor(p.speaker)}">
+                  {p.speaker}
+                </span>
+                <span class="chip-meta">
+                  {p.count} {p.count === 1 ? "line" : "lines"} ·
+                  {fmtSpeakingTime(p.totalMs)}
+                </span>
+              </button>
+            {/if}
+          {/each}
+        </div>
+      </section>
+    {/if}
 
     <section class="player">
       <div class="track-toggle">
@@ -403,6 +518,87 @@
   .client {
     color: #24c8db;
     margin-left: 0.4rem;
+  }
+
+  .participants {
+    margin-bottom: 1.5rem;
+  }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .chip {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+    padding: 0.45rem 0.85rem;
+    border: 1px solid #3a3a3a;
+    border-radius: 10px;
+    background-color: #1e1e1e;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.12s;
+  }
+
+  .chip:hover {
+    background-color: #252525;
+  }
+
+  .chip-name {
+    font-weight: 500;
+    font-size: 0.9rem;
+  }
+
+  .chip-meta {
+    font-size: 0.75rem;
+    color: #808080;
+  }
+
+  .chip-editing {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+    border-color: #24c8db;
+    background-color: #1e2a2e;
+    cursor: default;
+  }
+
+  .chip-input {
+    padding: 0.3rem 0.55rem;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background-color: #2a2a2a;
+    color: inherit;
+    font: inherit;
+    font-size: 0.85rem;
+    width: 12rem;
+  }
+
+  .chip-save,
+  .chip-cancel {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background-color: #2a2a2a;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .chip-save {
+    border-color: #24c8db;
+    background-color: #24c8db22;
+  }
+
+  .chip-save:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .player {
