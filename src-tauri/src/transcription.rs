@@ -24,6 +24,20 @@ pub struct MergedTranscript {
     pub timeline: Vec<Utterance>,
 }
 
+#[derive(Clone, Copy)]
+enum TrackKind {
+    Mic,
+    System,
+}
+
+#[derive(Clone, Debug)]
+struct TaggedWord {
+    text: String,
+    start_ms: u64,
+    end_ms: u64,
+    speaker: String,
+}
+
 pub async fn transcribe_session(session_dir: &Path, config: &Config) -> Result<MergedTranscript> {
     let mic = session_dir.join("mic.wav");
     let system = session_dir.join("system.wav");
@@ -33,29 +47,19 @@ pub async fn transcribe_session(session_dir: &Path, config: &Config) -> Result<M
         .build()?;
     let api_key = &config.api_keys.assemblyai;
 
-    let mut tasks = Vec::new();
+    let mut all_words: Vec<TaggedWord> = Vec::new();
     if mic.exists() {
-        tasks.push(transcribe_track(&client, api_key, mic.clone(), "You".to_string()));
+        all_words.extend(transcribe_track(&client, api_key, mic.clone(), TrackKind::Mic).await?);
     }
     if system.exists() {
-        tasks.push(transcribe_track(
-            &client,
-            api_key,
-            system.clone(),
-            "System".to_string(),
-        ));
+        all_words.extend(transcribe_track(&client, api_key, system.clone(), TrackKind::System).await?);
     }
-    if tasks.is_empty() {
-        anyhow::bail!("no track files to transcribe in {}", session_dir.display());
+    if all_words.is_empty() {
+        anyhow::bail!("no usable tracks in {}", session_dir.display());
     }
 
-    let mut results = Vec::new();
-    for t in tasks {
-        results.push(t.await?);
-    }
-
-    let mut timeline: Vec<Utterance> = results.into_iter().flatten().collect();
-    timeline.sort_by_key(|u| u.start_ms);
+    all_words.sort_by_key(|w| w.start_ms);
+    let timeline = chunk_into_utterances(&all_words);
     let duration_ms = timeline.last().map(|u| u.end_ms).unwrap_or(0);
 
     let merged = MergedTranscript {
@@ -72,10 +76,9 @@ pub async fn transcribe_session(session_dir: &Path, config: &Config) -> Result<M
 async fn transcribe_track(
     client: &reqwest::Client,
     api_key: &str,
-    audio_path: std::path::PathBuf,
-    speaker_label_for_mic: String,
-) -> Result<Vec<Utterance>> {
-    let is_mic = speaker_label_for_mic == "You";
+    audio_path: PathBuf,
+    kind: TrackKind,
+) -> Result<Vec<TaggedWord>> {
     let compressed = compress_for_upload(&audio_path)
         .await
         .with_context(|| format!("compress {}", audio_path.display()))?;
@@ -96,7 +99,7 @@ async fn transcribe_track(
 
     let create_body = serde_json::json!({
         "audio_url": upload.upload_url,
-        "speaker_labels": true,
+        "speaker_labels": matches!(kind, TrackKind::System),
     });
     let created: CreatedResponse = client
         .post(format!("{ASSEMBLY_BASE}/transcript"))
@@ -126,9 +129,7 @@ async fn transcribe_track(
             .context("poll json")?;
 
         match poll.status.as_str() {
-            "completed" => {
-                return Ok(extract_utterances(&poll, is_mic, &speaker_label_for_mic));
-            }
+            "completed" => return Ok(words_from_response(&poll, kind)),
             "error" => {
                 return Err(anyhow!(
                     "assemblyai transcription error: {}",
@@ -169,24 +170,74 @@ async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
     Ok(output)
 }
 
-fn extract_utterances(resp: &TranscriptResponse, is_mic: bool, mic_label: &str) -> Vec<Utterance> {
-    resp.utterances
-        .as_ref()
-        .map(|utts| {
-            utts.iter()
-                .map(|u| Utterance {
-                    speaker: if is_mic {
-                        mic_label.to_string()
-                    } else {
-                        format!("Speaker {}", u.speaker)
-                    },
-                    start_ms: u.start,
-                    end_ms: u.end,
-                    text: u.text.clone(),
-                })
-                .collect()
+fn words_from_response(resp: &TranscriptResponse, kind: TrackKind) -> Vec<TaggedWord> {
+    let Some(words) = resp.words.as_ref() else {
+        return Vec::new();
+    };
+    words
+        .iter()
+        .map(|w| TaggedWord {
+            text: w.text.clone(),
+            start_ms: w.start,
+            end_ms: w.end,
+            speaker: match kind {
+                TrackKind::Mic => "You".to_string(),
+                TrackKind::System => match &w.speaker {
+                    Some(s) => format!("Speaker {s}"),
+                    None => "Speaker ?".to_string(),
+                },
+            },
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn chunk_into_utterances(words: &[TaggedWord]) -> Vec<Utterance> {
+    // Break on speaker change OR large gap OR max duration.
+    // Because words from all tracks are merged and time-sorted before this
+    // runs, an interjection from "You" in the middle of a "Speaker A"
+    // monologue naturally splits A's chunk in half.
+    const MAX_GAP_MS: u64 = 1500;
+    const MAX_DURATION_MS: u64 = 20_000;
+
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut chunk_start = 0usize;
+
+    for i in 1..words.len() {
+        let prev = &words[i - 1];
+        let cur = &words[i];
+        let first = &words[chunk_start];
+        let gap = cur.start_ms.saturating_sub(prev.end_ms);
+        let duration = cur.end_ms.saturating_sub(first.start_ms);
+        let speaker_changed = cur.speaker != first.speaker;
+
+        if gap > MAX_GAP_MS || duration > MAX_DURATION_MS || speaker_changed {
+            result.push(build_utterance(&words[chunk_start..i]));
+            chunk_start = i;
+        }
+    }
+
+    if chunk_start < words.len() {
+        result.push(build_utterance(&words[chunk_start..]));
+    }
+    result
+}
+
+fn build_utterance(words: &[TaggedWord]) -> Utterance {
+    let text = words
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Utterance {
+        speaker: words[0].speaker.clone(),
+        start_ms: words.first().unwrap().start_ms,
+        end_ms: words.last().unwrap().end_ms,
+        text,
+    }
 }
 
 #[derive(Deserialize)]
@@ -205,13 +256,14 @@ struct TranscriptResponse {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    utterances: Option<Vec<AssemblyUtterance>>,
+    words: Option<Vec<AssemblyWord>>,
 }
 
 #[derive(Deserialize)]
-struct AssemblyUtterance {
-    speaker: String,
+struct AssemblyWord {
+    text: String,
     start: u64,
     end: u64,
-    text: String,
+    #[serde(default)]
+    speaker: Option<String>,
 }
