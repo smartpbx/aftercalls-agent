@@ -6,32 +6,64 @@ mod transcription;
 mod vault;
 
 use recorder::Recorder;
+use serde::Serialize;
 use std::path::PathBuf;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-#[tauri::command]
-fn start_recording(state: State<Recorder>, app: tauri::AppHandle) -> Result<String, String> {
+#[derive(Serialize, Clone)]
+struct RecordingStateEvent {
+    recording: bool,
+}
+
+fn emit_state(app: &AppHandle, recording: bool) {
+    let _ = app.emit("recording-state", RecordingStateEvent { recording });
+}
+
+fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let base = app
         .path()
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
         .join("recordings");
-    state
-        .start(base)
-        .map(|p| p.to_string_lossy().into_owned())
+    let path = state.start(base)?;
+    emit_state(app, true);
+    Ok(path.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
-fn stop_recording(state: State<Recorder>, app: tauri::AppHandle) -> Result<String, String> {
+fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
+    emit_state(app, false);
     let session_dir = path.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         pipeline::run(session_dir, app_clone).await;
     });
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn start_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
+    do_start(&state, &app)
+}
+
+#[tauri::command]
+fn stop_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
+    do_stop(&state, &app)
+}
+
+fn toggle_recording(app: &AppHandle) {
+    let state = app.state::<Recorder>();
+    let result = if state.is_active() {
+        do_stop(&state, app)
+    } else {
+        do_start(&state, app)
+    };
+    if let Err(e) = result {
+        eprintln!("callscribe: hotkey toggle error: {e}");
+    }
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -77,14 +109,33 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
+    // Super+Shift+R: rare conflict vs. Ctrl+Shift+R (browser hard-reload).
+    // On Wayland/Hyprland this still depends on xdg-desktop-portal-hyprland
+    // implementing the GlobalShortcuts portal; falling back to a Hyprland
+    // bind → CLI trigger is tracked as a follow-up.
+    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyR);
+    if let Err(e) = app.global_shortcut().on_shortcut(shortcut, |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            toggle_recording(app);
+        }
+    }) {
+        eprintln!("callscribe: global shortcut unavailable ({e}); use the UI or tray");
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Recorder::new())
         .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .setup(|app| {
             setup_tray(app.handle())?;
+            setup_hotkey(app.handle())?;
             Ok(())
         })
         .on_window_event(|win, event| {

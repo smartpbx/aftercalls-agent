@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,7 @@ type SharedWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
 
 pub struct Recorder {
     inner: Mutex<Inner>,
+    active: AtomicBool,
 }
 
 struct Inner {
@@ -52,7 +54,12 @@ impl Recorder {
                 tx,
                 _worker: worker,
             }),
+            active: AtomicBool::new(false),
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
     }
 
     pub fn start(&self, base_dir: PathBuf) -> Result<PathBuf, String> {
@@ -66,7 +73,11 @@ impl Recorder {
                 reply: reply_tx,
             })
             .map_err(|e| e.to_string())?;
-        reply_rx.recv().map_err(|e| e.to_string())?
+        let result = reply_rx.recv().map_err(|e| e.to_string())?;
+        if result.is_ok() {
+            self.active.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     pub fn stop(&self) -> Result<PathBuf, String> {
@@ -77,7 +88,11 @@ impl Recorder {
             .tx
             .send(Command_::Stop { reply: reply_tx })
             .map_err(|e| e.to_string())?;
-        reply_rx.recv().map_err(|e| e.to_string())?
+        let result = reply_rx.recv().map_err(|e| e.to_string())?;
+        if result.is_ok() {
+            self.active.store(false, Ordering::Relaxed);
+        }
+        result
     }
 }
 

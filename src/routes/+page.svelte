@@ -20,6 +20,8 @@
 
   let unlisten: UnlistenFn | null = null;
 
+  let unlistenState: UnlistenFn | null = null;
+
   onMount(async () => {
     unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
       const p = evt.payload;
@@ -28,10 +30,22 @@
       if (p.stage === "failed") pipelineError = p.error;
       if (p.stage === "done") notePath = p.note_path;
     });
+    unlistenState = await listen<{ recording: boolean }>(
+      "recording-state",
+      (evt) => {
+        recording = evt.payload.recording;
+        if (recording) {
+          pipelineStage = "";
+          pipelineError = "";
+          notePath = "";
+        }
+      },
+    );
   });
 
   onDestroy(() => {
     unlisten?.();
+    unlistenState?.();
   });
 
   async function start() {
