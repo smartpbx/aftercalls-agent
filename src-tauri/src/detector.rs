@@ -6,25 +6,19 @@ use tokio::sync::mpsc;
 
 use crate::recorder::Recorder;
 
-/// Apps we *don't* want to treat as "a call." The rest — Zoom, Teams, Discord,
-/// Slack, Zoho Cliq, phone softphones, anything with a real name — prompt.
-/// Matched case-insensitively, as substrings, against the `application.name`
-/// reported by `pactl list source-outputs`.
+/// Apps we *don't* want to treat as "a call." Matched case-insensitively as
+/// substrings. Kept tight: WEBRTC VoiceEngine is the generic Chromium/Electron
+/// audio stack, so Discord hits it — we rely on `application.process.binary`
+/// to identify the real app (Discord / teams-for-linux / etc.) and only
+/// blacklist things that are *never* an app-meeting (our own capture and
+/// accessibility noise).
 const MIC_CONSUMER_BLACKLIST: &[&str] = &[
-    // Our own capture path
-    "pipewire alsa [client]",
+    "pipewire alsa [client]", // generic ALSA client (our cpal mic path lands here)
+    "pacat",                  // parec's binary
+    "parec",
     "pw-cat",
     "pw-record",
-    "parec",
-    // Accessibility / TTS noise
     "speech-dispatcher",
-    // Browsers (user chose to skip browser-meeting detection for now)
-    "chromium input",
-    "zen",
-    "firefox",
-    "webrtc voiceengine",
-    // Misc background audio
-    "steam voice settings",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -241,15 +235,36 @@ fn raw_mic_consumers() -> Vec<String> {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut names = Vec::new();
+    let mut result = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_binary: Option<String> = None;
+
+    let flush = |result: &mut Vec<String>,
+                 name: &mut Option<String>,
+                 binary: &mut Option<String>| {
+        if let Some(app) = binary.take().or_else(|| name.take()) {
+            result.push(app);
+        }
+        *name = None;
+        *binary = None;
+    };
+
     for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("application.name = \"") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Source Output #") {
+            flush(&mut result, &mut cur_name, &mut cur_binary);
+        } else if let Some(rest) = trimmed.strip_prefix("application.name = \"") {
             if let Some(end) = rest.find('"') {
-                names.push(rest[..end].to_string());
+                cur_name = Some(rest[..end].to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("application.process.binary = \"") {
+            if let Some(end) = rest.find('"') {
+                cur_binary = Some(rest[..end].to_string());
             }
         }
     }
-    names
+    flush(&mut result, &mut cur_name, &mut cur_binary);
+    result
 }
 
 #[cfg(not(target_os = "linux"))]
