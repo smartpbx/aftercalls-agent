@@ -99,8 +99,12 @@ async fn get_call(id: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn get_session_audio_path(app: AppHandle, session_id: String, track: String) -> Result<String, String> {
-    if track != "mic" && track != "system" {
+fn get_session_audio_path(
+    app: AppHandle,
+    session_id: String,
+    track: String,
+) -> Result<String, String> {
+    if !matches!(track.as_str(), "mic" | "system" | "mixed") {
         return Err("invalid track".into());
     }
     let dir = app
@@ -114,6 +118,18 @@ fn get_session_audio_path(app: AppHandle, session_id: String, track: String) -> 
         return Err(format!("not found: {}", dir.display()));
     }
     Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn delete_call(id: String) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::delete_call(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn toggle_recording(app: &AppHandle) {
@@ -204,6 +220,7 @@ pub fn run() {
             list_calls,
             get_call,
             get_session_audio_path,
+            delete_call,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

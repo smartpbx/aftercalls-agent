@@ -67,6 +67,12 @@ fn notify_done(app: &AppHandle, note_path: &std::path::Path) {
 async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<PathBuf> {
     let config = Config::load()?;
 
+    // Best-effort: produce mixed.wav for review-UI playback. If ffmpeg fails
+    // we still proceed — mic/system tracks are enough for transcription.
+    if let Err(e) = mix_tracks(session_dir).await {
+        eprintln!("callscribe: mix failed: {e:#}");
+    }
+
     emit(app, PipelineEvent::Transcribing);
     let transcript = transcription::transcribe_session(session_dir, &config).await?;
 
@@ -96,4 +102,34 @@ fn emit(app: &AppHandle, event: PipelineEvent) {
     if let Err(e) = app.emit("pipeline", event) {
         eprintln!("callscribe: emit failed: {e}");
     }
+}
+
+async fn mix_tracks(session_dir: &std::path::Path) -> Result<()> {
+    let mic = session_dir.join("mic.wav");
+    let system = session_dir.join("system.wav");
+    let mixed = session_dir.join("mixed.wav");
+    if !mic.exists() || !system.exists() {
+        // Nothing useful to mix; review UI will fall back to whichever track exists.
+        return Ok(());
+    }
+    let status = tokio::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(&mic)
+        .arg("-i")
+        .arg(&system)
+        .arg("-filter_complex")
+        .arg("[0:a][1:a]amix=inputs=2:duration=longest:normalize=0")
+        .arg("-c:a")
+        .arg("pcm_s16le")
+        .arg(&mixed)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg amix failed: {status}");
+    }
+    Ok(())
 }

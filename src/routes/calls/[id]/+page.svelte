@@ -33,9 +33,10 @@
 
   let audioSrc = $state<string>("");
   let audioError = $state("");
-  let track = $state<"mic" | "system">("system");
+  let track = $state<"mixed" | "mic" | "system">("mixed");
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
+  let deleting = $state(false);
 
   onMount(async () => {
     try {
@@ -48,7 +49,7 @@
     }
   });
 
-  async function loadAudio(which: "mic" | "system") {
+  async function loadAudio(which: "mixed" | "mic" | "system") {
     if (!call) return;
     audioError = "";
     track = which;
@@ -61,6 +62,20 @@
     } catch (e) {
       audioError = String(e);
       audioSrc = "";
+    }
+  }
+
+  async function deleteCall() {
+    if (!call) return;
+    if (!confirm(`Delete "${call.title ?? "this call"}"? Audio files stay on disk.`))
+      return;
+    deleting = true;
+    try {
+      await invoke("delete_call", { id: call.id });
+      window.location.href = "/calls";
+    } catch (e) {
+      error = String(e);
+      deleting = false;
     }
   }
 
@@ -107,7 +122,12 @@
     <p class="error">{error}</p>
   {:else if call}
     <header>
-      <h1>{call.title ?? "(untitled)"}</h1>
+      <div class="title-row">
+        <h1>{call.title ?? "(untitled)"}</h1>
+        <button class="delete" disabled={deleting} onclick={deleteCall}>
+          {deleting ? "Deleting…" : "Delete"}
+        </button>
+      </div>
       <p class="meta">
         {new Date(call.recorded_at).toLocaleString()}
         {#if call.matched_client}· <span class="client">{call.matched_client}</span>{/if}
@@ -116,6 +136,9 @@
 
     <section class="player">
       <div class="track-toggle">
+        <button class:active={track === "mixed"} onclick={() => loadAudio("mixed")}>
+          Everyone
+        </button>
         <button
           class:active={track === "system"}
           onclick={() => loadAudio("system")}>Other participants</button>
@@ -197,8 +220,35 @@
     margin-bottom: 1.25rem;
   }
 
+  .title-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 0.3rem;
+  }
+
+  .delete {
+    border: 1px solid #552525;
+    background-color: transparent;
+    color: #ff6b6b;
+    border-radius: 8px;
+    padding: 0.35rem 0.9rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s;
+  }
+  .delete:hover:not(:disabled) {
+    background-color: #3a1c1c;
+    border-color: #ff6b6b;
+  }
+  .delete:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
   h1 {
-    margin: 0 0 0.3rem;
+    margin: 0;
     font-weight: 600;
     letter-spacing: -0.02em;
     font-size: 1.5rem;
