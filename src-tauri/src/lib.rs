@@ -1,6 +1,7 @@
 mod config;
 mod detector;
 mod pipeline;
+mod portal;
 mod recorder;
 mod summary;
 mod transcription;
@@ -75,6 +76,44 @@ fn confirm_auto_end(detector: State<Detector>) {
 #[tauri::command]
 fn keep_auto_recording(detector: State<Detector>) {
     detector.decide(UserDecision::KeepRecording);
+}
+
+#[tauri::command]
+async fn list_calls() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::list_calls(backend).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_call(id: String) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::get_call(backend, &id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_session_audio_path(app: AppHandle, session_id: String, track: String) -> Result<String, String> {
+    if track != "mic" && track != "system" {
+        return Err("invalid track".into());
+    }
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("recordings")
+        .join(&session_id)
+        .join(format!("{track}.wav"));
+    if !dir.exists() {
+        return Err(format!("not found: {}", dir.display()));
+    }
+    Ok(dir.to_string_lossy().into_owned())
 }
 
 fn toggle_recording(app: &AppHandle) {
@@ -162,6 +201,9 @@ pub fn run() {
             dismiss_auto_start,
             confirm_auto_end,
             keep_auto_recording,
+            list_calls,
+            get_call,
+            get_session_audio_path,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
