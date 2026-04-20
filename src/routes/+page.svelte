@@ -1,12 +1,39 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { onMount, onDestroy } from "svelte";
+
+  type PipelineEvent =
+    | { stage: "started"; session_dir: string }
+    | { stage: "transcribing" }
+    | { stage: "done"; session_dir: string }
+    | { stage: "failed"; error: string };
 
   let recording = $state(false);
   let sessionDir = $state("");
   let error = $state("");
+  let pipelineStage = $state<string>("");
+  let pipelineError = $state("");
+
+  let unlisten: UnlistenFn | null = null;
+
+  onMount(async () => {
+    unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
+      const p = evt.payload;
+      pipelineError = "";
+      pipelineStage = p.stage;
+      if (p.stage === "failed") pipelineError = p.error;
+    });
+  });
+
+  onDestroy(() => {
+    unlisten?.();
+  });
 
   async function start() {
     error = "";
+    pipelineStage = "";
+    pipelineError = "";
     try {
       sessionDir = await invoke<string>("start_recording");
       recording = true;
@@ -24,6 +51,13 @@
       error = String(e);
     }
   }
+
+  const stageLabel: Record<string, string> = {
+    started: "Processing…",
+    transcribing: "Transcribing…",
+    done: "Transcribed",
+    failed: "Failed",
+  };
 </script>
 
 <main class="container">
@@ -41,6 +75,16 @@
     <p class="status recording">● Recording — {sessionDir}</p>
   {:else if sessionDir}
     <p class="status">Saved to {sessionDir}</p>
+  {/if}
+
+  {#if pipelineStage && !recording}
+    <p class="status {pipelineStage}">
+      {stageLabel[pipelineStage] ?? pipelineStage}
+    </p>
+  {/if}
+
+  {#if pipelineError}
+    <p class="error">{pipelineError}</p>
   {/if}
 
   {#if error}
@@ -107,6 +151,19 @@
   }
 
   .status.recording {
+    color: #ff6b6b;
+  }
+
+  .status.transcribing,
+  .status.started {
+    color: #e0b050;
+  }
+
+  .status.done {
+    color: #7abf7a;
+  }
+
+  .status.failed {
     color: #ff6b6b;
   }
 
