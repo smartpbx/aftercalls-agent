@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -75,7 +76,10 @@ async fn transcribe_track(
     speaker_label_for_mic: String,
 ) -> Result<Vec<Utterance>> {
     let is_mic = speaker_label_for_mic == "You";
-    let bytes = fs::read(&audio_path).with_context(|| format!("read {}", audio_path.display()))?;
+    let compressed = compress_for_upload(&audio_path)
+        .await
+        .with_context(|| format!("compress {}", audio_path.display()))?;
+    let bytes = fs::read(&compressed).with_context(|| format!("read {}", compressed.display()))?;
 
     let upload: UploadResponse = client
         .post(format!("{ASSEMBLY_BASE}/upload"))
@@ -134,6 +138,35 @@ async fn transcribe_track(
             _ => continue,
         }
     }
+}
+
+async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
+    // 16kHz mono Opus is what ASR models consume internally; any more is waste.
+    // ~15-20x size reduction vs raw WAV → proportionally faster upload.
+    let output = input.with_extension("opus");
+    let status = tokio::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-c:a")
+        .arg("libopus")
+        .arg("-b:a")
+        .arg("32k")
+        .arg(&output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("run ffmpeg")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg exited with {status}");
+    }
+    Ok(output)
 }
 
 fn extract_utterances(resp: &TranscriptResponse, is_mic: bool, mic_label: &str) -> Vec<Utterance> {
