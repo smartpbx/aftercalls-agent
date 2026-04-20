@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+  import { invoke } from "@tauri-apps/api/core";
+  import { readFile } from "@tauri-apps/plugin-fs";
   import { page } from "$app/state";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
 
   type Utterance = {
     idx: number;
@@ -53,17 +54,26 @@
     if (!call) return;
     audioError = "";
     track = which;
+    // Revoke old blob URL to avoid leaking memory across track switches.
+    if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
+    audioSrc = "";
     try {
       const path = await invoke<string>("get_session_audio_path", {
         sessionId: call.session_id,
         track: which,
       });
-      audioSrc = convertFileSrc(path);
+      const bytes = await readFile(path);
+      const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
+      audioSrc = URL.createObjectURL(blob);
     } catch (e) {
       audioError = String(e);
       audioSrc = "";
     }
   }
+
+  onDestroy(() => {
+    if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
+  });
 
   async function deleteCall() {
     if (!call) return;
