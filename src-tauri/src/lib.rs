@@ -1,4 +1,5 @@
 mod config;
+mod detector;
 mod pipeline;
 mod recorder;
 mod summary;
@@ -22,7 +23,7 @@ fn emit_state(app: &AppHandle, recording: bool) {
     let _ = app.emit("recording-state", RecordingStateEvent { recording });
 }
 
-fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
+pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let base = app
         .path()
         .app_local_data_dir()
@@ -33,7 +34,7 @@ fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
+pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
     emit_state(app, false);
     let session_dir = path.clone();
@@ -136,6 +137,7 @@ pub fn run() {
         .setup(|app| {
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;
+            detector::spawn(app.handle().clone());
             Ok(())
         })
         .on_window_event(|win, event| {
