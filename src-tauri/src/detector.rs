@@ -235,24 +235,33 @@ fn raw_mic_consumers() -> Vec<String> {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
+    let own_pid = std::process::id().to_string();
+
     let mut result = Vec::new();
     let mut cur_name: Option<String> = None;
     let mut cur_binary: Option<String> = None;
+    let mut cur_pid: Option<String> = None;
 
     let flush = |result: &mut Vec<String>,
                  name: &mut Option<String>,
-                 binary: &mut Option<String>| {
-        if let Some(app) = binary.take().or_else(|| name.take()) {
-            result.push(app);
+                 binary: &mut Option<String>,
+                 pid: &mut Option<String>,
+                 own_pid: &str| {
+        let is_ours = pid.as_deref() == Some(own_pid);
+        if !is_ours {
+            if let Some(app) = binary.take().or_else(|| name.take()) {
+                result.push(app);
+            }
         }
         *name = None;
         *binary = None;
+        *pid = None;
     };
 
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("Source Output #") {
-            flush(&mut result, &mut cur_name, &mut cur_binary);
+            flush(&mut result, &mut cur_name, &mut cur_binary, &mut cur_pid, &own_pid);
         } else if let Some(rest) = trimmed.strip_prefix("application.name = \"") {
             if let Some(end) = rest.find('"') {
                 cur_name = Some(rest[..end].to_string());
@@ -261,9 +270,13 @@ fn raw_mic_consumers() -> Vec<String> {
             if let Some(end) = rest.find('"') {
                 cur_binary = Some(rest[..end].to_string());
             }
+        } else if let Some(rest) = trimmed.strip_prefix("application.process.id = \"") {
+            if let Some(end) = rest.find('"') {
+                cur_pid = Some(rest[..end].to_string());
+            }
         }
     }
-    flush(&mut result, &mut cur_name, &mut cur_binary);
+    flush(&mut result, &mut cur_name, &mut cur_binary, &mut cur_pid, &own_pid);
     result
 }
 

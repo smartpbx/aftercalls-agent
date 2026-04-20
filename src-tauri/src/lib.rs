@@ -4,6 +4,7 @@ mod pipeline;
 mod recorder;
 mod summary;
 mod transcription;
+mod upload;
 mod vault;
 
 use detector::{Detector, UserDecision};

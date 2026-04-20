@@ -9,6 +9,14 @@ pub struct Config {
     pub api_keys: ApiKeys,
     pub openai: OpenAI,
     pub vault: Vault,
+    #[serde(default)]
+    pub backend: Option<Backend>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct Backend {
+    pub url: String,
+    pub token: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -43,6 +51,12 @@ impl Config {
         }
         if let Ok(v) = env::var("CALLSCRIBE_OPENAI_MODEL") {
             cfg.openai.model = v;
+        }
+        if let (Ok(url), Ok(token)) = (
+            env::var("CALLSCRIBE_BACKEND_URL"),
+            env::var("CALLSCRIBE_BACKEND_TOKEN"),
+        ) {
+            cfg.backend = Some(Backend { url, token });
         }
         Ok(cfg)
     }

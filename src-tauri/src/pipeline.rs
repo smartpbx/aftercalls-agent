@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::config::Config;
-use crate::{summary, transcription, vault};
+use crate::{summary, transcription, upload, vault};
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "stage", rename_all = "snake_case")]
@@ -14,6 +14,7 @@ pub enum PipelineEvent {
     Transcribing,
     Summarizing,
     WritingNote,
+    Uploading,
     Done { session_dir: String, note_path: String },
     Failed { error: String },
 }
@@ -74,7 +75,20 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
     let summary = summary::generate(session_dir, &transcript, &config, &candidates).await?;
 
     emit(app, PipelineEvent::WritingNote);
-    let note_path = vault::write_note(&config.vault, &summary, &transcript, session_dir, &candidates)?;
+    let note_path =
+        vault::write_note(&config.vault, &summary, &transcript, session_dir, &candidates)?;
+
+    if let Some(backend) = &config.backend {
+        emit(app, PipelineEvent::Uploading);
+        if let Err(e) = upload::post_call(backend, &transcript, &summary, session_dir, &note_path)
+            .await
+        {
+            // Don't fail the whole pipeline if the backend is down — local
+            // note already landed in the vault.
+            eprintln!("callscribe: backend upload failed: {e:#}");
+        }
+    }
+
     Ok(note_path)
 }
 

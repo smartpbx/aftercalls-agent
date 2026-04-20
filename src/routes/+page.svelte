@@ -8,6 +8,7 @@
     | { stage: "transcribing" }
     | { stage: "summarizing" }
     | { stage: "writing_note" }
+    | { stage: "uploading" }
     | { stage: "done"; session_dir: string; note_path: string }
     | { stage: "failed"; error: string };
 
@@ -87,6 +88,7 @@
     transcribing: "Transcribing…",
     summarizing: "Summarizing…",
     writing_note: "Writing note…",
+    uploading: "Syncing to backend…",
     done: "Saved",
     failed: "Failed",
   };
@@ -224,6 +226,7 @@
   .status.transcribing,
   .status.summarizing,
   .status.writing_note,
+  .status.uploading,
   .status.started {
     color: #e0b050;
   }
