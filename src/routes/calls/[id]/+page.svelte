@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { readFile } from "@tauri-apps/plugin-fs";
+  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
 
@@ -38,6 +39,11 @@
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
   let deleting = $state(false);
+  let copiedLabel = $state("");
+  let editingIdx = $state<number | null>(null);
+  let editValue = $state("");
+  let applyToAll = $state(false);
+  let savingEdit = $state(false);
 
   onMount(async () => {
     try {
@@ -74,6 +80,74 @@
   onDestroy(() => {
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
   });
+
+  async function copy(text: string, label: string) {
+    try {
+      await writeText(text);
+      copiedLabel = label;
+      setTimeout(() => {
+        if (copiedLabel === label) copiedLabel = "";
+      }, 1500);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function copyActionItems() {
+    if (!call) return;
+    copy(call.action_items.map((a) => `- ${a}`).join("\n"), "actions");
+  }
+
+  function startEdit(u: Utterance) {
+    editingIdx = u.idx;
+    editValue = u.speaker;
+    applyToAll = false;
+  }
+
+  function cancelEdit() {
+    editingIdx = null;
+    editValue = "";
+    applyToAll = false;
+  }
+
+  async function saveEdit() {
+    if (!call || editingIdx === null) return;
+    const current = call.utterances.find((x) => x.idx === editingIdx);
+    if (!current) return;
+    const to = editValue.trim();
+    if (!to || to === current.speaker) {
+      cancelEdit();
+      return;
+    }
+    savingEdit = true;
+    try {
+      if (applyToAll) {
+        const from = current.speaker;
+        await invoke<number>("rename_speaker", {
+          id: call.id,
+          from,
+          to,
+        });
+        call.utterances = call.utterances.map((u) =>
+          u.speaker === from ? { ...u, speaker: to } : u,
+        );
+      } else {
+        await invoke("update_utterance_speaker", {
+          id: call.id,
+          idx: editingIdx,
+          speaker: to,
+        });
+        call.utterances = call.utterances.map((u) =>
+          u.idx === editingIdx ? { ...u, speaker: to } : u,
+        );
+      }
+      cancelEdit();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      savingEdit = false;
+    }
+  }
 
   async function deleteCall() {
     if (!call) return;
@@ -171,14 +245,27 @@
 
     {#if call.summary_text}
       <section>
-        <h2>Summary</h2>
+        <div class="section-head">
+          <h2>Summary</h2>
+          <button
+            class="copy"
+            onclick={() => copy(call!.summary_text ?? "", "summary")}
+          >
+            {copiedLabel === "summary" ? "Copied" : "Copy"}
+          </button>
+        </div>
         <p class="summary">{call.summary_text}</p>
       </section>
     {/if}
 
     {#if call.action_items.length > 0}
       <section>
-        <h2>Action items</h2>
+        <div class="section-head">
+          <h2>Action items</h2>
+          <button class="copy" onclick={copyActionItems}>
+            {copiedLabel === "actions" ? "Copied" : "Copy"}
+          </button>
+        </div>
         <ul class="actions">
           {#each call.action_items as item (item)}
             <li>{item}</li>
@@ -191,17 +278,55 @@
       <h2>Transcript</h2>
       <div class="transcript">
         {#each call.utterances as u (u.idx)}
-          <button
-            class="utt"
-            class:active={u.idx === activeIdx}
-            onclick={() => seekTo(u.start_ms)}
-          >
-            <span class="timestamp">{fmtTime(u.start_ms)}</span>
-            <span class="speaker" style="color: {speakerColor(u.speaker)}"
-              >{u.speaker}</span
+          {#if editingIdx === u.idx}
+            <div class="utt-editor">
+              <input
+                class="speaker-input"
+                bind:value={editValue}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") saveEdit();
+                  if (e.key === "Escape") cancelEdit();
+                }}
+              />
+              <label class="apply-all">
+                <input type="checkbox" bind:checked={applyToAll} />
+                Apply to all "{u.speaker}" in this call
+              </label>
+              <div class="editor-buttons">
+                <button class="primary" disabled={savingEdit} onclick={saveEdit}>
+                  {savingEdit ? "Saving…" : "Save"}
+                </button>
+                <button onclick={cancelEdit}>Cancel</button>
+              </div>
+            </div>
+          {:else}
+            <div
+              class="utt"
+              class:active={u.idx === activeIdx}
+              role="button"
+              tabindex="0"
+              onclick={() => seekTo(u.start_ms)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  seekTo(u.start_ms);
+                }
+              }}
             >
-            <span class="text">{u.text}</span>
-          </button>
+              <span class="timestamp">{fmtTime(u.start_ms)}</span>
+              <button
+                type="button"
+                class="speaker"
+                style="color: {speakerColor(u.speaker)}"
+                title="Click to rename"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  startEdit(u);
+                }}
+              >{u.speaker}</button>
+              <span class="text">{u.text}</span>
+            </div>
+          {/if}
         {/each}
       </div>
     </section>
@@ -361,6 +486,101 @@
     font-size: 0.9rem;
     line-height: 1.5;
     transition: background-color 0.1s;
+  }
+
+  .speaker {
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0 0.25rem;
+    margin: 0 -0.25rem;
+    background: none;
+    border: none;
+    font: inherit;
+    text-align: left;
+    font-weight: 500;
+    font-size: 0.85rem;
+    padding-top: 0.05rem;
+  }
+
+  .speaker:hover {
+    background-color: #2e2e2e;
+  }
+
+  .section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .section-head h2 {
+    margin: 0;
+  }
+
+  .copy {
+    padding: 0.25rem 0.7rem;
+    font-size: 0.75rem;
+    border-radius: 999px;
+    border: 1px solid #3a3a3a;
+    background-color: #252525;
+    color: #c0c0c0;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+
+  .copy:hover {
+    border-color: #24c8db;
+    color: #f6f6f6;
+  }
+
+  .utt-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.6rem 0.7rem;
+    margin: 0.2rem 0;
+    border: 1px solid #24c8db;
+    border-radius: 6px;
+    background-color: #1e2a2e;
+  }
+
+  .speaker-input {
+    padding: 0.35rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background-color: #2a2a2a;
+    color: inherit;
+    font-size: 0.9rem;
+    font-family: inherit;
+  }
+
+  .apply-all {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    color: #c0c0c0;
+  }
+
+  .editor-buttons {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .editor-buttons button {
+    padding: 0.3rem 0.9rem;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    border: 1px solid #3a3a3a;
+    background-color: #2a2a2a;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .editor-buttons button.primary {
+    border-color: #24c8db;
+    background-color: #24c8db22;
   }
 
   .utt:hover {

@@ -132,6 +132,34 @@ async fn delete_call(id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn update_utterance_speaker(
+    id: String,
+    idx: i32,
+    speaker: String,
+) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::update_utterance(backend, &id, idx, &speaker)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_speaker(id: String, from: String, to: String) -> Result<u64, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::rename_speaker(backend, &id, &from, &to)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<Recorder>();
     let result = if state.is_active() {
@@ -210,6 +238,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Recorder::new())
         .invoke_handler(tauri::generate_handler![
             start_recording,
@@ -222,6 +251,8 @@ pub fn run() {
             get_call,
             get_session_audio_path,
             delete_call,
+            update_utterance_speaker,
+            rename_speaker,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

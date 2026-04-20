@@ -8,6 +8,7 @@
     "opener:default",
     "fs:default",
     "fs:allow-read-file",
+    "clipboard-manager:allow-write-text",
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "$APPLOCALDATA/**" }]
