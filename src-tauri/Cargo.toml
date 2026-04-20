@@ -27,3 +27,6 @@ hound = "3.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

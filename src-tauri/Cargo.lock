@@ -16,6 +16,7 @@ dependencies = [
  "chrono",
  "cpal",
  "hound",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
