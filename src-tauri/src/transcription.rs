@@ -52,22 +52,27 @@ pub async fn transcribe_session(
         .build()?;
     let api_key = &config.api_keys.assemblyai;
 
-    let mut all_words: Vec<TaggedWord> = Vec::new();
+    // Per-track chunking keeps a speaker's phrase whole even when the other
+    // track interjects mid-utterance during overlapping speech. Merging at the
+    // chunk level (instead of the word level) means "What's happening?" stays
+    // one utterance even if the other speaker says "It doesn't" simultaneously.
+    let mut timeline: Vec<Utterance> = Vec::new();
     if mic.exists() {
-        all_words
-            .extend(transcribe_track(&client, api_key, mic.clone(), TrackKind::Mic, vocab).await?);
+        let words = transcribe_track(&client, api_key, mic.clone(), TrackKind::Mic, vocab).await?;
+        timeline.extend(chunk_into_utterances(&words));
     }
     if system.exists() {
-        all_words.extend(
-            transcribe_track(&client, api_key, system.clone(), TrackKind::System, vocab).await?,
-        );
+        let words =
+            transcribe_track(&client, api_key, system.clone(), TrackKind::System, vocab).await?;
+        timeline.extend(chunk_into_utterances(&words));
     }
-    if all_words.is_empty() {
+    if timeline.is_empty() {
         anyhow::bail!("no usable tracks in {}", session_dir.display());
     }
 
-    all_words.sort_by_key(|w| w.start_ms);
-    let timeline = chunk_into_utterances(&all_words);
+    // Stable sort preserves mic-before-system tiebreaker for chunks that
+    // start at the same instant (rare but deterministic reads matter for tests).
+    timeline.sort_by_key(|u| u.start_ms);
     let duration_ms = timeline.last().map(|u| u.end_ms).unwrap_or(0);
 
     let merged = MergedTranscript {

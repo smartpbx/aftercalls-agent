@@ -6,6 +6,7 @@
 <nav>
   <a href="/" class:active={page.url.pathname === "/"}>Record</a>
   <a href="/calls" class:active={page.url.pathname.startsWith("/calls")}>Calls</a>
+  <a href="/settings" class:active={page.url.pathname.startsWith("/settings")}>Settings</a>
 </nav>
 
 <div class="content">

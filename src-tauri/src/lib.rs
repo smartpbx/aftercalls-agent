@@ -59,6 +59,57 @@ fn stop_recording(state: State<Recorder>, app: AppHandle) -> Result<String, Stri
 }
 
 #[tauri::command]
+async fn process_imported_file(app: AppHandle, source_path: String) -> Result<String, String> {
+    let src = std::path::PathBuf::from(&source_path);
+    if !src.exists() {
+        return Err(format!("file not found: {source_path}"));
+    }
+    // New session dir named after the import moment so it sorts alongside real
+    // recordings. The "imp_" prefix is just for humans eyeballing the folder.
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("recordings")
+        .join(format!("imp_{stamp}"));
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+
+    // Normalize whatever the user picked (mp3/m4a/mp4/etc.) into WAV so the
+    // pipeline's AssemblyAI upload path (which re-encodes to Opus anyway) gets
+    // a consistent input. Stored as system.wav so diarization kicks in — a
+    // Zoom/Meet export usually has multiple voices mixed together.
+    let dest = base.join("system.wav");
+    let status = tokio::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(&src)
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-c:a")
+        .arg("pcm_s16le")
+        .arg(&dest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("run ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg exited with {status} (unsupported format?)"));
+    }
+
+    let session_dir = base.clone();
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        pipeline::run(session_dir, app_clone).await;
+    });
+    Ok(base.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn confirm_auto_start(detector: State<Detector>) {
     detector.decide(UserDecision::ConfirmStart);
 }
@@ -118,6 +169,33 @@ fn get_session_audio_path(
         return Err(format!("not found: {}", dir.display()));
     }
     Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn get_org_vocab() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::get_org_vocab(backend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_org_vocab(
+    custom_spelling: serde_json::Value,
+    word_boost: Vec<String>,
+) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::set_org_vocab(backend, &custom_spelling, &word_boost)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -251,10 +329,12 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Recorder::new())
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            process_imported_file,
             confirm_auto_start,
             dismiss_auto_start,
             confirm_auto_end,
@@ -263,6 +343,8 @@ pub fn run() {
             get_call,
             get_session_audio_path,
             get_audio_urls,
+            get_org_vocab,
+            set_org_vocab,
             delete_call,
             update_utterance_speaker,
             rename_speaker,

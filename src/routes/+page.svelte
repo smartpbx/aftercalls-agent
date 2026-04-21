@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { onMount, onDestroy } from "svelte";
 
   type PipelineEvent =
@@ -83,6 +84,35 @@
     }
   }
 
+  let importing = $state(false);
+
+  async function importRecording() {
+    error = "";
+    const picked = await openDialog({
+      multiple: false,
+      filters: [
+        {
+          name: "Audio",
+          extensions: ["wav", "mp3", "m4a", "mp4", "ogg", "opus", "flac", "webm"],
+        },
+      ],
+    });
+    if (!picked || Array.isArray(picked)) return;
+    importing = true;
+    pipelineStage = "";
+    pipelineError = "";
+    notePath = "";
+    try {
+      sessionDir = await invoke<string>("process_imported_file", {
+        sourcePath: picked,
+      });
+    } catch (e) {
+      error = String(e);
+    } finally {
+      importing = false;
+    }
+  }
+
   const stageLabel: Record<string, string> = {
     started: "Processing…",
     transcribing: "Transcribing…",
@@ -131,6 +161,9 @@
   <div class="row">
     {#if !recording}
       <button onclick={start}>Start recording</button>
+      <button class="secondary" disabled={importing} onclick={importRecording}>
+        {importing ? "Importing…" : "Import file…"}
+      </button>
     {:else}
       <button class="stop" onclick={stop}>Stop recording</button>
     {/if}
@@ -187,6 +220,7 @@
   .row {
     display: flex;
     justify-content: center;
+    gap: 0.6rem;
   }
 
   button {
@@ -207,6 +241,13 @@
 
   button.stop {
     border-color: #ff6b6b;
+  }
+
+  button.secondary {
+    padding: 0.55em 1.3em;
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: #c0c0c0;
   }
 
   .status {

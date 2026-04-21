@@ -137,6 +137,47 @@ pub async fn fetch_vocab(backend: &Backend) -> Result<OrgVocab> {
     })
 }
 
+pub async fn get_org_vocab(backend: &Backend) -> Result<Value> {
+    let client = client()?;
+    let url = format!("{}/v1/org/vocab", backend.url.trim_end_matches('/'));
+    client
+        .get(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .context("backend response")?
+        .json::<Value>()
+        .await
+        .context("decode org vocab")
+}
+
+pub async fn set_org_vocab(
+    backend: &Backend,
+    custom_spelling: &Value,
+    word_boost: &[String],
+) -> Result<()> {
+    let client = client()?;
+    let url = format!("{}/v1/org/vocab", backend.url.trim_end_matches('/'));
+    let resp = client
+        .put(&url)
+        .bearer_auth(&backend.token)
+        .json(&serde_json::json!({
+            "custom_spelling": custom_spelling,
+            "word_boost": word_boost,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("PUT {url}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {status}: {text}");
+    }
+    Ok(())
+}
+
 pub async fn get_audio_urls(backend: &Backend, id: &str) -> Result<Value> {
     let client = client()?;
     let url = format!(
