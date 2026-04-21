@@ -254,11 +254,7 @@
     {#if recording}
       <div class="row row-live">
         <span class="row-dot live"></span>
-        <div class="row-body">
-          <p class="row-title">Recording call</p>
-          <p class="row-sub">Capturing mic + system audio</p>
-        </div>
-        <span class="row-meta">{sessionDir.split("/").slice(-1)[0]}</span>
+        <span class="row-title">Recording mic + system audio</span>
       </div>
     {:else if pipelineStage}
       <div

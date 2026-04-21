@@ -1,4 +1,17 @@
 {
+  "0.3.0": {
+    "headline": "the one where calls stop disappearing and the portal catches up",
+    "changes": [
+      "Windows: recordings stop failing after \"Stop\". The agent now falls back to uploading WAV when ffmpeg isn't installed, so the transcription service can actually fetch the audio.",
+      "Renaming a speaker now rewrites the transcript, summary, action items, and participants in one go — no more \"Speaker A\" stuck in the summary after you've renamed them.",
+      "Participants moved to the top of the call view (above Summary) so you rename before you read. Speaker names in the summary and action items are tinted with each person's chip color so you can scan them at a glance.",
+      "Web portal caught up to the agent: waveform, highlights (create/edit/delete/auto-detect), speaker editing, delete-with-confirm, copy buttons, and a themed /downloads page.",
+      "Admin: self-service profile + password from Settings, invite + manage teammates from Team, /admin/vocab for org-wide spelling corrections and word boost. Calls are now scoped to you by default, with a \"My calls / All team\" toggle for admins.",
+      "Recording status card trimmed — no more on-screen file paths.",
+      "Post-update welcome modal now fires after sign-in so it can greet you by name."
+    ],
+    "footer": "Known: the Linux AppImage can still crash on some distros (bundled webkit2gtk fork). Fix is in progress — use the .deb if you're on Debian/Ubuntu."
+  },
   "0.2.1": {
     "headline": "a few fixes that make the app actually work on fresh installs",
     "changes": [

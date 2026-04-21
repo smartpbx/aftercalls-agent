@@ -117,31 +117,46 @@ pub async fn attach_note_path(
     Ok(())
 }
 
-/// PUTs the three track files (mic.opus, system.opus, mixed.wav) to the
-/// presigned URLs returned by /v1/calls. Missing files are skipped silently;
-/// individual upload failures are reported but don't abort the batch so one
-/// broken track doesn't lose the others.
+/// PUTs the three track files to their presigned URLs. For mic and
+/// system, prefers the `.opus` (compressed by pipeline.rs via ffmpeg)
+/// but falls back to the raw `.wav` when ffmpeg isn't available —
+/// notably on stock Windows. AssemblyAI sniffs the container on
+/// download, so the URL's extension doesn't matter; the bytes drive
+/// decoding. Missing files are skipped silently; individual upload
+/// failures are reported but don't abort the batch so one broken
+/// track doesn't lose the others.
 pub async fn upload_audio(session_dir: &Path, urls: &UploadUrls) -> Result<()> {
     let client = http_client()?;
-    let tracks = [
-        (urls.mic.as_deref(), session_dir.join("mic.opus"), "audio/ogg"),
+
+    // Each entry: (presigned URL, preferred-then-fallback source paths with
+    // matching content types). The first existing source wins.
+    let candidates: [(Option<&str>, &[(PathBuf, &str)]); 3] = [
+        (
+            urls.mic.as_deref(),
+            &[
+                (session_dir.join("mic.opus"), "audio/ogg"),
+                (session_dir.join("mic.wav"), "audio/wav"),
+            ],
+        ),
         (
             urls.system.as_deref(),
-            session_dir.join("system.opus"),
-            "audio/ogg",
+            &[
+                (session_dir.join("system.opus"), "audio/ogg"),
+                (session_dir.join("system.wav"), "audio/wav"),
+            ],
         ),
         (
             urls.mixed.as_deref(),
-            session_dir.join("mixed.wav"),
-            "audio/wav",
+            &[(session_dir.join("mixed.wav"), "audio/wav")],
         ),
     ];
-    for (url, path, content_type) in tracks {
+
+    for (url, sources) in candidates {
         let Some(url) = url else { continue };
-        if !path.exists() {
+        let Some((path, content_type)) = sources.iter().find(|(p, _)| p.exists()) else {
             continue;
-        }
-        if let Err(e) = put_file(&client, url, &path, content_type).await {
+        };
+        if let Err(e) = put_file(&client, url, path, content_type).await {
             eprintln!(
                 "aftercalls: audio upload failed for {}: {e:#}",
                 path.display()
