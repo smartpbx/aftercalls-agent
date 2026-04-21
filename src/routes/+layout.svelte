@@ -76,7 +76,7 @@
     if (p === "/calls") return "Calls";
     if (p.startsWith("/calls/")) return "Call";
     if (p.startsWith("/settings")) return "Settings";
-    return "callscribe";
+    return "aftercalls";
   });
 </script>
 
@@ -84,7 +84,7 @@
   <aside class="rail">
     <a href="/" class="brand">
       <span class="onair" class:live={recording}></span>
-      <span class="wordmark">callscribe</span>
+      <span class="wordmark">aftercalls</span>
     </a>
 
     <nav>

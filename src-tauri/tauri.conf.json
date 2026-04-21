@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "callscribe",
+  "productName": "aftercalls",
   "version": "0.1.0",
   "identifier": "com.callscribe.agent",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "callscribe",
+        "title": "aftercalls",
         "width": 800,
         "height": 600
       }

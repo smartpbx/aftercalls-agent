@@ -44,7 +44,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
             let _ = app
                 .notification()
                 .builder()
-                .title("callscribe: transcription failed")
+                .title("aftercalls: transcription failed")
                 .body(format!("{e:#}"))
                 .show();
             emit(&app, PipelineEvent::Failed { error: format!("{e:#}") });
@@ -60,7 +60,7 @@ fn notify_done(app: &AppHandle, note_path: &std::path::Path) {
     let _ = app
         .notification()
         .builder()
-        .title("callscribe: note saved")
+        .title("aftercalls: note saved")
         .body(title)
         .show();
 }

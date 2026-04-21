@@ -271,7 +271,7 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show callscribe", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show aftercalls", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
@@ -282,7 +282,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
 
     TrayIconBuilder::with_id("main")
-        .tooltip("callscribe")
+        .tooltip("aftercalls")
         .icon(icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
