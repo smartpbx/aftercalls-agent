@@ -11,6 +11,9 @@
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-write-html",
     "dialog:allow-open",
+    "updater:default",
+    "process:default",
+    "process:allow-restart",
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "$APPLOCALDATA/**" }]
