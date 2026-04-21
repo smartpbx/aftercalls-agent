@@ -76,6 +76,28 @@ struct RecordingStateEvent {
     recording: bool,
 }
 
+/// Writes a small metadata file into a newly-created session_dir capturing
+/// how the recording started and what (if any) app triggered it. The
+/// pipeline reads this at upload time so the backend knows whether a call
+/// was auto-detected from Teams, manually started, or imported from a file.
+pub(crate) fn write_session_source(
+    session_dir: &std::path::Path,
+    kind: &str,
+    app: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "kind": kind,
+        "app": app,
+    });
+    let path = session_dir.join("source.json");
+    if let Err(e) = std::fs::write(&path, payload.to_string()) {
+        eprintln!(
+            "aftercalls: failed to write source.json for {}: {e}",
+            session_dir.display()
+        );
+    }
+}
+
 fn emit_state(app: &AppHandle, recording: bool) {
     let _ = app.emit("recording-state", RecordingStateEvent { recording });
     apply_tray_state(
@@ -114,7 +136,9 @@ pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, Strin
 
 #[tauri::command]
 fn start_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
-    do_start(&state, &app)
+    let path = do_start(&state, &app)?;
+    write_session_source(std::path::Path::new(&path), "manual", None);
+    Ok(path)
 }
 
 #[tauri::command]
@@ -164,6 +188,9 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
     if !status.success() {
         return Err(format!("ffmpeg exited with {status} (unsupported format?)"));
     }
+
+    let source_app = src.file_name().map(|s| s.to_string_lossy().into_owned());
+    write_session_source(&base, "imported", source_app.as_deref());
 
     let session_dir = base.clone();
     let app_clone = app.clone();
@@ -379,13 +406,18 @@ async fn rename_speaker(id: String, from: String, to: String) -> Result<u64, Str
 
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<Recorder>();
-    let result = if state.is_active() {
-        do_stop(&state, app)
+    if state.is_active() {
+        if let Err(e) = do_stop(&state, app) {
+            eprintln!("aftercalls: hotkey stop error: {e}");
+        }
     } else {
-        do_start(&state, app)
-    };
-    if let Err(e) = result {
-        eprintln!("aftercalls: hotkey toggle error: {e}");
+        match do_start(&state, app) {
+            Ok(path) => {
+                // Hotkey + tray-menu toggles are manual starts from the user.
+                write_session_source(std::path::Path::new(&path), "manual", None);
+            }
+            Err(e) => eprintln!("aftercalls: hotkey start error: {e}"),
+        }
     }
 }
 

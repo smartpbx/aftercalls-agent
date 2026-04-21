@@ -27,8 +27,52 @@
     participants: string[];
     note_markdown_path: string | null;
     status: string;
+    source_app: string | null;
+    source_kind: string | null;
     utterances: Utterance[];
   };
+
+  function prettyApp(raw: string | null): string | null {
+    if (!raw) return null;
+    const key = raw.toLowerCase();
+    const map: Record<string, string> = {
+      zoom: "Zoom",
+      "zoom.us": "Zoom",
+      teams: "Teams",
+      "teams-for-linux": "Teams",
+      "microsoft teams": "Teams",
+      slack: "Slack",
+      discord: "Discord",
+      "discord-canary": "Discord",
+      firefox: "Firefox",
+      "google chrome": "Chrome",
+      chrome: "Chrome",
+      chromium: "Chromium",
+      "zen-browser": "Zen",
+      zen: "Zen",
+      brave: "Brave",
+      "obs-studio": "OBS",
+      obs: "OBS",
+      smartpbx: "SmartPBX",
+      ringotel: "Ringotel",
+      signal: "Signal",
+      telegram: "Telegram",
+    };
+    return map[key] ?? raw;
+  }
+
+  function sourceKindLabel(kind: string | null): string {
+    switch (kind) {
+      case "auto_detected":
+        return "Auto-detected";
+      case "imported":
+        return "Imported file";
+      case "manual":
+        return "Manual";
+      default:
+        return "";
+    }
+  }
 
   type Highlight = {
     id: string;
@@ -540,11 +584,19 @@
         <div class="head-main">
           <p class="dateline">{fmtDateTitle(call.recorded_at)}</p>
           <h1>{call.title ?? "(untitled)"}</h1>
-          {#if call.matched_client}
-            <p class="client-row">
+          <p class="chip-row">
+            {#if call.matched_client}
               <span class="chip chip-accent">{call.matched_client}</span>
-            </p>
-          {/if}
+            {/if}
+            {#if prettyApp(call.source_app)}
+              <span class="chip" title={sourceKindLabel(call.source_kind)}>
+                <span class="src-dot" aria-hidden="true"></span>
+                {prettyApp(call.source_app)}
+              </span>
+            {:else if call.source_kind}
+              <span class="chip">{sourceKindLabel(call.source_kind)}</span>
+            {/if}
+          </p>
         </div>
         <button class="delete" disabled={deleting} onclick={deleteCall}>
           {deleting ? "Deleting…" : "Delete"}
@@ -976,8 +1028,21 @@
     margin: 0 0 0.55rem;
   }
 
-  .client-row {
+  .chip-row {
     margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+  }
+
+  .src-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--bone-3);
+    display: inline-block;
+    margin-right: 0.3rem;
   }
 
   .delete {

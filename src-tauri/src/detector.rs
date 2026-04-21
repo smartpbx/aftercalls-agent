@@ -173,7 +173,12 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
     match (phase, decision) {
         (Phase::AwaitingStartConfirm { consumer }, UserDecision::ConfirmStart) => {
             match crate::do_start(&state, app) {
-                Ok(_) => {
+                Ok(path) => {
+                    crate::write_session_source(
+                        std::path::Path::new(&path),
+                        "auto_detected",
+                        Some(&consumer),
+                    );
                     emit(app, AutoDetectEvent::Cleared);
                     Phase::Recording { consumer, gone_since: None }
                 }

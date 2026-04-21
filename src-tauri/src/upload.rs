@@ -35,6 +35,11 @@ pub async fn post_call(
         .unwrap_or_default();
     let recorded_at = parse_session_timestamp(&session_id);
 
+    // Load the source descriptor (manual / auto_detected / imported) written
+    // at recording-start; silently treat a missing/corrupt file as "unknown"
+    // rather than failing the upload — old sessions predate this format.
+    let source = read_source_json(session_dir);
+
     let body = CreateCall {
         session_id: session_id.clone(),
         recorded_at,
@@ -45,6 +50,8 @@ pub async fn post_call(
         action_items: &summary.action_items,
         participants: &summary.participants,
         note_markdown_path: note_path.to_string_lossy().into_owned(),
+        source_kind: source.kind.as_deref(),
+        source_app: source.app.as_deref(),
         utterances: transcript
             .timeline
             .iter()
@@ -159,7 +166,25 @@ struct CreateCall<'a> {
     action_items: &'a [String],
     participants: &'a [String],
     note_markdown_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_app: Option<&'a str>,
     utterances: Vec<CreateUtterance<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct SourceDescriptor {
+    kind: Option<String>,
+    app: Option<String>,
+}
+
+fn read_source_json(session_dir: &Path) -> SourceDescriptor {
+    let path = session_dir.join("source.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => SourceDescriptor::default(),
+    }
 }
 
 #[derive(Serialize)]

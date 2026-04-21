@@ -10,7 +10,53 @@
     title: string | null;
     matched_client: string | null;
     status: string;
+    source_app: string | null;
+    source_kind: string | null;
   };
+
+  // Tidy a raw app binary or application-name into something human. Unknown
+  // apps fall through unchanged so we don't hide information.
+  function prettyApp(raw: string | null): string | null {
+    if (!raw) return null;
+    const key = raw.toLowerCase();
+    const map: Record<string, string> = {
+      zoom: "Zoom",
+      "zoom.us": "Zoom",
+      teams: "Teams",
+      "teams-for-linux": "Teams",
+      "microsoft teams": "Teams",
+      slack: "Slack",
+      discord: "Discord",
+      "discord-canary": "Discord",
+      firefox: "Firefox",
+      "google chrome": "Chrome",
+      chrome: "Chrome",
+      chromium: "Chromium",
+      "zen-browser": "Zen",
+      zen: "Zen",
+      brave: "Brave",
+      "obs-studio": "OBS",
+      obs: "OBS",
+      smartpbx: "SmartPBX",
+      ringotel: "Ringotel",
+      signal: "Signal",
+      telegram: "Telegram",
+    };
+    return map[key] ?? raw;
+  }
+
+  function sourceKindLabel(kind: string | null): string {
+    switch (kind) {
+      case "auto_detected":
+        return "Auto";
+      case "imported":
+        return "Imported";
+      case "manual":
+        return "Manual";
+      default:
+        return "";
+    }
+  }
 
   let calls = $state<Call[]>([]);
   let error = $state("");
@@ -146,6 +192,13 @@
                     <div class="entry-meta">
                       {#if call.matched_client}
                         <span class="chip chip-accent">{call.matched_client}</span>
+                      {/if}
+                      {#if prettyApp(call.source_app)}
+                        <span class="chip" title={sourceKindLabel(call.source_kind)}>
+                          {prettyApp(call.source_app)}
+                        </span>
+                      {:else if call.source_kind}
+                        <span class="chip">{sourceKindLabel(call.source_kind)}</span>
                       {/if}
                       {#if call.status !== "complete"}
                         <span class="chip chip-sig">{call.status}</span>
