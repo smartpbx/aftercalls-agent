@@ -177,18 +177,16 @@ jobs:
             --output appimage
           ls -la "$APPIMAGE_NAME"
 
-          # Sign with the Tauri minisign key. Writing the key to a temp
-          # file (mode 600) is less error-prone than piping it through
-          # process substitution — tauri signer chokes on stdin in some
-          # versions.
-          umask 077
-          TAURI_KEYFILE="$(mktemp)"
-          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$TAURI_KEYFILE"
+          # Sign with the Tauri minisign key. `-k` takes the base64
+          # key *content* (not a path) — a tempfile path trips the
+          # base64 decode with `Invalid symbol 46 at offset 8` (the
+          # `.` in `/tmp/tmp.XXX`). The secret is already masked in
+          # Actions logs; /proc/cmdline exposure on an ephemeral runner
+          # is the same posture tauri-action uses internally.
           pnpm exec tauri signer sign \
-            -k "$TAURI_KEYFILE" \
+            -k "$TAURI_SIGNING_PRIVATE_KEY" \
             -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
             "$APPIMAGE_NAME"
-          rm -f "$TAURI_KEYFILE"
           ls -la "$APPIMAGE_NAME.sig"
 
           # Attach to the draft release. --clobber handles reruns.
