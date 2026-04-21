@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { goto } from "$app/navigation";
+  import { getVersion } from "@tauri-apps/api/app";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
@@ -22,6 +23,7 @@
   let updateError = $state("");
   let updateDownloaded = $state(0);
   let updateTotal = $state(0);
+  let version = $state("");
 
   onMount(async () => {
     unlistenState = await listen<{ recording: boolean }>(
@@ -41,6 +43,14 @@
     unlistenTray = await listen<string>("tray-open", (evt) => {
       if (evt.payload === "settings") goto("/settings");
     });
+
+    // Read the running binary's version; displayed in the rail foot so a
+    // user can tell which build they're on post-update.
+    try {
+      version = await getVersion();
+    } catch (e) {
+      console.warn("getVersion failed", e);
+    }
 
     // Check for a new release on startup. The updater plugin talks to
     // latest.json on the Releases page; null return means we're current.
@@ -143,6 +153,10 @@
       <span class="wordmark">aftercalls</span>
     </a>
 
+    {#if version}
+      <p class="version">v{version}</p>
+    {/if}
+
     <nav>
       {#each items as it (it.href)}
         {@const active = it.match(page.url.pathname)}
@@ -244,7 +258,15 @@
     display: flex;
     align-items: center;
     gap: 0.55rem;
-    padding: 0.25rem 0.45rem 1.1rem;
+    padding: 0.25rem 0.45rem 0.25rem;
+  }
+
+  .version {
+    margin: 0 0 0.8rem 2.05rem;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--bone-3);
+    letter-spacing: 0.04em;
   }
 
   nav {
