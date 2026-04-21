@@ -119,9 +119,12 @@
         console.warn("audio-urls unavailable, falling back to local files", e);
       }
       try {
-        highlights = await invoke<Highlight[]>("list_highlights", {
+        const hs = await invoke<Highlight[]>("list_highlights", {
           callId: page.params.id,
         });
+        // Only replace state if the backend returned an array; a stray null
+        // from an older backend would blow up `{#each highlights}` rendering.
+        if (Array.isArray(hs)) highlights = hs;
       } catch (e) {
         console.warn("list_highlights failed", e);
       }
@@ -242,7 +245,10 @@
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
     audioSrc = "";
 
-    const remote = audioUrls[which];
+    // `audioUrls` is typed as an object but defensive-access it in case the
+    // backend / invoke handler returns null on error — blew up a whole route
+    // once because `audioUrls[which]` threw before the fallback branch.
+    const remote = audioUrls && audioUrls[which];
     if (remote) {
       try {
         const resp = await fetch(remote);
