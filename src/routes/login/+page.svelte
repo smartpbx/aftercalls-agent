@@ -3,8 +3,11 @@
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
 
+  const REMEMBERED_EMAIL_KEY = "aftercalls.login.rememberedEmail";
+
   let email = $state("");
   let password = $state("");
+  let rememberEmail = $state(false);
   let submitting = $state(false);
   let error = $state("");
 
@@ -16,6 +19,16 @@
   };
 
   onMount(async () => {
+    // Pre-fill last-used email if the user opted into remember-me on a
+    // previous sign-in. Only the address is persisted — never the password.
+    try {
+      const saved = localStorage.getItem(REMEMBERED_EMAIL_KEY);
+      if (saved) {
+        email = saved;
+        rememberEmail = true;
+      }
+    } catch {}
+
     // If someone hits /login while already logged in, bounce them home.
     try {
       const me = await invoke<Me | null>("current_user");
@@ -30,7 +43,12 @@
     error = "";
     submitting = true;
     try {
-      await invoke<Me>("login", { email: email.trim(), password });
+      const trimmed = email.trim();
+      await invoke<Me>("login", { email: trimmed, password });
+      try {
+        if (rememberEmail) localStorage.setItem(REMEMBERED_EMAIL_KEY, trimmed);
+        else localStorage.removeItem(REMEMBERED_EMAIL_KEY);
+      } catch {}
       goto("/");
     } catch (e: any) {
       error = String(e).replace(/^Error:\s*/, "");
@@ -69,6 +87,15 @@
           bind:value={password}
           disabled={submitting}
         />
+      </label>
+
+      <label class="remember">
+        <input
+          type="checkbox"
+          bind:checked={rememberEmail}
+          disabled={submitting}
+        />
+        <span>Remember my email</span>
       </label>
 
       {#if error}
@@ -167,6 +194,23 @@
 
   input:disabled {
     opacity: 0.6;
+  }
+
+  .remember {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    color: var(--bone-2);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .remember input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+    cursor: pointer;
   }
 
   .error {
