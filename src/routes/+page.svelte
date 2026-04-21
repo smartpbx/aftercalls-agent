@@ -187,8 +187,8 @@
     </div>
   {/if}
 
-  <section class="cta-card" style="--i: 2">
-    <!-- Primary action — big business CTA. Icon + label; state flips to live. -->
+  <section class="cta" style="--i: 2">
+    <!-- Primary action — button flips to live state with inline timer. -->
     <button
       class="record-btn"
       class:live={recording}
@@ -197,11 +197,11 @@
     >
       <span class="record-icon">
         {#if recording}
-          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-            <rect x="4" y="4" width="12" height="12" rx="1.5" fill="currentColor" />
+          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+            <rect x="4.5" y="4.5" width="11" height="11" rx="1.5" fill="currentColor" />
           </svg>
         {:else}
-          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
             <circle cx="10" cy="10" r="5" fill="currentColor" />
           </svg>
         {/if}
@@ -215,7 +215,11 @@
     </button>
 
     <div class="cta-secondary">
-      <span class="kbd">Super</span><span class="kbd">Shift</span><span class="kbd">R</span>
+      <span class="kbd-row">
+        <span class="kbd">Super</span>
+        <span class="kbd">Shift</span>
+        <span class="kbd">R</span>
+      </span>
       <span class="sep">·</span>
       <button class="link" disabled={importing} onclick={importRecording}>
         {importing ? "Importing…" : "Import a file"}
@@ -268,9 +272,9 @@
 
 <style>
   .page {
-    max-width: 680px;
+    max-width: 560px;
     margin: 0 auto;
-    padding: 3rem 2rem 4rem;
+    padding: 2.4rem 2rem 4rem;
     display: flex;
     flex-direction: column;
     gap: 1.4rem;
@@ -279,14 +283,14 @@
   }
 
   .head h1 {
-    font-size: 1.75rem;
+    font-size: 1.55rem;
     margin-bottom: 0.35rem;
   }
 
   .sub {
     margin: 0;
     color: var(--bone-2);
-    font-size: 0.92rem;
+    font-size: 0.88rem;
     max-width: 44ch;
   }
 
@@ -328,20 +332,13 @@
     flex-shrink: 0;
   }
 
-  /* ── CTA card ──────────────────────────────────────────────────────── */
-  .cta-card {
-    padding: 1.8rem;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-lg);
-    background: linear-gradient(
-      180deg,
-      var(--ink-1) 0%,
-      var(--ink-0) 100%
-    );
+  /* ── CTA ───────────────────────────────────────────────────────────── */
+  .cta {
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 0.95rem;
+    align-items: flex-start;
+    gap: 0.85rem;
+    padding: 0.4rem 0 0.8rem;
   }
 
   .record-btn {
@@ -419,9 +416,14 @@
   .cta-secondary {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: 0.5rem;
     font-size: 0.8rem;
     color: var(--bone-3);
+  }
+
+  .kbd-row {
+    display: inline-flex;
+    gap: 0.18rem;
   }
 
   .kbd {
@@ -437,7 +439,6 @@
 
   .sep {
     color: var(--bone-4);
-    margin: 0 0.1rem;
   }
 
   .link {

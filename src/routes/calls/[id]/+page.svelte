@@ -495,45 +495,42 @@
       ></audio>
     </section>
 
-    <!-- ── Two-column layout for Summary + Actions, transcript full-width ─ -->
-    <div class="split" style="--i: 2">
-      {#if call.summary_text}
-        <section class="block">
-          <div class="block-head">
-            <h2>Summary</h2>
-            <button
-              class="copy-btn"
-              onclick={() => copy(call!.summary_text ?? "", "summary")}
-            >
-              {copiedLabel === "summary" ? "Copied" : "Copy"}
-            </button>
-          </div>
-          <p class="summary">{call.summary_text}</p>
-        </section>
-      {/if}
+    {#if call.summary_text}
+      <section class="block" style="--i: 2">
+        <div class="block-head">
+          <h2>Summary</h2>
+          <button
+            class="copy-btn"
+            onclick={() => copy(call!.summary_text ?? "", "summary")}
+          >
+            {copiedLabel === "summary" ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <p class="summary">{call.summary_text}</p>
+      </section>
+    {/if}
 
-      {#if call.action_items.length > 0}
-        <section class="block">
-          <div class="block-head">
-            <h2>Action items</h2>
-            <button class="copy-btn" onclick={copyActionItems}>
-              {copiedLabel === "actions" ? "Copied" : "Copy"}
-            </button>
-          </div>
-          <ul class="actions">
-            {#each call.action_items as item, i (i)}
-              <li>
-                <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
-                <span>{item}</span>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/if}
-    </div>
+    {#if call.action_items.length > 0}
+      <section class="block" style="--i: 3">
+        <div class="block-head">
+          <h2>Action items</h2>
+          <button class="copy-btn" onclick={copyActionItems}>
+            {copiedLabel === "actions" ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <ul class="actions">
+          {#each call.action_items as item, i (i)}
+            <li>
+              <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
+              <span>{item}</span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
     {#if speakers.length > 0}
-      <section class="block" style="--i: 3">
+      <section class="block" style="--i: 4">
         <div class="block-head">
           <h2>Participants</h2>
         </div>
@@ -583,7 +580,7 @@
       </section>
     {/if}
 
-    <section class="block" style="--i: 4">
+    <section class="block" style="--i: 5">
       <div class="block-head">
         <h2>Transcript</h2>
         <button class="copy-btn" onclick={copyTranscript}>
@@ -946,25 +943,9 @@
     font-size: 0.85rem;
   }
 
-  /* ── Split ─────────────────────────────────────────────────────────── */
-  .split {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 2rem;
-    margin-bottom: 2rem;
-  }
-  @media (min-width: 860px) {
-    .split {
-      grid-template-columns: 1.3fr 1fr;
-    }
-  }
-
   /* ── Block common ──────────────────────────────────────────────────── */
   .block {
     margin-bottom: 2rem;
-  }
-  .split .block {
-    margin-bottom: 0;
   }
 
   .block-head {
@@ -998,6 +979,7 @@
     line-height: 1.6;
     color: var(--bone-1);
     white-space: pre-wrap;
+    max-width: 74ch;
   }
 
   /* ── Actions ───────────────────────────────────────────────────────── */
@@ -1008,6 +990,7 @@
     display: flex;
     flex-direction: column;
     gap: 0;
+    max-width: 74ch;
   }
 
   .actions li {
