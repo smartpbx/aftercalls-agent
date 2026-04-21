@@ -1,4 +1,13 @@
 {
+  "0.3.2": {
+    "headline": "session tokens stay fresh, and the summary reads like something you'd paste into an email",
+    "changes": [
+      "Fixed a bug where recordings made more than an hour after signing in failed with a 401. The agent now refreshes its session token automatically when it's about to expire — the same way it already did for read-only requests. If you hit this, signing out and back in was the workaround; you shouldn't need to anymore.",
+      "Summaries and action items now refer to you by your first name in the third person, not \"You.\" So you can copy/paste straight into an email to a customer or teammate without rewriting.",
+      "Transcript lines you spoke also get labeled with your first name instead of \"You.\""
+    ],
+    "footer": "Calls recorded before this update still show the old wording — the new prompt only runs on fresh recordings. Re-summarize (#19) is in the queue so we can apply the new prompt to older calls too."
+  },
   "0.3.1": {
     "headline": "the Windows upload actually works this time, and your transcript clicks go where you meant",
     "changes": [
