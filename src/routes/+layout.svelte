@@ -4,6 +4,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { onDestroy, onMount } from "svelte";
@@ -66,6 +67,33 @@
     firstName: string;
   } | null>(null);
   let releaseNotesChecked = false;
+
+  // On Windows the backend drops native decorations so we draw our
+  // own titlebar inside the webview. Detected once via UA; native
+  // decorations stay on Linux + macOS.
+  const isWindows =
+    typeof navigator !== "undefined" &&
+    /windows/i.test(navigator.userAgent);
+  let winMaximized = $state(false);
+
+  async function minimizeWindow() {
+    try {
+      await getCurrentWindow().minimize();
+    } catch {}
+  }
+  async function toggleMaximize() {
+    const w = getCurrentWindow();
+    try {
+      await w.toggleMaximize();
+      winMaximized = await w.isMaximized();
+    } catch {}
+  }
+  async function closeWindow() {
+    // Hide-on-close is handled Rust-side (prevents quit, keeps tray alive).
+    try {
+      await getCurrentWindow().close();
+    } catch {}
+  }
 
   onMount(async () => {
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
@@ -130,6 +158,23 @@
       version = await getVersion();
     } catch (e) {
       console.warn("getVersion failed", e);
+    }
+
+    // Keep the maximize-button glyph in sync with actual window state.
+    if (isWindows) {
+      try {
+        winMaximized = await getCurrentWindow().isMaximized();
+        const unlisten = await getCurrentWindow().onResized(async () => {
+          try {
+            winMaximized = await getCurrentWindow().isMaximized();
+          } catch {}
+        });
+        const prev = unlistenUpdatePoll;
+        unlistenUpdatePoll = () => {
+          prev?.();
+          unlisten();
+        };
+      } catch {}
     }
 
     // Check for a new release on startup + on a slow periodic timer.
@@ -333,8 +378,13 @@
   </aside>
 
   <div class="main">
-    <header class="topstrip">
-      <div class="crumbs">
+    <header
+      class="topstrip"
+      class:has-win-controls={isWindows}
+      data-tauri-drag-region
+      ondblclick={isWindows ? toggleMaximize : undefined}
+    >
+      <div class="crumbs" data-tauri-drag-region>
         <span class="crumb">{pageTitle}</span>
       </div>
 
@@ -391,6 +441,42 @@
             <span class="ind-label">Idle</span>
           {/if}
         </div>
+
+        {#if isWindows}
+          <!-- Windows-only window controls. The rest of the topstrip is
+               the drag region; these buttons opt out so clicks don't
+               also drag the window. -->
+          <div class="win-controls">
+            <button
+              type="button"
+              class="wc-btn"
+              aria-label="Minimize"
+              onclick={minimizeWindow}
+            >
+              <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2" y="5.4" width="8" height="1.2" fill="currentColor"/></svg>
+            </button>
+            <button
+              type="button"
+              class="wc-btn"
+              aria-label={winMaximized ? "Restore" : "Maximize"}
+              onclick={toggleMaximize}
+            >
+              {#if winMaximized}
+                <svg viewBox="0 0 12 12" width="12" height="12"><rect x="3.2" y="3.2" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1.1"/><rect x="4.8" y="1.6" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              {:else}
+                <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+              {/if}
+            </button>
+            <button
+              type="button"
+              class="wc-btn wc-close"
+              aria-label="Close"
+              onclick={closeWindow}
+            >
+              <svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 3 L9 9 M9 3 L3 9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        {/if}
       </div>
     </header>
 
@@ -589,6 +675,17 @@
     height: var(--topbar-h);
     padding: 0 1.5rem;
     border-bottom: 1px solid var(--hairline);
+    /* The strip doubles as the window drag region on Windows when the
+       native chrome is dropped (see lib.rs setup + issue #25). The
+       drag attribute lives on the markup; this just makes the cursor
+       match. Buttons inside opt out via `-webkit-app-region: no-drag`
+       equivalent (Tauri's drag region is opt-in per element). */
+  }
+  .topstrip.has-win-controls {
+    /* No outer padding on the right so the window controls go
+       edge-to-edge like a native titlebar. */
+    padding: 0 0 0 1.5rem;
+  }
     /* Derive the translucent background from the active ink-0 so the strip
      * tracks the theme. Was hard-coded rgba(14,13,12,0.85) before, which
      * painted a dark bar over the cream light-mode body. */
@@ -681,6 +778,42 @@
     font-size: 0.72rem;
     letter-spacing: 0.04em;
     color: var(--bone-2);
+  }
+
+  /* ── Windows custom titlebar controls ──────────────────────────── */
+  .win-controls {
+    display: flex;
+    align-items: stretch;
+    height: var(--topbar-h);
+    margin-left: 0.3rem;
+  }
+  .wc-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 100%;
+    background: transparent;
+    border: none;
+    color: var(--bone-2);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+    /* Native Windows titlebar buttons are square + flush with the
+       top/right corners; mimic that. */
+  }
+  .wc-btn:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .wc-btn:active {
+    background: var(--ink-3);
+  }
+  .wc-btn.wc-close:hover {
+    background: #e81123;
+    color: #ffffff;
+  }
+  .wc-btn.wc-close:active {
+    background: #b5101a;
   }
 
   .pip {

@@ -616,6 +616,14 @@ pub fn run() {
         .setup(|app| {
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;
+            // Drop the native window chrome on Windows so the webview
+            // can draw an integrated dark titlebar (see #25). Linux
+            // users keep GTK decorations since they already theme
+            // with the system.
+            #[cfg(target_os = "windows")]
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.set_decorations(false);
+            }
             let detector = Detector::spawn(app.handle().clone());
             app.manage(detector);
             Ok(())
