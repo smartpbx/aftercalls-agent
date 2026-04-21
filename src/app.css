@@ -6,8 +6,17 @@
  * primary UI.
  */
 
+/* Theme tokens. The `data-theme` attribute on <html> is set by the inline
+ * bootstrap script in app.html before first paint (to avoid a flash) and
+ * swapped by the settings UI. Three states:
+ *   - data-theme="dark"   — explicit dark
+ *   - data-theme="light"  — explicit light
+ *   - data-theme="system" — match prefers-color-scheme
+ * The design system names are theme-agnostic: "ink" is the surface, "bone"
+ * is the reader. Light mode inverts which physical color each name maps to.
+ */
 :root {
-  /* ink — warm off-blacks with a faint espresso cast */
+  /* ── Dark palette (default) ────────────────────────────────────────── */
   --ink-0: #0e0d0c;
   --ink-1: #161412;
   --ink-2: #1c1a17;
@@ -15,24 +24,20 @@
   --hairline: #2a2724;
   --hairline-hi: #38342f;
 
-  /* bone — warm cream text, four levels */
   --bone-0: #f1ede5;
   --bone-1: #d2ccc0;
   --bone-2: #938c80;
   --bone-3: #6a645a;
   --bone-4: #494540;
 
-  /* accent — deep muted teal (petrol), used for CTAs + active states */
   --accent: #3a9b92;
   --accent-hi: #56b8ae;
   --accent-soft: rgba(58, 155, 146, 0.14);
   --accent-glow: rgba(58, 155, 146, 0.36);
 
-  /* live — recording indicator; warm red so it sits apart from the accent */
   --live: #ff5032;
   --live-soft: rgba(255, 80, 50, 0.18);
 
-  /* status */
   --olive: #8faf72;
   --olive-soft: rgba(143, 175, 114, 0.16);
   --sig: #c9a24a;
@@ -51,6 +56,72 @@
   --radius-lg: 14px;
 
   color-scheme: dark;
+}
+
+/* ── Light palette ─────────────────────────────────────────────────────
+ * Warm cream surfaces + warm off-black text. Accent stays the same teal
+ * (just shaded a touch darker for contrast on the lighter background).
+ */
+:root[data-theme="light"],
+:root[data-theme="system"] {
+  --ink-0: #faf6ec;
+  --ink-1: #f3eddf;
+  --ink-2: #ece5d3;
+  --ink-3: #e1d8c3;
+  --hairline: #cfc6b0;
+  --hairline-hi: #b5ac94;
+
+  --bone-0: #1a1814;
+  --bone-1: #3e3a33;
+  --bone-2: #6b6459;
+  --bone-3: #8b8478;
+  --bone-4: #b0a997;
+
+  --accent: #237e76;
+  --accent-hi: #2d9c92;
+  --accent-soft: rgba(35, 126, 118, 0.12);
+  --accent-glow: rgba(35, 126, 118, 0.28);
+
+  --live: #d14028;
+  --live-soft: rgba(209, 64, 40, 0.14);
+
+  --olive: #6b8c4d;
+  --olive-soft: rgba(107, 140, 77, 0.12);
+  --sig: #a37e2a;
+
+  color-scheme: light;
+}
+
+/* Auto light only when the "system" preference actually says light. */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --ink-0: #0e0d0c;
+    --ink-1: #161412;
+    --ink-2: #1c1a17;
+    --ink-3: #24211d;
+    --hairline: #2a2724;
+    --hairline-hi: #38342f;
+
+    --bone-0: #f1ede5;
+    --bone-1: #d2ccc0;
+    --bone-2: #938c80;
+    --bone-3: #6a645a;
+    --bone-4: #494540;
+
+    --accent: #3a9b92;
+    --accent-hi: #56b8ae;
+    --accent-soft: rgba(58, 155, 146, 0.14);
+    --accent-glow: rgba(58, 155, 146, 0.36);
+
+    --live: #ff5032;
+    --live-soft: rgba(255, 80, 50, 0.18);
+
+    --olive: #8faf72;
+    --olive-soft: rgba(143, 175, 114, 0.16);
+    --sig: #c9a24a;
+
+    color-scheme: dark;
+  }
 }
 
 * {
@@ -72,8 +143,8 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Very subtle grain so the off-black doesn't feel flat. Held behind
- * everything so content paints above. */
+/* Very subtle grain so the surface doesn't feel flat. Reduced further on
+ * light theme where the darker noise pattern would read as speckles. */
 body::before {
   content: "";
   position: fixed;
@@ -83,6 +154,14 @@ body::before {
   opacity: 0.025;
   mix-blend-mode: overlay;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+:root[data-theme="light"] body::before {
+  opacity: 0.012;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] body::before {
+    opacity: 0.012;
+  }
 }
 
 h1,

@@ -531,8 +531,8 @@
   {:else if call}
     <header class="head" style="--i: 0">
       <a class="back" href="/calls">
-        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-          <path d="M10 3 L5 8 L10 13" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M10 3 L5 8 L10 13" stroke="currentColor" stroke-width="1.75" fill="none" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
         <span>Calls</span>
       </a>
@@ -927,14 +927,28 @@
   .back {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    font-size: 0.8rem;
-    color: var(--bone-3);
-    margin-bottom: 1rem;
-    transition: color 0.15s;
+    gap: 0.45rem;
+    font-size: 0.88rem;
+    font-weight: 500;
+    color: var(--bone-2);
+    padding: 0.4rem 0.8rem 0.4rem 0.55rem;
+    margin: 0 0 1.1rem -0.55rem;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: all 0.15s;
+  }
+  .back svg {
+    width: 13px;
+    height: 13px;
+    transition: transform 0.15s;
   }
   .back:hover {
     color: var(--bone-0);
+    background: var(--ink-2);
+    border-color: var(--hairline);
+  }
+  .back:hover svg {
+    transform: translateX(-2px);
   }
 
   .head-row {

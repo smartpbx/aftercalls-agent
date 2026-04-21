@@ -2,6 +2,17 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
 
+  type Theme = "dark" | "light" | "system";
+  let theme = $state<Theme>("dark");
+
+  function setTheme(t: Theme) {
+    theme = t;
+    document.documentElement.setAttribute("data-theme", t);
+    try {
+      localStorage.setItem("aftercalls:theme", t);
+    } catch (_) {}
+  }
+
   // AssemblyAI shape: [{"from": ["ee we","E-wee"], "to": "Ewee"}]
   // The editor flattens into rows so the form is easy to reason about; we
   // rehydrate the nested shape on save.
@@ -20,6 +31,12 @@
   let savedAt = $state(0);
 
   onMount(async () => {
+    // Read the theme that the bootstrap script already applied so the UI
+    // starts matching what the page is rendering.
+    const applied = document.documentElement.getAttribute("data-theme");
+    if (applied === "light" || applied === "system") theme = applied;
+    else theme = "dark";
+
     try {
       const v = await invoke<Vocab>("get_org_vocab");
       rows = (v.custom_spelling ?? []).map((e) => ({
@@ -83,10 +100,39 @@
     </p>
   </header>
 
+  <section class="card" style="--i: 1">
+    <div class="card-head">
+      <div>
+        <h2>Appearance</h2>
+        <p class="hint">
+          System mode follows your OS light/dark preference.
+        </p>
+      </div>
+    </div>
+    <div class="theme-row" role="group" aria-label="Theme">
+      {#each [
+        { v: "dark", label: "Dark" },
+        { v: "light", label: "Light" },
+        { v: "system", label: "System" },
+      ] as opt (opt.v)}
+        <button
+          type="button"
+          class="theme-opt"
+          class:active={theme === opt.v}
+          aria-pressed={theme === opt.v}
+          onclick={() => setTheme(opt.v as Theme)}
+        >
+          <span class="theme-swatch {opt.v}"></span>
+          <span>{opt.label}</span>
+        </button>
+      {/each}
+    </div>
+  </section>
+
   {#if loading}
-    <p class="state" style="--i: 1">Loading…</p>
+    <p class="state" style="--i: 2">Loading…</p>
   {:else}
-    <section class="card" style="--i: 1">
+    <section class="card" style="--i: 2">
       <div class="card-head">
         <div>
           <h2>Spelling corrections</h2>
@@ -139,7 +185,7 @@
       {/if}
     </section>
 
-    <section class="card" style="--i: 2">
+    <section class="card" style="--i: 3">
       <div class="card-head">
         <div>
           <h2>Word boost</h2>
@@ -157,7 +203,7 @@
       ></textarea>
     </section>
 
-    <div class="actions" style="--i: 3">
+    <div class="actions" style="--i: 4">
       <button type="button" class="save" disabled={saving} onclick={save}>
         {saving ? "Saving…" : "Save changes"}
       </button>
@@ -189,6 +235,64 @@
 
   .state {
     color: var(--bone-3);
+  }
+
+  .theme-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+
+  .theme-opt {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.7rem 0.9rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--ink-0);
+    color: var(--bone-1);
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition:
+      border-color 0.15s,
+      color 0.15s,
+      background 0.15s;
+  }
+
+  .theme-opt:hover {
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
+  }
+
+  .theme-opt.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--bone-0);
+  }
+
+  .theme-swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    border: 1px solid var(--hairline);
+    flex-shrink: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  /* Little previews that stay true to each theme regardless of current mode
+   * so the user can see what they're picking. */
+  .theme-swatch.dark {
+    background: linear-gradient(135deg, #0e0d0c 0%, #24211d 100%);
+    border-color: #3a9b92;
+  }
+  .theme-swatch.light {
+    background: linear-gradient(135deg, #faf6ec 0%, #e1d8c3 100%);
+    border-color: #237e76;
+  }
+  .theme-swatch.system {
+    background: linear-gradient(135deg, #0e0d0c 0%, #0e0d0c 50%, #faf6ec 50%, #faf6ec 100%);
+    border-color: var(--accent);
   }
 
   .card {

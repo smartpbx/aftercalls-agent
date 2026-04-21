@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
@@ -11,6 +11,19 @@
       href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+    <script>
+      // Set data-theme before the first paint so the user doesn't see a
+      // dark-to-light flash. Reads the persisted choice from localStorage;
+      // falls back to "dark".
+      (function () {
+        try {
+          var t = localStorage.getItem("aftercalls:theme");
+          if (t === "light" || t === "dark" || t === "system") {
+            document.documentElement.setAttribute("data-theme", t);
+          }
+        } catch (_) {}
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
