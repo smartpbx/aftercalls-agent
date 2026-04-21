@@ -4,6 +4,7 @@
   import { writeText, writeHtml } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
+  import Waveform from "$lib/Waveform.svelte";
 
   type Utterance = {
     idx: number;
@@ -36,9 +37,11 @@
   let audioSrc = $state<string>("");
   let audioError = $state("");
   let track = $state<"mixed" | "mic" | "system">("mixed");
-  let audioUrls = $state<{ mic?: string; system?: string; mixed?: string }>({});
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
+  let audioUrls = $state<{ mic?: string; system?: string; mixed?: string }>({});
+  let playing = $state(false);
+  let rate = $state(1);
   let deleting = $state(false);
   let copiedLabel = $state("");
   let editingIdx = $state<number | null>(null);
@@ -53,8 +56,6 @@
   onMount(async () => {
     try {
       call = await invoke<Call>("get_call", { id: page.params.id });
-      // Best-effort: try remote URLs first. If the backend isn't reachable or
-      // the bucket isn't populated yet, loadAudio falls back to local files.
       try {
         audioUrls = await invoke("get_audio_urls", { id: page.params.id });
       } catch (e) {
@@ -72,7 +73,6 @@
     if (!call) return;
     audioError = "";
     track = which;
-    // Revoke old blob URL to avoid leaking memory across track switches.
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
     audioSrc = "";
 
@@ -116,7 +116,6 @@
     }
   }
 
-  // Rich copy: HTML for Word/email paste, plain fallback for terminals/textareas.
   async function copyRich(html: string, plain: string, label: string) {
     try {
       await writeHtml(html, plain);
@@ -130,7 +129,7 @@
     copiedLabel = label;
     setTimeout(() => {
       if (copiedLabel === label) copiedLabel = "";
-    }, 1500);
+    }, 1800);
   }
 
   function escapeHtml(s: string) {
@@ -238,12 +237,32 @@
   function seekTo(ms: number) {
     if (audioEl) {
       audioEl.currentTime = ms / 1000;
-      audioEl.play();
+      if (audioEl.paused) audioEl.play();
     }
   }
 
   function onTimeUpdate() {
     if (audioEl) currentMs = Math.floor(audioEl.currentTime * 1000);
+  }
+
+  function onPlay() {
+    playing = true;
+  }
+  function onPause() {
+    playing = false;
+  }
+
+  function togglePlay() {
+    if (!audioEl) return;
+    if (audioEl.paused) audioEl.play();
+    else audioEl.pause();
+  }
+
+  function cycleRate() {
+    const order = [1, 1.25, 1.5, 2, 0.75];
+    const idx = order.indexOf(rate);
+    rate = order[(idx + 1) % order.length];
+    if (audioEl) audioEl.playbackRate = rate;
   }
 
   let activeIdx = $derived.by(() => {
@@ -317,38 +336,173 @@
     }
   }
 
+  // Stable per-speaker accent colors. "You" always gets the brand accent; others
+  // pick from a muted palette tuned for the warm dark surface.
   function speakerColor(speaker: string): string {
-    if (speaker === "You") return "#24c8db";
+    if (speaker === "You") return "var(--accent)";
     const hash = [...speaker].reduce((a, c) => a + c.charCodeAt(0), 0);
-    const palette = ["#e0b050", "#b080e0", "#7abf7a", "#ff9070", "#8aa8e0"];
+    const palette = [
+      "#c9a24a", // saffron
+      "#8faf72", // sage
+      "#d07e4e", // rust
+      "#b06a8c", // wine
+      "#8aa2c0", // slate
+    ];
     return palette[hash % palette.length];
   }
+
+  function fmtDateTitle(iso: string) {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  const trackLabels = {
+    mixed: "Everyone",
+    mic: "You",
+    system: "Others",
+  } as const;
 </script>
 
-<main class="container">
-  <a class="back" href="/calls">← Calls</a>
-
+<main class="page reveal">
   {#if loading}
-    <p class="muted">Loading…</p>
+    <p class="state" style="--i: 0">Loading call…</p>
   {:else if error}
-    <p class="error">{error}</p>
+    <p class="state err" style="--i: 0">{error}</p>
   {:else if call}
-    <header>
-      <div class="title-row">
-        <h1>{call.title ?? "(untitled)"}</h1>
+    <header class="head" style="--i: 0">
+      <a class="back" href="/calls">
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path d="M10 3 L5 8 L10 13" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span>Calls</span>
+      </a>
+      <div class="head-row">
+        <div class="head-main">
+          <p class="dateline">{fmtDateTitle(call.recorded_at)}</p>
+          <h1>{call.title ?? "(untitled)"}</h1>
+          {#if call.matched_client}
+            <p class="client-row">
+              <span class="chip chip-accent">{call.matched_client}</span>
+            </p>
+          {/if}
+        </div>
         <button class="delete" disabled={deleting} onclick={deleteCall}>
           {deleting ? "Deleting…" : "Delete"}
         </button>
       </div>
-      <p class="meta">
-        {new Date(call.recorded_at).toLocaleString()}
-        {#if call.matched_client}· <span class="client">{call.matched_client}</span>{/if}
-      </p>
     </header>
 
+    <!-- ── Player ───────────────────────────────────────────────────────── -->
+    <section class="player" style="--i: 1">
+      <div class="wave-host">
+        <Waveform
+          src={audioSrc}
+          audio={audioEl}
+          bind:currentMs
+          durationMs={call.duration_ms}
+          onseek={(ms) => seekTo(ms)}
+        />
+      </div>
+
+      <div class="transport">
+        <button
+          class="play"
+          class:playing
+          onclick={togglePlay}
+          aria-label={playing ? "Pause" : "Play"}
+          disabled={!audioSrc}
+        >
+          {#if playing}
+            <svg viewBox="0 0 20 20" width="12" height="12" aria-hidden="true">
+              <rect x="5" y="4" width="3.2" height="12" rx="0.8" fill="currentColor" />
+              <rect x="11.8" y="4" width="3.2" height="12" rx="0.8" fill="currentColor" />
+            </svg>
+          {:else}
+            <svg viewBox="0 0 20 20" width="12" height="12" aria-hidden="true">
+              <path d="M6 4 L16 10 L6 16 Z" fill="currentColor" />
+            </svg>
+          {/if}
+        </button>
+
+        <div class="tracks">
+          {#each ["mixed", "mic", "system"] as key (key)}
+            <button
+              class="track-pill"
+              class:active={track === key}
+              onclick={() => loadAudio(key as "mixed" | "mic" | "system")}
+            >
+              {trackLabels[key as keyof typeof trackLabels]}
+            </button>
+          {/each}
+        </div>
+
+        <button class="rate" onclick={cycleRate} aria-label="Playback rate">
+          {rate}×
+        </button>
+      </div>
+
+      {#if audioError}
+        <p class="inline-err">{audioError}</p>
+      {/if}
+
+      <audio
+        bind:this={audioEl}
+        src={audioSrc}
+        ontimeupdate={onTimeUpdate}
+        onplay={onPlay}
+        onpause={onPause}
+        preload="auto"
+      ></audio>
+    </section>
+
+    <!-- ── Two-column layout for Summary + Actions, transcript full-width ─ -->
+    <div class="split" style="--i: 2">
+      {#if call.summary_text}
+        <section class="block">
+          <div class="block-head">
+            <h2>Summary</h2>
+            <button
+              class="copy-btn"
+              onclick={() => copy(call!.summary_text ?? "", "summary")}
+            >
+              {copiedLabel === "summary" ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <p class="summary">{call.summary_text}</p>
+        </section>
+      {/if}
+
+      {#if call.action_items.length > 0}
+        <section class="block">
+          <div class="block-head">
+            <h2>Action items</h2>
+            <button class="copy-btn" onclick={copyActionItems}>
+              {copiedLabel === "actions" ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <ul class="actions">
+            {#each call.action_items as item, i (i)}
+              <li>
+                <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
+                <span>{item}</span>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+    </div>
+
     {#if speakers.length > 0}
-      <section class="participants">
-        <h2>Participants</h2>
+      <section class="block" style="--i: 3">
+        <div class="block-head">
+          <h2>Participants</h2>
+        </div>
         <div class="chips">
           {#each speakers as p (p.speaker)}
             {#if editingSpeaker === p.speaker}
@@ -375,17 +529,18 @@
             {:else}
               <button
                 type="button"
-                class="chip"
-                style="border-color: {speakerColor(p.speaker)}"
+                class="chip speaker-chip"
+                style="--c: {speakerColor(p.speaker)}"
                 title="Rename {p.speaker}"
                 onclick={() => startSpeakerRename(p.speaker)}
               >
-                <span class="chip-name" style="color: {speakerColor(p.speaker)}">
-                  {p.speaker}
-                </span>
-                <span class="chip-meta">
-                  {p.count} {p.count === 1 ? "line" : "lines"} ·
-                  {fmtSpeakingTime(p.totalMs)}
+                <span class="chip-dot"></span>
+                <span class="chip-body">
+                  <span class="chip-name">{p.speaker}</span>
+                  <span class="chip-meta">
+                    {p.count} {p.count === 1 ? "line" : "lines"} ·
+                    {fmtSpeakingTime(p.totalMs)}
+                  </span>
                 </span>
               </button>
             {/if}
@@ -394,66 +549,10 @@
       </section>
     {/if}
 
-    <section class="player">
-      <div class="track-toggle">
-        <button class:active={track === "mixed"} onclick={() => loadAudio("mixed")}>
-          Everyone
-        </button>
-        <button
-          class:active={track === "system"}
-          onclick={() => loadAudio("system")}>Other participants</button>
-        <button class:active={track === "mic"} onclick={() => loadAudio("mic")}>
-          You
-        </button>
-      </div>
-      {#if audioSrc}
-        <!-- svelte-ignore a11y_media_has_caption -->
-        <audio
-          bind:this={audioEl}
-          src={audioSrc}
-          controls
-          ontimeupdate={onTimeUpdate}
-        ></audio>
-      {:else if audioError}
-        <p class="error small">{audioError}</p>
-      {/if}
-    </section>
-
-    {#if call.summary_text}
-      <section>
-        <div class="section-head">
-          <h2>Summary</h2>
-          <button
-            class="copy"
-            onclick={() => copy(call!.summary_text ?? "", "summary")}
-          >
-            {copiedLabel === "summary" ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <p class="summary">{call.summary_text}</p>
-      </section>
-    {/if}
-
-    {#if call.action_items.length > 0}
-      <section>
-        <div class="section-head">
-          <h2>Action items</h2>
-          <button class="copy" onclick={copyActionItems}>
-            {copiedLabel === "actions" ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <ul class="actions">
-          {#each call.action_items as item (item)}
-            <li>{item}</li>
-          {/each}
-        </ul>
-      </section>
-    {/if}
-
-    <section>
-      <div class="section-head">
+    <section class="block" style="--i: 4">
+      <div class="block-head">
         <h2>Transcript</h2>
-        <button class="copy" onclick={copyTranscript}>
+        <button class="copy-btn" onclick={copyTranscript}>
           {copiedLabel === "transcript" ? "Copied" : "Copy"}
         </button>
       </div>
@@ -471,13 +570,13 @@
               />
               <label class="apply-all">
                 <input type="checkbox" bind:checked={applyToAll} />
-                Apply to all "{u.speaker}" in this call
+                Apply to all "{u.speaker}"
               </label>
               <div class="editor-buttons">
-                <button class="primary" disabled={savingEdit} onclick={saveEdit}>
+                <button class="ed-save" disabled={savingEdit} onclick={saveEdit}>
                   {savingEdit ? "Saving…" : "Save"}
                 </button>
-                <button onclick={cancelEdit}>Cancel</button>
+                <button class="ed-cancel" onclick={cancelEdit}>Cancel</button>
               </div>
             </div>
           {:else}
@@ -494,18 +593,21 @@
                 }
               }}
             >
-              <span class="timestamp">{fmtTime(u.start_ms)}</span>
+              <span class="utt-ts">{fmtTime(u.start_ms)}</span>
               <button
                 type="button"
-                class="speaker"
-                style="color: {speakerColor(u.speaker)}"
+                class="utt-speaker"
+                style="--c: {speakerColor(u.speaker)}"
                 title="Click to rename"
                 onclick={(e) => {
                   e.stopPropagation();
                   startEdit(u);
                 }}
-              >{u.speaker}</button>
-              <span class="text">{u.text}</span>
+              >
+                <span class="utt-speaker-dot"></span>
+                {u.speaker}
+              </button>
+              <span class="utt-text">{u.text}</span>
             </div>
           {/if}
         {/each}
@@ -515,314 +617,480 @@
 </main>
 
 <style>
-  .container {
-    max-width: 900px;
+  .page {
+    max-width: 1000px;
     margin: 0 auto;
-    padding: 1.5rem 1.5rem 4rem;
+    padding: 1.4rem 2rem 5rem;
+    position: relative;
+    z-index: 2;
+  }
+
+  .state {
+    color: var(--bone-3);
+  }
+  .state.err {
+    color: var(--live);
+  }
+
+  /* ── Head ──────────────────────────────────────────────────────────── */
+  .head {
+    margin-bottom: 1.6rem;
   }
 
   .back {
-    display: inline-block;
-    font-size: 0.85rem;
-    color: #a0a0a0;
-    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: var(--bone-3);
     margin-bottom: 1rem;
+    transition: color 0.15s;
   }
   .back:hover {
-    color: #f6f6f6;
+    color: var(--bone-0);
   }
 
-  header {
-    margin-bottom: 1.25rem;
-  }
-
-  .title-row {
+  .head-row {
     display: flex;
-    justify-content: space-between;
     align-items: flex-start;
+    justify-content: space-between;
     gap: 1rem;
-    margin-bottom: 0.3rem;
+  }
+
+  .head-main {
+    min-width: 0;
+  }
+
+  .dateline {
+    margin: 0 0 0.35rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    color: var(--bone-3);
+  }
+
+  .head-main h1 {
+    font-size: 1.6rem;
+    line-height: 1.2;
+    margin: 0 0 0.55rem;
+  }
+
+  .client-row {
+    margin: 0;
   }
 
   .delete {
-    border: 1px solid #552525;
-    background-color: transparent;
-    color: #ff6b6b;
+    padding: 0.4rem 0.85rem;
+    border: 1px solid var(--hairline);
     border-radius: 8px;
-    padding: 0.35rem 0.9rem;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: background-color 0.15s, border-color 0.15s;
+    color: var(--bone-3);
+    font-size: 0.78rem;
+    transition: all 0.15s;
   }
   .delete:hover:not(:disabled) {
-    background-color: #3a1c1c;
-    border-color: #ff6b6b;
+    border-color: var(--live);
+    color: var(--live);
   }
   .delete:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
 
-  h1 {
-    margin: 0;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    font-size: 1.5rem;
-  }
-  h2 {
-    margin: 0 0 0.75rem;
-    font-weight: 500;
-    font-size: 1rem;
-    color: #c0c0c0;
-  }
-
-  .meta {
-    margin: 0;
-    color: #a0a0a0;
-    font-size: 0.9rem;
-  }
-  .client {
-    color: #24c8db;
-    margin-left: 0.4rem;
-  }
-
-  .participants {
-    margin-bottom: 1.5rem;
-  }
-
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-  }
-
+  /* ── Chips ─────────────────────────────────────────────────────────── */
   .chip {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 0.15rem;
-    padding: 0.45rem 0.85rem;
-    border: 1px solid #3a3a3a;
-    border-radius: 10px;
-    background-color: #1e1e1e;
-    color: inherit;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-1);
+    color: var(--bone-1);
     font: inherit;
     text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s;
+    transition: border-color 0.15s, background 0.15s;
   }
 
   .chip:hover {
-    background-color: #252525;
+    border-color: var(--hairline-hi);
+    background: var(--ink-2);
+  }
+
+  .chip-accent {
+    border-color: rgba(58, 155, 146, 0.32);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 0.2rem 0.6rem;
+  }
+
+  .speaker-chip .chip-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--c);
+    flex-shrink: 0;
+  }
+
+  .chip-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    line-height: 1.25;
   }
 
   .chip-name {
     font-weight: 500;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
+    color: var(--c);
   }
 
   .chip-meta {
-    font-size: 0.75rem;
-    color: #808080;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.02em;
+    color: var(--bone-3);
   }
 
   .chip-editing {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.4rem;
-    border-color: #24c8db;
-    background-color: #1e2a2e;
-    cursor: default;
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
 
   .chip-input {
-    padding: 0.3rem 0.55rem;
+    padding: 0.35rem 0.55rem;
     border-radius: 6px;
-    border: 1px solid #3a3a3a;
-    background-color: #2a2a2a;
-    color: inherit;
-    font: inherit;
+    border: 1px solid var(--hairline);
+    background: var(--ink-0);
+    color: var(--bone-0);
     font-size: 0.85rem;
-    width: 12rem;
+    width: 10rem;
   }
 
   .chip-save,
   .chip-cancel {
-    padding: 0.3rem 0.7rem;
-    font-size: 0.8rem;
+    padding: 0.35rem 0.7rem;
+    font-size: 0.78rem;
     border-radius: 6px;
-    border: 1px solid #3a3a3a;
-    background-color: #2a2a2a;
-    color: inherit;
-    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
   }
 
   .chip-save {
-    border-color: #24c8db;
-    background-color: #24c8db22;
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-weight: 500;
   }
-
   .chip-save:disabled {
-    opacity: 0.5;
+    opacity: 0.6;
     cursor: not-allowed;
   }
 
+  /* ── Player ────────────────────────────────────────────────────────── */
   .player {
-    margin-bottom: 1.5rem;
+    margin-bottom: 2rem;
+    padding: 1.1rem 1.2rem 1.2rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    background: var(--ink-1);
+  }
+
+  .wave-host {
+    padding: 0.3rem 0 1.4rem;
+  }
+
+  .transport {
     display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
+    align-items: center;
+    gap: 0.7rem;
   }
 
-  .track-toggle {
+  .play {
     display: flex;
-    gap: 0.4rem;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid var(--hairline-hi);
+    background: var(--ink-2);
+    color: var(--bone-0);
+    transition: all 0.15s;
+    flex-shrink: 0;
   }
 
-  .track-toggle button {
-    padding: 0.3rem 0.9rem;
-    font-size: 0.8rem;
-    border-radius: 999px;
-    border: 1px solid #3a3a3a;
-    background-color: #2a2a2a;
-    color: #a0a0a0;
-    cursor: pointer;
+  .play:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .play.playing {
+    background: var(--accent);
+    color: var(--ink-0);
+    border-color: var(--accent);
+  }
+  .play:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
-  .track-toggle button.active {
-    border-color: #24c8db;
-    color: #f6f6f6;
+  .tracks {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 8px;
+    background: var(--ink-2);
+    border: 1px solid var(--hairline);
+  }
+
+  .track-pill {
+    padding: 0.3rem 0.75rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--bone-3);
+    border-radius: 6px;
+    transition: all 0.15s;
+  }
+
+  .track-pill:hover {
+    color: var(--bone-0);
+  }
+
+  .track-pill.active {
+    background: var(--ink-0);
+    color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--hairline-hi);
+  }
+
+  .rate {
+    margin-left: auto;
+    padding: 0.35rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--bone-1);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-2);
+    transition: border-color 0.15s;
+  }
+  .rate:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   audio {
-    width: 100%;
-    background-color: #2a2a2a;
-    border-radius: 8px;
+    display: none;
   }
 
-  section {
-    margin-bottom: 1.5rem;
+  .inline-err {
+    margin: 0.6rem 0 0;
+    color: var(--live);
+    font-size: 0.85rem;
   }
 
+  /* ── Split ─────────────────────────────────────────────────────────── */
+  .split {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2rem;
+    margin-bottom: 2rem;
+  }
+  @media (min-width: 860px) {
+    .split {
+      grid-template-columns: 1.3fr 1fr;
+    }
+  }
+
+  /* ── Block common ──────────────────────────────────────────────────── */
+  .block {
+    margin-bottom: 2rem;
+  }
+  .split .block {
+    margin-bottom: 0;
+  }
+
+  .block-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin-bottom: 0.7rem;
+  }
+
+  .copy-btn {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    color: var(--bone-2);
+    transition: all 0.15s;
+  }
+
+  .copy-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Summary ───────────────────────────────────────────────────────── */
   .summary {
     margin: 0;
+    font-size: 0.95rem;
+    line-height: 1.6;
+    color: var(--bone-1);
     white-space: pre-wrap;
-    line-height: 1.55;
-    color: #d8d8d8;
   }
 
+  /* ── Actions ───────────────────────────────────────────────────────── */
   .actions {
+    list-style: none;
+    padding: 0;
     margin: 0;
-    padding-left: 1.2rem;
-    color: #d8d8d8;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
   }
 
   .actions li {
-    margin-bottom: 0.35rem;
+    display: grid;
+    grid-template-columns: 32px 1fr;
+    gap: 0.8rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--bone-1);
+    font-size: 0.9rem;
     line-height: 1.5;
   }
+  .actions li:last-child {
+    border-bottom: none;
+  }
 
+  .action-idx {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    padding-top: 0.22rem;
+  }
+
+  /* ── Chips row (participants) ──────────────────────────────────────── */
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+  }
+
+  /* ── Transcript ────────────────────────────────────────────────────── */
   .transcript {
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    border: 1px solid #2a2a2a;
-    border-radius: 10px;
-    background-color: #1c1c1c;
-    padding: 0.5rem;
-    max-height: 60vh;
-    overflow-y: auto;
+    border-top: 1px solid var(--hairline);
   }
 
   .utt {
     display: grid;
-    grid-template-columns: 4ch 12ch 1fr;
-    gap: 0.75rem;
-    text-align: left;
-    padding: 0.5rem 0.7rem;
-    border: none;
-    background: none;
-    color: inherit;
+    grid-template-columns: 56px 120px 1fr;
+    align-items: baseline;
+    gap: 0.9rem;
+    padding: 0.7rem 0.4rem;
+    border-bottom: 1px solid var(--hairline);
     cursor: pointer;
-    border-radius: 6px;
-    font-size: 0.9rem;
-    line-height: 1.5;
-    transition: background-color 0.1s;
+    transition: background 0.1s;
   }
 
-  .speaker {
-    cursor: pointer;
-    border-radius: 4px;
-    padding: 0 0.25rem;
-    margin: 0 -0.25rem;
-    background: none;
-    border: none;
-    font: inherit;
-    text-align: left;
-    font-weight: 500;
-    font-size: 0.85rem;
-    padding-top: 0.05rem;
+  .utt:hover {
+    background: var(--ink-1);
   }
 
-  .speaker:hover {
-    background-color: #2e2e2e;
+  .utt.active {
+    background: linear-gradient(
+      90deg,
+      var(--accent-soft) 0%,
+      transparent 80%
+    );
+    border-left: 2px solid var(--accent);
+    padding-left: 0.7rem;
   }
 
-  .section-head {
-    display: flex;
-    justify-content: space-between;
+  .utt-ts {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-3);
+    letter-spacing: 0.02em;
+  }
+
+  .utt.active .utt-ts {
+    color: var(--accent);
+  }
+
+  .utt-speaker {
+    display: inline-flex;
     align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
+    gap: 0.45rem;
+    padding: 0.1rem 0.4rem 0.1rem 0.3rem;
+    margin: -0.1rem -0.4rem;
+    border-radius: 4px;
+    color: var(--c);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 500;
+    text-align: left;
+    transition: background 0.15s;
   }
 
-  .section-head h2 {
-    margin: 0;
+  .utt-speaker:hover {
+    background: var(--ink-2);
   }
 
-  .copy {
-    padding: 0.25rem 0.7rem;
-    font-size: 0.75rem;
-    border-radius: 999px;
-    border: 1px solid #3a3a3a;
-    background-color: #252525;
-    color: #c0c0c0;
-    cursor: pointer;
-    transition: border-color 0.15s, color 0.15s;
+  .utt-speaker-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--c);
+    flex-shrink: 0;
   }
 
-  .copy:hover {
-    border-color: #24c8db;
-    color: #f6f6f6;
+  .utt-text {
+    color: var(--bone-1);
+    font-size: 0.9rem;
+    line-height: 1.55;
   }
 
+  .utt.active .utt-text {
+    color: var(--bone-0);
+  }
+
+  /* Editor inline */
   .utt-editor {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    padding: 0.6rem 0.7rem;
-    margin: 0.2rem 0;
-    border: 1px solid #24c8db;
-    border-radius: 6px;
-    background-color: #1e2a2e;
+    gap: 0.55rem;
+    padding: 0.85rem 1rem;
+    margin: 0.3rem 0;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--accent-soft);
   }
 
   .speaker-input {
-    padding: 0.35rem 0.6rem;
+    padding: 0.45rem 0.65rem;
     border-radius: 6px;
-    border: 1px solid #3a3a3a;
-    background-color: #2a2a2a;
-    color: inherit;
+    border: 1px solid var(--hairline);
+    background: var(--ink-0);
+    color: var(--bone-0);
     font-size: 0.9rem;
-    font-family: inherit;
+    max-width: 18rem;
   }
 
   .apply-all {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    font-size: 0.8rem;
-    color: #c0c0c0;
+    font-size: 0.82rem;
+    color: var(--bone-1);
   }
 
   .editor-buttons {
@@ -830,55 +1098,24 @@
     gap: 0.4rem;
   }
 
-  .editor-buttons button {
-    padding: 0.3rem 0.9rem;
+  .ed-save,
+  .ed-cancel {
+    padding: 0.35rem 0.9rem;
     font-size: 0.8rem;
     border-radius: 6px;
-    border: 1px solid #3a3a3a;
-    background-color: #2a2a2a;
-    color: inherit;
-    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
   }
 
-  .editor-buttons button.primary {
-    border-color: #24c8db;
-    background-color: #24c8db22;
-  }
-
-  .utt:hover {
-    background-color: #2a2a2a;
-  }
-
-  .utt.active {
-    background-color: #24c8db22;
-  }
-
-  .timestamp {
-    color: #808080;
-    font-family: ui-monospace, Menlo, monospace;
-    font-size: 0.75rem;
-    padding-top: 0.15rem;
-  }
-
-  .speaker {
+  .ed-save {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
     font-weight: 500;
-    font-size: 0.85rem;
-    padding-top: 0.05rem;
   }
-
-  .text {
-    color: #e0e0e0;
-  }
-
-  .error.small {
-    font-size: 0.85rem;
-  }
-
-  .error {
-    color: #ff6b6b;
-  }
-
-  .muted {
-    color: #a0a0a0;
+  .ed-save:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>

@@ -3,8 +3,8 @@
   import { onMount } from "svelte";
 
   // AssemblyAI shape: [{"from": ["ee we","E-wee"], "to": "Ewee"}]
-  // The editor normalizes the nested-array shape into flat rows so the form
-  // is easy to reason about; we rehydrate on save.
+  // The editor flattens into rows so the form is easy to reason about; we
+  // rehydrate the nested shape on save.
   type SpellRow = { to: string; from: string };
 
   type Vocab = {
@@ -62,7 +62,6 @@
         wordBoost: boost,
       });
       savedAt = Date.now();
-      // Re-normalize what we just saved so the UI matches server truth.
       rows = spelling.map((e) => ({ to: e.to, from: e.from.join(", ") }));
       boostText = boost.join(", ");
     } catch (e) {
@@ -75,14 +74,20 @@
   let savedRecently = $derived(savedAt > 0 && Date.now() - savedAt < 3000);
 </script>
 
-<main class="container">
-  <h1>Org settings</h1>
+<main class="page reveal">
+  <header class="head" style="--i: 0">
+    <h1>Settings</h1>
+    <p class="sub">
+      Transcription hints for your organization. Applied to every call the
+      agent processes.
+    </p>
+  </header>
 
   {#if loading}
-    <p class="muted">Loading…</p>
+    <p class="state" style="--i: 1">Loading…</p>
   {:else}
-    <section>
-      <header class="section-head">
+    <section class="card" style="--i: 1">
+      <div class="card-head">
         <div>
           <h2>Spelling corrections</h2>
           <p class="hint">
@@ -92,11 +97,13 @@
             every occurrence in normal speech.
           </p>
         </div>
-        <button type="button" class="add" onclick={addRow}>+ Add row</button>
-      </header>
+        <button type="button" class="add" onclick={addRow}>
+          + Add row
+        </button>
+      </div>
 
       {#if rows.length === 0}
-        <p class="muted empty">No corrections yet.</p>
+        <p class="empty">No corrections yet.</p>
       {:else}
         <div class="rows">
           <div class="row row-head">
@@ -116,8 +123,15 @@
                 placeholder="ee we, E-wee"
                 bind:value={row.from}
               />
-              <button type="button" class="remove" onclick={() => removeRow(idx)}>
-                ✕
+              <button
+                type="button"
+                class="remove"
+                aria-label="Remove row"
+                onclick={() => removeRow(idx)}
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                  <path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                </svg>
               </button>
             </div>
           {/each}
@@ -125,8 +139,8 @@
       {/if}
     </section>
 
-    <section>
-      <header class="section-head">
+    <section class="card" style="--i: 2">
+      <div class="card-head">
         <div>
           <h2>Word boost</h2>
           <p class="hint">
@@ -134,7 +148,7 @@
             product names — less aggressive than spelling corrections.
           </p>
         </div>
-      </header>
+      </div>
       <textarea
         class="boost"
         rows="3"
@@ -143,9 +157,9 @@
       ></textarea>
     </section>
 
-    <div class="actions">
+    <div class="actions" style="--i: 3">
       <button type="button" class="save" disabled={saving} onclick={save}>
-        {saving ? "Saving…" : "Save"}
+        {saving ? "Saving…" : "Save changes"}
       </button>
       {#if savedRecently}<span class="saved">Saved</span>{/if}
       {#if error}<span class="error">{error}</span>{/if}
@@ -154,24 +168,38 @@
 </main>
 
 <style>
-  .container {
+  .page {
     max-width: 820px;
     margin: 0 auto;
-    padding: 1.5rem 1.5rem 4rem;
+    padding: 2.2rem 2rem 4rem;
+    position: relative;
+    z-index: 2;
   }
 
-  h1 {
-    margin: 0 0 1.5rem;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    font-size: 1.5rem;
+  .head {
+    margin-bottom: 1.6rem;
   }
 
-  section {
-    margin-bottom: 2rem;
+  .sub {
+    margin: 0.3rem 0 0;
+    color: var(--bone-2);
+    font-size: 0.9rem;
+    max-width: 54ch;
   }
 
-  .section-head {
+  .state {
+    color: var(--bone-3);
+  }
+
+  .card {
+    padding: 1.2rem 1.3rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    background: var(--ink-1);
+    margin-bottom: 1.2rem;
+  }
+
+  .card-head {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
@@ -179,40 +207,41 @@
     margin-bottom: 0.9rem;
   }
 
-  h2 {
-    margin: 0 0 0.35rem;
-    font-weight: 500;
-    font-size: 1rem;
-    color: #c0c0c0;
-  }
-
   .hint {
-    margin: 0;
-    color: #808080;
-    font-size: 0.82rem;
-    line-height: 1.5;
+    margin: 0.3rem 0 0;
+    color: var(--bone-3);
+    font-size: 0.8rem;
+    line-height: 1.55;
     max-width: 58ch;
   }
 
   .add {
     flex-shrink: 0;
-    padding: 0.4rem 0.9rem;
-    font-size: 0.8rem;
-    border-radius: 999px;
-    border: 1px solid #3a3a3a;
-    background-color: #252525;
-    color: #c0c0c0;
-    cursor: pointer;
+    padding: 0.38rem 0.85rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: 8px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
+    transition: all 0.15s;
   }
   .add:hover {
-    border-color: #24c8db;
-    color: #f6f6f6;
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .empty {
+    margin: 0;
+    padding: 0.8rem 0.2rem;
+    color: var(--bone-3);
+    font-size: 0.85rem;
   }
 
   .rows {
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
+    gap: 0.45rem;
   }
 
   .row {
@@ -223,50 +252,60 @@
   }
 
   .row-head {
-    font-size: 0.75rem;
-    color: #808080;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--bone-3);
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
     padding: 0 0.2rem;
+    margin-bottom: 0.15rem;
   }
 
   .input,
   .boost {
     padding: 0.5rem 0.7rem;
     border-radius: 8px;
-    border: 1px solid #3a3a3a;
-    background-color: #1c1c1c;
+    border: 1px solid var(--hairline);
+    background: var(--ink-0);
     color: inherit;
     font: inherit;
-    font-size: 0.9rem;
+    font-size: 0.88rem;
     width: 100%;
     box-sizing: border-box;
+    transition: border-color 0.15s;
+  }
+
+  .input::placeholder,
+  .boost::placeholder {
+    color: var(--bone-4);
   }
 
   .input:focus,
   .boost:focus {
     outline: none;
-    border-color: #24c8db;
+    border-color: var(--accent);
   }
 
   .boost {
     resize: vertical;
-    font-family: inherit;
-    line-height: 1.5;
+    line-height: 1.55;
   }
 
   .remove {
-    padding: 0.35rem 0.6rem;
-    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
     border-radius: 6px;
-    border: 1px solid #3a3a3a;
-    background-color: transparent;
-    color: #a0a0a0;
-    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--bone-3);
+    transition: all 0.15s;
   }
   .remove:hover {
-    color: #ff6b6b;
-    border-color: #552525;
+    color: var(--live);
+    border-color: var(--live);
   }
 
   .actions {
@@ -277,14 +316,18 @@
   }
 
   .save {
-    padding: 0.55rem 1.4rem;
-    border-radius: 999px;
-    border: 1px solid #24c8db;
-    background-color: #24c8db22;
-    color: #f6f6f6;
-    font-size: 0.9rem;
-    font-weight: 500;
-    cursor: pointer;
+    padding: 0.55rem 1.2rem;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-size: 0.88rem;
+    font-weight: 600;
+    transition: all 0.15s;
+  }
+  .save:hover:not(:disabled) {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
   }
   .save:disabled {
     opacity: 0.5;
@@ -292,21 +335,13 @@
   }
 
   .saved {
-    color: #7abf7a;
-    font-size: 0.85rem;
+    color: var(--olive);
+    font-size: 0.83rem;
+    font-weight: 500;
   }
 
   .error {
-    color: #ff6b6b;
-    font-size: 0.85rem;
-  }
-
-  .muted {
-    color: #a0a0a0;
-  }
-
-  .empty {
-    margin: 0;
-    padding: 0.6rem 0.2rem;
+    color: var(--live);
+    font-size: 0.83rem;
   }
 </style>

@@ -1,0 +1,200 @@
+/* callscribe design system
+ *
+ * Clean business UI. Warm off-black surface, bone text, deep-teal accent for
+ * calls-to-action + active states; warm red for live recording. All UI is
+ * Geist sans; Geist Mono for timestamps and technical readouts. No serifs in
+ * primary UI.
+ */
+
+:root {
+  /* ink — warm off-blacks with a faint espresso cast */
+  --ink-0: #0e0d0c;
+  --ink-1: #161412;
+  --ink-2: #1c1a17;
+  --ink-3: #24211d;
+  --hairline: #2a2724;
+  --hairline-hi: #38342f;
+
+  /* bone — warm cream text, four levels */
+  --bone-0: #f1ede5;
+  --bone-1: #d2ccc0;
+  --bone-2: #938c80;
+  --bone-3: #6a645a;
+  --bone-4: #494540;
+
+  /* accent — deep muted teal (petrol), used for CTAs + active states */
+  --accent: #3a9b92;
+  --accent-hi: #56b8ae;
+  --accent-soft: rgba(58, 155, 146, 0.14);
+  --accent-glow: rgba(58, 155, 146, 0.36);
+
+  /* live — recording indicator; warm red so it sits apart from the accent */
+  --live: #ff5032;
+  --live-soft: rgba(255, 80, 50, 0.18);
+
+  /* status */
+  --olive: #8faf72;
+  --olive-soft: rgba(143, 175, 114, 0.16);
+  --sig: #c9a24a;
+
+  /* type */
+  --font-sans:
+    "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* rhythm */
+  --rail-w: 212px;
+  --topbar-h: 40px;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background-color: var(--ink-0);
+  color: var(--bone-0);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Very subtle grain so the off-black doesn't feel flat. Held behind
+ * everything so content paints above. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.025;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-sans);
+  margin: 0;
+  color: var(--bone-0);
+  letter-spacing: -0.015em;
+}
+
+h1 {
+  font-weight: 600;
+  font-size: 1.55rem;
+  line-height: 1.2;
+}
+
+h2 {
+  font-weight: 600;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bone-2);
+}
+
+h3 {
+  font-weight: 500;
+  font-size: 1rem;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+}
+
+/* Wordmark — Geist tight, heavier weight, tight tracking for distinction
+ * without romance. Includes a small callout marker. */
+.wordmark {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 1.05rem;
+  letter-spacing: -0.02em;
+}
+
+/* The on-air dot beside the wordmark. Pulses when recording. */
+.onair {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bone-4);
+  transition:
+    background 0.25s,
+    box-shadow 0.25s;
+}
+.onair.live {
+  background: var(--live);
+  animation: onair-pulse 1.4s ease-in-out infinite;
+}
+@keyframes onair-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 80, 50, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(255, 80, 50, 0);
+  }
+}
+
+/* Stagger-in for page content. Children with --i:0, --i:1… cascade in. */
+.reveal > * {
+  opacity: 0;
+  transform: translateY(4px);
+  animation: reveal 420ms cubic-bezier(0.2, 0.6, 0.2, 1) forwards;
+  animation-delay: calc(var(--i, 0) * 55ms + 60ms);
+}
+@keyframes reveal {
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--bone-0);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bone-4) transparent;
+}
