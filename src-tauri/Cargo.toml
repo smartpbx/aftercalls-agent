@@ -42,3 +42,13 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Release profile tuned for CI iteration, not final-byte size. Thin LTO is
+# ~95% of fat LTO's runtime quality at a fraction of the link time, and
+# codegen-units=16 lets parallel codegen actually use the CI runner's cores.
+# If we ship this to many users and shave bytes becomes a goal, flip lto
+# back to "fat" and codegen-units to 1 for the final-release profile only.
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = true
+
