@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
+  import { goto } from "$app/navigation";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onDestroy, onMount } from "svelte";
   import "../app.css";
@@ -10,6 +11,7 @@
   let pipelineStage = $state("");
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
+  let unlistenTray: UnlistenFn | null = null;
 
   onMount(async () => {
     unlistenState = await listen<{ recording: boolean }>(
@@ -25,11 +27,16 @@
         }, 4000);
       }
     });
+    // Tray menu items that need to route: open Settings directly.
+    unlistenTray = await listen<string>("tray-open", (evt) => {
+      if (evt.payload === "settings") goto("/settings");
+    });
   });
 
   onDestroy(() => {
     unlistenState?.();
     unlistenPipeline?.();
+    unlistenTray?.();
   });
 
   const items: {

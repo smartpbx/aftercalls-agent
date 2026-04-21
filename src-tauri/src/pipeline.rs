@@ -21,6 +21,7 @@ pub enum PipelineEvent {
 }
 
 pub async fn run(session_dir: PathBuf, app: AppHandle) {
+    crate::tray_set_processing(&app);
     emit(
         &app,
         PipelineEvent::Started {
@@ -50,6 +51,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
             emit(&app, PipelineEvent::Failed { error: format!("{e:#}") });
         }
     }
+    crate::tray_set_idle(&app);
 }
 
 fn notify_done(app: &AppHandle, note_path: &std::path::Path) {

@@ -12,10 +12,64 @@ use detector::{Detector, UserDecision};
 use recorder::Recorder;
 use serde::Serialize;
 use std::path::PathBuf;
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+// Holds references to tray menu items we need to mutate (toggle label) so we
+// can fetch them out of app state instead of hunting through the menu tree.
+struct TrayItems {
+    toggle: MenuItem<Wry>,
+}
+
+#[derive(Clone, Copy)]
+enum TrayState {
+    Idle,
+    Recording,
+    Processing,
+}
+
+pub(crate) fn tray_set_processing(app: &AppHandle) {
+    apply_tray_state(app, TrayState::Processing);
+}
+pub(crate) fn tray_set_idle(app: &AppHandle) {
+    apply_tray_state(app, TrayState::Idle);
+}
+
+fn apply_tray_state(app: &AppHandle, state: TrayState) {
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    // tauri::include_image! decodes the PNG at compile time into raw RGBA,
+    // so this is a zero-IO, zero-decode swap at runtime.
+    let (img, tip): (Image<'static>, &str) = match state {
+        TrayState::Idle => (
+            tauri::include_image!("icons/tray-idle.png"),
+            "aftercalls — idle",
+        ),
+        TrayState::Recording => (
+            tauri::include_image!("icons/tray-recording.png"),
+            "aftercalls — recording",
+        ),
+        TrayState::Processing => (
+            tauri::include_image!("icons/tray-processing.png"),
+            "aftercalls — processing",
+        ),
+    };
+    let _ = tray.set_icon(Some(img));
+    let _ = tray.set_tooltip(Some(tip));
+
+    // Flip the start/stop menu label to match.
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let label = match state {
+            TrayState::Recording => "Stop recording",
+            _ => "Start recording",
+        };
+        let _ = items.toggle.set_text(label);
+    }
+}
 
 #[derive(Serialize, Clone)]
 struct RecordingStateEvent {
@@ -24,6 +78,16 @@ struct RecordingStateEvent {
 
 fn emit_state(app: &AppHandle, recording: bool) {
     let _ = app.emit("recording-state", RecordingStateEvent { recording });
+    apply_tray_state(
+        app,
+        if recording {
+            TrayState::Recording
+        } else {
+            // Pipeline handler will bump us to Processing immediately after stop;
+            // this covers the "start failed" / "no recording" case.
+            TrayState::Idle
+        },
+    );
 }
 
 pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
@@ -271,23 +335,37 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show aftercalls", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
+    let toggle = MenuItem::with_id(app, "toggle", "Start recording", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Open aftercalls", true, None::<&str>)?;
+    let settings =
+        MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&toggle, &sep1, &show, &settings, &sep2, &quit],
+    )?;
 
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+    let idle_icon = tauri::include_image!("icons/tray-idle.png");
+
+    app.manage(TrayItems {
+        toggle: toggle.clone(),
+    });
 
     TrayIconBuilder::with_id("main")
-        .tooltip("aftercalls")
-        .icon(icon)
+        .tooltip("aftercalls — idle")
+        .icon(idle_icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
+            "toggle" => toggle_recording(app),
             "show" => show_main_window(app),
+            "settings" => {
+                show_main_window(app);
+                // Frontend listens for this and routes to /settings.
+                let _ = app.emit("tray-open", "settings");
+            }
             "quit" => app.exit(0),
             _ => {}
         })
