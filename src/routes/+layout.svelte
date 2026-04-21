@@ -30,12 +30,16 @@
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
 
-  // Linux-only manual update check. `latest.json` strips linux-* entries
-  // (AppImage crashes on some distros → updater would clobber a stable
-  // tarball install), so tauri-plugin-updater's `check()` always returns
-  // null on Linux. Instead we fetch the manifest directly, version-compare,
-  // and show a pill that deep-links to /downloads when something newer is
-  // out. No in-place upgrade — Linux users grab a new tarball per release.
+  // Linux has two update paths depending on how the app was installed:
+  //   - AppImage → tauri-plugin-updater's `check()` returns an Update
+  //     (APPIMAGE env var is set at launch; updater swaps in place).
+  //     Same user flow as Windows: "Install" button kicks it off.
+  //   - .deb / .rpm / tarball → `check()` returns null because the
+  //     updater can't replace those installs. We fall back to a
+  //     manifest fetch + semver compare, showing a "Get it ↗" pill
+  //     that opens /downloads. No in-place upgrade.
+  // The latest.json at the URL below always has a linux-x86_64
+  // entry pointing at the slim system-webkit AppImage (#31).
   const UPDATE_MANIFEST_URL =
     "https://aftercalls-updates.tor1.digitaloceanspaces.com/latest.json";
 
@@ -54,8 +58,22 @@
     // Skip while one's already offered or being installed — don't
     // clobber the user's in-flight decision.
     if (updateAvailable || linuxUpdateAvailable || updateState === "downloading") return;
+    // Primary path: Tauri's updater plugin. Works for Windows, macOS,
+    // and AppImage Linux. Returns null for non-AppImage Linux installs.
+    try {
+      const u = await checkForUpdate();
+      if (u) {
+        updateAvailable = u;
+        return;
+      }
+    } catch (e) {
+      // Network blip or non-AppImage Linux — retry next tick, fall
+      // through to the Linux manifest-fetch fallback below.
+      console.warn("update check failed", e);
+    }
+    // Linux-only fallback for .deb/.rpm/tarball users (updater returned
+    // null or threw because the running binary isn't an AppImage).
     if (isLinux) {
-      // Manifest fetch path (see comment above).
       try {
         const resp = await fetch(UPDATE_MANIFEST_URL, { cache: "no-store" });
         if (!resp.ok) return;
@@ -65,16 +83,8 @@
           linuxUpdateAvailable = doc.version;
         }
       } catch (e) {
-        console.warn("linux update check failed", e);
+        console.warn("linux manifest fetch failed", e);
       }
-      return;
-    }
-    try {
-      const u = await checkForUpdate();
-      if (u) updateAvailable = u;
-    } catch (e) {
-      // Network blip shouldn't nag; we'll retry next tick.
-      console.warn("update check failed", e);
     }
   }
 

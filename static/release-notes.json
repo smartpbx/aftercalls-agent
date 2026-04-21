@@ -1,12 +1,13 @@
 {
   "0.3.8": {
-    "headline": "Windows titlebar really works this time, Linux stops spawning extra windows, and you can download the audio",
+    "headline": "One-click Linux updates, Windows titlebar really working, no more phantom windows, and an audio download button",
     "changes": [
+      "Linux: one-click in-place auto-update actually works now. We stopped shipping Tauri's bundled-webkit AppImage (the one that crashed on Arch/NixOS/some Ubuntu combos) and build a slim AppImage instead that dynamic-links to your distro's own libwebkit2gtk-4.1 + libgtk-3. Install the v0.3.8 AppImage once, and from then on updates arrive as a pill in the top bar exactly like Windows — click Install, the app swaps itself and relaunches. Requires libwebkit2gtk-4.1 + libgtk-3 installed on the host (preinstalled on Debian/Ubuntu; one package on Arch/Fedora).",
+      "Linux on .deb / .rpm / tarball installs: the built-in updater still can't swap those in place, but you'll see the same \"Get it ↗\" notification pill pointing at /downloads that v0.3.7 shipped.",
       "Call detail: new Download button next to the playback-rate button on both the app and the web portal. Downloads whichever track is selected (Everyone / You / Others) as an .opus file named after the call, which plays in Windows Media Player, macOS, VLC, and any modern browser without needing a codec.",
       "Windows: the titlebar drag AND the min / max / close buttons both work. v0.3.7 swapped the drag approach and accidentally broke both. Back on the Tauri drag-region path with a small pointer-events tweak so clicks on the SVG icons actually reach the buttons.",
       "Linux: opening the app from the tray while a call was active sometimes spawned two or three phantom copies of the window. Added single-instance handling so a second launch re-shows the existing window instead of starting a fresh process, and skipped the redundant show() call when the window is already visible (which was the trigger on Hyprland / sway)."
-    ],
-    "footer": "Linux in-place auto-update is still notification-only — the built-in updater needs a stable Linux AppImage to swap, and the one Tauri produces bundles a crashy webkit fork. A proper fix is on the way (#31)."
+    ]
   },
   "0.3.7": {
     "headline": "Linux update pill, working Windows titlebar buttons, and a less-naggy vault toggle",

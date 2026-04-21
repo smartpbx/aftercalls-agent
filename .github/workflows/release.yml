@@ -99,27 +99,107 @@ jobs:
             ${{ github.event.inputs.tag || github.ref_name }}.
 
             ### Install
-            - **Linux**: prefer the `-linux-x86_64-sysweblink.tar.gz`
-              (stable, links against system webkit2gtk). Alternatively
-              the `.deb` on Debian/Ubuntu. The AppImage is included
-              but has known stability issues on some distros.
-            - **Windows**: download the `.msi` or the NSIS `.exe`.
+            - **Linux**: `.AppImage` is the default — slim, links against
+              system `libwebkit2gtk-4.1` + `libgtk-3`. Also available:
+              `.deb` (Debian / Ubuntu / Pop), `.rpm` (Fedora / RHEL).
+            - **Windows**: `.msi` or `.exe` (NSIS).
 
-            Windows + macOS auto-update from a running instance; Linux
-            users grab a new tarball per release (see `/downloads` on
-            the portal).
+            All three desktop platforms auto-update from a running
+            instance (Linux updates via AppImage-in-place swap).
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+          # Skip tauri-bundler's AppImage on Linux — it invokes
+          # linuxdeploy-plugin-gtk.sh which bundles a forked webkit that
+          # SIGABRTs on Arch / NixOS / some Ubuntu combos. We build a
+          # slim system-webkit AppImage ourselves in the next step.
+          args: ${{ matrix.os == 'ubuntu-24.04' && '--bundles deb rpm' || '' }}
 
-      # System-linked Linux tarball. The AppImage that tauri-action
-      # produces bundles libwebkit2gtk-4.1 via linuxdeploy-plugin-gtk,
-      # and that bundled build crashes renderer-side on some distros.
-      # This tarball ships just the agent binary + icon + desktop
-      # entry, dynamically linked against system webkit — stable
-      # wherever libwebkit2gtk-4.1 is installed (Arch, NixOS, Debian,
-      # Ubuntu). Lives as a normal release asset; the portal's
-      # /downloads page picks it up via the updater manifest.
+      # Slim system-webkit AppImage. tauri-bundler's AppImage target
+      # unconditionally runs linuxdeploy-plugin-gtk.sh, which bundles a
+      # forked libwebkit2gtk-4.1 that SIGABRTs renderer-side on Arch,
+      # NixOS, and some Ubuntu combos (see #1). We've skipped that
+      # target via `--bundles deb rpm` above and build our own AppImage
+      # here using linuxdeploy *without* the gtk plugin — the binary
+      # dynamic-links against the host's webkit at runtime, same as
+      # the sysweblink tarball. Requires libwebkit2gtk-4.1 + libgtk-3
+      # installed on the user's system (preinstalled on Debian/Ubuntu;
+      # one package on Arch/Fedora).
+      #
+      # Signed with the same Tauri minisign key as the Windows/macOS
+      # bundles so tauri-plugin-updater can in-place-swap it. That
+      # closes the "Linux has no one-click update" gap (#31).
+      - name: Package slim (system-webkit) Linux AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euxo pipefail
+          VERSION="${TAG#v}"
+          APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
+
+          # linuxdeploy is the lower-level tool tauri-bundler wraps;
+          # running it directly lets us skip --plugin gtk.
+          curl -sSL -o linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy.AppImage
+
+          # Fresh AppDir, assembled from the already-built binary.
+          APPDIR=slim-appdir
+          rm -rf "$APPDIR" "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig"
+          mkdir -p "$APPDIR/usr/bin" \
+                   "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/128x128/apps"
+          cp src-tauri/target/release/agent "$APPDIR/usr/bin/aftercalls"
+          chmod +x "$APPDIR/usr/bin/aftercalls"
+          cp src-tauri/icons/128x128.png \
+             "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png"
+          cat > "$APPDIR/usr/share/applications/aftercalls.desktop" <<DESKTOP
+          [Desktop Entry]
+          Name=aftercalls
+          Comment=Call recording + transcription
+          Exec=aftercalls
+          Icon=aftercalls
+          Terminal=false
+          Type=Application
+          Categories=AudioVideo;Recorder;
+          DESKTOP
+
+          # OUTPUT= renames the final AppImage to match Tauri's naming.
+          OUTPUT="$APPIMAGE_NAME" ./linuxdeploy.AppImage \
+            --appdir "$APPDIR" \
+            --desktop-file "$APPDIR/usr/share/applications/aftercalls.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png" \
+            --executable "$APPDIR/usr/bin/aftercalls" \
+            --output appimage
+          ls -la "$APPIMAGE_NAME"
+
+          # Sign with the Tauri minisign key. Writing the key to a temp
+          # file (mode 600) is less error-prone than piping it through
+          # process substitution — tauri signer chokes on stdin in some
+          # versions.
+          umask 077
+          TAURI_KEYFILE="$(mktemp)"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$TAURI_KEYFILE"
+          pnpm exec tauri signer sign \
+            -k "$TAURI_KEYFILE" \
+            -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "$APPIMAGE_NAME"
+          rm -f "$TAURI_KEYFILE"
+          ls -la "$APPIMAGE_NAME.sig"
+
+          # Attach to the draft release. --clobber handles reruns.
+          gh release upload "$TAG" \
+            "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig" \
+            --clobber
+
+      # Keep the sysweblink tarball too for users who prefer a plain
+      # binary layout (package managers, NixOS overlays, etc). Same
+      # binary as the slim AppImage — just packaged as tar.gz with an
+      # install.md.
       - name: Package system-linked Linux tarball
         if: matrix.os == 'ubuntu-24.04'
         env:
@@ -143,12 +223,11 @@ jobs:
           Categories=AudioVideo;Recorder;
           DESKTOP
           cat > "$STAGE/INSTALL.md" <<'DOC'
-          # aftercalls — system-linked Linux build
+          # aftercalls — system-linked Linux tarball
 
-          This tarball is the aftercalls desktop agent linked against
-          your distro's webkit2gtk-4.1 + gtk-3. Use this when the
-          AppImage build is unstable on your distro — most common on
-          Arch and NixOS.
+          Raw binary layout for users who don't want AppImage. Dynamic-
+          links to your distro's libwebkit2gtk-4.1 + libgtk-3, same as
+          the AppImage we ship.
 
           ## Requirements
 
@@ -170,10 +249,10 @@ jobs:
 
           ## Updates
 
-          The built-in updater expects an AppImage and cannot swap a
-          plain binary in place. Watch
-          https://app.aftercalls.io/downloads and grab a new tarball
-          per release.
+          Tauri's in-place auto-updater only swaps AppImage installs
+          (it can't touch an /opt binary). You'll still see the
+          "update available" pill inside the app — click to jump to
+          https://app.aftercalls.io/downloads and grab the new tarball.
           DOC
           cd dist
           tar czf "../aftercalls-${TAG}-linux-x86_64-sysweblink.tar.gz" aftercalls
@@ -184,10 +263,11 @@ jobs:
 
   # Mirror installers + manifest to the public Spaces updater bucket
   # so running apps can poll for updates without hitting the private
-  # repo on GitHub. Only Windows/macOS entries survive into
-  # latest.json — Linux AppImage updates are intentionally disabled
-  # since the bundled webkit crashes on several distros; Linux users
-  # grab a new tarball per release instead.
+  # repo on GitHub. Injects a linux-x86_64 entry pointing at our slim
+  # system-webkit AppImage — tauri-action didn't emit a Linux updater
+  # entry (we passed --bundles deb rpm to skip its crashy AppImage),
+  # so we add it here from the .sig file produced by the slim-
+  # AppImage step above.
   publish-to-spaces:
     needs: release
     runs-on: ubuntu-24.04
@@ -204,23 +284,43 @@ jobs:
           gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*'
           ls -la
 
-      - name: Rewrite latest.json URLs to Spaces + strip Linux
+      - name: Rewrite latest.json URLs to Spaces + inject Linux entry
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
           BUCKET: ${{ secrets.SPACES_BUCKET }}
           REGION: ${{ secrets.SPACES_REGION }}
         run: |
+          set -eu
+          VERSION="${TAG#v}"
           BASE="https://${BUCKET}.${REGION}.digitaloceanspaces.com/${TAG}"
-          jq --arg base "$BASE" '
+          SLIM_APPIMAGE="aftercalls_${VERSION}_amd64.AppImage"
+
+          if [ ! -f "/tmp/release/${SLIM_APPIMAGE}.sig" ]; then
+            echo "FATAL: slim AppImage signature missing — the slim-"
+            echo "AppImage build step must have failed upstream."
+            ls -la /tmp/release/
+            exit 1
+          fi
+          LINUX_SIG_B64=$(base64 -w0 < "/tmp/release/${SLIM_APPIMAGE}.sig")
+
+          # 1. Rewrite every existing platform URL to point at Spaces
+          #    instead of github.com (running apps hit Spaces since the
+          #    GitHub release is private).
+          # 2. Inject linux-x86_64 entry for the slim AppImage —
+          #    tauri-action didn't emit one since we built AppImage
+          #    ourselves outside its pipeline.
+          jq --arg base "$BASE" \
+             --arg linuxurl "$BASE/$SLIM_APPIMAGE" \
+             --arg linuxsig "$LINUX_SIG_B64" '
             .platforms |= (
               with_entries(
                 .value.url = ($base + "/" + (.value.url | split("/") | .[-1]))
               )
-              | with_entries(select(.key | startswith("linux-") | not))
             )
+            | .platforms["linux-x86_64"] = { signature: $linuxsig, url: $linuxurl }
           ' /tmp/release/latest.json > /tmp/release/latest.rewritten.json
           mv /tmp/release/latest.rewritten.json /tmp/release/latest.json
-          echo "--- latest.json after rewrite + linux-strip ---"
+          echo "--- latest.json after rewrite + linux-inject ---"
           cat /tmp/release/latest.json
 
       - name: Upload to Spaces
