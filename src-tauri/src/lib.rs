@@ -262,6 +262,53 @@ fn get_session_audio_path(
     Ok(dir.to_string_lossy().into_owned())
 }
 
+#[derive(Serialize)]
+struct LoginResult {
+    email: String,
+    display_name: String,
+    role: String,
+    org_display_name: String,
+}
+
+#[tauri::command]
+async fn login(email: String, password: String) -> Result<LoginResult, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    let auth = portal::login(backend, &email, &password)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(LoginResult {
+        email: auth.email,
+        display_name: auth.display_name,
+        role: auth.role,
+        org_display_name: auth.org_display_name,
+    })
+}
+
+#[tauri::command]
+async fn logout() -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::logout(backend).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn current_user() -> Result<Option<LoginResult>, String> {
+    let auth = config::read_auth_file().map_err(|e| e.to_string())?;
+    Ok(auth.map(|a| LoginResult {
+        email: a.email,
+        display_name: a.display_name,
+        role: a.role,
+        org_display_name: a.org_display_name,
+    }))
+}
+
 #[tauri::command]
 async fn get_org_vocab() -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
@@ -514,6 +561,9 @@ pub fn run() {
             dismiss_auto_start,
             confirm_auto_end,
             keep_auto_recording,
+            login,
+            logout,
+            current_user,
             list_calls,
             get_call,
             get_session_audio_path,

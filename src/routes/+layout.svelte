@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { goto } from "$app/navigation";
+  import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
@@ -10,11 +11,23 @@
 
   let { children } = $props();
 
+  type Me = {
+    email: string;
+    display_name: string;
+    role: string;
+    org_display_name: string;
+  };
+
+  let me = $state<Me | null>(null);
+  let authResolved = $state(false);
+
   let recording = $state(false);
   let pipelineStage = $state("");
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
+
+  let isLoginPage = $derived(page.url.pathname.startsWith("/login"));
 
   // Auto-update state. Sits in the top strip as an unobtrusive nudge, then
   // flips into a progress row while downloading, then into a restart prompt.
@@ -45,6 +58,20 @@
         ev.error?.stack ?? ev.error?.message ?? ev.message,
       );
     });
+
+    // Route guard: if we have no auth.json, send the user to /login. Do
+    // this before subscribing to tray/pipeline events so background work
+    // doesn't reference state from a signed-out session.
+    try {
+      me = await invoke<Me | null>("current_user");
+    } catch (e) {
+      console.warn("current_user failed", e);
+    }
+    authResolved = true;
+    if (!me && !page.url.pathname.startsWith("/login")) {
+      goto("/login");
+      return;
+    }
 
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
@@ -166,6 +193,15 @@
   });
 </script>
 
+<!-- Before auth resolves we render nothing so the login form doesn't flash
+     behind the rail and vice versa. -->
+{#if !authResolved}
+  <div class="booting"></div>
+{:else if isLoginPage}
+  <div class="bare">
+    {@render children()}
+  </div>
+{:else}
 <div class="shell">
   <aside class="rail">
     <a href="/" class="brand">
@@ -188,9 +224,15 @@
       {/each}
     </nav>
 
-    <!-- Version tag anchored to the bottom of the rail so the user always
-         has a visible reference for which build is running. -->
+    <!-- Anchored to the bottom of the rail: current user + running
+         version, so which account + which build is one glance away. -->
     <div class="rail-foot">
+      {#if me}
+        <div class="who">
+          <span class="who-name">{me.display_name}</span>
+          <span class="who-org">{me.org_display_name}</span>
+        </div>
+      {/if}
       {#if version}
         <span class="version">v{version}</span>
       {/if}
@@ -255,8 +297,19 @@
     </div>
   </div>
 </div>
+{/if}
 
 <style>
+  .booting {
+    min-height: 100vh;
+  }
+
+  .bare {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
   .shell {
     position: relative;
     z-index: 1;
@@ -289,14 +342,40 @@
     padding-top: 0.8rem;
     border-top: 1px solid var(--hairline);
     display: flex;
-    align-items: center;
-    gap: 0.4rem;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .who {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding: 0 0.55rem;
+  }
+
+  .who-name {
+    font-size: 0.82rem;
+    color: var(--bone-1);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .who-org {
+    font-size: 0.7rem;
+    color: var(--bone-3);
+    letter-spacing: 0.02em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .version {
     font-family: var(--font-mono);
     font-size: 0.7rem;
-    color: var(--bone-3);
+    color: var(--bone-4);
     letter-spacing: 0.04em;
     padding: 0.15rem 0.55rem;
   }

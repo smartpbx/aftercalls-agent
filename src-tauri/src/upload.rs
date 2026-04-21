@@ -1,12 +1,15 @@
-use anyhow::{Context, Result};
+//! Backend interaction for creating the call row, uploading audio, and
+//! attaching the local vault-note path after processing lands. The
+//! transcription + summarization work is now a separate backend
+//! pipeline (see portal::transcribe / portal::summarize).
+
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::Backend;
-use crate::summary::Summary;
-use crate::transcription::MergedTranscript;
+use crate::config::{read_auth_file, AuthFile, Backend};
 
 #[derive(Deserialize, Debug, Default)]
 pub struct UploadUrls {
@@ -16,59 +19,50 @@ pub struct UploadUrls {
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // call_id kept for future direct-lookup flows
+#[allow(dead_code)]
 pub struct CreateCallResponse {
     pub call_id: String,
     pub upload_urls: UploadUrls,
 }
 
-pub async fn post_call(
+/// Create (or upsert) the call row on the backend with the minimal
+/// metadata we know pre-pipeline: session_id, recorded_at, duration
+/// estimate (zero is fine — transcribe backfills the real duration),
+/// the source descriptor, and an empty utterances array. The response
+/// carries the presigned PUT URLs the agent needs for the audio.
+pub async fn create_call(
     backend: &Backend,
-    transcript: &MergedTranscript,
-    summary: &Summary,
     session_dir: &Path,
-    note_path: &Path,
+    duration_ms_hint: u64,
 ) -> Result<CreateCallResponse> {
     let session_id = session_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let recorded_at = parse_session_timestamp(&session_id);
-
-    // Load the source descriptor (manual / auto_detected / imported) written
-    // at recording-start; silently treat a missing/corrupt file as "unknown"
-    // rather than failing the upload — old sessions predate this format.
     let source = read_source_json(session_dir);
 
     let body = CreateCall {
         session_id: session_id.clone(),
         recorded_at,
-        duration_ms: transcript.duration_ms as i64,
-        title: &summary.title,
-        matched_client: summary.matched_client.as_deref(),
-        summary_text: &summary.summary,
-        action_items: &summary.action_items,
-        participants: &summary.participants,
-        note_markdown_path: note_path.to_string_lossy().into_owned(),
-        source_kind: source.kind.as_deref(),
-        source_app: source.app.as_deref(),
-        utterances: transcript
-            .timeline
-            .iter()
-            .map(|u| CreateUtterance {
-                speaker: &u.speaker,
-                start_ms: u.start_ms as i64,
-                end_ms: u.end_ms as i64,
-                text: &u.text,
-            })
-            .collect(),
+        duration_ms: duration_ms_hint as i64,
+        title: None,
+        matched_client: None,
+        summary_text: None,
+        action_items: Vec::new(),
+        participants: Vec::new(),
+        note_markdown_path: None,
+        source_kind: source.kind,
+        source_app: source.app,
+        utterances: Vec::new(),
     };
 
-    let client = http_client()?;
     let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
+    let auth = auth_header(backend)?;
+    let client = http_client()?;
     let resp = client
         .post(&url)
-        .bearer_auth(&backend.token)
+        .header("authorization", auth)
         .json(&body)
         .send()
         .await
@@ -81,6 +75,47 @@ pub async fn post_call(
     resp.json::<CreateCallResponse>()
         .await
         .context("decode create-call response")
+}
+
+/// After transcribe + summarize land server-side the row already has
+/// the transcript + title + summary persisted. This call just attaches
+/// the local vault note path so the portal can link out to it.
+pub async fn attach_note_path(
+    backend: &Backend,
+    session_dir: &Path,
+    note_path: &Path,
+) -> Result<()> {
+    let session_id = session_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let recorded_at = parse_session_timestamp(&session_id);
+
+    // Same endpoint, upsert semantics. We send just the fields we're
+    // updating; backend's ON CONFLICT UPDATE preserves the rest.
+    let body = AttachNote {
+        session_id,
+        recorded_at,
+        duration_ms: 0,
+        note_markdown_path: Some(note_path.to_string_lossy().into_owned()),
+    };
+
+    let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
+    let auth = auth_header(backend)?;
+    let client = http_client()?;
+    let resp = client
+        .post(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    Ok(())
 }
 
 /// PUTs the three track files (mic.opus, system.opus, mixed.wav) to the
@@ -143,9 +178,23 @@ async fn put_file(
 
 fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        // Uploads can be slow on hotel wifi; 10min is comfortably above worst case.
         .timeout(Duration::from_secs(600))
         .build()?)
+}
+
+fn auth_header(backend: &Backend) -> Result<String> {
+    // Keep this loose — portal.rs owns the refresh-on-expiry dance;
+    // pipeline code just needs a header. If the JWT is stale the
+    // backend will reply 401 and the caller can re-auth.
+    if let Some(auth) = read_auth_file()? {
+        return Ok(format!("Bearer {}", auth.access_token));
+    }
+    if let Some(tok) = &backend.token {
+        if !tok.is_empty() {
+            return Ok(format!("Bearer {tok}"));
+        }
+    }
+    Err(anyhow!("not logged in"))
 }
 
 fn parse_session_timestamp(session_id: &str) -> DateTime<Utc> {
@@ -155,22 +204,33 @@ fn parse_session_timestamp(session_id: &str) -> DateTime<Utc> {
 }
 
 #[derive(Serialize)]
-struct CreateCall<'a> {
+struct CreateCall {
     session_id: String,
     recorded_at: DateTime<Utc>,
     duration_ms: i64,
-    title: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    matched_client: Option<&'a str>,
-    summary_text: &'a str,
-    action_items: &'a [String],
-    participants: &'a [String],
-    note_markdown_path: String,
+    title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source_kind: Option<&'a str>,
+    matched_client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source_app: Option<&'a str>,
-    utterances: Vec<CreateUtterance<'a>>,
+    summary_text: Option<String>,
+    action_items: Vec<String>,
+    participants: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note_markdown_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_app: Option<String>,
+    utterances: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AttachNote {
+    session_id: String,
+    recorded_at: DateTime<Utc>,
+    duration_ms: i64,
+    note_markdown_path: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -187,10 +247,10 @@ fn read_source_json(session_dir: &Path) -> SourceDescriptor {
     }
 }
 
-#[derive(Serialize)]
-struct CreateUtterance<'a> {
-    speaker: &'a str,
-    start_ms: i64,
-    end_ms: i64,
-    text: &'a str,
+// AuthFile needs to be reachable for pipeline.rs's peeks at the current
+// user (e.g. to surface org_display_name in UI bits). Re-export here
+// so callers don't need to reach into config directly.
+#[allow(dead_code)]
+pub fn current_auth() -> Option<AuthFile> {
+    read_auth_file().ok().flatten()
 }

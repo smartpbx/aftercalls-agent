@@ -1,9 +1,31 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { goto } from "$app/navigation";
   import { onMount } from "svelte";
 
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
+
+  type Me = {
+    email: string;
+    display_name: string;
+    role: string;
+    org_display_name: string;
+  };
+  let me = $state<Me | null>(null);
+  let signingOut = $state(false);
+
+  async function signOut() {
+    signingOut = true;
+    try {
+      await invoke("logout");
+      goto("/login");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      signingOut = false;
+    }
+  }
 
   function setTheme(t: Theme) {
     theme = t;
@@ -36,6 +58,12 @@
     const applied = document.documentElement.getAttribute("data-theme");
     if (applied === "light" || applied === "system") theme = applied;
     else theme = "dark";
+
+    try {
+      me = await invoke<Me | null>("current_user");
+    } catch (e) {
+      console.warn("current_user failed", e);
+    }
 
     try {
       const v = await invoke<Vocab>("get_org_vocab");
@@ -99,6 +127,28 @@
       agent processes.
     </p>
   </header>
+
+  {#if me}
+    <section class="card" style="--i: 0.5">
+      <div class="card-head">
+        <div>
+          <h2>Account</h2>
+          <p class="hint">
+            Signed in as <strong>{me.email}</strong> ({me.role}) on
+            <strong>{me.org_display_name}</strong>.
+          </p>
+        </div>
+        <button
+          type="button"
+          class="add"
+          disabled={signingOut}
+          onclick={signOut}
+        >
+          {signingOut ? "Signing out…" : "Sign out"}
+        </button>
+      </div>
+    </section>
+  {/if}
 
   <section class="card" style="--i: 1">
     <div class="card-head">
