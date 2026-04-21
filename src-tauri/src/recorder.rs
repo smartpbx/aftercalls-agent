@@ -275,21 +275,39 @@ where
 
 #[cfg(target_os = "linux")]
 fn start_system_loopback(output_path: &Path) -> Result<(Child, String)> {
+    use std::os::unix::process::CommandExt;
     let default_sink = default_sink_name().context("get default sink")?;
     let monitor = format!("{default_sink}.monitor");
     // parec (PulseAudio API) respects the `.monitor` source name; pw-cat's
     // --target resolves to the wrong node because PipeWire exposes the monitor
     // as a port of the sink node, not as a separate node.
-    let child = Command::new("parec")
-        .arg("--device")
+    //
+    // PR_SET_PDEATHSIG ties parec's lifetime to the agent process — if the
+    // agent is SIGKILL'd (e.g. binary swap, crash, user force-quit) parec
+    // gets SIGINT instead of being reparented to systemd and silently
+    // writing to a stale session dir forever. Learned this the hard way:
+    // a 37-minute orphaned parec chewed through 400 MB of wav because a
+    // mid-session binary swap left the child behind.
+    let mut cmd = Command::new("parec");
+    cmd.arg("--device")
         .arg(&monitor)
         .arg("--file-format=wav")
         .arg(output_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn parec")?;
+        .stderr(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            // SIGINT on parent death — parec flushes its WAV on INT, so the
+            // on-disk file is at least decodable even in the crash path.
+            let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT);
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("spawn parec")?;
     Ok((child, monitor))
 }
 
