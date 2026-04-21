@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,6 +17,10 @@ type SharedWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
 pub struct Recorder {
     inner: Mutex<Inner>,
     active: AtomicBool,
+    // Unix-ms timestamp set when `start()` succeeds; 0 while idle. Lets
+    // the UI rebuild the running timer after a webview remount (tray
+    // hide+show, route nav) without persisting state to disk.
+    started_at_ms: AtomicI64,
 }
 
 struct Inner {
@@ -55,11 +59,19 @@ impl Recorder {
                 _worker: worker,
             }),
             active: AtomicBool::new(false),
+            started_at_ms: AtomicI64::new(0),
         }
     }
 
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn started_at_ms(&self) -> Option<i64> {
+        match self.started_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ts => Some(ts),
+        }
     }
 
     pub fn start(&self, base_dir: PathBuf) -> Result<PathBuf, String> {
@@ -75,6 +87,8 @@ impl Recorder {
             .map_err(|e| e.to_string())?;
         let result = reply_rx.recv().map_err(|e| e.to_string())?;
         if result.is_ok() {
+            self.started_at_ms
+                .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
             self.active.store(true, Ordering::Relaxed);
         }
         result
@@ -91,6 +105,7 @@ impl Recorder {
         let result = reply_rx.recv().map_err(|e| e.to_string())?;
         if result.is_ok() {
             self.active.store(false, Ordering::Relaxed);
+            self.started_at_ms.store(0, Ordering::Relaxed);
         }
         result
     }

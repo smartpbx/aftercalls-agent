@@ -146,13 +146,24 @@ fn stop_recording(state: State<Recorder>, app: AppHandle) -> Result<String, Stri
     do_stop(&state, &app)
 }
 
+#[derive(serde::Serialize)]
+struct RecordingStatus {
+    recording: bool,
+    // Unix-ms timestamp of start; None when idle. Lets the UI rebuild
+    // the running timer after a webview remount (tray hide+show,
+    // route nav) rather than restarting from 00:00.
+    started_at_ms: Option<i64>,
+}
+
 // Point-in-time query used by the Record page on mount. The
 // "recording-state" event only fires on transitions, so a page that
-// remounts mid-recording (e.g. navigating away and back) has no other
-// way to learn the current state.
+// remounts mid-recording has no other way to learn the current state.
 #[tauri::command]
-fn is_recording(state: State<Recorder>) -> bool {
-    state.is_active()
+fn is_recording(state: State<Recorder>) -> RecordingStatus {
+    RecordingStatus {
+        recording: state.is_active(),
+        started_at_ms: state.started_at_ms(),
+    }
 }
 
 #[tauri::command]

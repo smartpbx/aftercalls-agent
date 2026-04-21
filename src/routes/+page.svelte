@@ -66,13 +66,25 @@
     });
 
     // "recording-state" only fires on transitions, so a remount
-    // mid-recording (e.g. nav away and back) wouldn't know the truth.
-    // Ask the backend directly. Timer stays at 00:00 because the
-    // recorder doesn't expose a start time yet — secondary to being
-    // able to stop at all.
+    // mid-recording (e.g. tray hide+show, route nav) wouldn't know
+    // the truth. Ask the backend directly + rebuild the timer from
+    // the real start time.
     try {
-      const live = await invoke<boolean>("is_recording");
-      if (live && !recording) recording = true;
+      const status = await invoke<{
+        recording: boolean;
+        started_at_ms: number | null;
+      }>("is_recording");
+      if (status.recording && !recording) {
+        recording = true;
+        if (status.started_at_ms) {
+          startAt = status.started_at_ms;
+          elapsedMs = Date.now() - startAt;
+          timer = window.setInterval(
+            () => (elapsedMs = Date.now() - startAt),
+            250,
+          );
+        }
+      }
     } catch {}
   });
 
