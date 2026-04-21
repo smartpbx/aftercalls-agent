@@ -1,4 +1,11 @@
 {
+  "0.3.4": {
+    "headline": "Windows finally looks like it belongs in the dark theme",
+    "changes": [
+      "Windows: native titlebar is replaced with an integrated dark one. Double-click the top bar to maximize, drag to move, and the min/max/close buttons match the app palette (close still turns Windows-red on hover, as it should).",
+      "Linux/macOS: unchanged — GTK chrome and native macOS traffic lights stay intact."
+    ]
+  },
   "0.3.3": {
     "headline": "Windows finally captures the other side of the call",
     "changes": [
