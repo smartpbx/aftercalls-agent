@@ -95,6 +95,68 @@ pub async fn rename_speaker(
         .unwrap_or(0))
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct OrgVocab {
+    pub custom_spelling: serde_json::Value,
+    pub word_boost: Vec<String>,
+}
+
+/// Pulls the per-org AssemblyAI hints. Best-effort: on failure we log and
+/// return defaults so transcription still runs without vocab.
+pub async fn fetch_vocab(backend: &Backend) -> Result<OrgVocab> {
+    let client = client()?;
+    let url = format!("{}/v1/config", backend.url.trim_end_matches('/'));
+    let body: Value = client
+        .get(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .context("backend config response")?
+        .json()
+        .await
+        .context("decode backend config")?;
+
+    let custom_spelling = body
+        .get("custom_spelling")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+    let word_boost = body
+        .get("word_boost")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(OrgVocab {
+        custom_spelling,
+        word_boost,
+    })
+}
+
+pub async fn get_audio_urls(backend: &Backend, id: &str) -> Result<Value> {
+    let client = client()?;
+    let url = format!(
+        "{}/v1/calls/{}/audio-urls",
+        backend.url.trim_end_matches('/'),
+        id
+    );
+    client
+        .get(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .context("backend response")?
+        .json::<Value>()
+        .await
+        .context("decode audio-urls")
+}
+
 pub async fn delete_call(backend: &Backend, id: &str) -> Result<()> {
     let client = client()?;
     let url = format!("{}/v1/calls/{}", backend.url.trim_end_matches('/'), id);

@@ -121,6 +121,18 @@ fn get_session_audio_path(
 }
 
 #[tauri::command]
+async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::get_audio_urls(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_call(id: String) -> Result<(), String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
@@ -250,6 +262,7 @@ pub fn run() {
             list_calls,
             get_call,
             get_session_audio_path,
+            get_audio_urls,
             delete_call,
             update_utterance_speaker,
             rename_speaker,

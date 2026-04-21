@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { readFile } from "@tauri-apps/plugin-fs";
-  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import { writeText, writeHtml } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
 
@@ -36,6 +36,7 @@
   let audioSrc = $state<string>("");
   let audioError = $state("");
   let track = $state<"mixed" | "mic" | "system">("mixed");
+  let audioUrls = $state<{ mic?: string; system?: string; mixed?: string }>({});
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
   let deleting = $state(false);
@@ -52,6 +53,13 @@
   onMount(async () => {
     try {
       call = await invoke<Call>("get_call", { id: page.params.id });
+      // Best-effort: try remote URLs first. If the backend isn't reachable or
+      // the bucket isn't populated yet, loadAudio falls back to local files.
+      try {
+        audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+      } catch (e) {
+        console.warn("audio-urls unavailable, falling back to local files", e);
+      }
       await loadAudio(track);
     } catch (e) {
       error = String(e);
@@ -67,6 +75,20 @@
     // Revoke old blob URL to avoid leaking memory across track switches.
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
     audioSrc = "";
+
+    const remote = audioUrls[which];
+    if (remote) {
+      try {
+        const resp = await fetch(remote);
+        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+        const blob = await resp.blob();
+        audioSrc = URL.createObjectURL(blob);
+        return;
+      } catch (e) {
+        console.warn(`remote fetch failed for ${which}, falling back:`, e);
+      }
+    }
+
     try {
       const path = await invoke<string>("get_session_audio_path", {
         sessionId: call.session_id,
@@ -88,18 +110,57 @@
   async function copy(text: string, label: string) {
     try {
       await writeText(text);
-      copiedLabel = label;
-      setTimeout(() => {
-        if (copiedLabel === label) copiedLabel = "";
-      }, 1500);
+      flashCopied(label);
     } catch (e) {
       error = String(e);
     }
   }
 
+  // Rich copy: HTML for Word/email paste, plain fallback for terminals/textareas.
+  async function copyRich(html: string, plain: string, label: string) {
+    try {
+      await writeHtml(html, plain);
+      flashCopied(label);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function flashCopied(label: string) {
+    copiedLabel = label;
+    setTimeout(() => {
+      if (copiedLabel === label) copiedLabel = "";
+    }, 1500);
+  }
+
+  function escapeHtml(s: string) {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   function copyActionItems() {
     if (!call) return;
-    copy(call.action_items.map((a) => `- ${a}`).join("\n"), "actions");
+    const items = call.action_items;
+    const plain = items.map((a) => `• ${a}`).join("\n");
+    const html = `<ul>${items.map((a) => `<li>${escapeHtml(a)}</li>`).join("")}</ul>`;
+    copyRich(html, plain, "actions");
+  }
+
+  function copyTranscript() {
+    if (!call) return;
+    const plain = call.utterances
+      .map((u) => `${u.speaker}: ${u.text}`)
+      .join("\n\n");
+    const html = call.utterances
+      .map(
+        (u) =>
+          `<p><strong>${escapeHtml(u.speaker)}:</strong> ${escapeHtml(u.text)}</p>`,
+      )
+      .join("");
+    copyRich(html, plain, "transcript");
   }
 
   function startEdit(u: Utterance) {
@@ -390,7 +451,12 @@
     {/if}
 
     <section>
-      <h2>Transcript</h2>
+      <div class="section-head">
+        <h2>Transcript</h2>
+        <button class="copy" onclick={copyTranscript}>
+          {copiedLabel === "transcript" ? "Copied" : "Copy"}
+        </button>
+      </div>
       <div class="transcript">
         {#each call.utterances as u (u.idx)}
           {#if editingIdx === u.idx}

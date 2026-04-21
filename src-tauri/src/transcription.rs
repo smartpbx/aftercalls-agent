@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::portal::OrgVocab;
 
 const ASSEMBLY_BASE: &str = "https://api.assemblyai.com/v2";
 
@@ -38,7 +39,11 @@ struct TaggedWord {
     speaker: String,
 }
 
-pub async fn transcribe_session(session_dir: &Path, config: &Config) -> Result<MergedTranscript> {
+pub async fn transcribe_session(
+    session_dir: &Path,
+    config: &Config,
+    vocab: &OrgVocab,
+) -> Result<MergedTranscript> {
     let mic = session_dir.join("mic.wav");
     let system = session_dir.join("system.wav");
 
@@ -49,10 +54,13 @@ pub async fn transcribe_session(session_dir: &Path, config: &Config) -> Result<M
 
     let mut all_words: Vec<TaggedWord> = Vec::new();
     if mic.exists() {
-        all_words.extend(transcribe_track(&client, api_key, mic.clone(), TrackKind::Mic).await?);
+        all_words
+            .extend(transcribe_track(&client, api_key, mic.clone(), TrackKind::Mic, vocab).await?);
     }
     if system.exists() {
-        all_words.extend(transcribe_track(&client, api_key, system.clone(), TrackKind::System).await?);
+        all_words.extend(
+            transcribe_track(&client, api_key, system.clone(), TrackKind::System, vocab).await?,
+        );
     }
     if all_words.is_empty() {
         anyhow::bail!("no usable tracks in {}", session_dir.display());
@@ -78,6 +86,7 @@ async fn transcribe_track(
     api_key: &str,
     audio_path: PathBuf,
     kind: TrackKind,
+    vocab: &OrgVocab,
 ) -> Result<Vec<TaggedWord>> {
     let compressed = compress_for_upload(&audio_path)
         .await
@@ -97,10 +106,19 @@ async fn transcribe_track(
         .await
         .context("upload json")?;
 
-    let create_body = serde_json::json!({
+    let mut create_body = serde_json::json!({
         "audio_url": upload.upload_url,
         "speaker_labels": matches!(kind, TrackKind::System),
     });
+    // AssemblyAI rejects empty arrays for these fields; only send when populated.
+    if let Some(arr) = vocab.custom_spelling.as_array() {
+        if !arr.is_empty() {
+            create_body["custom_spelling"] = vocab.custom_spelling.clone();
+        }
+    }
+    if !vocab.word_boost.is_empty() {
+        create_body["word_boost"] = serde_json::json!(vocab.word_boost);
+    }
     let created: CreatedResponse = client
         .post(format!("{ASSEMBLY_BASE}/transcript"))
         .header("authorization", api_key)

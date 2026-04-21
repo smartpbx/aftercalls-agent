@@ -5,7 +5,8 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::config::Config;
-use crate::{summary, transcription, upload, vault};
+use crate::portal::OrgVocab;
+use crate::{portal, summary, transcription, upload, vault};
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "stage", rename_all = "snake_case")]
@@ -73,8 +74,16 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
         eprintln!("callscribe: mix failed: {e:#}");
     }
 
+    let vocab = match &config.backend {
+        Some(b) => portal::fetch_vocab(b).await.unwrap_or_else(|e| {
+            eprintln!("callscribe: fetch vocab failed: {e:#}");
+            OrgVocab::default()
+        }),
+        None => OrgVocab::default(),
+    };
+
     emit(app, PipelineEvent::Transcribing);
-    let transcript = transcription::transcribe_session(session_dir, &config).await?;
+    let transcript = transcription::transcribe_session(session_dir, &config, &vocab).await?;
 
     emit(app, PipelineEvent::Summarizing);
     let candidates = vault::list_clients(&config.vault)?;
@@ -86,12 +95,17 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
 
     if let Some(backend) = &config.backend {
         emit(app, PipelineEvent::Uploading);
-        if let Err(e) = upload::post_call(backend, &transcript, &summary, session_dir, &note_path)
-            .await
-        {
-            // Don't fail the whole pipeline if the backend is down — local
-            // note already landed in the vault.
-            eprintln!("callscribe: backend upload failed: {e:#}");
+        match upload::post_call(backend, &transcript, &summary, session_dir, &note_path).await {
+            Ok(resp) => {
+                if let Err(e) = upload::upload_audio(session_dir, &resp.upload_urls).await {
+                    eprintln!("callscribe: audio upload batch failed: {e:#}");
+                }
+            }
+            Err(e) => {
+                // Don't fail the whole pipeline if the backend is down — local
+                // note already landed in the vault.
+                eprintln!("callscribe: backend upload failed: {e:#}");
+            }
         }
     }
 
