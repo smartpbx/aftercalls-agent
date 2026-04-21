@@ -1628,7 +1628,7 @@
     line-height: 1.6;
     color: var(--bone-1);
     white-space: pre-wrap;
-    max-width: 74ch;
+    overflow-wrap: anywhere;
   }
   :global(.spk) {
     font-weight: 500;
@@ -1649,7 +1649,6 @@
     display: flex;
     flex-direction: column;
     gap: 0;
-    max-width: 74ch;
   }
 
   .actions li {
