@@ -64,5 +64,5 @@ impl Config {
 
 fn config_path() -> Result<PathBuf> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no user config dir"))?;
-    Ok(dir.join("callscribe").join("config.toml"))
+    Ok(dir.join("aftercalls").join("config.toml"))
 }

@@ -102,7 +102,7 @@ pub async fn upload_audio(session_dir: &Path, urls: &UploadUrls) -> Result<()> {
         }
         if let Err(e) = put_file(&client, url, &path, content_type).await {
             eprintln!(
-                "callscribe: audio upload failed for {}: {e:#}",
+                "aftercalls: audio upload failed for {}: {e:#}",
                 path.display()
             );
         }

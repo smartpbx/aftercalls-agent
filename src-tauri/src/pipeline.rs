@@ -40,7 +40,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
             );
         }
         Err(e) => {
-            eprintln!("callscribe: pipeline failed: {e:#}");
+            eprintln!("aftercalls: pipeline failed: {e:#}");
             let _ = app
                 .notification()
                 .builder()
@@ -71,12 +71,12 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
     // Best-effort: produce mixed.wav for review-UI playback. If ffmpeg fails
     // we still proceed — mic/system tracks are enough for transcription.
     if let Err(e) = mix_tracks(session_dir).await {
-        eprintln!("callscribe: mix failed: {e:#}");
+        eprintln!("aftercalls: mix failed: {e:#}");
     }
 
     let vocab = match &config.backend {
         Some(b) => portal::fetch_vocab(b).await.unwrap_or_else(|e| {
-            eprintln!("callscribe: fetch vocab failed: {e:#}");
+            eprintln!("aftercalls: fetch vocab failed: {e:#}");
             OrgVocab::default()
         }),
         None => OrgVocab::default(),
@@ -98,13 +98,13 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
         match upload::post_call(backend, &transcript, &summary, session_dir, &note_path).await {
             Ok(resp) => {
                 if let Err(e) = upload::upload_audio(session_dir, &resp.upload_urls).await {
-                    eprintln!("callscribe: audio upload batch failed: {e:#}");
+                    eprintln!("aftercalls: audio upload batch failed: {e:#}");
                 }
             }
             Err(e) => {
                 // Don't fail the whole pipeline if the backend is down — local
                 // note already landed in the vault.
-                eprintln!("callscribe: backend upload failed: {e:#}");
+                eprintln!("aftercalls: backend upload failed: {e:#}");
             }
         }
     }
@@ -114,7 +114,7 @@ async fn run_inner(session_dir: &std::path::Path, app: &AppHandle) -> Result<Pat
 
 fn emit(app: &AppHandle, event: PipelineEvent) {
     if let Err(e) = app.emit("pipeline", event) {
-        eprintln!("callscribe: emit failed: {e}");
+        eprintln!("aftercalls: emit failed: {e}");
     }
 }
 

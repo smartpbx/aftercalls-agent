@@ -140,17 +140,17 @@ fn begin(base_dir: &Path) -> Result<Active> {
     let mic_track = build_cpal_track(&mic_device, session_dir.join("mic.wav"))
         .context("build mic track")?;
     eprintln!(
-        "callscribe: recording mic from {:?}",
+        "aftercalls: recording mic from {:?}",
         mic_device.name().unwrap_or_default()
     );
 
     let system_child = match start_system_loopback(&session_dir.join("system.wav")) {
         Ok((child, target)) => {
-            eprintln!("callscribe: recording system audio from {target}");
+            eprintln!("aftercalls: recording system audio from {target}");
             Some(child)
         }
         Err(e) => {
-            eprintln!("callscribe: skipping system loopback: {e:#}");
+            eprintln!("aftercalls: skipping system loopback: {e:#}");
             None
         }
     };
@@ -196,7 +196,7 @@ fn build_cpal_track(device: &Device, output_path: PathBuf) -> Result<CpalTrack> 
 
     let wav = WavWriter::create(&output_path, spec).context("create wav")?;
     let writer: SharedWriter = Arc::new(Mutex::new(Some(wav)));
-    let err_fn = |e| eprintln!("callscribe: input stream error: {e}");
+    let err_fn = |e| eprintln!("aftercalls: input stream error: {e}");
 
     let stream = match sample_format {
         SampleFormat::F32 => {

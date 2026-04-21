@@ -258,7 +258,7 @@ fn toggle_recording(app: &AppHandle) {
         do_start(&state, app)
     };
     if let Err(e) = result {
-        eprintln!("callscribe: hotkey toggle error: {e}");
+        eprintln!("aftercalls: hotkey toggle error: {e}");
     }
 }
 
@@ -316,7 +316,7 @@ fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
             toggle_recording(app);
         }
     }) {
-        eprintln!("callscribe: global shortcut unavailable ({e}); use the UI or tray");
+        eprintln!("aftercalls: global shortcut unavailable ({e}); use the UI or tray");
     }
     Ok(())
 }

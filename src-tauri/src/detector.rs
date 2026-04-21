@@ -92,7 +92,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
     match phase {
         Phase::Idle => {
             if let Some(consumer) = consumers.iter().next() {
-                eprintln!("callscribe: '{consumer}' is using the mic — prompting");
+                eprintln!("aftercalls: '{consumer}' is using the mic — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: consumer.clone() });
                 show_window(app);
                 Phase::AwaitingStartConfirm { consumer: consumer.clone() }
@@ -114,7 +114,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             } else {
                 let since = gone_since.unwrap_or_else(Instant::now);
                 if since.elapsed() >= CONSUMER_GONE_BEFORE_END_PROMPT {
-                    eprintln!("callscribe: '{consumer}' stopped using mic — prompting to end");
+                    eprintln!("aftercalls: '{consumer}' stopped using mic — prompting to end");
                     emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
                     show_window(app);
                     Phase::AwaitingEndConfirm { consumer }
@@ -137,7 +137,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             let still_suppressing = consumers.contains(&consumer);
             // If a different consumer is now on the mic, prompt for it.
             if let Some(other) = consumers.iter().find(|c| **c != consumer) {
-                eprintln!("callscribe: new mic consumer '{other}' — prompting");
+                eprintln!("aftercalls: new mic consumer '{other}' — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: other.clone() });
                 show_window(app);
                 Phase::AwaitingStartConfirm { consumer: other.clone() }
@@ -178,7 +178,7 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
                     Phase::Recording { consumer, gone_since: None }
                 }
                 Err(e) => {
-                    eprintln!("callscribe: auto-start failed: {e}");
+                    eprintln!("aftercalls: auto-start failed: {e}");
                     emit(app, AutoDetectEvent::Cleared);
                     Phase::Idle
                 }
