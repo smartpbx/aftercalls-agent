@@ -496,19 +496,22 @@
     system: "Others",
   } as const;
 
+  // Kept in lock-step with Waveform.kindBand() so the chip row reads as the
+  // same color as the band above it. Each value is the "edge" color from the
+  // waveform — saturated enough to pop on the warm-ink background.
   function kindAccent(kind: string): string {
     switch (kind) {
       case "decision":
-        return "var(--accent)";
+        return "#56b8ae"; // bright teal
       case "follow_up":
-        return "var(--sig)";
+        return "#f0c86e"; // warm gold
       case "question":
-        return "#8aa2c0";
+        return "#aac3e1"; // slate
       case "action":
-        return "var(--olive)";
+        return "#afd28c"; // olive
       case "bookmark":
       default:
-        return "var(--bone-2)";
+        return "#ffaa87"; // coral
     }
   }
 

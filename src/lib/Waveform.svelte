@@ -160,8 +160,16 @@
       for (const h of highlights) {
         const x1 = (h.start_ms / durationMs) * cw;
         const x2 = (h.end_ms / durationMs) * cw;
-        g.fillStyle = kindBand(h.kind);
-        g.fillRect(x1, 0, Math.max(2, x2 - x1), ch);
+        const w = Math.max(2, x2 - x1);
+        const { fill, edge } = kindBand(h.kind);
+        // Translucent body.
+        g.fillStyle = fill;
+        g.fillRect(x1, 0, w, ch);
+        // A 2px cap at top + bottom so overlapping bands stay legible and
+        // short bands still read as a distinct highlight.
+        g.fillStyle = edge;
+        g.fillRect(x1, 0, w, 2);
+        g.fillRect(x1, ch - 2, w, 2);
       }
       if (dragRange && isMarking) {
         const x1 = (dragRange.start_ms / durationMs) * cw;
@@ -229,20 +237,28 @@
     return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   }
 
-  // Translucent fill per highlight kind — soft enough to not drown the bars.
-  function kindBand(kind: string): string {
+  // Translucent band fills + a brighter top/bottom edge per highlight kind.
+  // The waveform bars are warm bone so the previous translucent bone bookmark
+  // color was invisible against them — each kind now gets a saturated hue
+  // distinct from the bars.
+  function kindBand(kind: string): { fill: string; edge: string } {
     switch (kind) {
       case "decision":
-        return "rgba(58, 155, 146, 0.22)"; // accent teal
+        // Teal — matches the app accent.
+        return { fill: "rgba(58, 155, 146, 0.38)", edge: "rgba(86, 184, 174, 0.95)" };
       case "follow_up":
-        return "rgba(201, 162, 74, 0.18)"; // sig gold
+        // Warm gold.
+        return { fill: "rgba(224, 176, 80, 0.32)", edge: "rgba(240, 200, 110, 0.95)" };
       case "question":
-        return "rgba(138, 162, 192, 0.20)"; // slate
+        // Slate.
+        return { fill: "rgba(138, 162, 192, 0.36)", edge: "rgba(170, 195, 225, 0.95)" };
       case "action":
-        return "rgba(143, 175, 114, 0.22)"; // olive
+        // Olive.
+        return { fill: "rgba(143, 175, 114, 0.36)", edge: "rgba(175, 210, 140, 0.95)" };
       case "bookmark":
       default:
-        return "rgba(210, 204, 192, 0.14)"; // bone
+        // Coral — high-contrast against the bone bars, saves bone for text.
+        return { fill: "rgba(245, 138, 103, 0.34)", edge: "rgba(255, 170, 135, 0.95)" };
     }
   }
 
