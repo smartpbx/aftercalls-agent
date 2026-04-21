@@ -146,6 +146,15 @@ fn stop_recording(state: State<Recorder>, app: AppHandle) -> Result<String, Stri
     do_stop(&state, &app)
 }
 
+// Point-in-time query used by the Record page on mount. The
+// "recording-state" event only fires on transitions, so a page that
+// remounts mid-recording (e.g. navigating away and back) has no other
+// way to learn the current state.
+#[tauri::command]
+fn is_recording(state: State<Recorder>) -> bool {
+    state.is_active()
+}
+
 #[tauri::command]
 async fn process_imported_file(app: AppHandle, source_path: String) -> Result<String, String> {
     let src = std::path::PathBuf::from(&source_path);
@@ -556,6 +565,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            is_recording,
             process_imported_file,
             confirm_auto_start,
             dismiss_auto_start,

@@ -64,6 +64,16 @@
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
       prompt = evt.payload.kind === "cleared" ? null : evt.payload;
     });
+
+    // "recording-state" only fires on transitions, so a remount
+    // mid-recording (e.g. nav away and back) wouldn't know the truth.
+    // Ask the backend directly. Timer stays at 00:00 because the
+    // recorder doesn't expose a start time yet — secondary to being
+    // able to stop at all.
+    try {
+      const live = await invoke<boolean>("is_recording");
+      if (live && !recording) recording = true;
+    } catch {}
   });
 
   onDestroy(() => {
