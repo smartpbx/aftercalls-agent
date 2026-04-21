@@ -106,6 +106,16 @@
     }
   }
 
+  // Flipping the switch should "just work" — no Save button nag when
+  // turning the feature off entirely. When flipping *on* we still
+  // require Save because the path/subfolder fields haven't been
+  // filled in yet; writing enabled=true with an empty path would
+  // make the pipeline try to write to the filesystem root.
+  async function toggleVault(next: boolean) {
+    vault.enabled = next;
+    if (!next) await saveVault();
+  }
+
   let vaultSavedRecently = $derived(
     vaultSavedAt > 0 && Date.now() - vaultSavedAt < 3000,
   );
@@ -219,7 +229,11 @@
         </p>
       </div>
       <label class="switch">
-        <input type="checkbox" bind:checked={vault.enabled} />
+        <input
+          type="checkbox"
+          checked={vault.enabled}
+          onchange={(e) => toggleVault((e.currentTarget as HTMLInputElement).checked)}
+        />
         <span class="track" aria-hidden="true">
           <span class="knob"></span>
         </span>
@@ -256,20 +270,25 @@
           Leave blank to drop all notes in the vault root.
         </p>
       </div>
-    {/if}
 
-    <div class="vault-actions">
-      <button
-        type="button"
-        class="save"
-        disabled={vaultSaving}
-        onclick={saveVault}
-      >
-        {vaultSaving ? "Saving…" : "Save vault settings"}
-      </button>
-      {#if vaultSavedRecently}<span class="saved">Saved</span>{/if}
-      {#if vaultError}<span class="error-inline">{vaultError}</span>{/if}
-    </div>
+      <div class="vault-actions">
+        <button
+          type="button"
+          class="save"
+          disabled={vaultSaving}
+          onclick={saveVault}
+        >
+          {vaultSaving ? "Saving…" : "Save vault settings"}
+        </button>
+        {#if vaultSavedRecently}<span class="saved">Saved</span>{/if}
+        {#if vaultError}<span class="error-inline">{vaultError}</span>{/if}
+      </div>
+    {:else if vaultSavedRecently || vaultError}
+      <div class="vault-actions">
+        {#if vaultSavedRecently}<span class="saved">Saved</span>{/if}
+        {#if vaultError}<span class="error-inline">{vaultError}</span>{/if}
+      </div>
+    {/if}
   </section>
 
   {#if error}<p class="error" style="--i: 4">{error}</p>{/if}

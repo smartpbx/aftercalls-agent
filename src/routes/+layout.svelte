@@ -7,6 +7,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { onDestroy, onMount } from "svelte";
   import "../app.css";
 
@@ -29,10 +30,45 @@
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
 
+  // Linux-only manual update check. `latest.json` strips linux-* entries
+  // (AppImage crashes on some distros → updater would clobber a stable
+  // tarball install), so tauri-plugin-updater's `check()` always returns
+  // null on Linux. Instead we fetch the manifest directly, version-compare,
+  // and show a pill that deep-links to /downloads when something newer is
+  // out. No in-place upgrade — Linux users grab a new tarball per release.
+  const UPDATE_MANIFEST_URL =
+    "https://aftercalls-updates.tor1.digitaloceanspaces.com/latest.json";
+
+  function semverGt(a: string, b: string): boolean {
+    const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
+    const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
+    for (let i = 0; i < 3; i++) {
+      const va = pa[i] ?? 0;
+      const vb = pb[i] ?? 0;
+      if (va !== vb) return va > vb;
+    }
+    return false;
+  }
+
   async function pollForUpdate() {
     // Skip while one's already offered or being installed — don't
     // clobber the user's in-flight decision.
-    if (updateAvailable || updateState === "downloading") return;
+    if (updateAvailable || linuxUpdateAvailable || updateState === "downloading") return;
+    if (isLinux) {
+      // Manifest fetch path (see comment above).
+      try {
+        const resp = await fetch(UPDATE_MANIFEST_URL, { cache: "no-store" });
+        if (!resp.ok) return;
+        const doc = (await resp.json()) as { version?: string };
+        if (!doc.version || !version) return;
+        if (semverGt(doc.version, version)) {
+          linuxUpdateAvailable = doc.version;
+        }
+      } catch (e) {
+        console.warn("linux update check failed", e);
+      }
+      return;
+    }
     try {
       const u = await checkForUpdate();
       if (u) updateAvailable = u;
@@ -40,6 +76,18 @@
       // Network blip shouldn't nag; we'll retry next tick.
       console.warn("update check failed", e);
     }
+  }
+
+  async function openDownloadsPage() {
+    try {
+      await openUrl("https://app.aftercalls.io/downloads");
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  }
+
+  function dismissLinuxUpdate() {
+    linuxUpdateAvailable = null;
   }
 
   let isLoginPage = $derived(page.url.pathname.startsWith("/login"));
@@ -52,6 +100,11 @@
   let updateDownloaded = $state(0);
   let updateTotal = $state(0);
   let version = $state("");
+  // Linux has no in-place updater (see pollForUpdate). When we detect a
+  // newer version on the manifest we stash the *new* version string here
+  // and the topstrip renders a "v0.x.y out — get it" pill that opens
+  // /downloads in the user's browser.
+  let linuxUpdateAvailable = $state<string | null>(null);
 
   // Post-update welcome. On each auth session we compare the running
   // binary's version against the last one we showed release notes for
@@ -74,6 +127,10 @@
   const isWindows =
     typeof navigator !== "undefined" &&
     /windows/i.test(navigator.userAgent);
+  const isLinux =
+    typeof navigator !== "undefined" &&
+    /linux/i.test(navigator.userAgent) &&
+    !/android/i.test(navigator.userAgent);
   let winMaximized = $state(false);
 
   async function minimizeWindow() {
@@ -93,6 +150,30 @@
     try {
       await getCurrentWindow().close();
     } catch {}
+  }
+
+  // Manual drag handler for the Windows custom titlebar. Using either
+  // `data-tauri-drag-region` or CSS `-webkit-app-region: drag` on some
+  // WebView2 builds eats mousedown events at the compositor — the
+  // window-control buttons never see their clicks. Handling the
+  // mousedown here lets us scope the drag to clicks that *didn't* hit
+  // an interactive element, and leave every other mousedown alone.
+  async function handleTopstripMouseDown(ev: MouseEvent) {
+    if (!isWindows) return;
+    if (ev.button !== 0) return;
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    // Skip buttons, inputs, anchors, and anything that might be
+    // interactive — Tauri's own drag-region handler uses a similar
+    // allow-list.
+    if (target.closest("button, a, input, textarea, select, [role='button']")) {
+      return;
+    }
+    try {
+      await getCurrentWindow().startDragging();
+    } catch (e) {
+      console.warn("startDragging failed", e);
+    }
   }
 
   onMount(async () => {
@@ -381,10 +462,10 @@
     <header
       class="topstrip"
       class:has-win-controls={isWindows}
-      data-tauri-drag-region
+      onmousedown={isWindows ? handleTopstripMouseDown : undefined}
       ondblclick={isWindows ? toggleMaximize : undefined}
     >
-      <div class="crumbs" data-tauri-drag-region>
+      <div class="crumbs">
         <span class="crumb">{pageTitle}</span>
       </div>
 
@@ -414,6 +495,19 @@
               <button class="update-install" onclick={installUpdate}>Install</button>
               <button class="update-dismiss" onclick={dismissUpdate}>Later</button>
             {/if}
+          </div>
+        {:else if linuxUpdateAvailable}
+          <div class="update">
+            <span class="pip sig"></span>
+            <span class="update-label">
+              v{linuxUpdateAvailable} available
+            </span>
+            <button class="update-install" onclick={openDownloadsPage}>
+              Get it ↗
+            </button>
+            <button class="update-dismiss" onclick={dismissLinuxUpdate}>
+              Later
+            </button>
           </div>
         {/if}
 
@@ -677,32 +771,21 @@
     border-bottom: 1px solid var(--hairline);
     /* Translucent background tracks the active theme — was hard-coded
        dark before so it looked wrong in light mode. The strip also
-       doubles as the drag region on Windows (see #25); buttons inside
-       opt out since Tauri's drag region is opt-in per element. */
+       doubles as the drag region on Windows (see #25); we handle that
+       JS-side via onmousedown + startDragging because
+       `-webkit-app-region: drag` eats mousedown events at the
+       compositor level and the window-control buttons never see
+       their clicks. */
     background: color-mix(in srgb, var(--ink-0) 85%, transparent);
     backdrop-filter: saturate(140%) blur(10px);
     -webkit-backdrop-filter: saturate(140%) blur(10px);
-    -webkit-user-select: none;
-    user-select: none;
   }
-  /* Windows: tauri's data-tauri-drag-region attribute silently stops
-     working on some WebView2 versions. Adding the Chromium
-     `-webkit-app-region: drag` equivalent is belt + suspenders; both
-     will no-op if the other one already handled the event. */
   .topstrip.has-win-controls {
     /* No outer padding on the right so the window controls go
        edge-to-edge like a native titlebar. */
     padding: 0 0 0 1.5rem;
-    -webkit-app-region: drag;
-    app-region: drag;
-  }
-  .topstrip.has-win-controls .update,
-  .topstrip.has-win-controls .update-install,
-  .topstrip.has-win-controls .update-dismiss,
-  .topstrip.has-win-controls .win-controls,
-  .topstrip.has-win-controls .wc-btn {
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
+    -webkit-user-select: none;
+    user-select: none;
   }
 
   .crumbs {

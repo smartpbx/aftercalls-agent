@@ -1,4 +1,12 @@
 {
+  "0.3.7": {
+    "headline": "Linux update pill, working Windows titlebar buttons, and a less-naggy vault toggle",
+    "changes": [
+      "Linux: the app now checks for new releases in the background and shows a \"v0.x.y available — Get it ↗\" pill in the top bar when one is out. Clicking it opens the downloads page in your browser so you can grab the tarball or .deb. (The built-in updater still can't swap a Linux binary in place — the AppImage's bundled webkit crashes on too many distros to rely on it — but at least you'll know there's something to update to.)",
+      "Windows: the minimize / maximize / close buttons in the titlebar actually respond to clicks now. The previous release made the titlebar draggable but accidentally swallowed the clicks on those buttons.",
+      "Settings → Obsidian vault: flipping the switch off saves immediately — no Save button required. The Save button also hides itself when the feature is off, instead of sitting there looking like unfinished work."
+    ]
+  },
   "0.3.6": {
     "headline": "A handful of polish fixes you'll notice immediately",
     "changes": [
