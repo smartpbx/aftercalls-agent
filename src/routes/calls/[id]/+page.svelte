@@ -561,6 +561,38 @@
   // pick from a muted palette tuned for the warm dark surface. Must tolerate
   // null/undefined speaker strings — one bad row otherwise took down the whole
   // call-detail render tree when `[...null]` threw at template time.
+  // Called from {@html ...}. Escapes HTML, then wraps each matching
+  // speaker name (longest-first so full names beat prefixes) in a
+  // colored span. Shares behavior with the portal.
+  function renderWithSpeakers(text: string | null | undefined): string {
+    if (!text) return "";
+    const esc = (s: string) =>
+      s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    let out = esc(text);
+    const names = speakers
+      .map((s) => ({ name: s.speaker, color: speakerColor(s.speaker) }))
+      .sort((a, b) => b.name.length - a.name.length);
+    for (const { name, color } of names) {
+      if (!name) continue;
+      const escName = esc(name);
+      const reName = escName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(
+        `(^|[^A-Za-z0-9_])(${reName})(?=[^A-Za-z0-9_]|$)`,
+        "g",
+      );
+      out = out.replace(
+        re,
+        (_m, lead: string, match: string) =>
+          `${lead}<span class="spk" style="color:${color}">${match}</span>`,
+      );
+    }
+    return out;
+  }
+
   function speakerColor(speaker: string | null | undefined): string {
     if (!speaker) return "var(--bone-2)";
     if (speaker === "You") return "var(--accent)";
@@ -857,44 +889,11 @@
       {/if}
     </section>
 
-    {#if call.summary_text}
+    {#if speakers.length > 0}
       <section class="block" style="--i: 2">
         <div class="block-head">
-          <h2>Summary</h2>
-          <button
-            class="copy-btn"
-            onclick={() => copy(call!.summary_text ?? "", "summary")}
-          >
-            {copiedLabel === "summary" ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <p class="summary">{call.summary_text}</p>
-      </section>
-    {/if}
-
-    {#if Array.isArray(call.action_items) && call.action_items.length > 0}
-      <section class="block" style="--i: 3">
-        <div class="block-head">
-          <h2>Action items</h2>
-          <button class="copy-btn" onclick={copyActionItems}>
-            {copiedLabel === "actions" ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <ul class="actions">
-          {#each call.action_items as item, i (i)}
-            <li>
-              <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
-              <span>{item}</span>
-            </li>
-          {/each}
-        </ul>
-      </section>
-    {/if}
-
-    {#if speakers.length > 0}
-      <section class="block" style="--i: 4">
-        <div class="block-head">
           <h2>Participants</h2>
+          <span class="block-hint">Renaming here rewrites transcript, summary, and action items.</span>
         </div>
         <div class="chips">
           {#each speakers as p (p.speaker)}
@@ -939,6 +938,40 @@
             {/if}
           {/each}
         </div>
+      </section>
+    {/if}
+
+    {#if call.summary_text}
+      <section class="block" style="--i: 3">
+        <div class="block-head">
+          <h2>Summary</h2>
+          <button
+            class="copy-btn"
+            onclick={() => copy(call!.summary_text ?? "", "summary")}
+          >
+            {copiedLabel === "summary" ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <p class="summary">{@html renderWithSpeakers(call.summary_text)}</p>
+      </section>
+    {/if}
+
+    {#if Array.isArray(call.action_items) && call.action_items.length > 0}
+      <section class="block" style="--i: 4">
+        <div class="block-head">
+          <h2>Action items</h2>
+          <button class="copy-btn" onclick={copyActionItems}>
+            {copiedLabel === "actions" ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <ul class="actions">
+          {#each call.action_items as item, i (i)}
+            <li>
+              <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
+              <span>{@html renderWithSpeakers(item)}</span>
+            </li>
+          {/each}
+        </ul>
       </section>
     {/if}
 
@@ -1596,6 +1629,16 @@
     color: var(--bone-1);
     white-space: pre-wrap;
     max-width: 74ch;
+  }
+  :global(.spk) {
+    font-weight: 500;
+  }
+  .block-hint {
+    font-size: 0.72rem;
+    color: var(--bone-3);
+    letter-spacing: normal;
+    text-transform: none;
+    font-weight: 400;
   }
 
   /* ── Actions ───────────────────────────────────────────────────────── */
