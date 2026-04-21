@@ -86,6 +86,11 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
     }
     compress_for_upload(&session_dir.join("mic.wav")).await.ok();
     compress_for_upload(&session_dir.join("system.wav")).await.ok();
+    // Previously mixed was uploaded as raw WAV — turned every call
+    // into a multi-MB upload long after mic/system had already
+    // landed. Opus-compress it the same way; upload.rs falls back
+    // to the wav if ffmpeg is missing (Windows stock).
+    compress_for_upload(&session_dir.join("mixed.wav")).await.ok();
 
     // Step 3: create the call row so we get upload URLs.
     emit(app, PipelineEvent::Uploading);

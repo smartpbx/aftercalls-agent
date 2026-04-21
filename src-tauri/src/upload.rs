@@ -147,7 +147,10 @@ pub async fn upload_audio(session_dir: &Path, urls: &UploadUrls) -> Result<()> {
         ),
         (
             urls.mixed.as_deref(),
-            &[(session_dir.join("mixed.wav"), "audio/wav")],
+            &[
+                (session_dir.join("mixed.opus"), "audio/ogg"),
+                (session_dir.join("mixed.wav"), "audio/wav"),
+            ],
         ),
     ];
 
