@@ -407,11 +407,16 @@
     }
   }
 
-  async function deleteCall() {
+  let confirmingDelete = $state(false);
+
+  function askDeleteCall() {
+    confirmingDelete = true;
+  }
+
+  async function confirmDeleteCall() {
     if (!call) return;
-    if (!confirm(`Delete "${call.title ?? "this call"}"? Audio files stay on disk.`))
-      return;
     deleting = true;
+    confirmingDelete = false;
     try {
       await invoke("delete_call", { id: call.id });
       window.location.href = "/calls";
@@ -633,7 +638,7 @@
             {/if}
           </p>
         </div>
-        <button class="delete" disabled={deleting} onclick={deleteCall}>
+        <button class="delete" disabled={deleting} onclick={askDeleteCall}>
           {deleting ? "Deleting…" : "Delete"}
         </button>
       </div>
@@ -989,6 +994,51 @@
     </section>
   {/if}
 </main>
+
+{#if confirmingDelete && call}
+  <div
+    class="modal-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={() => (confirmingDelete = false)}
+    onkeydown={(e) => {
+      if (e.key === "Escape") confirmingDelete = false;
+    }}
+  >
+    <div
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-del-title"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      tabindex="-1"
+    >
+      <h3 id="confirm-del-title">Delete this call?</h3>
+      <p class="modal-body">
+        <strong>{call.title ?? "Untitled call"}</strong> will be removed from
+        the portal and your call list. The audio files stay on disk under
+        <code>{call.session_id}</code>.
+      </p>
+      <div class="modal-actions">
+        <button
+          class="btn-ghost"
+          onclick={() => (confirmingDelete = false)}
+          disabled={deleting}
+        >
+          Cancel
+        </button>
+        <button
+          class="btn-danger"
+          onclick={confirmDeleteCall}
+          disabled={deleting}
+        >
+          {deleting ? "Deleting…" : "Delete"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .page {
@@ -1707,6 +1757,94 @@
   }
   .ed-save:disabled {
     opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  /* ── Delete confirm modal ──────────────────────────────────────────── */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(3px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+    padding: 1rem;
+    cursor: default;
+  }
+
+  .modal {
+    max-width: 440px;
+    width: 100%;
+    padding: 1.4rem 1.5rem 1.2rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius-lg);
+    background: var(--ink-1);
+    box-shadow: 0 22px 40px -12px rgba(0, 0, 0, 0.55);
+    cursor: auto;
+  }
+
+  .modal h3 {
+    margin: 0 0 0.6rem;
+    font-size: 1.05rem;
+    color: var(--bone-0);
+    font-weight: 600;
+  }
+
+  .modal-body {
+    margin: 0 0 1.1rem;
+    color: var(--bone-1);
+    font-size: 0.9rem;
+    line-height: 1.55;
+  }
+
+  .modal-body code {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--bone-2);
+    background: var(--ink-2);
+    padding: 0.08rem 0.35rem;
+    border-radius: 4px;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+
+  .btn-ghost,
+  .btn-danger {
+    padding: 0.5rem 1rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    border-radius: 8px;
+    border: 1px solid var(--hairline);
+    transition: all 0.15s;
+  }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--bone-2);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
+  }
+
+  .btn-danger {
+    background: var(--live);
+    border-color: var(--live);
+    color: #fff;
+  }
+  .btn-danger:hover:not(:disabled) {
+    filter: brightness(1.1);
+  }
+
+  .btn-ghost:disabled,
+  .btn-danger:disabled {
+    opacity: 0.55;
     cursor: not-allowed;
   }
 </style>
