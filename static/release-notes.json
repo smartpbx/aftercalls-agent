@@ -1,0 +1,15 @@
+{
+  "0.2.0": {
+    "headline": "Account controls, a real waveform, and a bug fix you'll be glad to hear about",
+    "changes": [
+      "You can now edit your display name, email, and password from Settings in the web portal. Email changes go through a verification link.",
+      "Admins can edit teammates: rename, change email, change role, or trigger a password reset — all from the Team page.",
+      "Invited users now show up as \"pending\" in Team, so you can see who hasn't accepted yet.",
+      "Call detail now renders a real waveform, thanks to server-side peak generation. No more flat line.",
+      "The recording timer stays in sync after you close the app to tray and reopen it mid-recording.",
+      "Deleting a call shows a proper confirm dialog instead of the browser's default.",
+      "Fixed a bug where finished calls were silently losing their transcript and summary after the vault note was saved. Your future recordings will land complete."
+    ],
+    "footer": "Heads up: older recordings in the portal may still be blank from that last bug. We can help recover from local vault notes if you need to — just reach out."
+  }
+}

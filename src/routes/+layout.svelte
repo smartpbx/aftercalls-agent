@@ -38,6 +38,19 @@
   let updateTotal = $state(0);
   let version = $state("");
 
+  // Post-update welcome. On every launch we compare the running binary's
+  // version against the last one we showed release notes for (localStorage).
+  // If it's new, we pop the modal once and persist. No key => first install;
+  // we still show a welcome with the current version's notes so first-run
+  // users get the same pitch without a second boot.
+  const LAST_SEEN_VERSION_KEY = "aftercalls.lastSeenVersion";
+  let releaseNotes = $state<{
+    version: string;
+    headline: string;
+    changes: string[];
+    footer?: string;
+  } | null>(null);
+
   onMount(async () => {
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
     // client-side route transition can take the whole renderer down (blank
@@ -112,7 +125,46 @@
     } catch (e) {
       console.warn("update check failed", e);
     }
+
+    // Post-update "what's new" check. Only runs after we have the current
+    // version — compare against the last-seen key and pop the modal if
+    // it's new (or absent). Notes are bundled in static/release-notes.json
+    // so no network call is involved.
+    if (version) {
+      try {
+        const lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
+        if (lastSeen !== version) {
+          const resp = await fetch("/release-notes.json");
+          if (resp.ok) {
+            const all = (await resp.json()) as Record<
+              string,
+              { headline: string; changes: string[]; footer?: string }
+            >;
+            const entry = all[version];
+            if (entry) {
+              releaseNotes = { version, ...entry };
+            } else {
+              // No entry for this exact version — silently bookmark it so
+              // we don't pop an empty modal. Future versions with entries
+              // will still trigger.
+              localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("release notes load failed", e);
+      }
+    }
   });
+
+  function dismissReleaseNotes() {
+    if (releaseNotes) {
+      try {
+        localStorage.setItem(LAST_SEEN_VERSION_KEY, releaseNotes.version);
+      } catch {}
+    }
+    releaseNotes = null;
+  }
 
   async function installUpdate() {
     if (!updateAvailable) return;
@@ -301,6 +353,46 @@
     </div>
   </div>
 </div>
+{/if}
+
+{#if releaseNotes}
+  <div
+    class="rn-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={dismissReleaseNotes}
+    onkeydown={(e) => {
+      if (e.key === "Escape") dismissReleaseNotes();
+    }}
+  >
+    <div
+      class="rn-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="rn-title"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <span class="rn-badge">v{releaseNotes.version}</span>
+        <h2 id="rn-title">{releaseNotes.headline}</h2>
+      </div>
+      <ul class="rn-list">
+        {#each releaseNotes.changes as line (line)}
+          <li>{line}</li>
+        {/each}
+      </ul>
+      {#if releaseNotes.footer}
+        <p class="rn-footer">{releaseNotes.footer}</p>
+      {/if}
+      <div class="rn-actions">
+        <button class="rn-dismiss" onclick={dismissReleaseNotes}>
+          Got it
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -589,5 +681,92 @@
   .page {
     flex: 1;
     min-height: 0;
+  }
+
+  /* ── Release notes modal ─────────────────────────────────────────── */
+  .rn-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 60;
+    padding: 1rem;
+    cursor: default;
+  }
+  .rn-modal {
+    max-width: 520px;
+    width: 100%;
+    padding: 1.6rem 1.7rem 1.3rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius-lg);
+    background: var(--ink-1);
+    box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.6);
+    cursor: auto;
+  }
+  .rn-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.7rem;
+    margin-bottom: 0.9rem;
+  }
+  .rn-badge {
+    display: inline-block;
+    padding: 0.15rem 0.45rem;
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.04em;
+    border-radius: 4px;
+    flex-shrink: 0;
+    margin-top: 0.25rem;
+  }
+  .rn-head h2 {
+    margin: 0;
+    font-size: 1.1rem;
+    line-height: 1.35;
+    color: var(--bone-0);
+    font-weight: 600;
+  }
+  .rn-list {
+    margin: 0 0 1rem;
+    padding-left: 1.05rem;
+    color: var(--bone-1);
+  }
+  .rn-list li {
+    margin: 0 0 0.55rem;
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+  .rn-footer {
+    margin: 0 0 1rem;
+    padding: 0.7rem 0.85rem;
+    border-left: 2px solid var(--sig);
+    background: var(--ink-0);
+    color: var(--bone-2);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    border-radius: 6px;
+  }
+  .rn-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .rn-dismiss {
+    padding: 0.55rem 1.1rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-size: 0.88rem;
+    font-weight: 600;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .rn-dismiss:hover {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
   }
 </style>
