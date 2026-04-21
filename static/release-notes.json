@@ -1,4 +1,12 @@
 {
+  "0.3.3": {
+    "headline": "Windows finally captures the other side of the call",
+    "changes": [
+      "Windows: system audio (the person on the other end of a Zoom/Teams/phone call) is now captured alongside your mic via WASAPI loopback. Uses the cpal audio library the mic was already on, so no new drivers, no config — the call just records both sides.",
+      "Calls where one track didn't get uploaded (corner cases, crashes, mid-session agent swaps) no longer fail the whole pipeline — the backend skips missing tracks and transcribes whatever did arrive.",
+      "Linux: if the agent is force-killed mid-recording, the system-audio child process now dies with it instead of becoming an orphan that silently eats disk."
+    ]
+  },
   "0.3.2": {
     "headline": "session tokens stay fresh, and the summary reads like something you'd paste into an email",
     "changes": [
