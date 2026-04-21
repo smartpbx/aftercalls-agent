@@ -152,29 +152,6 @@
     } catch {}
   }
 
-  // Manual drag handler for the Windows custom titlebar. Using either
-  // `data-tauri-drag-region` or CSS `-webkit-app-region: drag` on some
-  // WebView2 builds eats mousedown events at the compositor — the
-  // window-control buttons never see their clicks. Handling the
-  // mousedown here lets us scope the drag to clicks that *didn't* hit
-  // an interactive element, and leave every other mousedown alone.
-  async function handleTopstripMouseDown(ev: MouseEvent) {
-    if (!isWindows) return;
-    if (ev.button !== 0) return;
-    const target = ev.target as HTMLElement | null;
-    if (!target) return;
-    // Skip buttons, inputs, anchors, and anything that might be
-    // interactive — Tauri's own drag-region handler uses a similar
-    // allow-list.
-    if (target.closest("button, a, input, textarea, select, [role='button']")) {
-      return;
-    }
-    try {
-      await getCurrentWindow().startDragging();
-    } catch (e) {
-      console.warn("startDragging failed", e);
-    }
-  }
 
   onMount(async () => {
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
@@ -462,11 +439,11 @@
     <header
       class="topstrip"
       class:has-win-controls={isWindows}
-      onmousedown={isWindows ? handleTopstripMouseDown : undefined}
+      data-tauri-drag-region
       ondblclick={isWindows ? toggleMaximize : undefined}
     >
-      <div class="crumbs">
-        <span class="crumb">{pageTitle}</span>
+      <div class="crumbs" data-tauri-drag-region>
+        <span class="crumb" data-tauri-drag-region>{pageTitle}</span>
       </div>
 
       <div class="strip-right">
@@ -894,6 +871,16 @@
     transition: background 0.12s, color 0.12s;
     /* Native Windows titlebar buttons are square + flush with the
        top/right corners; mimic that. */
+  }
+  /* Tauri's drag-region handler checks `e.target.tagName` against an
+     interactive allow-list (BUTTON, INPUT, A, SELECT, TEXTAREA). If a
+     click lands on a nested <svg>, target.tagName === 'svg' is not on
+     the list — the topstrip would start dragging and the button's
+     onclick never fires. pointer-events: none on the svg promotes the
+     target to the parent button, so the click hits target.tagName ===
+     'BUTTON' and Tauri skips the drag. */
+  .wc-btn svg {
+    pointer-events: none;
   }
   .wc-btn:hover {
     background: var(--ink-2);

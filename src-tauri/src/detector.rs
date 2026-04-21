@@ -299,7 +299,14 @@ fn emit(app: &AppHandle, event: AutoDetectEvent) {
 
 fn show_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
+        // See show_main_window in lib.rs — redundant show() on wlroots
+        // compositors can spawn a phantom second surface.
+        match win.is_visible() {
+            Ok(true) => {}
+            _ => {
+                let _ = win.show();
+            }
+        }
         let _ = win.unminimize();
         let _ = win.set_focus();
     }

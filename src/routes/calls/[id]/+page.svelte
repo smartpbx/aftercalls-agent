@@ -314,6 +314,47 @@
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
   });
 
+  let downloading = $state(false);
+  function safeFilename(s: string): string {
+    return (
+      s
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 100) || "aftercalls-recording"
+    );
+  }
+
+  async function downloadCurrentTrack() {
+    const url = audioUrls[track];
+    if (!url || !call) return;
+    downloading = true;
+    audioError = "";
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const base = safeFilename(call.title?.trim() || call.session_id);
+      const suffix = track === "mixed" ? "" : `-${track}`;
+      // Files are stored as Opus on Spaces. Opus plays natively in every
+      // major OS's default player (Windows 10+, macOS, Linux) and any
+      // modern media tool (VLC, ffmpeg). No transcode on our side.
+      const filename = `${base}${suffix}.opus`;
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(href), 1500);
+    } catch (e) {
+      audioError = `Download failed: ${e}`;
+    } finally {
+      downloading = false;
+    }
+  }
+
   async function copy(text: string, label: string) {
     try {
       await writeText(text);
@@ -766,6 +807,22 @@
 
         <button class="rate" onclick={cycleRate} aria-label="Playback rate">
           {rate}×
+        </button>
+        <button
+          class="t-btn download"
+          onclick={downloadCurrentTrack}
+          disabled={!audioUrls[track] || downloading}
+          title="Download {trackLabels[track]} track as .opus"
+          aria-label="Download audio"
+        >
+          {#if downloading}
+            …
+          {:else}
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+              <path d="M10 3 v9 M6 9 L10 13 L14 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+              <path d="M4 15 L4 17 L16 17 L16 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+            </svg>
+          {/if}
         </button>
       </div>
 

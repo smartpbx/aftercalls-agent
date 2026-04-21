@@ -550,7 +550,16 @@ fn toggle_recording(app: &AppHandle) {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
+        // Only call show() when the window is actually hidden. On some
+        // wlroots-family compositors (Hyprland, sway) a redundant show()
+        // on an already-visible window can materialize a duplicate surface
+        // (see #15 + the recent "3 windows on join call" report).
+        match win.is_visible() {
+            Ok(true) => {}
+            _ => {
+                let _ = win.show();
+            }
+        }
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
@@ -624,6 +633,16 @@ fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance *must* be registered first (upstream guidance).
+        // A second launch — tray double-click, CLI from a script, .desktop
+        // autostart, Hyprland bind, etc. — would otherwise spawn its own
+        // process + "main" window, producing the multi-window behavior the
+        // user saw on Linux. When a second launch happens the callback
+        // fires in the original process; we just re-show the existing
+        // main window and let the second process exit.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
