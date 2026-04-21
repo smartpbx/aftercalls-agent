@@ -169,17 +169,27 @@ select {
   }
 }
 
-/* Stagger-in for page content. Children with --i:0, --i:1… cascade in. */
+/* Stagger-in for page content. Children with --i:0, --i:1… cascade in.
+ * Keyframes go from 0 → 1 rather than the rule setting opacity:0 outright,
+ * so if the animation is disabled (prefers-reduced-motion, webview quirks,
+ * etc.) content still renders visible by default. */
 .reveal > * {
-  opacity: 0;
-  transform: translateY(4px);
-  animation: reveal 420ms cubic-bezier(0.2, 0.6, 0.2, 1) forwards;
+  animation: reveal 420ms cubic-bezier(0.2, 0.6, 0.2, 1) both;
   animation-delay: calc(var(--i, 0) * 55ms + 60ms);
 }
 @keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
   to {
     opacity: 1;
     transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reveal > * {
+    animation: none;
   }
 }
 

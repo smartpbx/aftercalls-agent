@@ -102,22 +102,6 @@
       {/each}
     </nav>
 
-    <div class="rail-foot">
-      <div class="state-row">
-        <span class="state-dot" class:live={recording}></span>
-        <span class="state-lbl">
-          {#if recording}
-            Recording
-          {:else if pipelineStage && pipelineStage !== "done"}
-            {stageLabel[pipelineStage] ?? pipelineStage}
-          {:else if pipelineStage === "done"}
-            Saved
-          {:else}
-            Idle
-          {/if}
-        </span>
-      </div>
-    </div>
   </aside>
 
   <div class="main">
@@ -219,36 +203,6 @@
   .nav-item:hover .glyph,
   .nav-item.active .glyph {
     color: var(--accent);
-  }
-
-  .rail-foot {
-    margin-top: auto;
-    padding-top: 0.7rem;
-    border-top: 1px solid var(--hairline);
-  }
-
-  .state-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.25rem 0.5rem;
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    color: var(--bone-3);
-    letter-spacing: 0.04em;
-  }
-
-  .state-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--bone-4);
-  }
-
-  .state-dot.live {
-    background: var(--live);
-    box-shadow: 0 0 6px var(--live);
-    animation: pip-pulse 1.2s ease-in-out infinite;
   }
 
   /* ── Main area ─────────────────────────────────────────────────────── */

@@ -258,6 +258,12 @@
     else audioEl.pause();
   }
 
+  function skip(sec: number) {
+    if (!audioEl || !call) return;
+    const maxSec = call.duration_ms / 1000;
+    audioEl.currentTime = Math.max(0, Math.min(maxSec, audioEl.currentTime + sec));
+  }
+
   function cycleRate() {
     const order = [1, 1.25, 1.5, 2, 0.75];
     const idx = order.indexOf(rate);
@@ -411,24 +417,52 @@
       </div>
 
       <div class="transport">
-        <button
-          class="play"
-          class:playing
-          onclick={togglePlay}
-          aria-label={playing ? "Pause" : "Play"}
-          disabled={!audioSrc}
-        >
-          {#if playing}
-            <svg viewBox="0 0 20 20" width="12" height="12" aria-hidden="true">
-              <rect x="5" y="4" width="3.2" height="12" rx="0.8" fill="currentColor" />
-              <rect x="11.8" y="4" width="3.2" height="12" rx="0.8" fill="currentColor" />
+        <div class="transport-left">
+          <button
+            class="t-btn"
+            onclick={() => skip(-10)}
+            aria-label="Back 10 seconds"
+            disabled={!audioSrc}
+            title="Back 10s"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+              <path d="M5 10 L11 5 L11 15 Z" fill="currentColor" />
+              <rect x="12.5" y="5" width="1.5" height="10" rx="0.5" fill="currentColor" />
+              <text x="10" y="19" text-anchor="middle" font-size="4.5" fill="currentColor" font-family="inherit" font-weight="600">10</text>
             </svg>
-          {:else}
-            <svg viewBox="0 0 20 20" width="12" height="12" aria-hidden="true">
-              <path d="M6 4 L16 10 L6 16 Z" fill="currentColor" />
+          </button>
+          <button
+            class="t-btn play"
+            class:playing
+            onclick={togglePlay}
+            aria-label={playing ? "Pause" : "Play"}
+            disabled={!audioSrc}
+          >
+            {#if playing}
+              <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+                <rect x="5" y="3.5" width="3.6" height="13" rx="0.8" fill="currentColor" />
+                <rect x="11.4" y="3.5" width="3.6" height="13" rx="0.8" fill="currentColor" />
+              </svg>
+            {:else}
+              <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+                <path d="M6 3.5 L17 10 L6 16.5 Z" fill="currentColor" />
+              </svg>
+            {/if}
+          </button>
+          <button
+            class="t-btn"
+            onclick={() => skip(10)}
+            aria-label="Forward 10 seconds"
+            disabled={!audioSrc}
+            title="Forward 10s"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+              <path d="M15 10 L9 5 L9 15 Z" fill="currentColor" />
+              <rect x="6" y="5" width="1.5" height="10" rx="0.5" fill="currentColor" />
+              <text x="10" y="19" text-anchor="middle" font-size="4.5" fill="currentColor" font-family="inherit" font-weight="600">10</text>
             </svg>
-          {/if}
-        </button>
+          </button>
+        </div>
 
         <div class="tracks">
           {#each ["mixed", "mic", "system"] as key (key)}
@@ -808,30 +842,52 @@
     gap: 0.7rem;
   }
 
-  .play {
+  .transport-left {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+
+  .t-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 34px;
     height: 34px;
-    border-radius: 50%;
-    border: 1px solid var(--hairline-hi);
+    border-radius: 8px;
+    border: 1px solid var(--hairline);
     background: var(--ink-2);
-    color: var(--bone-0);
+    color: var(--bone-1);
     transition: all 0.15s;
-    flex-shrink: 0;
   }
 
-  .play:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
+  .t-btn:hover:not(:disabled) {
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
   }
-  .play.playing {
+
+  .t-btn.play {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    border-color: var(--accent);
     background: var(--accent);
     color: var(--ink-0);
-    border-color: var(--accent);
+    box-shadow: 0 8px 22px -12px var(--accent-glow);
   }
-  .play:disabled {
+  .t-btn.play:hover:not(:disabled) {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+    color: var(--ink-0);
+  }
+  .t-btn.play.playing {
+    background: var(--ink-2);
+    color: var(--accent);
+    border-color: var(--accent);
+    box-shadow: none;
+  }
+  .t-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
