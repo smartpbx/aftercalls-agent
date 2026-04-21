@@ -52,7 +52,10 @@
 
   let ro: ResizeObserver | null = null;
   let rafId = 0;
+  // kept for when we reintroduce a decode path; currently unused.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   let abort: AbortController | null = null;
+  void abort;
 
   $effect(() => {
     // Re-decode whenever the source URL changes.
@@ -78,44 +81,23 @@
 
   onDestroy(() => {
     ro?.disconnect();
-    abort?.abort();
     cancelAnimationFrame(rafId);
   });
 
-  async function decode(url: string) {
-    abort?.abort();
-    abort = new AbortController();
-    status = "decoding";
-    errorMsg = "";
-    let ctx: AudioContext | null = null;
-    try {
-      const resp = await fetch(url, { signal: abort.signal });
-      if (!resp.ok) throw new Error(`fetch ${resp.status}`);
-      const buf = await resp.arrayBuffer();
-      // Bail early on degenerate buffers — decodeAudioData has historically
-      // crashed webkit2gtk on sub-header-sized data.
-      if (buf.byteLength < 100) {
-        throw new Error(`audio too small (${buf.byteLength} bytes)`);
-      }
-      const AC = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AC) throw new Error("AudioContext unavailable");
-      ctx = new AC();
-      const audioBuf = await ctx.decodeAudioData(buf);
-      peaks = extractPeaks(audioBuf, 1800);
-      status = "ready";
-      paint();
-    } catch (e: any) {
-      if (e?.name === "AbortError") return;
-      status = "error";
-      errorMsg = String(e);
-      peaks = null;
-    } finally {
-      // Always release the context even on error; leaked contexts eventually
-      // saturate the renderer. close() can itself throw on partial init.
-      try {
-        ctx?.close();
-      } catch {}
-    }
+  async function decode(_url: string) {
+    // Intentionally a no-op right now. The Web Audio decode path is the
+    // prime suspect for the WebKitWebProcess SIGABRT crash we're seeing on
+    // call-detail navigation — the bundled webkit2gtk-4.1 in the AppImage
+    // has historically been unstable around decodeAudioData on certain
+    // codec/container combinations, and nothing else on the page does
+    // anything the waveform route hasn't already seen elsewhere.
+    //
+    // Playback still works via the <audio> element; we just render a flat
+    // placeholder bar + the normal playhead until we move peak generation
+    // server-side (backend samples via ffmpeg + ships a JSON peaks file).
+    peaks = null;
+    status = "ready";
+    paint();
   }
 
   // Returns an interleaved [min, max] pair per column, normalized to [-1, 1].
@@ -167,7 +149,7 @@
   }
 
   function paintInner() {
-    if (!canvas || !peaks || width <= 0) return;
+    if (!canvas || width <= 0) return;
     const cw = width;
     const ch = height;
     canvas.width = Math.floor(cw * DPR);
@@ -220,7 +202,6 @@
     const bars = 220; // visible bar count — tuned for density, not resolution
     const gap = 2;
     const barW = Math.max(1.2, (cw - gap * (bars - 1)) / bars);
-    const srcCols = peaks.length / 2;
 
     // Styles
     const playedColor = getCss("--bone-1");
@@ -230,22 +211,40 @@
     const progress = durationMs > 0 ? currentMs / durationMs : 0;
     const playheadX = progress * cw;
 
-    for (let i = 0; i < bars; i++) {
-      const x = i * (barW + gap);
-      const colCenter = Math.floor(((i + 0.5) / bars) * srcCols);
-      const lo = peaks[colCenter * 2];
-      const hi = peaks[colCenter * 2 + 1];
-      const top = mid + lo * (mid - 6);
-      const bot = mid + hi * (mid - 6);
-      const h = Math.max(1.5, bot - top);
+    if (peaks) {
+      // Real waveform from decoded audio.
+      const srcCols = peaks.length / 2;
+      for (let i = 0; i < bars; i++) {
+        const x = i * (barW + gap);
+        const colCenter = Math.floor(((i + 0.5) / bars) * srcCols);
+        const lo = peaks[colCenter * 2];
+        const hi = peaks[colCenter * 2 + 1];
+        const top = mid + lo * (mid - 6);
+        const bot = mid + hi * (mid - 6);
+        const h = Math.max(1.5, bot - top);
 
-      // Color: played = warm bone, tip-of-playhead accent, unplayed = dim.
-      const barCenter = x + barW / 2;
-      const dx = Math.abs(barCenter - playheadX);
-      let color = barCenter <= playheadX ? playedColor : unplayedColor;
-      if (dx < 24) color = playedTail;
-      g.fillStyle = color;
-      g.fillRect(x, top, barW, h);
+        const barCenter = x + barW / 2;
+        const dx = Math.abs(barCenter - playheadX);
+        let color = barCenter <= playheadX ? playedColor : unplayedColor;
+        if (dx < 24) color = playedTail;
+        g.fillStyle = color;
+        g.fillRect(x, top, barW, h);
+      }
+    } else {
+      // Flat placeholder: the waveform strip still reads as a scrubber
+      // (played / unplayed split, accent tail on the playhead) even with
+      // no decoded peaks yet. Pre-existing playback + click-to-seek work
+      // unchanged since they're duration-driven, not peak-driven.
+      const ph = 3;
+      for (let i = 0; i < bars; i++) {
+        const x = i * (barW + gap);
+        const barCenter = x + barW / 2;
+        const dx = Math.abs(barCenter - playheadX);
+        let color = barCenter <= playheadX ? playedColor : unplayedColor;
+        if (dx < 24) color = playedTail;
+        g.fillStyle = color;
+        g.fillRect(x, mid - ph / 2, barW, ph);
+      }
     }
 
     // Playhead — thin rule with a small cap glow
