@@ -29,12 +29,21 @@
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
     // client-side route transition can take the whole renderer down (blank
     // window + blank devtools). Swallow + log so the UI stays alive.
+    // Using console.error (not warn) because some webkit builds filter warns
+    // out of the devtools panel by default.
     window.addEventListener("unhandledrejection", (ev) => {
-      console.warn("unhandled rejection (suppressed)", ev.reason);
+      const r: any = ev.reason;
+      console.error(
+        "[unhandledrejection]",
+        r?.stack ?? r?.message ?? String(r),
+      );
       ev.preventDefault();
     });
     window.addEventListener("error", (ev) => {
-      console.warn("uncaught error (suppressed)", ev.error ?? ev.message);
+      console.error(
+        "[error]",
+        ev.error?.stack ?? ev.error?.message ?? ev.message,
+      );
     });
 
     unlistenState = await listen<{ recording: boolean }>(

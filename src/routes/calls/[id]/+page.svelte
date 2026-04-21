@@ -110,29 +110,46 @@
   let speakerEditValue = $state("");
   let savingSpeaker = $state(false);
 
+  // Heavy tracing on this route while we're diagnosing the blank-on-click
+  // crash. console.error because webkit2gtk has been swallowing warn/log
+  // output intermittently — error shows up reliably.
+  const trace = (step: string, extra?: unknown) => {
+    if (extra === undefined) console.error("[call-detail]", step);
+    else console.error("[call-detail]", step, extra);
+  };
+
   onMount(async () => {
+    trace("onMount start", { id: page.params.id });
     try {
       call = await invoke<Call>("get_call", { id: page.params.id });
+      trace("get_call ok", {
+        id: call?.id,
+        utterances: call?.utterances?.length,
+      });
       try {
         audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+        trace("get_audio_urls ok", audioUrls);
       } catch (e) {
-        console.warn("audio-urls unavailable, falling back to local files", e);
+        trace("get_audio_urls FAILED (fallback to local)", e);
       }
       try {
         const hs = await invoke<Highlight[]>("list_highlights", {
           callId: page.params.id,
         });
-        // Only replace state if the backend returned an array; a stray null
-        // from an older backend would blow up `{#each highlights}` rendering.
         if (Array.isArray(hs)) highlights = hs;
+        trace("list_highlights ok", { count: highlights.length });
       } catch (e) {
-        console.warn("list_highlights failed", e);
+        trace("list_highlights FAILED", e);
       }
+      trace("loadAudio start", { track });
       await loadAudio(track);
+      trace("loadAudio done", { src: audioSrc, err: audioError });
     } catch (e) {
+      trace("onMount FATAL", e);
       error = String(e);
     } finally {
       loading = false;
+      trace("onMount end loading=false");
     }
   });
 
@@ -578,7 +595,9 @@
   }
 </script>
 
-<main class="page reveal">
+<!-- reveal class stripped on this route while we isolate the blank-on-click
+     crash — the CSS animation is the last untested variable. -->
+<main class="page">
   {#if loading}
     <p class="state" style="--i: 0">Loading call…</p>
   {:else if error}
