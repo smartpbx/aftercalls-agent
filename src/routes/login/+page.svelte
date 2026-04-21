@@ -49,6 +49,9 @@
         if (rememberEmail) localStorage.setItem(REMEMBERED_EMAIL_KEY, trimmed);
         else localStorage.removeItem(REMEMBERED_EMAIL_KEY);
       } catch {}
+      // Tell the layout that auth just changed — it'll refresh `me` and
+      // fire the release-notes modal personalized to the signed-in name.
+      window.dispatchEvent(new Event("aftercalls-login"));
       goto("/");
     } catch (e: any) {
       error = String(e).replace(/^Error:\s*/, "");

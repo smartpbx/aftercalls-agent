@@ -1,4 +1,14 @@
 {
+  "0.2.1": {
+    "headline": "a few fixes that make the app actually work on fresh installs",
+    "changes": [
+      "Fresh installs on Windows can now sign in — the agent creates a default config pointing at the production backend when one doesn't exist yet.",
+      "Call detail waveforms render everywhere again. A backend deadlock in peaks generation was silently leaving every non-trivial recording with no waveform.",
+      "Vocab settings (spelling corrections + word boost) moved to the web portal under Admin → Vocab. Admins manage them once for the whole team.",
+      "You'll see this welcome popup right after signing in, not just on first launch."
+    ],
+    "footer": "If you missed the v0.2.0 notes, open Settings → About or ask us — we can resurface them."
+  },
   "0.2.0": {
     "headline": "Account controls, a real waveform, and a bug fix you'll be glad to hear about",
     "changes": [

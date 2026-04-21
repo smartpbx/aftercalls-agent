@@ -38,18 +38,20 @@
   let updateTotal = $state(0);
   let version = $state("");
 
-  // Post-update welcome. On every launch we compare the running binary's
-  // version against the last one we showed release notes for (localStorage).
-  // If it's new, we pop the modal once and persist. No key => first install;
-  // we still show a welcome with the current version's notes so first-run
-  // users get the same pitch without a second boot.
+  // Post-update welcome. On each auth session we compare the running
+  // binary's version against the last one we showed release notes for
+  // (localStorage). If it's new, we pop the modal once the user's name
+  // is in hand so the greeting can be personal. No key => first install;
+  // we still show a welcome with the current version's notes.
   const LAST_SEEN_VERSION_KEY = "aftercalls.lastSeenVersion";
   let releaseNotes = $state<{
     version: string;
     headline: string;
     changes: string[];
     footer?: string;
+    firstName: string;
   } | null>(null);
+  let releaseNotesChecked = false;
 
   onMount(async () => {
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
@@ -126,36 +128,52 @@
       console.warn("update check failed", e);
     }
 
-    // Post-update "what's new" check. Only runs after we have the current
-    // version — compare against the last-seen key and pop the modal if
-    // it's new (or absent). Notes are bundled in static/release-notes.json
-    // so no network call is involved.
-    if (version) {
-      try {
-        const lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
-        if (lastSeen !== version) {
-          const resp = await fetch("/release-notes.json");
-          if (resp.ok) {
-            const all = (await resp.json()) as Record<
-              string,
-              { headline: string; changes: string[]; footer?: string }
-            >;
-            const entry = all[version];
-            if (entry) {
-              releaseNotes = { version, ...entry };
-            } else {
-              // No entry for this exact version — silently bookmark it so
-              // we don't pop an empty modal. Future versions with entries
-              // will still trigger.
-              localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
-            }
-          }
-        }
-      } catch (e) {
-        console.warn("release notes load failed", e);
-      }
-    }
+    // Fire the release-notes check if we already have an authed user
+    // (returning session). Otherwise wait for the login event below.
+    await maybeShowReleaseNotes();
+
+    // The /login page fires this after a successful sign-in so we can
+    // refresh the layout's user state + show the release-notes modal
+    // personalized with the just-logged-in name.
+    window.addEventListener("aftercalls-login", handleLoginEvent);
   });
+
+  async function handleLoginEvent() {
+    try {
+      me = await invoke<Me | null>("current_user");
+    } catch {}
+    await maybeShowReleaseNotes();
+  }
+
+  // Shows the release-notes modal at most once per "new" version per
+  // device — regardless of whether we're hit at onMount (returning
+  // user) or from the post-login event (fresh sign-in).
+  async function maybeShowReleaseNotes() {
+    if (releaseNotesChecked) return;
+    if (!version || !me) return;
+    releaseNotesChecked = true;
+    try {
+      const lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
+      if (lastSeen === version) return;
+      const resp = await fetch("/release-notes.json");
+      if (!resp.ok) return;
+      const all = (await resp.json()) as Record<
+        string,
+        { headline: string; changes: string[]; footer?: string }
+      >;
+      const entry = all[version];
+      if (!entry) {
+        // No entry for this version — silently bookmark so the modal
+        // doesn't fire empty next launch.
+        localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
+        return;
+      }
+      const firstName = (me?.display_name ?? "").split(/\s+/)[0] ?? "";
+      releaseNotes = { version, firstName, ...entry };
+    } catch (e) {
+      console.warn("release notes load failed", e);
+    }
+  }
 
   function dismissReleaseNotes() {
     if (releaseNotes) {
@@ -199,6 +217,7 @@
     unlistenState?.();
     unlistenPipeline?.();
     unlistenTray?.();
+    window.removeEventListener("aftercalls-login", handleLoginEvent);
   });
 
   const items: {
@@ -376,7 +395,13 @@
     >
       <div class="rn-head">
         <span class="rn-badge">v{releaseNotes.version}</span>
-        <h2 id="rn-title">{releaseNotes.headline}</h2>
+        <h2 id="rn-title">
+          {#if releaseNotes.firstName}
+            {releaseNotes.firstName}, {releaseNotes.headline}
+          {:else}
+            {releaseNotes.headline}
+          {/if}
+        </h2>
       </div>
       <ul class="rn-list">
         {#each releaseNotes.changes as line (line)}
