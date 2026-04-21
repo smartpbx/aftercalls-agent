@@ -263,6 +263,57 @@ async fn set_org_vocab(
 }
 
 #[tauri::command]
+async fn list_highlights(call_id: String) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::list_highlights(backend, &call_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_highlight(
+    call_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::create_highlight(backend, &call_id, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_highlight(id: String, body: serde_json::Value) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::update_highlight(backend, &id, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_highlight(id: String) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::delete_highlight(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
@@ -423,6 +474,10 @@ pub fn run() {
             get_audio_urls,
             get_org_vocab,
             set_org_vocab,
+            list_highlights,
+            create_highlight,
+            update_highlight,
+            delete_highlight,
             delete_call,
             update_utterance_speaker,
             rename_speaker,

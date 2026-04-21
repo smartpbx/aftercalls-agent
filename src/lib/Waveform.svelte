@@ -6,14 +6,24 @@
   // canvas, then blits + overlays the playhead at 60fps. Keeps paint work off
   // the hot path during playback — only the playhead moves frame-to-frame.
 
+  type Highlight = {
+    id: string;
+    start_ms: number;
+    end_ms: number;
+    kind: string;
+    label: string | null;
+  };
+
   type Props = {
     src: string; // Blob URL or remote URL (presigned). Empty = empty state.
     audio: HTMLAudioElement | undefined;
     currentMs: number;
     durationMs: number;
     height?: number;
-    // Called when the user clicks/drags the waveform to seek.
+    highlights?: Highlight[];
     onseek?: (ms: number) => void;
+    // Shift-drag emits a range so the parent can create a highlight.
+    onmark?: (range: { start_ms: number; end_ms: number }) => void;
   };
 
   let {
@@ -22,8 +32,13 @@
     currentMs = $bindable(0),
     durationMs,
     height = 140,
+    highlights = [],
     onseek,
+    onmark,
   }: Props = $props();
+
+  let dragRange = $state<{ start_ms: number; end_ms: number } | null>(null);
+  let isMarking = $state(false);
 
   let wrap: HTMLDivElement | undefined = $state();
   let canvas: HTMLCanvasElement | undefined = $state();
@@ -140,6 +155,36 @@
     g.scale(DPR, DPR);
     g.clearRect(0, 0, cw, ch);
 
+    // ── Highlight bands (painted behind the bars) ──────────────────────
+    if (durationMs > 0) {
+      for (const h of highlights) {
+        const x1 = (h.start_ms / durationMs) * cw;
+        const x2 = (h.end_ms / durationMs) * cw;
+        g.fillStyle = kindBand(h.kind);
+        g.fillRect(x1, 0, Math.max(2, x2 - x1), ch);
+      }
+      if (dragRange && isMarking) {
+        const x1 = (dragRange.start_ms / durationMs) * cw;
+        const x2 = (dragRange.end_ms / durationMs) * cw;
+        g.fillStyle = getCss("--accent-soft");
+        g.fillRect(
+          Math.min(x1, x2),
+          0,
+          Math.max(2, Math.abs(x2 - x1)),
+          ch,
+        );
+        g.strokeStyle = getCss("--accent");
+        g.setLineDash([4, 3]);
+        g.strokeRect(
+          Math.min(x1, x2) + 0.5,
+          0.5,
+          Math.max(2, Math.abs(x2 - x1)) - 1,
+          ch - 1,
+        );
+        g.setLineDash([]);
+      }
+    }
+
     const mid = ch / 2;
     const bars = 220; // visible bar count — tuned for density, not resolution
     const gap = 2;
@@ -184,6 +229,23 @@
     return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   }
 
+  // Translucent fill per highlight kind — soft enough to not drown the bars.
+  function kindBand(kind: string): string {
+    switch (kind) {
+      case "decision":
+        return "rgba(58, 155, 146, 0.22)"; // accent teal
+      case "follow_up":
+        return "rgba(201, 162, 74, 0.18)"; // sig gold
+      case "question":
+        return "rgba(138, 162, 192, 0.20)"; // slate
+      case "action":
+        return "rgba(143, 175, 114, 0.22)"; // olive
+      case "bookmark":
+      default:
+        return "rgba(210, 204, 192, 0.14)"; // bone
+    }
+  }
+
   // Playhead RAF — only re-paints when the audio is actually playing (saves
   // idle CPU). Re-paint also runs after decode and on resize.
   function loop() {
@@ -206,6 +268,41 @@
   function onPointerDown(e: PointerEvent) {
     if (!wrap) return;
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
+    // Shift-drag marks a region; plain click-drag scrubs.
+    if (e.shiftKey && onmark) {
+      const start = xToMs(e.clientX);
+      dragRange = { start_ms: start, end_ms: start };
+      isMarking = true;
+      paint();
+
+      const move = (ev: PointerEvent) => {
+        if (!dragRange) return;
+        dragRange = { start_ms: dragRange.start_ms, end_ms: xToMs(ev.clientX) };
+        paint();
+      };
+      const up = (ev: PointerEvent) => {
+        (ev.target as HTMLElement).releasePointerCapture?.(ev.pointerId);
+        wrap?.removeEventListener("pointermove", move);
+        wrap?.removeEventListener("pointerup", up);
+        wrap?.removeEventListener("pointercancel", up);
+        if (dragRange) {
+          const lo = Math.min(dragRange.start_ms, dragRange.end_ms);
+          const hi = Math.max(dragRange.start_ms, dragRange.end_ms);
+          // Require at least a tenth of a second so a stray click isn't treated
+          // as a mark.
+          if (hi - lo >= 100) onmark({ start_ms: lo, end_ms: hi });
+        }
+        dragRange = null;
+        isMarking = false;
+        paint();
+      };
+      wrap.addEventListener("pointermove", move);
+      wrap.addEventListener("pointerup", up);
+      wrap.addEventListener("pointercancel", up);
+      return;
+    }
+
     const ms = xToMs(e.clientX);
     onseek?.(ms);
 
@@ -237,11 +334,12 @@
     return `${m}:${String(r).padStart(2, "0")}`;
   }
 
-  // Repaint reactively for currentMs/durationMs changes coming from outside.
+  // Repaint reactively for currentMs/durationMs/highlights changes coming
+  // from outside. Svelte 5 effect tracks through property reads.
   $effect(() => {
-    // touch dependencies explicitly
     currentMs;
     durationMs;
+    highlights;
     paint();
   });
 </script>

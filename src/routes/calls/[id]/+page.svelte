@@ -30,7 +30,20 @@
     utterances: Utterance[];
   };
 
+  type Highlight = {
+    id: string;
+    call_id: string;
+    start_ms: number;
+    end_ms: number;
+    kind: string;
+    label: string | null;
+    note: string | null;
+    source: string;
+    created_at: string;
+  };
+
   let call = $state<Call | null>(null);
+  let highlights = $state<Highlight[]>([]);
   let error = $state("");
   let loading = $state(true);
 
@@ -61,6 +74,13 @@
       } catch (e) {
         console.warn("audio-urls unavailable, falling back to local files", e);
       }
+      try {
+        highlights = await invoke<Highlight[]>("list_highlights", {
+          callId: page.params.id,
+        });
+      } catch (e) {
+        console.warn("list_highlights failed", e);
+      }
       await loadAudio(track);
     } catch (e) {
       error = String(e);
@@ -68,6 +88,75 @@
       loading = false;
     }
   });
+
+  async function createHighlight(range: { start_ms: number; end_ms: number }) {
+    if (!call) return;
+    try {
+      const created = await invoke<Highlight>("create_highlight", {
+        callId: call.id,
+        body: {
+          start_ms: range.start_ms,
+          end_ms: range.end_ms,
+          kind: "bookmark",
+          label: null,
+        },
+      });
+      highlights = [...highlights, created].sort((a, b) => a.start_ms - b.start_ms);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function deleteHighlight(id: string) {
+    try {
+      await invoke("delete_highlight", { id });
+      highlights = highlights.filter((h) => h.id !== id);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function retitleHighlight(id: string, label: string, kind?: string) {
+    try {
+      await invoke("update_highlight", {
+        id,
+        body: { label, kind: kind ?? null },
+      });
+      highlights = highlights.map((h) =>
+        h.id === id ? { ...h, label, kind: kind ?? h.kind } : h,
+      );
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  let editingHighlight = $state<string | null>(null);
+  let highlightLabelEdit = $state("");
+  let highlightKindEdit = $state("bookmark");
+
+  function startEditHighlight(h: Highlight) {
+    editingHighlight = h.id;
+    highlightLabelEdit = h.label ?? "";
+    highlightKindEdit = h.kind;
+  }
+
+  async function saveEditHighlight() {
+    if (!editingHighlight) return;
+    await retitleHighlight(
+      editingHighlight,
+      highlightLabelEdit.trim(),
+      highlightKindEdit,
+    );
+    editingHighlight = null;
+  }
+
+  const HIGHLIGHT_KINDS = [
+    { value: "bookmark", label: "Bookmark" },
+    { value: "decision", label: "Decision" },
+    { value: "follow_up", label: "Follow-up" },
+    { value: "question", label: "Question" },
+    { value: "action", label: "Action" },
+  ];
 
   async function loadAudio(which: "mixed" | "mic" | "system") {
     if (!call) return;
@@ -373,6 +462,29 @@
     mic: "You",
     system: "Others",
   } as const;
+
+  function kindAccent(kind: string): string {
+    switch (kind) {
+      case "decision":
+        return "var(--accent)";
+      case "follow_up":
+        return "var(--sig)";
+      case "question":
+        return "#8aa2c0";
+      case "action":
+        return "var(--olive)";
+      case "bookmark":
+      default:
+        return "var(--bone-2)";
+    }
+  }
+
+  function kindLabel(kind: string): string {
+    return (
+      HIGHLIGHT_KINDS.find((k) => k.value === kind)?.label ??
+      kind.replace(/_/g, " ")
+    );
+  }
 </script>
 
 <main class="page reveal">
@@ -412,7 +524,9 @@
           audio={audioEl}
           bind:currentMs
           durationMs={call.duration_ms}
+          {highlights}
           onseek={(ms) => seekTo(ms)}
+          onmark={(r) => createHighlight(r)}
         />
       </div>
 
@@ -493,7 +607,97 @@
         onpause={onPause}
         preload="auto"
       ></audio>
+
+      <p class="hint">
+        <kbd>Shift</kbd>+drag on the waveform to mark a highlight.
+      </p>
     </section>
+
+    {#if highlights.length > 0}
+      <section class="block" style="--i: 1.5">
+        <div class="block-head">
+          <h2>Highlights</h2>
+        </div>
+        <ul class="highlights">
+          {#each highlights as h (h.id)}
+            <li class="hl" style="--c: {kindAccent(h.kind)}">
+              <button
+                type="button"
+                class="hl-main"
+                onclick={() => seekTo(h.start_ms)}
+                title="Jump to {fmtTime(h.start_ms)}"
+              >
+                <span class="hl-dot"></span>
+                <span class="hl-time">{fmtTime(h.start_ms)} – {fmtTime(h.end_ms)}</span>
+                {#if editingHighlight === h.id}
+                  <select
+                    class="hl-kind"
+                    bind:value={highlightKindEdit}
+                    onclick={(e) => e.stopPropagation()}
+                  >
+                    {#each HIGHLIGHT_KINDS as k (k.value)}
+                      <option value={k.value}>{k.label}</option>
+                    {/each}
+                  </select>
+                  <input
+                    class="hl-label-input"
+                    placeholder="Label (optional)"
+                    bind:value={highlightLabelEdit}
+                    onclick={(e) => e.stopPropagation()}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        saveEditHighlight();
+                      }
+                      if (e.key === "Escape") editingHighlight = null;
+                    }}
+                  />
+                {:else}
+                  <span class="hl-kind-chip">{kindLabel(h.kind)}</span>
+                  {#if h.label}
+                    <span class="hl-label">{h.label}</span>
+                  {:else}
+                    <span class="hl-label hl-placeholder">Untitled</span>
+                  {/if}
+                  {#if h.source === "ai"}
+                    <span class="hl-ai" title="Detected by AI">AI</span>
+                  {/if}
+                {/if}
+              </button>
+              {#if editingHighlight === h.id}
+                <button
+                  class="hl-action"
+                  aria-label="Save"
+                  onclick={saveEditHighlight}
+                >Save</button>
+                <button
+                  class="hl-action"
+                  aria-label="Cancel"
+                  onclick={() => (editingHighlight = null)}
+                >Cancel</button>
+              {:else}
+                <button
+                  class="hl-action"
+                  aria-label="Edit highlight"
+                  onclick={() => startEditHighlight(h)}
+                  title="Edit"
+                >Edit</button>
+                <button
+                  class="hl-action hl-delete"
+                  aria-label="Delete highlight"
+                  onclick={() => deleteHighlight(h.id)}
+                  title="Delete"
+                >
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                  </svg>
+                </button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
     {#if call.summary_text}
       <section class="block" style="--i: 2">
@@ -941,6 +1145,160 @@
     margin: 0.6rem 0 0;
     color: var(--live);
     font-size: 0.85rem;
+  }
+
+  .player .hint {
+    margin: 0.8rem 0 0;
+    font-size: 0.75rem;
+    color: var(--bone-3);
+    letter-spacing: 0.005em;
+  }
+
+  kbd {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.08rem 0.38rem;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    background: var(--ink-2);
+    color: var(--bone-2);
+    letter-spacing: 0.02em;
+    margin-right: 0.2rem;
+  }
+
+  /* ── Highlights panel ──────────────────────────────────────────────── */
+  .highlights {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .hl {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.1rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .hl-main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.2rem 0.4rem;
+    border-radius: 6px;
+    background: none;
+    color: inherit;
+    text-align: left;
+    transition: background 0.12s;
+  }
+  .hl-main:hover {
+    background: var(--ink-1);
+  }
+
+  .hl-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--c);
+    flex-shrink: 0;
+  }
+
+  .hl-time {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--bone-3);
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+  }
+
+  .hl-kind-chip {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--c);
+    padding: 0.1rem 0.45rem;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+
+  .hl-label {
+    color: var(--bone-1);
+    font-size: 0.88rem;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hl-placeholder {
+    color: var(--bone-4);
+    font-style: italic;
+  }
+
+  .hl-ai {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    color: var(--sig);
+    border: 1px solid rgba(201, 162, 74, 0.4);
+    padding: 0.05rem 0.35rem;
+    border-radius: 3px;
+    margin-left: auto;
+  }
+
+  .hl-kind {
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font-size: 0.82rem;
+  }
+
+  .hl-label-input {
+    flex: 1;
+    padding: 0.35rem 0.55rem;
+    border-radius: 6px;
+    border: 1px solid var(--hairline-hi);
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font-size: 0.88rem;
+    min-width: 0;
+  }
+  .hl-label-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .hl-action {
+    padding: 0.25rem 0.6rem;
+    font-size: 0.72rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--bone-2);
+    transition: all 0.15s;
+  }
+  .hl-action:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .hl-action.hl-delete:hover {
+    border-color: var(--live);
+    color: var(--live);
+  }
+  .hl-action.hl-delete {
+    display: flex;
+    align-items: center;
+    padding: 0.25rem 0.45rem;
   }
 
   /* ── Block common ──────────────────────────────────────────────────── */

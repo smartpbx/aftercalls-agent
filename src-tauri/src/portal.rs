@@ -178,6 +178,87 @@ pub async fn set_org_vocab(
     Ok(())
 }
 
+pub async fn list_highlights(backend: &Backend, call_id: &str) -> Result<Value> {
+    let client = client()?;
+    let url = format!(
+        "{}/v1/calls/{}/highlights",
+        backend.url.trim_end_matches('/'),
+        call_id
+    );
+    client
+        .get(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .context("backend response")?
+        .json::<Value>()
+        .await
+        .context("decode highlights list")
+}
+
+pub async fn create_highlight(
+    backend: &Backend,
+    call_id: &str,
+    body: &Value,
+) -> Result<Value> {
+    let client = client()?;
+    let url = format!(
+        "{}/v1/calls/{}/highlights",
+        backend.url.trim_end_matches('/'),
+        call_id
+    );
+    let resp = client
+        .post(&url)
+        .bearer_auth(&backend.token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    resp.json::<Value>().await.context("decode highlight create")
+}
+
+pub async fn update_highlight(backend: &Backend, id: &str, body: &Value) -> Result<()> {
+    let client = client()?;
+    let url = format!("{}/v1/highlights/{}", backend.url.trim_end_matches('/'), id);
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&backend.token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    Ok(())
+}
+
+pub async fn delete_highlight(backend: &Backend, id: &str) -> Result<()> {
+    let client = client()?;
+    let url = format!("{}/v1/highlights/{}", backend.url.trim_end_matches('/'), id);
+    let resp = client
+        .delete(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    Ok(())
+}
+
 pub async fn get_audio_urls(backend: &Backend, id: &str) -> Result<Value> {
     let client = client()?;
     let url = format!(
