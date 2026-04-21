@@ -153,10 +153,6 @@
       <span class="wordmark">aftercalls</span>
     </a>
 
-    {#if version}
-      <p class="version">v{version}</p>
-    {/if}
-
     <nav>
       {#each items as it (it.href)}
         {@const active = it.match(page.url.pathname)}
@@ -172,6 +168,13 @@
       {/each}
     </nav>
 
+    <!-- Version tag anchored to the bottom of the rail so the user always
+         has a visible reference for which build is running. -->
+    <div class="rail-foot">
+      {#if version}
+        <span class="version">v{version}</span>
+      {/if}
+    </div>
   </aside>
 
   <div class="main">
@@ -261,12 +264,21 @@
     padding: 0.25rem 0.45rem 0.25rem;
   }
 
+  .rail-foot {
+    margin-top: auto;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--hairline);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
   .version {
-    margin: 0 0 0.8rem 2.05rem;
     font-family: var(--font-mono);
-    font-size: 0.68rem;
+    font-size: 0.7rem;
     color: var(--bone-3);
     letter-spacing: 0.04em;
+    padding: 0.15rem 0.55rem;
   }
 
   nav {
