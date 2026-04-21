@@ -15,7 +15,7 @@
   };
 
   type Props = {
-    src: string; // Blob URL or remote URL (presigned). Empty = empty state.
+    peaksUrl: string | undefined; // presigned URL to the JSON peaks doc
     audio: HTMLAudioElement | undefined;
     currentMs: number;
     durationMs: number;
@@ -27,7 +27,7 @@
   };
 
   let {
-    src,
+    peaksUrl,
     audio,
     currentMs = $bindable(0),
     durationMs,
@@ -58,13 +58,13 @@
   void abort;
 
   $effect(() => {
-    // Re-decode whenever the source URL changes.
-    if (!src) {
+    // Re-fetch whenever the peaks URL changes.
+    if (!peaksUrl) {
       peaks = null;
       status = "idle";
       return;
     }
-    decode(src);
+    loadPeaks(peaksUrl);
   });
 
   onMount(() => {
@@ -84,19 +84,37 @@
     cancelAnimationFrame(rafId);
   });
 
-  async function decode(_url: string) {
-    // Intentionally a no-op right now. The Web Audio decode path is the
-    // prime suspect for the WebKitWebProcess SIGABRT crash we're seeing on
-    // call-detail navigation — the bundled webkit2gtk-4.1 in the AppImage
-    // has historically been unstable around decodeAudioData on certain
-    // codec/container combinations, and nothing else on the page does
-    // anything the waveform route hasn't already seen elsewhere.
-    //
-    // Playback still works via the <audio> element; we just render a flat
-    // placeholder bar + the normal playhead until we move peak generation
-    // server-side (backend samples via ffmpeg + ships a JSON peaks file).
-    peaks = null;
-    status = "ready";
+  // Backend shape (peaks::PeaksDoc): interleaved [min, max] per bucket,
+  // length = width * 2, each value in [-1, 1].
+  type PeaksDoc = {
+    width: number;
+    duration_ms: number;
+    peaks: number[];
+  };
+
+  async function loadPeaks(url: string) {
+    // Client-side audio decode via decodeAudioData was the prime suspect
+    // for the WebKitWebProcess SIGABRT crash on call-detail navigation;
+    // peak generation moved to the backend (ffmpeg-sampled JSON). We
+    // just fetch and render.
+    status = "decoding";
+    errorMsg = "";
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+      const doc = (await resp.json()) as PeaksDoc;
+      if (!Array.isArray(doc.peaks) || doc.peaks.length === 0) {
+        peaks = null;
+      } else {
+        peaks = new Float32Array(doc.peaks);
+      }
+      status = "ready";
+    } catch (e) {
+      console.warn("peaks fetch failed", e);
+      errorMsg = String(e);
+      peaks = null;
+      status = "error";
+    }
     paint();
   }
 

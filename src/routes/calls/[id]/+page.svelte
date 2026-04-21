@@ -96,7 +96,12 @@
   let track = $state<"mixed" | "mic" | "system">("mixed");
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
-  let audioUrls = $state<{ mic?: string; system?: string; mixed?: string }>({});
+  let audioUrls = $state<{
+    mic?: string;
+    system?: string;
+    mixed?: string;
+    peaks?: string;
+  }>({});
   let playing = $state(false);
   let rate = $state(1);
   let deleting = $state(false);
@@ -638,7 +643,7 @@
     <section class="player" style="--i: 1">
       <div class="wave-host">
         <Waveform
-          src={audioSrc}
+          peaksUrl={audioUrls.peaks}
           audio={audioEl}
           bind:currentMs
           durationMs={call.duration_ms}
