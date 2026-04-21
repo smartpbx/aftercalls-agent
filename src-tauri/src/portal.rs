@@ -39,7 +39,10 @@ struct MeResponse {
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
 /// within a minute of expiry. Falls back to the legacy static bearer
 /// token only if no auth.json is on disk.
-async fn build_auth_header(backend: &Backend) -> Result<String> {
+///
+/// Shared with upload.rs so post-call pipeline HTTP doesn't skip the
+/// refresh and 401 on a stale token that expired mid-recording.
+pub async fn build_auth_header(backend: &Backend) -> Result<String> {
     if let Some(mut auth) = read_auth_file()? {
         // Treat any token with <60s left as expired so we don't hand out
         // an access token that's about to fail mid-request.

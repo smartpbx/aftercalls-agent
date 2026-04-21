@@ -3,13 +3,14 @@
 //! transcription + summarization work is now a separate backend
 //! pipeline (see portal::transcribe / portal::summarize).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{read_auth_file, AuthFile, Backend};
+use crate::portal::build_auth_header;
 
 #[derive(Deserialize, Debug, Default)]
 pub struct UploadUrls {
@@ -58,7 +59,7 @@ pub async fn create_call(
     };
 
     let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
-    let auth = auth_header(backend)?;
+    let auth = build_auth_header(backend).await?;
     let client = http_client()?;
     let resp = client
         .post(&url)
@@ -100,7 +101,7 @@ pub async fn attach_note_path(
         backend.url.trim_end_matches('/'),
         call_id
     );
-    let auth = auth_header(backend)?;
+    let auth = build_auth_header(backend).await?;
     let client = http_client()?;
     let resp = client
         .post(&url)
@@ -211,21 +212,6 @@ fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?)
-}
-
-fn auth_header(backend: &Backend) -> Result<String> {
-    // Keep this loose — portal.rs owns the refresh-on-expiry dance;
-    // pipeline code just needs a header. If the JWT is stale the
-    // backend will reply 401 and the caller can re-auth.
-    if let Some(auth) = read_auth_file()? {
-        return Ok(format!("Bearer {}", auth.access_token));
-    }
-    if let Some(tok) = &backend.token {
-        if !tok.is_empty() {
-            return Ok(format!("Bearer {tok}"));
-        }
-    }
-    Err(anyhow!("not logged in"))
 }
 
 fn parse_session_timestamp(session_id: &str) -> DateTime<Utc> {
