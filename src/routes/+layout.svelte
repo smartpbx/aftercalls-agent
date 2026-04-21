@@ -70,7 +70,11 @@
     authResolved = true;
     if (!me && !page.url.pathname.startsWith("/login")) {
       goto("/login");
-      return;
+      // NOTE: intentionally do NOT return here. onMount runs once for the
+      // layout's lifetime, so if we bail now the recording-state / pipeline
+      // listeners are never attached for this session. After the user logs
+      // in the layout doesn't remount — the listeners we set up below are
+      // the same ones that'll drive the status pill post-login.
     }
 
     unlistenState = await listen<{ recording: boolean }>(

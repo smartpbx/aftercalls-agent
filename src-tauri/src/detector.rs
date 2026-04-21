@@ -19,6 +19,7 @@ const MIC_CONSUMER_BLACKLIST: &[&str] = &[
     "pw-cat",
     "pw-record",
     "speech-dispatcher",
+    "aftercalls",             // our own cpal mic consumer shows up as "pipewire alsa [aftercalls]"
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
