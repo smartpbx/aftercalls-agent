@@ -26,6 +26,17 @@
   let version = $state("");
 
   onMount(async () => {
+    // Safety net: on webkit2gtk, an unhandled promise rejection during a
+    // client-side route transition can take the whole renderer down (blank
+    // window + blank devtools). Swallow + log so the UI stays alive.
+    window.addEventListener("unhandledrejection", (ev) => {
+      console.warn("unhandled rejection (suppressed)", ev.reason);
+      ev.preventDefault();
+    });
+    window.addEventListener("error", (ev) => {
+      console.warn("uncaught error (suppressed)", ev.error ?? ev.message);
+    });
+
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
       (evt) => (recording = evt.payload.recording),
