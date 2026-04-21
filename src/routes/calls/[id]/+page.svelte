@@ -399,9 +399,8 @@
           from,
           to,
         });
-        call.utterances = call.utterances.map((u) =>
-          u.speaker === from ? { ...u, speaker: to } : u,
-        );
+        // Refetch — rename also rewrites summary + action items.
+        call = await invoke<Call>("get_call", { id: call.id });
       } else {
         await invoke("update_utterance_speaker", {
           id: call.id,
@@ -545,9 +544,11 @@
     savingSpeaker = true;
     try {
       await invoke<number>("rename_speaker", { id: call.id, from, to });
-      call.utterances = call.utterances.map((u) =>
-        u.speaker === from ? { ...u, speaker: to } : u,
-      );
+      // Refetch the whole call — the backend rename rewrites summary +
+      // action items + participants in the same transaction, and
+      // locally patching only utterances left the portal-synced bits
+      // stale until the user reloaded the page.
+      call = await invoke<Call>("get_call", { id: call.id });
       cancelSpeakerRename();
     } catch (e) {
       error = String(e);
