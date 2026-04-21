@@ -80,27 +80,26 @@ pub async fn create_call(
 /// After transcribe + summarize land server-side the row already has
 /// the transcript + title + summary persisted. This call just attaches
 /// the local vault note path so the portal can link out to it.
+///
+/// History: previously POSTed back to /v1/calls with a sparse body,
+/// trusting a comment that claimed ON CONFLICT DO UPDATE preserved
+/// absent fields. It doesn't — the backend overwrites every column
+/// from EXCLUDED and re-DELETEs utterances. The narrow /note-path
+/// endpoint on the backend only touches the column named.
 pub async fn attach_note_path(
     backend: &Backend,
-    session_dir: &Path,
+    call_id: &str,
     note_path: &Path,
 ) -> Result<()> {
-    let session_id = session_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let recorded_at = parse_session_timestamp(&session_id);
+    let body = serde_json::json!({
+        "note_markdown_path": note_path.to_string_lossy(),
+    });
 
-    // Same endpoint, upsert semantics. We send just the fields we're
-    // updating; backend's ON CONFLICT UPDATE preserves the rest.
-    let body = AttachNote {
-        session_id,
-        recorded_at,
-        duration_ms: 0,
-        note_markdown_path: Some(note_path.to_string_lossy().into_owned()),
-    };
-
-    let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/calls/{}/note-path",
+        backend.url.trim_end_matches('/'),
+        call_id
+    );
     let auth = auth_header(backend)?;
     let client = http_client()?;
     let resp = client
@@ -223,14 +222,6 @@ struct CreateCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_app: Option<String>,
     utterances: Vec<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct AttachNote {
-    session_id: String,
-    recorded_at: DateTime<Utc>,
-    duration_ms: i64,
-    note_markdown_path: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

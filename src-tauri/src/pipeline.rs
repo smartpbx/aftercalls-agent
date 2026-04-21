@@ -118,7 +118,7 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
 
     // Step 8: attach the note path back onto the row so the portal can
     // link out (or we can later use it for Obsidian URI deep-links).
-    if let Err(e) = upload::attach_note_path(backend, session_dir, &note_path).await {
+    if let Err(e) = upload::attach_note_path(backend, &created.call_id, &note_path).await {
         eprintln!("aftercalls: attach note path failed: {e:#}");
     }
 
