@@ -350,7 +350,16 @@
         {/if}
 
         <div class="indicator">
-          {#if recording}
+          {#if recording && pipelineStage && pipelineStage !== "done"}
+            <!-- Back-to-back case: user's recording a new call while the
+                 previous one is still processing. Keep both visible so
+                 the pipeline progress isn't lost behind the live pill. -->
+            <span class="pip live"></span>
+            <span class="ind-label">Recording</span>
+            <span class="ind-sep">·</span>
+            <span class="pip {pipelineStage}"></span>
+            <span class="ind-label">{stageLabel[pipelineStage] ?? pipelineStage}</span>
+          {:else if recording}
             <span class="pip live"></span>
             <span class="ind-label">Recording</span>
           {:else if pipelineStage && pipelineStage !== "done"}

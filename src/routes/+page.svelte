@@ -249,14 +249,16 @@
     </div>
   </section>
 
-  <!-- Status lane — shows active recording or pipeline progress inline. -->
+  <!-- Status lane — stacks so a pipeline still in flight is still
+       visible while the user records the next call. -->
   <section class="status" style="--i: 3">
     {#if recording}
       <div class="row row-live">
         <span class="row-dot live"></span>
         <span class="row-title">Recording mic + system audio</span>
       </div>
-    {:else if pipelineStage}
+    {/if}
+    {#if pipelineStage}
       <div
         class="row"
         class:row-done={pipelineStage === "done"}
@@ -275,7 +277,8 @@
           <span class="row-meta">{notePath.split("/").slice(-1)[0]}</span>
         {/if}
       </div>
-    {:else}
+    {/if}
+    {#if !recording && !pipelineStage}
       <p class="idle">Ready when you are.</p>
     {/if}
 
