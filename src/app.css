@@ -248,13 +248,24 @@ select {
   }
 }
 
-/* Stagger-in for page content. Children with --i:0, --i:1… cascade in.
- * Keyframes go from 0 → 1 rather than the rule setting opacity:0 outright,
- * so if the animation is disabled (prefers-reduced-motion, webview quirks,
- * etc.) content still renders visible by default. */
-.reveal > * {
-  animation: reveal 420ms cubic-bezier(0.2, 0.6, 0.2, 1) both;
-  animation-delay: calc(var(--i, 0) * 55ms + 60ms);
+/* Staggered fade-in for page content. Children supply --i:0, --i:1… to
+ * cascade their entrance.
+ *
+ * Two safety belts against the "stuck at opacity:0" mode we've seen on
+ * webkit2gtk after some HMR / route-change edge cases:
+ *   1. The animation rule is gated on `prefers-reduced-motion: no-preference`.
+ *      If the webview or the user disables animations for any reason, the
+ *      rule doesn't apply and children render at their default opacity (1).
+ *   2. `both` fill mode plus `forwards` means once the animation finishes,
+ *      children are locked at the `to` keyframe. If a paint glitch cancels
+ *      a running animation, the next reflow restarts from `from` rather
+ *      than sticking halfway.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .reveal > * {
+    animation: reveal 420ms cubic-bezier(0.2, 0.6, 0.2, 1) both;
+    animation-delay: calc(var(--i, 0) * 55ms + 60ms);
+  }
 }
 @keyframes reveal {
   from {
@@ -264,11 +275,6 @@ select {
   to {
     opacity: 1;
     transform: none;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .reveal > * {
-    animation: none;
   }
 }
 

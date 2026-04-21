@@ -330,7 +330,10 @@
     height: var(--topbar-h);
     padding: 0 1.5rem;
     border-bottom: 1px solid var(--hairline);
-    background: rgba(14, 13, 12, 0.85);
+    /* Derive the translucent background from the active ink-0 so the strip
+     * tracks the theme. Was hard-coded rgba(14,13,12,0.85) before, which
+     * painted a dark bar over the cream light-mode body. */
+    background: color-mix(in srgb, var(--ink-0) 85%, transparent);
     backdrop-filter: saturate(140%) blur(10px);
     -webkit-backdrop-filter: saturate(140%) blur(10px);
   }

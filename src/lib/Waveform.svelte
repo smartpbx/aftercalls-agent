@@ -144,6 +144,17 @@
   }
 
   function paint() {
+    try {
+      paintInner();
+    } catch (e) {
+      // A single paint failure shouldn't take the whole page down — we're
+      // called from a $effect and from the RAF loop, and an unhandled throw
+      // in either context blanks the route in some webkit2gtk builds.
+      console.warn("Waveform paint failed", e);
+    }
+  }
+
+  function paintInner() {
     if (!canvas || !peaks || width <= 0) return;
     const cw = width;
     const ch = height;
