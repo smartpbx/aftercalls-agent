@@ -299,7 +299,12 @@ jobs:
             ls -la /tmp/release/
             exit 1
           fi
-          LINUX_SIG_B64=$(base64 -w0 < "/tmp/release/${SLIM_APPIMAGE}.sig")
+          # `tauri signer sign` writes the .sig file with its contents
+          # already base64-encoded (same format tauri-bundler emits).
+          # The manifest signature field wants that base64 string as-is
+          # — an extra `base64 -w0` here would double-encode and every
+          # Linux updater check would fail signature verification.
+          LINUX_SIG=$(cat "/tmp/release/${SLIM_APPIMAGE}.sig")
 
           # 1. Rewrite every existing platform URL to point at Spaces
           #    instead of github.com (running apps hit Spaces since the
@@ -309,7 +314,7 @@ jobs:
           #    ourselves outside its pipeline.
           jq --arg base "$BASE" \
              --arg linuxurl "$BASE/$SLIM_APPIMAGE" \
-             --arg linuxsig "$LINUX_SIG_B64" '
+             --arg linuxsig "$LINUX_SIG" '
             .platforms |= (
               with_entries(
                 .value.url = ($base + "/" + (.value.url | split("/") | .[-1]))
