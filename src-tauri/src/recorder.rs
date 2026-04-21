@@ -43,9 +43,18 @@ struct CpalTrack {
     writer: SharedWriter,
 }
 
+// System audio capture: either a subprocess (parec on Linux, output
+// streamed to system.wav) or a cpal stream (Windows WASAPI loopback,
+// data written via the normal CpalTrack writer). Kept as an enum so
+// finish() can clean up either kind.
+enum SystemCapture {
+    Child(Child),
+    Cpal(CpalTrack),
+}
+
 struct Active {
     cpal_tracks: Vec<CpalTrack>,
-    system_child: Option<Child>,
+    system: Option<SystemCapture>,
     session_dir: PathBuf,
 }
 
@@ -159,10 +168,10 @@ fn begin(base_dir: &Path) -> Result<Active> {
         mic_device.name().unwrap_or_default()
     );
 
-    let system_child = match start_system_loopback(&session_dir.join("system.wav")) {
-        Ok((child, target)) => {
+    let system = match start_system_loopback(&session_dir.join("system.wav")) {
+        Ok((cap, target)) => {
             eprintln!("aftercalls: recording system audio from {target}");
-            Some(child)
+            Some(cap)
         }
         Err(e) => {
             eprintln!("aftercalls: skipping system loopback: {e:#}");
@@ -171,10 +180,13 @@ fn begin(base_dir: &Path) -> Result<Active> {
     };
 
     mic_track._stream.play().context("start mic stream")?;
+    if let Some(SystemCapture::Cpal(t)) = &system {
+        t._stream.play().context("start system loopback stream")?;
+    }
 
     Ok(Active {
         cpal_tracks: vec![mic_track],
-        system_child,
+        system,
         session_dir,
     })
 }
@@ -186,8 +198,17 @@ fn finish(rec: Active) -> Result<PathBuf> {
             w.finalize().context("finalize wav")?;
         }
     }
-    if let Some(mut child) = rec.system_child {
-        stop_child_gracefully(&mut child).context("stop system loopback")?;
+    match rec.system {
+        Some(SystemCapture::Child(mut child)) => {
+            stop_child_gracefully(&mut child).context("stop system loopback")?;
+        }
+        Some(SystemCapture::Cpal(t)) => {
+            drop(t._stream);
+            if let Some(w) = t.writer.lock().unwrap().take() {
+                w.finalize().context("finalize system wav")?;
+            }
+        }
+        None => {}
     }
     Ok(rec.session_dir)
 }
@@ -196,6 +217,14 @@ fn build_cpal_track(device: &Device, output_path: PathBuf) -> Result<CpalTrack> 
     let config = device
         .default_input_config()
         .context("default input config")?;
+    build_cpal_track_from_config(device, output_path, config)
+}
+
+fn build_cpal_track_from_config(
+    device: &Device,
+    output_path: PathBuf,
+    config: cpal::SupportedStreamConfig,
+) -> Result<CpalTrack> {
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.clone().into();
 
@@ -274,7 +303,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn start_system_loopback(output_path: &Path) -> Result<(Child, String)> {
+fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
     use std::os::unix::process::CommandExt;
     let default_sink = default_sink_name().context("get default sink")?;
     let monitor = format!("{default_sink}.monitor");
@@ -285,9 +314,7 @@ fn start_system_loopback(output_path: &Path) -> Result<(Child, String)> {
     // PR_SET_PDEATHSIG ties parec's lifetime to the agent process — if the
     // agent is SIGKILL'd (e.g. binary swap, crash, user force-quit) parec
     // gets SIGINT instead of being reparented to systemd and silently
-    // writing to a stale session dir forever. Learned this the hard way:
-    // a 37-minute orphaned parec chewed through 400 MB of wav because a
-    // mid-session binary swap left the child behind.
+    // writing to a stale session dir forever.
     let mut cmd = Command::new("parec");
     cmd.arg("--device")
         .arg(&monitor)
@@ -298,8 +325,6 @@ fn start_system_loopback(output_path: &Path) -> Result<(Child, String)> {
         .stderr(Stdio::piped());
     unsafe {
         cmd.pre_exec(|| {
-            // SIGINT on parent death — parec flushes its WAV on INT, so the
-            // on-disk file is at least decodable even in the crash path.
             let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT);
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -308,11 +333,34 @@ fn start_system_loopback(output_path: &Path) -> Result<(Child, String)> {
         });
     }
     let child = cmd.spawn().context("spawn parec")?;
-    Ok((child, monitor))
+    Ok((SystemCapture::Child(child), monitor))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn start_system_loopback(_output_path: &Path) -> Result<(Child, String)> {
+// Windows WASAPI loopback capture. cpal's WASAPI backend uses
+// AUDCLNT_STREAMFLAGS_LOOPBACK internally when build_input_stream is
+// called on a device that exposes a render endpoint — i.e. the
+// default output device. Stream format comes from the device's
+// default OUTPUT config (loopback captures what's being rendered,
+// not what the output's input pair expects). Same CpalTrack writer
+// plumbing as the mic; the resulting system.wav is interchangeable
+// with Linux's parec output from the pipeline's perspective.
+#[cfg(target_os = "windows")]
+fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow!("no default output device for loopback"))?;
+    let label = device.name().unwrap_or_else(|_| "default output".into());
+    let config = device
+        .default_output_config()
+        .context("default output config (loopback)")?;
+    let track = build_cpal_track_from_config(&device, output_path.to_path_buf(), config)
+        .context("build system loopback track")?;
+    Ok((SystemCapture::Cpal(track), label))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn start_system_loopback(_output_path: &Path) -> Result<(SystemCapture, String)> {
     anyhow::bail!("system loopback not implemented on this platform yet")
 }
 
