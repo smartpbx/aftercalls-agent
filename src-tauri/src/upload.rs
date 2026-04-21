@@ -117,46 +117,60 @@ pub async fn attach_note_path(
     Ok(())
 }
 
-/// PUTs the three track files to their presigned URLs. For mic and
-/// system, prefers the `.opus` (compressed by pipeline.rs via ffmpeg)
-/// but falls back to the raw `.wav` when ffmpeg isn't available —
-/// notably on stock Windows. AssemblyAI sniffs the container on
-/// download, so the URL's extension doesn't matter; the bytes drive
-/// decoding. Missing files are skipped silently; individual upload
-/// failures are reported but don't abort the batch so one broken
-/// track doesn't lose the others.
+/// PUTs the three track files to their presigned URLs. Prefers the
+/// `.opus` (compressed by pipeline.rs via ffmpeg) and falls back to
+/// the raw `.wav` when ffmpeg isn't available — notably on stock
+/// Windows. The consuming services (AssemblyAI, ffmpeg on the
+/// backend, the browser's `<audio>`) sniff the container on
+/// download, so the bytes drive decoding regardless of the
+/// advertised content type.
+///
+/// Critically, the `content-type` we send on the PUT must match the
+/// one the backend baked into the presigned URL's signature — S3
+/// SigV4 signs that header. If we send `audio/wav` for a WAV fallback
+/// to a URL signed as `audio/ogg`, Spaces returns 403 and the upload
+/// silently drops. We use the signed-for content-type for the PUT
+/// header and let the consumer sniff the actual bytes.
+///
+/// Missing files are skipped silently; individual upload failures are
+/// logged but don't abort the batch so one broken track doesn't lose
+/// the others.
 pub async fn upload_audio(session_dir: &Path, urls: &UploadUrls) -> Result<()> {
     let client = http_client()?;
 
-    // Each entry: (presigned URL, preferred-then-fallback source paths with
-    // matching content types). The first existing source wins.
-    let candidates: [(Option<&str>, &[(PathBuf, &str)]); 3] = [
+    // Each entry: (presigned URL, the content-type the backend signed
+    // the URL with, preferred-then-fallback source paths). The first
+    // existing source file gets uploaded with the signed content-type.
+    let candidates: [(Option<&str>, &str, &[PathBuf]); 3] = [
         (
             urls.mic.as_deref(),
+            "audio/ogg",
             &[
-                (session_dir.join("mic.opus"), "audio/ogg"),
-                (session_dir.join("mic.wav"), "audio/wav"),
+                session_dir.join("mic.opus"),
+                session_dir.join("mic.wav"),
             ],
         ),
         (
             urls.system.as_deref(),
+            "audio/ogg",
             &[
-                (session_dir.join("system.opus"), "audio/ogg"),
-                (session_dir.join("system.wav"), "audio/wav"),
+                session_dir.join("system.opus"),
+                session_dir.join("system.wav"),
             ],
         ),
         (
             urls.mixed.as_deref(),
+            "audio/ogg",
             &[
-                (session_dir.join("mixed.opus"), "audio/ogg"),
-                (session_dir.join("mixed.wav"), "audio/wav"),
+                session_dir.join("mixed.opus"),
+                session_dir.join("mixed.wav"),
             ],
         ),
     ];
 
-    for (url, sources) in candidates {
+    for (url, content_type, sources) in candidates {
         let Some(url) = url else { continue };
-        let Some((path, content_type)) = sources.iter().find(|(p, _)| p.exists()) else {
+        let Some(path) = sources.iter().find(|p| p.exists()) else {
             continue;
         };
         if let Err(e) = put_file(&client, url, path, content_type).await {

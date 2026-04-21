@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { readFile } from "@tauri-apps/plugin-fs";
   import { writeText, writeHtml } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
@@ -278,33 +278,32 @@
     if (!call) return;
     audioError = "";
     track = which;
+    // Stale blob URLs from the old fetch-then-blob path may still be
+    // hanging around; revoke any we own. New path doesn't create blobs.
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
     audioSrc = "";
 
-    // `audioUrls` is typed as an object but defensive-access it in case the
-    // backend / invoke handler returns null on error — blew up a whole route
-    // once because `audioUrls[which]` threw before the fallback branch.
+    // Prefer binding <audio src> directly to the presigned Spaces URL
+    // so webkit streams progressively, knows the duration early, and
+    // seek operations are sample-accurate. The old path ran the whole
+    // file through fetch + blob, which froze the UI on big recordings
+    // (#13) and left click-to-seek jumping to random timestamps (#18).
     const remote = audioUrls && audioUrls[which];
     if (remote) {
-      try {
-        const resp = await fetch(remote);
-        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
-        const blob = await resp.blob();
-        audioSrc = URL.createObjectURL(blob);
-        return;
-      } catch (e) {
-        console.warn(`remote fetch failed for ${which}, falling back:`, e);
-      }
+      audioSrc = remote;
+      return;
     }
 
+    // Fallback: call was recorded on THIS machine and the remote upload
+    // hasn't completed yet (or failed). Serve the local file via the
+    // Tauri asset protocol instead of reading the whole thing into a
+    // blob — same streaming benefit as above.
     try {
       const path = await invoke<string>("get_session_audio_path", {
         sessionId: call.session_id,
         track: which,
       });
-      const bytes = await readFile(path);
-      const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
-      audioSrc = URL.createObjectURL(blob);
+      audioSrc = convertFileSrc(path);
     } catch (e) {
       audioError = String(e);
       audioSrc = "";
@@ -1218,9 +1217,7 @@
     border-color: rgba(58, 155, 146, 0.32);
     background: var(--accent-soft);
     color: var(--accent-hi);
-    font-size: 0.75rem;
     font-weight: 500;
-    padding: 0.2rem 0.6rem;
   }
 
   .speaker-chip .chip-dot {

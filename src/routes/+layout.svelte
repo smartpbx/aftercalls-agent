@@ -26,6 +26,20 @@
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
+  let unlistenUpdatePoll: (() => void) | null = null;
+
+  async function pollForUpdate() {
+    // Skip while one's already offered or being installed — don't
+    // clobber the user's in-flight decision.
+    if (updateAvailable || updateState === "downloading") return;
+    try {
+      const u = await checkForUpdate();
+      if (u) updateAvailable = u;
+    } catch (e) {
+      // Network blip shouldn't nag; we'll retry next tick.
+      console.warn("update check failed", e);
+    }
+  }
 
   let isLoginPage = $derived(page.url.pathname.startsWith("/login"));
 
@@ -118,15 +132,18 @@
       console.warn("getVersion failed", e);
     }
 
-    // Check for a new release on startup. The updater plugin talks to
-    // latest.json on the Releases page; null return means we're current.
-    // Failures are logged but silent — a network blip shouldn't nag the user.
-    try {
-      const u = await checkForUpdate();
-      if (u) updateAvailable = u;
-    } catch (e) {
-      console.warn("update check failed", e);
-    }
+    // Check for a new release on startup + on a slow periodic timer.
+    // Users who leave the tray running for days were only getting
+    // updates on next cold launch — now they'll see the "vX.Y.Z
+    // available" pill within ~1h of a release landing.
+    await pollForUpdate();
+    const updateTimer = window.setInterval(
+      () => {
+        pollForUpdate();
+      },
+      60 * 60 * 1000,
+    );
+    unlistenUpdatePoll = () => window.clearInterval(updateTimer);
 
     // Fire the release-notes check if we already have an authed user
     // (returning session). Otherwise wait for the login event below.
@@ -217,6 +234,7 @@
     unlistenState?.();
     unlistenPipeline?.();
     unlistenTray?.();
+    unlistenUpdatePoll?.();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
   });
 

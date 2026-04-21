@@ -1,4 +1,16 @@
 {
+  "0.3.1": {
+    "headline": "the Windows upload actually works this time, and your transcript clicks go where you meant",
+    "changes": [
+      "Windows: call uploads no longer fail with a 500. The agent's WAV-fallback path was sending a content-type that didn't match the signed URL, which Spaces was rejecting silently. Fixed.",
+      "Call detail (agent): clicking a transcript line now seeks to the correct timestamp every time. Audio loads fast on long calls too — we stopped round-tripping the whole file through fetch + blob.",
+      "Summaries hold a more consistent shape across calls — past tense, third person, action items as short imperative phrases.",
+      "Auto-detect end-of-call timeout dropped from 20s to 5s; the app will prompt to end a recording much sooner when you stop talking.",
+      "App checks for updates about once an hour while running, not just on launch.",
+      "Record page says \"Syncing to cloud\" instead of the more technical \"Syncing to backend.\"",
+      "Small UI: title chips are now the same size, and the record page stacks \"Recording · Transcribing\" when you start a new call while the previous one is still processing."
+    ]
+  },
   "0.3.0": {
     "headline": "the one where calls stop disappearing and the portal catches up",
     "changes": [

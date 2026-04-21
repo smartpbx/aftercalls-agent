@@ -24,7 +24,7 @@ const MIC_CONSUMER_BLACKLIST: &[&str] = &[
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the mic consumer must be gone before we prompt to end.
-const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(20);
+const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 pub enum UserDecision {

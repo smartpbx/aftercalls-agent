@@ -165,7 +165,7 @@
     transcribing: "Transcribing",
     summarizing: "Drafting summary",
     writing_note: "Writing vault note",
-    uploading: "Syncing to backend",
+    uploading: "Syncing to cloud",
     done: "Saved",
     failed: "Failed",
   };
