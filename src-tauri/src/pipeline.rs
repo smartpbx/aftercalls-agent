@@ -102,7 +102,13 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
 
     // Step 6: backend summarize (OpenAI with the org's key).
     emit(app, PipelineEvent::Summarizing);
-    let candidates = vault::list_clients(&config.vault)?;
+    let vault = config
+        .vault
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "vault not configured — open Settings and set vault.path + vault.clients_subpath in config.toml"
+        ))?;
+    let candidates = vault::list_clients(vault)?;
     let summary_json =
         portal::summarize(backend, &created.call_id, &serde_json::to_value(&transcript)?, &candidates)
             .await?;
@@ -114,7 +120,7 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
     // user's Obsidian vault is local-first by design.
     emit(app, PipelineEvent::WritingNote);
     let note_path =
-        vault::write_note(&config.vault, &summary, &transcript, session_dir, &candidates)?;
+        vault::write_note(vault, &summary, &transcript, session_dir, &candidates)?;
 
     // Step 8: attach the note path back onto the row so the portal can
     // link out (or we can later use it for Obsidian URI deep-links).

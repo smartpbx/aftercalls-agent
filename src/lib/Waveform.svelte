@@ -15,7 +15,10 @@
   };
 
   type Props = {
-    peaksUrl: string | undefined; // presigned URL to the JSON peaks doc
+    // Pre-fetched peaks buffer (interleaved [min,max] per column) or
+    // null when not loaded yet / unavailable. Parent owns the fetch
+    // so we don't drag CORS + auth concerns into the viz layer.
+    peaks: Float32Array | null;
     audio: HTMLAudioElement | undefined;
     currentMs: number;
     durationMs: number;
@@ -27,7 +30,7 @@
   };
 
   let {
-    peaksUrl,
+    peaks,
     audio,
     currentMs = $bindable(0),
     durationMs,
@@ -42,9 +45,6 @@
 
   let wrap: HTMLDivElement | undefined = $state();
   let canvas: HTMLCanvasElement | undefined = $state();
-  let peaks: Float32Array | null = $state(null);
-  let status = $state<"idle" | "decoding" | "ready" | "error">("idle");
-  let errorMsg = $state("");
   let width = $state(800);
   let hoverMs = $state<number | null>(null);
 
@@ -56,16 +56,6 @@
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   let abort: AbortController | null = null;
   void abort;
-
-  $effect(() => {
-    // Re-fetch whenever the peaks URL changes.
-    if (!peaksUrl) {
-      peaks = null;
-      status = "idle";
-      return;
-    }
-    loadPeaks(peaksUrl);
-  });
 
   onMount(() => {
     if (wrap) {
@@ -83,40 +73,6 @@
     ro?.disconnect();
     cancelAnimationFrame(rafId);
   });
-
-  // Backend shape (peaks::PeaksDoc): interleaved [min, max] per bucket,
-  // length = width * 2, each value in [-1, 1].
-  type PeaksDoc = {
-    width: number;
-    duration_ms: number;
-    peaks: number[];
-  };
-
-  async function loadPeaks(url: string) {
-    // Client-side audio decode via decodeAudioData was the prime suspect
-    // for the WebKitWebProcess SIGABRT crash on call-detail navigation;
-    // peak generation moved to the backend (ffmpeg-sampled JSON). We
-    // just fetch and render.
-    status = "decoding";
-    errorMsg = "";
-    try {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
-      const doc = (await resp.json()) as PeaksDoc;
-      if (!Array.isArray(doc.peaks) || doc.peaks.length === 0) {
-        peaks = null;
-      } else {
-        peaks = new Float32Array(doc.peaks);
-      }
-      status = "ready";
-    } catch (e) {
-      console.warn("peaks fetch failed", e);
-      errorMsg = String(e);
-      peaks = null;
-      status = "error";
-    }
-    paint();
-  }
 
   // Returns an interleaved [min, max] pair per column, normalized to [-1, 1].
   // We over-sample (resolution > display columns) so resizing the window
@@ -414,20 +370,13 @@
   aria-valuenow={currentMs}
   tabindex="0"
 >
-  {#if status === "decoding"}
-    <div class="overlay">
-      <div class="skeleton"></div>
-      <span>Analyzing audio…</span>
-    </div>
-  {:else if status === "error"}
-    <div class="overlay error">Could not decode audio: {errorMsg}</div>
-  {:else if status === "idle"}
-    <div class="overlay dim">No audio</div>
+  {#if !peaks}
+    <div class="overlay dim">No waveform</div>
   {/if}
 
   <canvas bind:this={canvas}></canvas>
 
-  {#if hoverMs !== null && status === "ready"}
+  {#if hoverMs !== null && peaks}
     <div
       class="hover-line"
       style="left: {durationMs > 0 ? (hoverMs / durationMs) * 100 : 0}%"

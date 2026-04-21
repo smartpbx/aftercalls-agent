@@ -10,7 +10,11 @@ use std::path::PathBuf;
 /// external API keys — the backend holds them per-org.
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
-    pub vault: Vault,
+    // Optional so fresh installs can hit the login screen without the
+    // user having to hand-write a config.toml first. The pipeline
+    // surfaces a clear error if vault is needed and absent.
+    #[serde(default)]
+    pub vault: Option<Vault>,
     #[serde(default)]
     pub backend: Option<Backend>,
 }
@@ -34,9 +38,29 @@ pub struct Vault {
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("read config at {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&content).context("parse config toml")?;
+        let mut cfg: Config = if path.exists() {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("read config at {}", path.display()))?;
+            toml::from_str(&content).context("parse config toml")?
+        } else {
+            // Fresh install (no config.toml). Write a default pointing at
+            // prod so the login screen works out of the box; user can
+            // fill in vault + overrides later from Settings.
+            let cfg = Config {
+                vault: None,
+                backend: Some(Backend {
+                    url: "https://api.aftercalls.io".to_string(),
+                    token: None,
+                }),
+            };
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).context("mkdir config dir")?;
+            }
+            let default_toml = "[backend]\nurl = \"https://api.aftercalls.io\"\n";
+            fs::write(&path, default_toml)
+                .with_context(|| format!("write default config at {}", path.display()))?;
+            cfg
+        };
 
         // Dev override: point the agent at a different backend without
         // editing config.toml.

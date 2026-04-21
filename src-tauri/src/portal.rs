@@ -268,6 +268,10 @@ pub async fn get_audio_urls(backend: &Backend, id: &str) -> Result<Value> {
     get_json(backend, &format!("/v1/calls/{id}/audio-urls")).await
 }
 
+pub async fn get_peaks(backend: &Backend, id: &str) -> Result<Value> {
+    get_json(backend, &format!("/v1/calls/{id}/peaks.json")).await
+}
+
 pub async fn delete_call(backend: &Backend, id: &str) -> Result<()> {
     delete_nop(backend, &format!("/v1/calls/{id}")).await
 }

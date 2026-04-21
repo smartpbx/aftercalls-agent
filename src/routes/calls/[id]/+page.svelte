@@ -100,8 +100,9 @@
     mic?: string;
     system?: string;
     mixed?: string;
-    peaks?: string;
+    peaks_available?: boolean;
   }>({});
+  let peaks = $state<Float32Array | null>(null);
   let playing = $state(false);
   let rate = $state(1);
   let deleting = $state(false);
@@ -136,6 +137,19 @@
         trace("get_audio_urls ok", audioUrls);
       } catch (e) {
         trace("get_audio_urls FAILED (fallback to local)", e);
+      }
+      if (audioUrls.peaks_available) {
+        try {
+          const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+            id: page.params.id,
+          });
+          if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
+            peaks = new Float32Array(doc.peaks);
+          }
+          trace("get_peaks ok", { bytes: doc.peaks?.length ?? 0 });
+        } catch (e) {
+          trace("get_peaks FAILED", e);
+        }
       }
       try {
         const hs = await invoke<Highlight[]>("list_highlights", {
@@ -648,7 +662,7 @@
     <section class="player" style="--i: 1">
       <div class="wave-host">
         <Waveform
-          peaksUrl={audioUrls.peaks}
+          {peaks}
           audio={audioEl}
           bind:currentMs
           durationMs={call.duration_ms}
