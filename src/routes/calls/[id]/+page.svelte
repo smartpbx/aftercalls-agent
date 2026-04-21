@@ -444,9 +444,10 @@
   }
 
   let activeIdx = $derived.by(() => {
-    if (!call) return -1;
+    if (!call || !Array.isArray(call.utterances)) return -1;
     for (let i = call.utterances.length - 1; i >= 0; i--) {
-      if (call.utterances[i].start_ms <= currentMs) return call.utterances[i].idx;
+      const u = call.utterances[i];
+      if (u && (u.start_ms ?? 0) <= currentMs) return u.idx;
     }
     return -1;
   });
@@ -454,20 +455,21 @@
   type SpeakerStat = { speaker: string; count: number; totalMs: number };
 
   let speakers = $derived.by<SpeakerStat[]>(() => {
-    if (!call) return [];
+    if (!call || !Array.isArray(call.utterances)) return [];
     const order: string[] = [];
     const map = new Map<string, SpeakerStat>();
     for (const u of call.utterances) {
-      const existing = map.get(u.speaker);
+      const name = u?.speaker ?? "Unknown";
+      const existing = map.get(name);
       if (existing) {
         existing.count++;
-        existing.totalMs += u.end_ms - u.start_ms;
+        existing.totalMs += (u.end_ms ?? 0) - (u.start_ms ?? 0);
       } else {
-        order.push(u.speaker);
-        map.set(u.speaker, {
-          speaker: u.speaker,
+        order.push(name);
+        map.set(name, {
+          speaker: name,
           count: 1,
-          totalMs: u.end_ms - u.start_ms,
+          totalMs: (u.end_ms ?? 0) - (u.start_ms ?? 0),
         });
       }
     }
@@ -515,8 +517,11 @@
   }
 
   // Stable per-speaker accent colors. "You" always gets the brand accent; others
-  // pick from a muted palette tuned for the warm dark surface.
-  function speakerColor(speaker: string): string {
+  // pick from a muted palette tuned for the warm dark surface. Must tolerate
+  // null/undefined speaker strings — one bad row otherwise took down the whole
+  // call-detail render tree when `[...null]` threw at template time.
+  function speakerColor(speaker: string | null | undefined): string {
+    if (!speaker) return "var(--bone-2)";
     if (speaker === "You") return "var(--accent)";
     const hash = [...speaker].reduce((a, c) => a + c.charCodeAt(0), 0);
     const palette = [
@@ -824,7 +829,7 @@
       </section>
     {/if}
 
-    {#if call.action_items.length > 0}
+    {#if Array.isArray(call.action_items) && call.action_items.length > 0}
       <section class="block" style="--i: 3">
         <div class="block-head">
           <h2>Action items</h2>
@@ -902,7 +907,7 @@
         </button>
       </div>
       <div class="transcript">
-        {#each call.utterances as u (u.idx)}
+        {#each (call.utterances ?? []) as u (u.idx)}
           {#if editingIdx === u.idx}
             <div class="utt-editor">
               <input
