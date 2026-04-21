@@ -48,9 +48,19 @@ impl Config {
     }
 }
 
+/// Name of the config subdirectory. `AFTERCALLS_PROFILE=dev` switches to
+/// `aftercalls-dev` so a locally-running dev build and the installed prod
+/// build don't stomp each other's config + credentials.
+fn profile_dir_name() -> String {
+    match env::var("AFTERCALLS_PROFILE") {
+        Ok(p) if !p.is_empty() => format!("aftercalls-{p}"),
+        _ => "aftercalls".to_string(),
+    }
+}
+
 fn config_path() -> Result<PathBuf> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no user config dir"))?;
-    Ok(dir.join("aftercalls").join("config.toml"))
+    Ok(dir.join(profile_dir_name()).join("config.toml"))
 }
 
 /// Path to auth.json — email/password login stashes access + refresh
@@ -59,7 +69,7 @@ fn config_path() -> Result<PathBuf> {
 /// interleave.
 pub fn auth_file() -> Result<PathBuf> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no user config dir"))?;
-    Ok(dir.join("aftercalls").join("auth.json"))
+    Ok(dir.join(profile_dir_name()).join("auth.json"))
 }
 
 /// Shape of auth.json. Serialized by the login flow, read by the
