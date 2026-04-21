@@ -106,32 +106,48 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
         .context("decode transcript from backend")?;
 
     // Step 6: backend summarize (OpenAI with the org's key).
+    // Vault is optional — if the user hasn't enabled Obsidian
+    // integration, we skip client candidates (no matching) and skip
+    // the note-writing step entirely. Transcription + summary + call
+    // row still land on the backend exactly the same way.
     emit(app, PipelineEvent::Summarizing);
-    let vault = config
-        .vault
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(
-            "vault not configured — open Settings and set vault.path + vault.clients_subpath in config.toml"
-        ))?;
-    let candidates = vault::list_clients(vault)?;
+    let vault = config.vault.as_ref();
+    let candidates: Vec<String> = match vault {
+        Some(v) => vault::list_clients(v).unwrap_or_else(|e| {
+            eprintln!("aftercalls: list_clients failed, summarizing without client candidates: {e:#}");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
     let summary_json =
         portal::summarize(backend, &created.call_id, &serde_json::to_value(&transcript)?, &candidates)
             .await?;
     let summary: Summary =
         serde_json::from_value(summary_json).context("decode summary from backend")?;
 
-    // Step 7: write the vault note. Everything else is now in the DB;
-    // this is the one bit of work that has to stay local because the
-    // user's Obsidian vault is local-first by design.
-    emit(app, PipelineEvent::WritingNote);
-    let note_path =
-        vault::write_note(vault, &summary, &transcript, session_dir, &candidates)?;
-
-    // Step 8: attach the note path back onto the row so the portal can
-    // link out (or we can later use it for Obsidian URI deep-links).
-    if let Err(e) = upload::attach_note_path(backend, &created.call_id, &note_path).await {
-        eprintln!("aftercalls: attach note path failed: {e:#}");
-    }
+    // Step 7: write the vault note. Skipped when vault isn't
+    // configured — everything else already landed in the DB. The
+    // return path here becomes the session_dir so the tray
+    // "saved" notification still has something to surface.
+    let note_path = if let Some(v) = vault {
+        emit(app, PipelineEvent::WritingNote);
+        match vault::write_note(v, &summary, &transcript, session_dir, &candidates) {
+            Ok(p) => {
+                // Step 8: attach the note path onto the call row for
+                // portal deep-linking.
+                if let Err(e) = upload::attach_note_path(backend, &created.call_id, &p).await {
+                    eprintln!("aftercalls: attach note path failed: {e:#}");
+                }
+                p
+            }
+            Err(e) => {
+                eprintln!("aftercalls: vault write failed: {e:#}");
+                session_dir.to_path_buf()
+            }
+        }
+    } else {
+        session_dir.to_path_buf()
+    };
 
     // Step 9: peaks, fire-and-forget — failure doesn't block the user
     // from seeing their note land.

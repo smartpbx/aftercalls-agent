@@ -8,28 +8,28 @@ use std::path::PathBuf;
 /// along with vault paths and a backend bearer token. Transcription +
 /// summarization moved server-side, so user machines no longer need the
 /// external API keys — the backend holds them per-org.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Config {
     // Optional so fresh installs can hit the login screen without the
-    // user having to hand-write a config.toml first. The pipeline
-    // surfaces a clear error if vault is needed and absent.
-    #[serde(default)]
+    // user having to hand-write a config.toml first. Pipeline code
+    // skips note-writing gracefully when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault: Option<Vault>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<Backend>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Backend {
     pub url: String,
     /// Legacy opaque bearer token. Left here so existing dev setups keep
     /// working through the auth transition; new installs use auth.json
     /// (email/password → access + refresh token) via [`auth_file`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Vault {
     pub path: String,
     pub clients_subpath: String,
@@ -69,6 +69,22 @@ impl Config {
             cfg.backend = Some(Backend { url, token });
         }
         Ok(cfg)
+    }
+
+    /// Serialize back to config.toml. Used by the Settings UI to flip
+    /// the vault section on/off and persist the path. Round-trips the
+    /// whole struct, which means user-written comments in the file
+    /// get stripped — that's acceptable here because the config file
+    /// is tiny and machine-managed.
+    pub fn save(&self) -> Result<()> {
+        let path = config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("mkdir config dir")?;
+        }
+        let text = toml::to_string_pretty(self).context("serialize config")?;
+        fs::write(&path, text)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
     }
 }
 

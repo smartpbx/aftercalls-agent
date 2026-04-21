@@ -1,4 +1,13 @@
 {
+  "0.3.5": {
+    "headline": "Obsidian is now optional, and Windows has a proper dark titlebar",
+    "changes": [
+      "Obsidian vault is opt-in per machine. Settings → Obsidian vault (this machine) has a toggle, folder picker, and clients-subfolder field. Leave it off on machines where your vault isn't available; pipeline completes without writing a note, nothing fails.",
+      "If you enable the vault but the write fails, the rest of the pipeline (transcribe, summarize, save to cloud) still succeeds — the error gets logged but doesn't fail the call.",
+      "Windows: native titlebar is replaced with an integrated dark one. Double-click to maximize, drag to move, and min/max/close buttons match the app palette."
+    ],
+    "footer": "v0.3.4 was the intended titlebar release but its CI build broke on a CSS regression — v0.3.5 is the same release with the build fixed."
+  },
   "0.3.4": {
     "headline": "Windows finally looks like it belongs in the dark theme",
     "changes": [

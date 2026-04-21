@@ -675,23 +675,18 @@
     height: var(--topbar-h);
     padding: 0 1.5rem;
     border-bottom: 1px solid var(--hairline);
-    /* The strip doubles as the window drag region on Windows when the
-       native chrome is dropped (see lib.rs setup + issue #25). The
-       drag attribute lives on the markup; this just makes the cursor
-       match. Buttons inside opt out via `-webkit-app-region: no-drag`
-       equivalent (Tauri's drag region is opt-in per element). */
+    /* Translucent background tracks the active theme — was hard-coded
+       dark before so it looked wrong in light mode. The strip also
+       doubles as the drag region on Windows (see #25); buttons inside
+       opt out since Tauri's drag region is opt-in per element. */
+    background: color-mix(in srgb, var(--ink-0) 85%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
   }
   .topstrip.has-win-controls {
     /* No outer padding on the right so the window controls go
        edge-to-edge like a native titlebar. */
     padding: 0 0 0 1.5rem;
-  }
-    /* Derive the translucent background from the active ink-0 so the strip
-     * tracks the theme. Was hard-coded rgba(14,13,12,0.85) before, which
-     * painted a dark bar over the cream light-mode body. */
-    background: color-mix(in srgb, var(--ink-0) 85%, transparent);
-    backdrop-filter: saturate(140%) blur(10px);
-    -webkit-backdrop-filter: saturate(140%) blur(10px);
   }
 
   .crumbs {

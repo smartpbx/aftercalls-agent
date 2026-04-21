@@ -419,6 +419,54 @@ async fn delete_highlight(id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ── Vault (Obsidian) per-machine settings ────────────────────────────
+
+#[derive(serde::Serialize)]
+struct VaultSettings {
+    enabled: bool,
+    path: String,
+    clients_subpath: String,
+}
+
+#[tauri::command]
+fn get_vault_settings() -> Result<VaultSettings, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    Ok(match cfg.vault {
+        Some(v) => VaultSettings {
+            enabled: true,
+            path: v.path,
+            clients_subpath: v.clients_subpath,
+        },
+        None => VaultSettings {
+            enabled: false,
+            path: String::new(),
+            clients_subpath: String::new(),
+        },
+    })
+}
+
+#[tauri::command]
+fn set_vault_settings(
+    enabled: bool,
+    path: String,
+    clients_subpath: String,
+) -> Result<(), String> {
+    let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
+    if enabled {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("vault path is required when enabled".into());
+        }
+        cfg.vault = Some(config::Vault {
+            path: path.to_string(),
+            clients_subpath: clients_subpath.trim().to_string(),
+        });
+    } else {
+        cfg.vault = None;
+    }
+    cfg.save().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
@@ -602,6 +650,8 @@ pub fn run() {
             get_session_audio_path,
             get_audio_urls,
             get_peaks,
+            get_vault_settings,
+            set_vault_settings,
             get_org_vocab,
             set_org_vocab,
             list_highlights,

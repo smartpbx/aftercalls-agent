@@ -3,6 +3,7 @@
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
@@ -38,6 +39,21 @@
 
   let error = $state("");
 
+  // ── Obsidian vault (per-machine) ─────────────────────────────────────
+  type VaultSettings = {
+    enabled: boolean;
+    path: string;
+    clients_subpath: string;
+  };
+  let vault = $state<VaultSettings>({
+    enabled: false,
+    path: "",
+    clients_subpath: "",
+  });
+  let vaultSaving = $state(false);
+  let vaultSavedAt = $state(0);
+  let vaultError = $state("");
+
   onMount(async () => {
     // Read the theme that the bootstrap script already applied so the UI
     // starts matching what the page is rendering.
@@ -50,7 +66,49 @@
     } catch (e) {
       console.warn("current_user failed", e);
     }
+
+    try {
+      vault = await invoke<VaultSettings>("get_vault_settings");
+    } catch (e) {
+      console.warn("get_vault_settings failed", e);
+    }
   });
+
+  async function pickVaultDir() {
+    try {
+      const chosen = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Select your Obsidian vault folder",
+      });
+      if (typeof chosen === "string" && chosen) {
+        vault.path = chosen;
+      }
+    } catch (e) {
+      vaultError = String(e);
+    }
+  }
+
+  async function saveVault() {
+    vaultSaving = true;
+    vaultError = "";
+    try {
+      await invoke("set_vault_settings", {
+        enabled: vault.enabled,
+        path: vault.path,
+        clientsSubpath: vault.clients_subpath,
+      });
+      vaultSavedAt = Date.now();
+    } catch (e) {
+      vaultError = String(e);
+    } finally {
+      vaultSaving = false;
+    }
+  }
+
+  let vaultSavedRecently = $derived(
+    vaultSavedAt > 0 && Date.now() - vaultSavedAt < 3000,
+  );
 
   // Org vocab management now lives in the portal — changes affect every
   // teammate's calls. The agent still reads vocab via get_org_vocab at
@@ -149,7 +207,67 @@
     </div>
   </section>
 
-  {#if error}<p class="error" style="--i: 3">{error}</p>{/if}
+  <section class="card" style="--i: 3">
+    <div class="card-head">
+      <div>
+        <h2>Obsidian vault (this machine)</h2>
+        <p class="hint">
+          Optional: save a Markdown note to your local Obsidian vault
+          after each call, organized under a client subfolder. Stored
+          per computer — leave off if this machine doesn't have your
+          vault.
+        </p>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" bind:checked={vault.enabled} />
+        <span>{vault.enabled ? "Enabled" : "Disabled"}</span>
+      </label>
+    </div>
+
+    {#if vault.enabled}
+      <div class="vault-field">
+        <label class="field-label">Vault folder</label>
+        <div class="vault-row">
+          <input
+            class="input vault-path"
+            placeholder="/home/you/Documents/ObsidianVault"
+            bind:value={vault.path}
+          />
+          <button type="button" class="add" onclick={pickVaultDir}>
+            Browse…
+          </button>
+        </div>
+      </div>
+      <div class="vault-field">
+        <label class="field-label">Clients subfolder (optional)</label>
+        <input
+          class="input"
+          placeholder="20 Clients"
+          bind:value={vault.clients_subpath}
+        />
+        <p class="hint small">
+          Relative to the vault folder. Notes land under
+          <code>{"{"}vault{"}"}/{"{"}subpath{"}"}/{"{"}matched-client{"}"}/</code>.
+          Leave blank to drop all notes in the vault root.
+        </p>
+      </div>
+    {/if}
+
+    <div class="vault-actions">
+      <button
+        type="button"
+        class="save"
+        disabled={vaultSaving}
+        onclick={saveVault}
+      >
+        {vaultSaving ? "Saving…" : "Save vault settings"}
+      </button>
+      {#if vaultSavedRecently}<span class="saved">Saved</span>{/if}
+      {#if vaultError}<span class="error-inline">{vaultError}</span>{/if}
+    </div>
+  </section>
+
+  {#if error}<p class="error" style="--i: 4">{error}</p>{/if}
 </main>
 
 <style>
@@ -163,6 +281,96 @@
 
   .head {
     margin-bottom: 1.6rem;
+  }
+
+  /* ── Vault section ──────────────────────────────────────────────── */
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--bone-2);
+    user-select: none;
+  }
+  .toggle input {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .vault-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-top: 0.9rem;
+  }
+  .vault-row {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .vault-path {
+    flex: 1;
+  }
+  .field-label {
+    font-size: 0.78rem;
+    color: var(--bone-2);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .input {
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font: inherit;
+    font-size: 0.88rem;
+    font-family: var(--font-mono);
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .hint.small code {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-2);
+    background: var(--ink-2);
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+  }
+  .vault-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-top: 1rem;
+  }
+  .save {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-weight: 600;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .save:hover:not(:disabled) {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .save:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .saved {
+    color: var(--olive);
+    font-size: 0.82rem;
+  }
+  .error-inline {
+    color: var(--live);
+    font-size: 0.82rem;
   }
 
   .sub {
