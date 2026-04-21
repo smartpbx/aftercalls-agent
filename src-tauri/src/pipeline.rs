@@ -34,7 +34,7 @@ pub enum PipelineEvent {
     Transcribing,
     Summarizing,
     WritingNote,
-    Done { session_dir: String, note_path: String },
+    Done { session_dir: String, note_path: String, call_id: String },
     Failed { error: String },
 }
 
@@ -47,7 +47,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
         },
     );
     match run_inner(&session_dir, &app).await {
-        Ok(note_path) => {
+        Ok((note_path, call_id)) => {
             let note_str = note_path.to_string_lossy().into_owned();
             notify_done(&app, &note_path);
             emit(
@@ -55,6 +55,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
                 PipelineEvent::Done {
                     session_dir: session_dir.to_string_lossy().into_owned(),
                     note_path: note_str,
+                    call_id,
                 },
             );
         }
@@ -72,7 +73,7 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
     crate::tray_set_idle(&app);
 }
 
-async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
+async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, String)> {
     let config = Config::load()?;
     let backend = config
         .backend
@@ -159,7 +160,7 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<PathBuf> {
         }
     });
 
-    Ok(note_path)
+    Ok((note_path, created.call_id))
 }
 
 fn notify_done(app: &AppHandle, note_path: &Path) {

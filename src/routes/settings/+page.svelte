@@ -218,9 +218,14 @@
           vault.
         </p>
       </div>
-      <label class="toggle">
+      <label class="switch">
         <input type="checkbox" bind:checked={vault.enabled} />
-        <span>{vault.enabled ? "Enabled" : "Disabled"}</span>
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {vault.enabled ? "On" : "Off"}
+        </span>
       </label>
     </div>
 
@@ -284,20 +289,60 @@
   }
 
   /* ── Vault section ──────────────────────────────────────────────── */
-  .toggle {
+  .switch {
     display: inline-flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.55rem;
     cursor: pointer;
     font-size: 0.85rem;
-    color: var(--bone-2);
+    color: var(--bone-1);
     user-select: none;
+    flex-shrink: 0;
   }
-  .toggle input {
+  .switch input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .switch .track {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--ink-3);
+    border: 1px solid var(--hairline);
+    transition: background 0.18s, border-color 0.18s;
+  }
+  .switch .knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
     width: 14px;
     height: 14px;
-    accent-color: var(--accent);
-    cursor: pointer;
+    border-radius: 50%;
+    background: var(--bone-2);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    transition: transform 0.18s, background 0.18s;
+  }
+  .switch input:checked + .track {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .switch input:checked + .track .knob {
+    transform: translateX(16px);
+    background: #ffffff;
+  }
+  .switch input:focus-visible + .track {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .switch-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+    min-width: 1.8rem;
   }
   .vault-field {
     display: flex;

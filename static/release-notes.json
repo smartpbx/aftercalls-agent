@@ -1,4 +1,13 @@
 {
+  "0.3.6": {
+    "headline": "A handful of polish fixes you'll notice immediately",
+    "changes": [
+      "Calls list groups calls by your local day instead of UTC. Calls recorded late evening were drifting to the next day (or the previous one) depending on your timezone. Now Today is actually today.",
+      "The \"Saved\" card after a call finishes is cleaner — one tap to open the call on the web portal, regardless of whether you use the Obsidian vault. The old path-and-vault-note line is gone.",
+      "Windows: the dark titlebar is draggable again — grab it anywhere empty to move the window.",
+      "Settings → Obsidian vault: the enable/disable checkbox is now an obvious on/off slider, so it's clear at a glance which state you're in."
+    ]
+  },
   "0.3.5": {
     "headline": "Obsidian is now optional, and Windows has a proper dark titlebar",
     "changes": [

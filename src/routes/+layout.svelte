@@ -682,11 +682,27 @@
     background: color-mix(in srgb, var(--ink-0) 85%, transparent);
     backdrop-filter: saturate(140%) blur(10px);
     -webkit-backdrop-filter: saturate(140%) blur(10px);
+    -webkit-user-select: none;
+    user-select: none;
   }
+  /* Windows: tauri's data-tauri-drag-region attribute silently stops
+     working on some WebView2 versions. Adding the Chromium
+     `-webkit-app-region: drag` equivalent is belt + suspenders; both
+     will no-op if the other one already handled the event. */
   .topstrip.has-win-controls {
     /* No outer padding on the right so the window controls go
        edge-to-edge like a native titlebar. */
     padding: 0 0 0 1.5rem;
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .topstrip.has-win-controls .update,
+  .topstrip.has-win-controls .update-install,
+  .topstrip.has-win-controls .update-dismiss,
+  .topstrip.has-win-controls .win-controls,
+  .topstrip.has-win-controls .wc-btn {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
   }
 
   .crumbs {

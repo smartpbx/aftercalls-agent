@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { onMount, onDestroy } from "svelte";
 
   type PipelineEvent =
@@ -10,7 +11,7 @@
     | { stage: "summarizing" }
     | { stage: "writing_note" }
     | { stage: "uploading" }
-    | { stage: "done"; session_dir: string; note_path: string }
+    | { stage: "done"; session_dir: string; note_path: string; call_id: string }
     | { stage: "failed"; error: string };
 
   type AutoDetectEvent =
@@ -23,10 +24,19 @@
   let error = $state("");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
-  let notePath = $state("");
+  let doneCallId = $state("");
   let prompt = $state<AutoDetectEvent | null>(null);
   let elapsedMs = $state(0);
   let importing = $state(false);
+
+  async function openCallInBrowser() {
+    if (!doneCallId) return;
+    try {
+      await openUrl(`https://app.aftercalls.io/calls/${doneCallId}`);
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  }
 
   let unlisten: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
@@ -40,7 +50,7 @@
       pipelineError = "";
       pipelineStage = p.stage;
       if (p.stage === "failed") pipelineError = p.error;
-      if (p.stage === "done") notePath = p.note_path;
+      if (p.stage === "done") doneCallId = p.call_id;
     });
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
@@ -49,7 +59,7 @@
         if (recording) {
           pipelineStage = "";
           pipelineError = "";
-          notePath = "";
+          doneCallId = "";
           startAt = Date.now();
           timer = window.setInterval(
             () => (elapsedMs = Date.now() - startAt),
@@ -103,7 +113,7 @@
       } else {
         pipelineStage = "";
         pipelineError = "";
-        notePath = "";
+        doneCallId = "";
         sessionDir = await invoke<string>("start_recording");
       }
     } catch (e) {
@@ -126,7 +136,7 @@
     importing = true;
     pipelineStage = "";
     pipelineError = "";
-    notePath = "";
+    doneCallId = "";
     try {
       sessionDir = await invoke<string>("process_imported_file", {
         sourcePath: picked,
@@ -269,12 +279,11 @@
           <p class="row-title">
             {pipelineLabels[pipelineStage] ?? pipelineStage}
           </p>
-          {#if notePath && pipelineStage === "done"}
-            <p class="row-sub">Note filed in your vault</p>
-          {/if}
         </div>
-        {#if notePath && pipelineStage === "done"}
-          <span class="row-meta">{notePath.split("/").slice(-1)[0]}</span>
+        {#if doneCallId && pipelineStage === "done"}
+          <button class="open-web" onclick={openCallInBrowser}>
+            Open on web ↗
+          </button>
         {/if}
       </div>
     {/if}
@@ -573,17 +582,21 @@
     font-weight: 500;
   }
 
-  .row-sub {
-    margin: 0.1rem 0 0;
+  .open-web {
+    flex-shrink: 0;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--accent);
     font-size: 0.78rem;
-    color: var(--bone-3);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
   }
-
-  .row-meta {
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    color: var(--bone-3);
-    letter-spacing: 0.04em;
+  .open-web:hover {
+    background: var(--accent);
+    color: var(--ink-0);
   }
 
   .inline-error {

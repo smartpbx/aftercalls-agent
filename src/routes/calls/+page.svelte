@@ -83,11 +83,20 @@
     );
   });
 
-  // Group by the date's ISO yyyy-mm-dd so day headings scan quickly.
+  // Group by LOCAL yyyy-mm-dd. Using toISOString here would bucket a call
+  // recorded at 11pm local on Monday under Tuesday (UTC).
+  function localDayKey(iso: string): string {
+    const d = new Date(iso);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+
   let groups = $derived.by(() => {
     const map = new Map<string, Call[]>();
     for (const c of filtered) {
-      const key = new Date(c.recorded_at).toISOString().slice(0, 10);
+      const key = localDayKey(c.recorded_at);
       const arr = map.get(key) ?? [];
       arr.push(c);
       map.set(key, arr);
@@ -95,8 +104,11 @@
     return [...map.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
   });
 
-  function fmtDay(iso: string) {
-    const d = new Date(iso);
+  function fmtDay(key: string) {
+    // Parse yyyy-mm-dd as a local date. `new Date("2026-04-21")` would
+    // parse as UTC midnight and drift back a day in western timezones.
+    const [y, m, dd] = key.split("-").map(Number);
+    const d = new Date(y, m - 1, dd);
     const today = new Date();
     const yest = new Date();
     yest.setDate(today.getDate() - 1);
