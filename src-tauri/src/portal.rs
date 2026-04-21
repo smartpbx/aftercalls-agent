@@ -242,6 +242,32 @@ pub async fn update_highlight(backend: &Backend, id: &str, body: &Value) -> Resu
     Ok(())
 }
 
+pub async fn auto_highlight(backend: &Backend, call_id: &str) -> Result<Value> {
+    // LLM call can take a minute; bump the timeout above the 30s default.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()?;
+    let url = format!(
+        "{}/v1/calls/{}/auto-highlight",
+        backend.url.trim_end_matches('/'),
+        call_id
+    );
+    let resp = client
+        .post(&url)
+        .bearer_auth(&backend.token)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    resp.json::<Value>()
+        .await
+        .context("decode auto-highlight response")
+}
+
 pub async fn delete_highlight(backend: &Backend, id: &str) -> Result<()> {
     let client = client()?;
     let url = format!("{}/v1/highlights/{}", backend.url.trim_end_matches('/'), id);

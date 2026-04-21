@@ -302,6 +302,18 @@ async fn update_highlight(id: String, body: serde_json::Value) -> Result<(), Str
 }
 
 #[tauri::command]
+async fn auto_highlight(call_id: String) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::auto_highlight(backend, &call_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_highlight(id: String) -> Result<(), String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
@@ -478,6 +490,7 @@ pub fn run() {
             create_highlight,
             update_highlight,
             delete_highlight,
+            auto_highlight,
             delete_call,
             update_utterance_speaker,
             rename_speaker,

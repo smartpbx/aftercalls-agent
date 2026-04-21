@@ -107,6 +107,39 @@
     }
   }
 
+  let autoDetecting = $state(false);
+  let autoDetectResult = $state<string>("");
+
+  async function autoDetect() {
+    if (!call) return;
+    autoDetecting = true;
+    autoDetectResult = "";
+    try {
+      const resp = await invoke<{
+        created: Highlight[];
+        skipped: number;
+      }>("auto_highlight", { callId: call.id });
+      // Merge: drop the old AI highlights (backend replaced them), keep user's.
+      const userOnly = highlights.filter((h) => h.source !== "ai");
+      highlights = [...userOnly, ...resp.created].sort(
+        (a, b) => a.start_ms - b.start_ms,
+      );
+      const note =
+        resp.created.length === 0
+          ? "No highlights detected."
+          : `Detected ${resp.created.length} highlight${resp.created.length === 1 ? "" : "s"}` +
+            (resp.skipped > 0 ? ` (${resp.skipped} skipped)` : "");
+      autoDetectResult = note;
+      setTimeout(() => {
+        autoDetectResult = "";
+      }, 4000);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      autoDetecting = false;
+    }
+  }
+
   async function deleteHighlight(id: string) {
     try {
       await invoke("delete_highlight", { id });
@@ -613,11 +646,27 @@
       </p>
     </section>
 
-    {#if highlights.length > 0}
-      <section class="block" style="--i: 1.5">
-        <div class="block-head">
-          <h2>Highlights</h2>
+    <section class="block" style="--i: 1.5">
+      <div class="block-head">
+        <h2>Highlights</h2>
+        <div class="hl-head-actions">
+          {#if autoDetectResult}<span class="hl-flash">{autoDetectResult}</span>{/if}
+          <button
+            class="copy-btn"
+            disabled={autoDetecting}
+            onclick={autoDetect}
+            title="Run an LLM pass over the transcript to auto-mark decisions, objections, commitments, etc."
+          >
+            {autoDetecting ? "Detecting…" : "Auto-detect"}
+          </button>
         </div>
+      </div>
+      {#if highlights.length === 0}
+        <p class="hl-empty">
+          None yet. <kbd>Shift</kbd>+drag on the waveform to mark one,
+          or tap <strong>Auto-detect</strong> to have the AI scan the call.
+        </p>
+      {:else}
         <ul class="highlights">
           {#each highlights as h (h.id)}
             <li class="hl" style="--c: {kindAccent(h.kind)}">
@@ -696,8 +745,8 @@
             </li>
           {/each}
         </ul>
-      </section>
-    {/if}
+      {/if}
+    </section>
 
     {#if call.summary_text}
       <section class="block" style="--i: 2">
@@ -1168,6 +1217,34 @@
   }
 
   /* ── Highlights panel ──────────────────────────────────────────────── */
+  .hl-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+
+  .hl-flash {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--olive);
+  }
+
+  .hl-empty {
+    margin: 0.4rem 0 0;
+    padding: 0.9rem 1rem;
+    border: 1px dashed var(--hairline);
+    border-radius: var(--radius);
+    color: var(--bone-3);
+    font-size: 0.85rem;
+    background: var(--ink-1);
+  }
+
+  .hl-empty strong {
+    color: var(--bone-1);
+    font-weight: 500;
+  }
+
   .highlights {
     list-style: none;
     padding: 0;
