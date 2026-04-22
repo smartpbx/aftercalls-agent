@@ -791,7 +791,15 @@
       <div class="head-row">
         <div class="head-main">
           <p class="dateline">{fmtDateTitle(call.recorded_at)}</p>
-          <h1>{call.title ?? "(untitled)"}</h1>
+          <h1>
+            {#if call.title}
+              {call.title}
+            {:else if call.status !== "complete" && call.status !== "failed"}
+              <span class="generating">Generating title<span class="gen-dots"></span></span>
+            {:else}
+              (untitled)
+            {/if}
+          </h1>
           <p class="chip-row">
             {#if call.matched_client}
               <span class="chip chip-accent">{call.matched_client}</span>
@@ -1092,6 +1100,20 @@
         </div>
         <p class="summary">{@html renderWithSpeakers(call.summary_text)}</p>
       </section>
+    {:else if call.status !== "complete" && call.status !== "failed"}
+      <section class="block" style="--i: 3">
+        <div class="block-head">
+          <h2>Summary</h2>
+        </div>
+        <div class="gen-shimmer">
+          <div class="gen-line"></div>
+          <div class="gen-line"></div>
+          <div class="gen-line short"></div>
+          <p class="gen-caption">
+            Writing summary<span class="gen-dots"></span>
+          </p>
+        </div>
+      </section>
     {/if}
 
     {#if Array.isArray(call.action_items) && call.action_items.length > 0}
@@ -1110,6 +1132,24 @@
             </li>
           {/each}
         </ul>
+      </section>
+    {:else if call.status !== "complete" && call.status !== "failed"}
+      <!-- While the pipeline still runs, surface that action items
+           are on the way. If the org has auto off, this still
+           renders briefly then clears to the Generate button state
+           once status flips to complete. -->
+      <section class="block" style="--i: 4">
+        <div class="block-head">
+          <h2>Action items</h2>
+        </div>
+        <div class="gen-shimmer">
+          <div class="gen-line short"></div>
+          <div class="gen-line"></div>
+          <div class="gen-line short"></div>
+          <p class="gen-caption">
+            Extracting action items<span class="gen-dots"></span>
+          </p>
+        </div>
       </section>
     {/if}
 
@@ -1755,6 +1795,59 @@
   .copy-btn:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+
+  /* ── Generating placeholders (mirrors portal styles) ─────────────
+     While the pipeline is still mid-flight, title + summary +
+     action items show a shimmer + animated "Generating…" caption
+     so the user can see something's coming. */
+  .generating {
+    color: var(--bone-3);
+    font-weight: 400;
+    font-style: italic;
+  }
+  .gen-dots::after {
+    content: "";
+    display: inline-block;
+    width: 1.2em;
+    text-align: left;
+    animation: gen-dots 1.4s steps(4, end) infinite;
+  }
+  @keyframes gen-dots {
+    0%   { content: ""; }
+    25%  { content: "."; }
+    50%  { content: ".."; }
+    75%  { content: "..."; }
+    100% { content: ""; }
+  }
+  .gen-shimmer {
+    padding: 0.2rem 0;
+  }
+  .gen-line {
+    height: 12px;
+    border-radius: 4px;
+    margin: 0.35rem 0;
+    background: linear-gradient(
+      90deg,
+      var(--ink-2) 0%,
+      var(--ink-3) 40%,
+      var(--ink-2) 60%,
+      var(--ink-2) 100%
+    );
+    background-size: 300% 100%;
+    animation: gen-shimmer 1.6s linear infinite;
+  }
+  .gen-line.short { width: 60%; }
+  @keyframes gen-shimmer {
+    0%   { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+  .gen-caption {
+    margin: 0.7rem 0 0;
+    color: var(--bone-3);
+    font-size: 0.85rem;
+    font-family: var(--font-mono);
+    letter-spacing: 0.02em;
   }
 
   /* ── Summary ───────────────────────────────────────────────────────── */

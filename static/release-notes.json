@@ -1,4 +1,11 @@
 {
+  "0.3.16": {
+    "headline": "Open a call while it's still processing and watch it fill in",
+    "changes": [
+      "When you open a call before the summary is ready, the title, Summary, and Action items sections now show an animated \"Generating...\" shimmer with a caption instead of looking blank. They fill in live as the backend finishes — no need to refresh.",
+      "Superadmins: new \"Create user directly\" form on the Team page (web portal) for bot accounts or seed users where invites don't work — skips the invite email and creates an active user with the password you enter."
+    ]
+  },
   "0.3.15": {
     "headline": "Live call updates, public help site, and an action-items toggle for admins",
     "changes": [
