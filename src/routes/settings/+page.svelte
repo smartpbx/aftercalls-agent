@@ -494,7 +494,12 @@
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--bone-3);
-    min-width: 1.8rem;
+    /* Fixed-width slot right of the switch so different label widths
+       (e.g. "TO TRAY" vs "EXIT") don't shove the knob around. Text
+       is left-aligned inside the slot so the state is still readable
+       without making the switch itself appear to move. */
+    min-width: 4.5rem;
+    text-align: left;
   }
   .vault-field {
     display: flex;

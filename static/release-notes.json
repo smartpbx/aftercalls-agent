@@ -1,4 +1,12 @@
 {
+  "0.3.11": {
+    "headline": "Settings moves into a user menu, fixed-width slider labels, and the web portal gains Terms of Service",
+    "changes": [
+      "Rail footer: clicking your name opens a dropdown menu with Settings and Sign out (plus Team / Org vocab / Terms for admins and superadmins — those open the web portal in your browser). Settings is no longer a primary nav entry; the main rail now has only Record and Calls.",
+      "Settings → Behavior: the on/off labels (ON/OFF, TO TRAY/EXIT) are in a fixed-width slot now, so flipping the switch doesn't shove the knob around.",
+      "The web portal at app.aftercalls.io now has a Terms of Service and Privacy Policy acceptance flow. On next sign-in you'll be asked to accept both before you can use the app. Superadmins get a new Terms tab that lists every published version, accept counts, and an audit roster (who accepted what, when, from what IP + browser)."
+    ]
+  },
   "0.3.10": {
     "headline": "Audio download actually saves the file, and Settings gets two behavior toggles",
     "changes": [

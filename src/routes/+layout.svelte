@@ -370,13 +370,42 @@
       match: (p) => p.startsWith("/calls"),
       icon: `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
     },
-    {
-      href: "/settings",
-      label: "Settings",
-      match: (p) => p.startsWith("/settings"),
-      icon: `<svg viewBox="0 0 20 20" width="16" height="16"><circle cx="10" cy="10" r="2.4" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10 2v2.2M10 15.8V18M2 10h2.2M15.8 10H18M4.3 4.3l1.6 1.6M14.1 14.1l1.6 1.6M4.3 15.7l1.6-1.6M14.1 5.9l1.6-1.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`,
-    },
+    // Settings moved out of the primary nav and into the user-menu
+    // dropdown in the rail foot — account-level knobs don't belong
+    // next to Record and Calls (the main workflow). See #33.
   ];
+
+  // ── User menu (rail foot) ────────────────────────────────────────
+  let userMenuOpen = $state(false);
+  function toggleUserMenu() {
+    userMenuOpen = !userMenuOpen;
+  }
+  function closeUserMenu() {
+    userMenuOpen = false;
+  }
+  async function openSettings() {
+    closeUserMenu();
+    await goto("/settings");
+  }
+  async function openPortalLink(path: string) {
+    closeUserMenu();
+    try {
+      await openUrl(`https://app.aftercalls.io${path}`);
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  }
+  async function manualUpdateCheck() {
+    closeUserMenu();
+    await pollForUpdate();
+  }
+  async function signOut() {
+    closeUserMenu();
+    try {
+      await invoke("logout");
+    } catch {}
+    await goto("/login");
+  }
 
   const stageLabel: Record<string, string> = {
     started: "Processing",
@@ -430,17 +459,82 @@
       {/each}
     </nav>
 
-    <!-- Anchored to the bottom of the rail: current user + running
-         version, so which account + which build is one glance away. -->
-    <div class="rail-foot">
+    <!-- Rail foot: user name/org doubles as the trigger for a
+         dropdown menu that carries every account-scoped action.
+         Keeps the primary nav clean (Record + Calls only). -->
+    <div class="rail-foot" class:menu-open={userMenuOpen}>
       {#if me}
-        <div class="who">
+        <button
+          type="button"
+          class="who-btn"
+          aria-haspopup="menu"
+          aria-expanded={userMenuOpen}
+          onclick={toggleUserMenu}
+        >
           <span class="who-name">{me.display_name}</span>
           <span class="who-org">{me.org_display_name}</span>
-        </div>
+          <span class="who-chevron" aria-hidden="true">
+            {userMenuOpen ? "▾" : "▸"}
+          </span>
+        </button>
       {/if}
       {#if version}
         <span class="version">v{version}</span>
+      {/if}
+
+      {#if userMenuOpen}
+        <!-- Backdrop absorbs outside clicks to dismiss the menu.
+             role="button" + keydown for a11y. -->
+        <div
+          class="user-menu-backdrop"
+          role="button"
+          tabindex="-1"
+          aria-label="Close menu"
+          onclick={closeUserMenu}
+          onkeydown={(e) => { if (e.key === "Escape") closeUserMenu(); }}
+        ></div>
+        <div class="user-menu" role="menu">
+          <button class="um-item" role="menuitem" onclick={openSettings}>
+            Settings
+          </button>
+          {#if me && (me.role === "admin" || me.role === "superadmin")}
+            <div class="um-sep"></div>
+            <button
+              class="um-item"
+              role="menuitem"
+              onclick={() => openPortalLink("/admin/users")}
+            >
+              Team <span class="um-ext" aria-hidden="true">↗</span>
+            </button>
+            <button
+              class="um-item"
+              role="menuitem"
+              onclick={() => openPortalLink("/admin/vocab")}
+            >
+              Org vocab <span class="um-ext" aria-hidden="true">↗</span>
+            </button>
+            {#if me.role === "superadmin"}
+              <button
+                class="um-item"
+                role="menuitem"
+                onclick={() => openPortalLink("/admin/tos")}
+              >
+                Terms &amp; privacy <span class="um-ext" aria-hidden="true">↗</span>
+              </button>
+            {/if}
+          {/if}
+          <div class="um-sep"></div>
+          <button
+            class="um-item"
+            role="menuitem"
+            onclick={manualUpdateCheck}
+          >
+            Check for updates
+          </button>
+          <button class="um-item um-danger" role="menuitem" onclick={signOut}>
+            Sign out
+          </button>
+        </div>
       {/if}
     </div>
   </aside>
@@ -663,6 +757,7 @@
   }
 
   .rail-foot {
+    position: relative;
     margin-top: auto;
     padding-top: 0.8rem;
     border-top: 1px solid var(--hairline);
@@ -672,11 +767,33 @@
     gap: 0.5rem;
   }
 
-  .who {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    padding: 0 0.55rem;
+  .who-btn {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    align-items: center;
+    gap: 0.1rem 0.4rem;
+    padding: 0.4rem 0.55rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .who-btn:hover,
+  .rail-foot.menu-open .who-btn {
+    background: var(--ink-2);
+    border-color: var(--hairline);
+  }
+  .who-btn .who-chevron {
+    grid-row: 1 / span 2;
+    grid-column: 2;
+    align-self: center;
+    color: var(--bone-4);
+    font-size: 0.72rem;
   }
 
   .who-name {
@@ -695,6 +812,67 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* ── User menu dropdown ──────────────────────────────────────────
+     Anchored above the rail-foot so the popup opens UP from the
+     button rather than overflowing the bottom of the rail. */
+  .user-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    cursor: default;
+  }
+  .user-menu {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    margin-bottom: 0.4rem;
+    padding: 0.35rem;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    box-shadow: 0 14px 30px -10px rgba(0, 0, 0, 0.55);
+    z-index: 45;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .um-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.55rem 0.7rem;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--bone-1);
+    font: inherit;
+    font-size: 0.85rem;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+  }
+  .um-item:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .um-item.um-danger {
+    color: var(--live);
+  }
+  .um-item.um-danger:hover {
+    background: var(--live-soft);
+  }
+  .um-ext {
+    color: var(--bone-4);
+    font-size: 0.75rem;
+  }
+  .um-sep {
+    height: 1px;
+    background: var(--hairline);
+    margin: 0.2rem 0.3rem;
   }
 
   .version {
