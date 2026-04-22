@@ -525,7 +525,10 @@
           <button
             class="um-item"
             role="menuitem"
-            onclick={() => openPortalLink("/help")}
+            onclick={async () => {
+              closeUserMenu();
+              try { await openUrl("https://aftercalls.io/help"); } catch {}
+            }}
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
           </button>

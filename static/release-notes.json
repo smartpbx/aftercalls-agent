@@ -1,4 +1,12 @@
 {
+  "0.3.15": {
+    "headline": "Live call updates, public help site, and an action-items toggle for admins",
+    "changes": [
+      "Opening a call while the backend is still working now actually streams in updates. The title, summary, and action items pop in as the pipeline finishes — no more hard refresh to see them (fixed a backend bug where calls were marked \"complete\" before the summarize step had even started).",
+      "The Help link in the user menu now opens aftercalls.io/help — a public, no-login-required knowledge base. Share the URL with anyone.",
+      "Admins: Org settings (portal → Org tab) now has an \"Auto-generate action items\" toggle, default off. When off, every call saves OpenAI cost — and when you do want action items, click the new Generate button on the call's Action items section to run a small LLM pass on-demand."
+    ]
+  },
   "0.3.14": {
     "headline": "Recycle bin for deleted calls, and a Help link in the user menu",
     "changes": [
