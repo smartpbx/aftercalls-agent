@@ -8,44 +8,23 @@
   import { goto } from "$app/navigation";
   import { onMount, onDestroy } from "svelte";
   import {
-    notifyRecordStart,
     notifyRecordStop,
     notifyPipelineDone,
     notifyPipelineFailed,
     notifyAutoDetect,
   } from "$lib/notify";
+  import {
+    detectPlatform,
+    loadRecordingPrefs,
+    playStartCueIfEnabled,
+  } from "$lib/compliance";
 
   // Platform string reported to the backend on recording-ack (#44).
   // Kept here (not Rust-side) because navigator UA is already in the
-  // webview context and the backend just stores it verbatim for the
-  // audit trail.
-  function detectPlatform(): "windows" | "linux" | "macos" {
-    if (typeof navigator === "undefined") return "macos";
-    const ua = navigator.userAgent;
-    if (/windows/i.test(ua)) return "windows";
-    if (/linux/i.test(ua) && !/android/i.test(ua)) return "linux";
-    return "macos";
-  }
-
-  type RecordingPrefs = {
-    recording_purpose: string;
-    recording_notification_mode: "off" | "user" | "enforced";
-  };
-
-  // Session-cached so we don't roundtrip every Copy-notice click or
-  // every recording-state transition. Fetched lazily on first use.
-  let recordingPrefs: RecordingPrefs | null = null;
-  async function loadRecordingPrefs(): Promise<RecordingPrefs | null> {
-    if (recordingPrefs) return recordingPrefs;
-    try {
-      const p = await invoke<RecordingPrefs>("get_recording_prefs");
-      recordingPrefs = p;
-      return p;
-    } catch (e) {
-      console.warn("get_recording_prefs failed", e);
-      return null;
-    }
-  }
+  // detectPlatform / loadRecordingPrefs / playStartCueIfEnabled are
+  // imported from $lib/compliance so this Record page and the
+  // layout's auto-detect slide-out share one prefs cache and one
+  // cue-play policy.
 
   type PipelineEvent =
     | { stage: "started"; session_dir: string }
@@ -161,9 +140,12 @@
       },
     );
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
+      // prompt_start is handled by the layout-level slide-out now
+      // (#59) so the user can see + respond to it from any route.
+      // The Record page still owns prompt_end (mid-recording idle
+      // mic) since the user is almost always on /record while live.
+      if (evt.payload.kind === "prompt_start") return;
       const next = evt.payload.kind === "cleared" ? null : evt.payload;
-      // Audio nudge only when a prompt *newly* appears — suppress
-      // on the cleared-state transition so dismissing doesn't beep.
       if (next && !prompt) notifyAutoDetect();
       prompt = next;
     });
@@ -310,18 +292,6 @@
     }
   }
 
-  // Wrapper around notifyRecordStart that respects the org's
-  // recording_notification_mode (#48). 'off' = silent, 'user' = honour
-  // the local sounds_enabled toggle, 'enforced' = play regardless.
-  async function playStartCueIfEnabled() {
-    const prefs = await loadRecordingPrefs();
-    const mode = prefs?.recording_notification_mode ?? "user";
-    if (mode === "off") return;
-    // `force` only on enforced; 'user' mode continues to defer to
-    // the user's sounds_enabled setting.
-    await notifyRecordStart(mode === "enforced");
-  }
-
   async function copyNotice() {
     copyError = "";
     copyingNotice = true;
@@ -375,18 +345,10 @@
     }
   }
 
-  async function confirmStart() {
-    // Same ack gate as the manual Start Recording button — the
-    // detector's "Yes, record" banner is semantically identical from
-    // a PIPEDA standpoint, so a first-time user hitting it first
-    // still gets the acknowledgment modal.
-    const ok = await ensureRecordingAcknowledged("auto");
-    if (!ok) return;
-    await invoke("confirm_auto_start");
-  }
-  async function dismissStart() {
-    await invoke("dismiss_auto_start");
-  }
+  // prompt_start's confirmStart/dismissStart moved to the layout's
+  // auto-detect slide-out (#59). This page keeps confirmEnd +
+  // keepRecording for the mid-recording prompt_end case which is
+  // usually viewed on /record anyway.
   async function confirmEnd() {
     await invoke("confirm_auto_end");
   }
@@ -428,21 +390,11 @@
     </p>
   </header>
 
-  <!-- Auto-detect banners, pinned above the CTA. -->
-  {#if prompt?.kind === "prompt_start"}
-    <div class="banner" style="--i: 1">
-      <div class="banner-body">
-        <p class="banner-label">Detected</p>
-        <p class="banner-text">
-          <strong>{prompt.app}</strong> is using the microphone. Record this call?
-        </p>
-      </div>
-      <div class="banner-actions">
-        <button class="btn primary" onclick={confirmStart}>Start recording</button>
-        <button class="btn ghost" onclick={dismissStart}>Dismiss</button>
-      </div>
-    </div>
-  {:else if prompt?.kind === "prompt_end"}
+  <!-- Auto-detect banners. prompt_start is handled layout-side
+       (see #59) so it surfaces on any route without a page swap.
+       prompt_end stays here because the user is practically always
+       on /record while a recording is live. -->
+  {#if prompt?.kind === "prompt_end"}
     <div class="banner" style="--i: 1">
       <div class="banner-body">
         <p class="banner-label">Idle mic</p>

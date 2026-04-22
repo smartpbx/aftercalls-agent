@@ -9,6 +9,8 @@
   import { relaunch } from "@tauri-apps/plugin-process";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { onDestroy, onMount } from "svelte";
+  import { notifyAutoDetect } from "$lib/notify";
+  import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import "../app.css";
 
   let { children } = $props();
@@ -29,6 +31,25 @@
   let unlistenPipeline: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
+  let unlistenAutoDetect: UnlistenFn | null = null;
+
+  // Auto-detect slide-out state (#59). Only the `prompt_start` kind
+  // surfaces here; `prompt_end` (mid-recording idle-mic prompt) stays
+  // on the Record page since the user is almost always on /record
+  // while a recording is live. This slide-out anchors to the rail's
+  // Record item so it's visible regardless of current route.
+  let autoPrompt = $state<{ app: string } | null>(null);
+  // PIPEDA ack modal state for the auto-detect start path. The Record
+  // page owns its own ack modal for the manual Start Recording
+  // button; having a second one here keeps the auto flow self-
+  // contained so a user on /calls never needs to route-change to
+  // acknowledge. Cached ack flag flips globally so both copies
+  // short-circuit once the user has accepted.
+  let autoAckOpen = $state(false);
+  let autoAckChecked = $state(false);
+  let autoAckError = $state("");
+  let autoAckSubmitting = $state(false);
+  let autoAckCached = $state(false);
 
   // Linux has two update paths depending on how the app was installed:
   //   - AppImage → tauri-plugin-updater's `check()` returns an Update
@@ -55,17 +76,31 @@
   }
 
   async function pollForUpdate() {
-    // Skip while one's already offered or being installed — don't
-    // clobber the user's in-flight decision.
-    if (updateAvailable || linuxUpdateAvailable || updateState === "downloading") return;
+    // Don't clobber an in-flight install — the Update object is the
+    // one being downloaded right now and swapping it out would break
+    // the progress callback. We DO still re-check in the
+    // at-rest / error states so a newer version on the manifest
+    // replaces a stale cached object (#58: user on 0.3.18 seeing a
+    // "0.3.19 available" pill that never updates to 0.3.20).
+    if (updateState === "downloading") return;
     // Primary path: Tauri's updater plugin. Works for Windows, macOS,
     // and AppImage Linux. Returns null for non-AppImage Linux installs.
     try {
       const u = await checkForUpdate();
       if (u) {
-        updateAvailable = u;
+        // Replace the cached object only if the manifest has moved
+        // forward. Keeps the pill steady when nothing changed; flips
+        // it to the newer version when 0.3.19 → 0.3.20 happens while
+        // the pill is open.
+        if (!updateAvailable || semverGt(u.version, updateAvailable.version)) {
+          updateAvailable = u;
+        }
         return;
       }
+      // `check()` returned null: there is no update. If we had a
+      // cached Update from a previous poll (edge case: manifest
+      // rolled back), clear it so the pill doesn't lie.
+      updateAvailable = null;
     } catch (e) {
       // Network blip or non-AppImage Linux — retry next tick, fall
       // through to the Linux manifest-fetch fallback below.
@@ -80,7 +115,12 @@
         const doc = (await resp.json()) as { version?: string };
         if (!doc.version || !version) return;
         if (semverGt(doc.version, version)) {
-          linuxUpdateAvailable = doc.version;
+          // Same refresh logic: only replace when newer.
+          if (!linuxUpdateAvailable || semverGt(doc.version, linuxUpdateAvailable)) {
+            linuxUpdateAvailable = doc.version;
+          }
+        } else {
+          linuxUpdateAvailable = null;
         }
       } catch (e) {
         console.warn("linux manifest fetch failed", e);
@@ -238,6 +278,37 @@
       if (evt.payload === "settings") goto("/settings");
     });
 
+    // Auto-detect → slide-out (#59). We only handle `prompt_start`
+    // here; mid-recording `prompt_end` prompts stay with the Record
+    // page since the user is almost always on /record while live.
+    // `cleared` drops both the slide-out and any open ack modal.
+    unlistenAutoDetect = await listen<
+      | { kind: "prompt_start"; app: string }
+      | { kind: "prompt_end"; app: string }
+      | { kind: "cleared" }
+    >("auto-detect", (evt) => {
+      if (evt.payload.kind === "prompt_start") {
+        // Only chime when the prompt newly appears — re-emissions
+        // (e.g. the detector re-confirming the same session) shouldn't
+        // repeat the sound.
+        if (!autoPrompt) notifyAutoDetect();
+        autoPrompt = { app: evt.payload.app };
+      } else if (evt.payload.kind === "cleared") {
+        autoPrompt = null;
+        autoAckOpen = false;
+      }
+    });
+
+    // Warm the ack-cached flag from current_user so the slide-out's
+    // "Record this call" click can short-circuit without a roundtrip
+    // when the user has already acknowledged.
+    try {
+      const u = await invoke<{
+        recording_acknowledged?: boolean;
+      } | null>("current_user");
+      autoAckCached = !!u?.recording_acknowledged;
+    } catch {}
+
     // Read the running binary's version; displayed in the rail foot so a
     // user can tell which build they're on post-update.
     try {
@@ -334,10 +405,28 @@
 
   async function installUpdate() {
     if (!updateAvailable) return;
+    // Re-check right before install so we install the newest version
+    // currently on the manifest, not whatever was cached in the
+    // Update object when the hourly poll last ran (#58). This
+    // collapses the 0.3.18 → 0.3.19 → 0.3.20 multi-step into one
+    // install whenever the manifest has moved forward between the
+    // poll and the click.
+    let target: Update = updateAvailable;
+    try {
+      const fresh = await checkForUpdate();
+      if (fresh && semverGt(fresh.version, target.version)) {
+        target = fresh;
+        updateAvailable = fresh;
+      }
+    } catch (e) {
+      // Network blip — proceed with the cached object. Better to
+      // install something than nothing.
+      console.warn("pre-install recheck failed, using cached target", e);
+    }
     updateState = "downloading";
     updateError = "";
     try {
-      await updateAvailable.downloadAndInstall((ev) => {
+      await target.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
           updateTotal = ev.data.contentLength ?? 0;
           updateDownloaded = 0;
@@ -366,8 +455,92 @@
     unlistenPipeline?.();
     unlistenTray?.();
     unlistenUpdatePoll?.();
+    unlistenAutoDetect?.();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
   });
+
+  // ── Auto-detect slide-out handlers (#59) ─────────────────────────
+  // "Record this call" path: gated on PIPEDA ack. Same gate logic
+  // the Record page's manual Start button uses, mirrored here so
+  // the auto-start flow never needs a route change.
+  async function autoRecordClick() {
+    if (autoAckCached) {
+      await triggerAutoStart();
+      return;
+    }
+    // Re-check in case the local cache is stale (e.g. user
+    // acknowledged on another device).
+    try {
+      const r = await invoke<{ accepted_at: string } | null>("get_recording_ack");
+      if (r) {
+        autoAckCached = true;
+        await triggerAutoStart();
+        return;
+      }
+    } catch {}
+    // Not acknowledged — show the ack modal. The slide-out stays
+    // visible behind the modal so the user's "Record this call"
+    // intent is preserved if they cancel.
+    autoAckChecked = false;
+    autoAckError = "";
+    autoAckOpen = true;
+  }
+
+  async function triggerAutoStart() {
+    try {
+      await invoke("confirm_auto_start");
+      autoPrompt = null;
+      // Fire the start cue per the org's notification mode. Non-
+      // blocking — if the audio subsystem is flaky we'd rather start
+      // the recording than miss it.
+      playStartCueIfEnabled().catch(() => {});
+    } catch (e) {
+      console.warn("confirm_auto_start failed", e);
+    }
+  }
+
+  async function autoDismiss() {
+    try {
+      await invoke("dismiss_auto_start");
+    } catch {}
+    autoPrompt = null;
+  }
+
+  async function submitAutoAck() {
+    if (!autoAckChecked || autoAckSubmitting) return;
+    autoAckSubmitting = true;
+    autoAckError = "";
+    try {
+      const agentVersion = await getVersion().catch(() => "unknown");
+      await invoke("post_recording_ack", {
+        agentVersion,
+        platform: detectPlatform(),
+      });
+      autoAckCached = true;
+      autoAckOpen = false;
+      await triggerAutoStart();
+    } catch (e) {
+      autoAckError = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      autoAckSubmitting = false;
+    }
+  }
+
+  function cancelAutoAck() {
+    if (autoAckSubmitting) return;
+    autoAckOpen = false;
+    autoAckChecked = false;
+    autoAckError = "";
+    // Leave the slide-out visible — the user can still decide to
+    // dismiss outright, or come back to acknowledge later before
+    // the detector's own timeout clears the prompt.
+  }
+
+  async function openConsentGuide() {
+    try {
+      await openUrl("https://aftercalls.io/help#privacy-consent");
+    } catch {}
+  }
 
   const items: {
     href: string;
@@ -465,15 +638,47 @@
     <nav>
       {#each items as it (it.href)}
         {@const active = it.match(page.url.pathname)}
-        <a
-          href={it.href}
-          class="nav-item"
-          class:active
-          aria-current={active ? "page" : undefined}
-        >
-          <span class="glyph">{@html it.icon}</span>
-          <span class="label">{it.label}</span>
-        </a>
+        <div class="nav-row" class:has-slideout={it.href === "/" && autoPrompt}>
+          <a
+            href={it.href}
+            class="nav-item"
+            class:active
+            aria-current={active ? "page" : undefined}
+          >
+            <span class="glyph">{@html it.icon}</span>
+            <span class="label">{it.label}</span>
+          </a>
+          {#if it.href === "/" && autoPrompt}
+            <!-- Auto-detect slide-out (#59). Anchored to the Record
+                 nav item so it's visible from every route, not just
+                 /record. Doesn't steal focus; doesn't route-change. -->
+            <div class="auto-slideout" role="dialog" aria-label="Call detected">
+              <div class="auto-head">
+                <span class="auto-pip" aria-hidden="true"></span>
+                <span class="auto-title">Call detected</span>
+              </div>
+              <p class="auto-body">
+                <strong>{autoPrompt.app}</strong> is using your microphone. Record this call?
+              </p>
+              <div class="auto-actions">
+                <button
+                  type="button"
+                  class="auto-primary"
+                  onclick={autoRecordClick}
+                >Record this call</button>
+                <button
+                  type="button"
+                  class="auto-secondary"
+                  onclick={autoDismiss}
+                >Not now</button>
+              </div>
+              <p class="auto-hint">
+                Change auto-detect in
+                <a href="/settings" onclick={() => (autoPrompt = null)}>Settings</a>.
+              </p>
+            </div>
+          {/if}
+        </div>
       {/each}
     </nav>
 
@@ -767,6 +972,77 @@
         <button class="rn-dismiss" onclick={dismissReleaseNotes}>
           Got it
         </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if autoAckOpen}
+  <!-- PIPEDA ack modal for the auto-detect start path (#44 + #59).
+       Mirror of the Record page's ack modal but layout-owned so the
+       slide-out never needs a route change to collect the ack. -->
+  <div
+    class="rn-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={cancelAutoAck}
+    onkeydown={(e) => {
+      if (e.key === "Escape") cancelAutoAck();
+    }}
+  >
+    <div
+      class="rn-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="auto-ack-title"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <h2 id="auto-ack-title">Before you record</h2>
+      </div>
+      <p class="auto-ack-body">
+        Under Canadian PIPEDA — and equivalent privacy laws in most
+        jurisdictions — you are responsible for notifying every
+        participant that the call is being recorded, obtaining their
+        consent, and using the recording only for the purpose you
+        disclosed.
+      </p>
+      <p class="auto-ack-body">
+        aftercalls doesn't automate consent. You do.
+      </p>
+      <label class="auto-ack-check">
+        <input
+          type="checkbox"
+          bind:checked={autoAckChecked}
+          disabled={autoAckSubmitting}
+        />
+        <span>I understand and will get consent from everyone I record.</span>
+      </label>
+      {#if autoAckError}
+        <p class="auto-ack-err">{autoAckError}</p>
+      {/if}
+      <div class="rn-actions">
+        <button
+          type="button"
+          class="rn-link"
+          onclick={openConsentGuide}
+        >See our recording-consent guide <span aria-hidden="true">↗</span></button>
+        <div class="auto-ack-buttons">
+          <button
+            type="button"
+            class="auto-secondary"
+            onclick={cancelAutoAck}
+            disabled={autoAckSubmitting}
+          >Cancel</button>
+          <button
+            type="button"
+            class="rn-dismiss"
+            onclick={submitAutoAck}
+            disabled={!autoAckChecked || autoAckSubmitting}
+          >{autoAckSubmitting ? "Saving…" : "I understand — start recording"}</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1266,5 +1542,185 @@
   }
   .rn-link:hover {
     color: var(--accent-hi);
+  }
+
+  /* ── Auto-detect slide-out (#59) ────────────────────────────────
+     Anchored to the Record nav item in the rail, extends out to the
+     right over the main content area. Doesn't steal focus, doesn't
+     route-change — the user stays wherever they were. Kind-neutral
+     bone/ink surface, sig-yellow accent on the "Call detected" pip
+     so it reads as an interrupt without shouting. */
+  .nav-row {
+    position: relative;
+  }
+  .auto-slideout {
+    position: absolute;
+    top: 0;
+    left: calc(100% + 0.6rem);
+    width: 280px;
+    padding: 0.85rem 0.9rem 0.8rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+    box-shadow: 0 14px 30px -10px rgba(0, 0, 0, 0.55);
+    z-index: 50;
+    animation: slide-in 180ms cubic-bezier(0.2, 0.6, 0.2, 1) both;
+  }
+  @keyframes slide-in {
+    from {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .auto-head {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.4rem;
+  }
+  .auto-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--sig);
+    box-shadow: 0 0 6px rgba(201, 162, 74, 0.7);
+    animation: auto-pip-pulse 1.3s ease-in-out infinite;
+  }
+  @keyframes auto-pip-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.5;
+    }
+  }
+  .auto-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--bone-2);
+  }
+  .auto-body {
+    margin: 0 0 0.8rem;
+    font-size: 0.85rem;
+    line-height: 1.45;
+    color: var(--bone-1);
+  }
+  .auto-body strong {
+    color: var(--bone-0);
+    font-weight: 600;
+  }
+  .auto-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-bottom: 0.5rem;
+  }
+  .auto-primary {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-weight: 600;
+    font-size: 0.82rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .auto-primary:hover {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .auto-secondary {
+    flex: 0 0 auto;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--bone-1);
+    font-size: 0.82rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .auto-secondary:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+  }
+  .auto-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .auto-hint {
+    margin: 0;
+    font-size: 0.72rem;
+    color: var(--bone-3);
+    line-height: 1.4;
+  }
+  .auto-hint a {
+    color: var(--bone-2);
+    text-decoration: underline;
+  }
+  .auto-hint a:hover {
+    color: var(--bone-0);
+  }
+
+  /* Auto-detect PIPEDA ack modal — reuses .rn-backdrop + .rn-modal
+     from the release-notes modal shared styles; only the body-copy
+     and checkbox rules are auto-ack-specific. */
+  .auto-ack-body {
+    margin: 0 0 0.8rem;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: var(--bone-1);
+  }
+  .auto-ack-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    margin: 0.8rem 0 0.6rem;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-0);
+    cursor: pointer;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: var(--bone-1);
+  }
+  .auto-ack-check input[type="checkbox"] {
+    margin-top: 0.12rem;
+    accent-color: var(--accent);
+  }
+  .auto-ack-err {
+    margin: 0.4rem 0 0;
+    padding: 0.55rem 0.7rem;
+    border-left: 2px solid var(--live);
+    background: var(--live-soft);
+    color: var(--bone-0);
+    font-size: 0.82rem;
+    border-radius: 6px;
+  }
+  .auto-ack-buttons {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  @media (max-width: 640px) {
+    /* On narrow screens the slide-out would overflow the viewport;
+       collapse to a full-width drawer below the rail item instead. */
+    .auto-slideout {
+      position: fixed;
+      top: auto;
+      left: 1rem;
+      right: 1rem;
+      bottom: 1rem;
+      width: auto;
+    }
   }
 </style>

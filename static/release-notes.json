@@ -1,4 +1,11 @@
 {
+  "0.3.22": {
+    "headline": "Call-detected now slides in without pulling you off the page",
+    "changes": [
+      "When the app detects a call starting from another app (Zoom, Teams, SmartPBX, etc.), it used to switch you to the Record tab. Now it slides a small \"Call detected\" panel out from the Record tab in the left rail — you can choose Record this call or Not now without leaving whatever you were reading. All the consent and notification-mode behaviour is the same; just the way it greets you changed.",
+      "The Install pill in the top bar now always points at the newest available version. If a version or two came out between when you saw the pill and when you clicked Install, we pick up the most recent one so you don't install an intermediate version and restart twice."
+    ]
+  },
   "0.3.21": {
     "headline": "Auto-tag your calls, then filter the list by tag",
     "changes": [
