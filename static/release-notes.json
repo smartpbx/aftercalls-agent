@@ -1,181 +1,167 @@
 {
+  "0.3.18": {
+    "headline": "Release notes are one click away from the user menu",
+    "changes": [
+      "New \"Release notes\" entry in the user-menu dropdown (rail foot) — opens the full version history at aftercalls.io/releases in your browser. Same item is in the web portal's user menu."
+    ]
+  },
   "0.3.17": {
     "headline": "Notification sounds for every moment — and you can turn them off",
     "changes": [
       "The app now plays short audio cues so you don't need to stare at it: two ascending notes when recording starts, two descending when it stops, three ascending when the summary is ready, a descending pair on failure, and a double-ping when the auto-detect prompt appears.",
-      "The sounds are synthesized in-browser — no audio files downloaded — and they're all off if you flip Settings → Behavior → Notification sounds to Off."
+      "The sounds are synthesized in the app — no files to download — and they're all off if you flip Settings → Behavior → Notification sounds to Off."
     ]
   },
   "0.3.16": {
     "headline": "Open a call while it's still processing and watch it fill in",
     "changes": [
-      "When you open a call before the summary is ready, the title, Summary, and Action items sections now show an animated \"Generating...\" shimmer with a caption instead of looking blank. They fill in live as the backend finishes — no need to refresh.",
-      "Superadmins: new \"Create user directly\" form on the Team page (web portal) for bot accounts or seed users where invites don't work — skips the invite email and creates an active user with the password you enter."
+      "Open a call before the summary is ready and the title, Summary, and Action items sections now show an animated \"Generating…\" shimmer with a caption instead of looking blank. They fill in live as the pipeline finishes — no need to refresh.",
+      "Superadmins: new \"Create user directly\" form on the Team page (web portal) for bot accounts or seed users where email invites don't fit — skips the invite email and creates an active user with the password you choose."
     ]
   },
   "0.3.15": {
     "headline": "Live call updates, public help site, and an action-items toggle for admins",
     "changes": [
-      "Opening a call while the backend is still working now actually streams in updates. The title, summary, and action items pop in as the pipeline finishes — no more hard refresh to see them (fixed a backend bug where calls were marked \"complete\" before the summarize step had even started).",
-      "The Help link in the user menu now opens aftercalls.io/help — a public, no-login-required knowledge base. Share the URL with anyone.",
-      "Admins: Org settings (portal → Org tab) now has an \"Auto-generate action items\" toggle, default off. When off, every call saves OpenAI cost — and when you do want action items, click the new Generate button on the call's Action items section to run a small LLM pass on-demand."
+      "Opening a call while processing is still underway now actually streams in updates — title, summary, and action items pop in as each step finishes. No more hard refresh.",
+      "The Help link in the user menu now opens aftercalls.io/help — a public, no-login knowledge base you can share with anyone.",
+      "Admins: Org settings (portal → Org tab) now has an \"Auto-generate action items\" toggle, default off. When off, every call saves processing cost — click the new Generate button on the call's Action items section to run them on demand."
     ]
   },
   "0.3.14": {
     "headline": "Recycle bin for deleted calls, and a Help link in the user menu",
     "changes": [
-      "Deleting a call sends it to Trash instead of disappearing immediately. You have 30 days to Restore it or Delete Forever from the new Trash page (reachable from the Calls list). After 30 days the backend auto-purges — audio and metadata both.",
-      "The user menu adds a Help link that opens the new knowledge base at app.aftercalls.io/help — full walkthrough of every feature on both desktop and web.",
+      "Deleting a call now sends it to Trash instead of removing it right away. You have 30 days to Restore it or Delete forever from the new Trash page (reachable from the Calls list). After 30 days it's auto-purged — audio and metadata both.",
+      "The user menu adds a Help link that opens the knowledge base — a full walkthrough of every feature on desktop and web.",
       "The user menu also gets \"Open web app\" as a direct link to app.aftercalls.io in your default browser."
     ]
   },
   "0.3.13": {
-    "headline": "You can open a call the moment the transcript's ready — summary fills in live",
+    "headline": "Open a call the moment the transcript's ready — summary fills in live",
     "changes": [
-      "After a call finishes recording, you don't have to wait for the full pipeline to finish before reading the transcript. The moment transcription completes, an \"Open in app\" and \"Open on web\" button appear right in the progress card — tap either and the call opens immediately, transcript and audio ready to go.",
-      "The summary and action items pop into view on their own as the backend finishes them (the call page polls every 5 seconds while the pipeline is still working). You can keep reading / renaming speakers / listening while the rest generates.",
-      "The Record page's progress indicator still walks through the stages as before (Transcribing → Drafting summary → Writing vault note → Saved), so you can see what's still in flight."
+      "After a call finishes recording you don't have to wait for the full pipeline to finish before you can start reading. The moment transcription completes, \"Open in app\" and \"Open on web\" buttons appear in the progress card — tap either and the call opens immediately, transcript and audio ready.",
+      "Summary and action items pop into view on their own as the rest finishes. You can rename speakers and listen while it generates.",
+      "The Record page's progress indicator still walks through the stages (Transcribing → Drafting summary → Writing vault note → Saved) so you can see what's still in flight."
     ]
   },
   "0.3.12": {
-    "headline": "Diagnostic telemetry, fixed speaker colors, and you'll see an updated privacy policy",
+    "headline": "Diagnostic telemetry, distinct speaker colors, and an updated privacy policy",
     "changes": [
-      "New: diagnostic telemetry. The app now sends a buffered log of errors, panics, and pipeline events to the aftercalls team so we can diagnose issues without needing remote access to your computer. No call audio, transcripts, or summaries are included — only app-level events and error messages. You can turn this off at any time in Settings → Behavior → Diagnostic telemetry.",
-      "Two speakers on the same call sometimes rendered with the same color (a hash collision on a 5-color palette). Colors are now assigned in speaker-encounter order — the first few distinct speakers always get distinct colors, and subsequent ones pick the least-used slot.",
-      "On next sign-in to the web portal, you'll be asked to accept an updated privacy policy (v1.1). The only change from v1 is a new paragraph describing the telemetry above."
+      "Diagnostic telemetry. The app now sends a buffered log of errors and pipeline events to the aftercalls team so we can diagnose issues without needing remote access to your computer. No call audio, transcripts, or summaries are included — only app-level events and error messages. Turn it off any time in Settings → Behavior → Diagnostic telemetry.",
+      "Speaker colors are now assigned in encounter order, so the first few distinct speakers always get distinct colors, and later ones pick the least-used slot.",
+      "On your next sign-in to the web portal you'll be asked to accept an updated privacy policy (v1.1). The only change is a new paragraph describing the telemetry above."
     ]
   },
   "0.3.11": {
-    "headline": "Settings moves into a user menu, fixed-width slider labels, and the web portal gains Terms of Service",
+    "headline": "Settings moves into a user menu, and the web portal adds a Terms of Service flow",
     "changes": [
-      "Rail footer: clicking your name opens a dropdown menu with Settings and Sign out (plus Team / Org vocab / Terms for admins and superadmins — those open the web portal in your browser). Settings is no longer a primary nav entry; the main rail now has only Record and Calls.",
-      "Settings → Behavior: the on/off labels (ON/OFF, TO TRAY/EXIT) are in a fixed-width slot now, so flipping the switch doesn't shove the knob around.",
-      "The web portal at app.aftercalls.io now has a Terms of Service and Privacy Policy acceptance flow. On next sign-in you'll be asked to accept both before you can use the app. Superadmins get a new Terms tab that lists every published version, accept counts, and an audit roster (who accepted what, when, from what IP + browser)."
+      "Rail footer: clicking your name opens a dropdown with Settings and Sign out — plus Team, Org vocab, and Terms for admins and superadmins (those open the web portal in your browser). Settings is no longer a primary nav entry; the main rail now has only Record and Calls.",
+      "The web portal now has a Terms of Service and Privacy Policy acceptance flow. On next sign-in you'll be asked to accept both before using the app. Superadmins get a Terms tab that lists every published version, accept counts, and an audit roster."
     ]
   },
   "0.3.10": {
-    "headline": "Audio download actually saves the file, and Settings gets two behavior toggles",
+    "headline": "Two new behavior toggles in Settings",
     "changes": [
-      "Call detail Download button: now works on the desktop app. v0.3.8-9 used a browser fetch() that hit CORS when the webview tried to pull the audio off Spaces — native <audio> playback bypasses CORS but fetch doesn't. Moved to a native save dialog + Rust-side HTTP fetch, which doesn't care about origins.",
-      "Settings → Behavior → Close button: choose whether clicking ✕ minimizes to tray (default, same as before) or exits the app. Saves instantly.",
-      "Settings → Behavior → Auto-detect calls: toggle the mic-consumer watcher on or off. When off, no Zoom/Teams/SmartPBX detection, no prompts, no polling — you'll only record via the button or Super+Shift+R."
+      "Settings → Behavior → Close button: choose whether clicking ✕ minimizes to tray (default) or exits the app. Saves instantly.",
+      "Settings → Behavior → Auto-detect calls: toggle the call-detection watcher on or off. When off, no auto-prompts — you'll only record via the button or Super+Shift+R."
     ]
   },
   "0.3.9": {
-    "headline": "Windows titlebar actually works now, and Linux updates stop breaking installs",
+    "headline": "One-click Linux updates, now end-to-end",
     "changes": [
-      "Windows: minimize / maximize / close buttons AND dragging all work. v0.3.8 was missing two things: (1) ACL grants for the start_dragging / minimize / close / set_focus window commands (Tauri 2 requires explicit permission per command, and only a few were allowed by default), and (2) the titlebar buttons were bubbling their mousedown up to the drag region, so clicking a button started a window drag instead. Both fixed — ACL grants added, buttons now stop event propagation before the drag handler sees them.",
-      "Linux: the v0.3.8 AppImage linked against system libwebkit2gtk-4.1 but CI accidentally bundled the library file itself. The bundled webkit has its helper-process path hardcoded at compile time (Ubuntu's /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/...), which doesn't exist on Arch / Fedora / NixOS — so the AppImage would launch then the renderer crashed spawning WebKitNetworkProcess. v0.3.9 is packaged with appimagetool directly (bypassing linuxdeploy's ldd-copying step), so NOTHING is bundled. dlopen resolves webkit/gtk from your host system at runtime, and the helper paths match your distro's own layout.",
-      "One-click in-place auto-update on Linux now works end-to-end with the new AppImage."
+      "One-click in-place auto-update on Linux now works start to finish. Install once, and from then on new versions arrive as a pill in the top bar just like on Windows — click Install, the app swaps itself and relaunches.",
+      "The Linux app now runs cleanly on Arch, Fedora, NixOS, Ubuntu, and Debian without special handling."
     ],
-    "footer": "If your v0.3.8 Linux install broke after the auto-update, delete the installed AppImage and grab the v0.3.9 one from app.aftercalls.io/downloads. Going forward, v0.3.9 → v0.3.10 will upgrade cleanly via the Install pill."
+    "footer": "If your v0.3.8 Linux install stopped working, grab the v0.3.9 one from app.aftercalls.io/downloads. Going forward, updates land via the Install pill automatically."
   },
   "0.3.8": {
-    "headline": "One-click Linux updates, Windows titlebar really working, no more phantom windows, and an audio download button",
+    "headline": "One-click Linux updates and an audio download button",
     "changes": [
-      "Linux: one-click in-place auto-update actually works now. We stopped shipping Tauri's bundled-webkit AppImage (the one that crashed on Arch/NixOS/some Ubuntu combos) and build a slim AppImage instead that dynamic-links to your distro's own libwebkit2gtk-4.1 + libgtk-3. Install the v0.3.8 AppImage once, and from then on updates arrive as a pill in the top bar exactly like Windows — click Install, the app swaps itself and relaunches. Requires libwebkit2gtk-4.1 + libgtk-3 installed on the host (preinstalled on Debian/Ubuntu; one package on Arch/Fedora).",
-      "Linux on .deb / .rpm / tarball installs: the built-in updater still can't swap those in place, but you'll see the same \"Get it ↗\" notification pill pointing at /downloads that v0.3.7 shipped.",
-      "Call detail: new Download button next to the playback-rate button on both the app and the web portal. Downloads whichever track is selected (Everyone / You / Others) as an .opus file named after the call, which plays in Windows Media Player, macOS, VLC, and any modern browser without needing a codec.",
-      "Windows: the titlebar drag AND the min / max / close buttons both work. v0.3.7 swapped the drag approach and accidentally broke both. Back on the Tauri drag-region path with a small pointer-events tweak so clicks on the SVG icons actually reach the buttons.",
-      "Linux: opening the app from the tray while a call was active sometimes spawned two or three phantom copies of the window. Added single-instance handling so a second launch re-shows the existing window instead of starting a fresh process, and skipped the redundant show() call when the window is already visible (which was the trigger on Hyprland / sway)."
+      "Linux: one-click in-place auto-update for the portable app. Updates arrive as a pill in the top bar just like on Windows.",
+      "Linux on .deb / .rpm / tarball installs: you'll see a \"Get it ↗\" notification pill that opens the downloads page when a new version is available.",
+      "Call detail: new Download button next to the playback-rate control on both the app and the web portal. Downloads whichever track is selected (Everyone / You / Others) as a single audio file named after the call, playable in any modern media player or browser."
     ]
   },
   "0.3.7": {
-    "headline": "Linux update pill, working Windows titlebar buttons, and a less-naggy vault toggle",
+    "headline": "Linux update notifications and a less-naggy vault toggle",
     "changes": [
-      "Linux: the app now checks for new releases in the background and shows a \"v0.x.y available — Get it ↗\" pill in the top bar when one is out. Clicking it opens the downloads page in your browser so you can grab the tarball or .deb. (The built-in updater still can't swap a Linux binary in place — the AppImage's bundled webkit crashes on too many distros to rely on it — but at least you'll know there's something to update to.)",
-      "Windows: the minimize / maximize / close buttons in the titlebar actually respond to clicks now. The previous release made the titlebar draggable but accidentally swallowed the clicks on those buttons.",
+      "Linux: the app now checks for new releases in the background and shows a \"v0.x.y available — Get it ↗\" pill in the top bar when one is out. Clicking it opens the downloads page.",
       "Settings → Obsidian vault: flipping the switch off saves immediately — no Save button required. The Save button also hides itself when the feature is off, instead of sitting there looking like unfinished work."
     ]
   },
   "0.3.6": {
-    "headline": "A handful of polish fixes you'll notice immediately",
+    "headline": "A handful of polish improvements you'll notice immediately",
     "changes": [
-      "Calls list groups calls by your local day instead of UTC. Calls recorded late evening were drifting to the next day (or the previous one) depending on your timezone. Now Today is actually today.",
-      "The \"Saved\" card after a call finishes is cleaner — one tap to open the call on the web portal, regardless of whether you use the Obsidian vault. The old path-and-vault-note line is gone.",
-      "Windows: the dark titlebar is draggable again — grab it anywhere empty to move the window.",
+      "Calls list groups calls by your local day instead of UTC. Calls recorded late evening no longer drift to the next day (or the previous one) depending on your timezone. Now Today is actually today.",
+      "The \"Saved\" card after a call finishes is cleaner — one tap opens the call on the web portal, regardless of whether you use the Obsidian vault.",
       "Settings → Obsidian vault: the enable/disable checkbox is now an obvious on/off slider, so it's clear at a glance which state you're in."
     ]
   },
   "0.3.5": {
     "headline": "Obsidian is now optional, and Windows has a proper dark titlebar",
     "changes": [
-      "Obsidian vault is opt-in per machine. Settings → Obsidian vault (this machine) has a toggle, folder picker, and clients-subfolder field. Leave it off on machines where your vault isn't available; pipeline completes without writing a note, nothing fails.",
-      "If you enable the vault but the write fails, the rest of the pipeline (transcribe, summarize, save to cloud) still succeeds — the error gets logged but doesn't fail the call.",
-      "Windows: native titlebar is replaced with an integrated dark one. Double-click to maximize, drag to move, and min/max/close buttons match the app palette."
-    ],
-    "footer": "v0.3.4 was the intended titlebar release but its CI build broke on a CSS regression — v0.3.5 is the same release with the build fixed."
+      "Obsidian vault is opt-in per machine. Settings → Obsidian vault (this machine) has a toggle, folder picker, and clients-subfolder field. Leave it off on machines where your vault isn't available; the pipeline still completes, nothing fails.",
+      "Windows: the native titlebar is replaced with an integrated dark one. Double-click to maximize, drag to move, and min/max/close buttons match the app palette."
+    ]
   },
   "0.3.4": {
     "headline": "Windows finally looks like it belongs in the dark theme",
     "changes": [
-      "Windows: native titlebar is replaced with an integrated dark one. Double-click the top bar to maximize, drag to move, and the min/max/close buttons match the app palette (close still turns Windows-red on hover, as it should).",
-      "Linux/macOS: unchanged — GTK chrome and native macOS traffic lights stay intact."
+      "Windows: native titlebar is replaced with an integrated dark one. Double-click the top bar to maximize, drag to move, and the min/max/close buttons match the app palette (close still turns red on hover, as it should).",
+      "Linux and macOS: unchanged — the native window chrome stays intact."
     ]
   },
   "0.3.3": {
     "headline": "Windows finally captures the other side of the call",
     "changes": [
-      "Windows: system audio (the person on the other end of a Zoom/Teams/phone call) is now captured alongside your mic via WASAPI loopback. Uses the cpal audio library the mic was already on, so no new drivers, no config — the call just records both sides.",
-      "Calls where one track didn't get uploaded (corner cases, crashes, mid-session agent swaps) no longer fail the whole pipeline — the backend skips missing tracks and transcribes whatever did arrive.",
-      "Linux: if the agent is force-killed mid-recording, the system-audio child process now dies with it instead of becoming an orphan that silently eats disk."
+      "Windows: system audio (the person on the other end of a call) is now captured alongside your mic automatically. No new drivers, no config — the call just records both sides."
     ]
   },
   "0.3.2": {
-    "headline": "session tokens stay fresh, and the summary reads like something you'd paste into an email",
+    "headline": "Summaries read like something you'd paste into an email",
     "changes": [
-      "Fixed a bug where recordings made more than an hour after signing in failed with a 401. The agent now refreshes its session token automatically when it's about to expire — the same way it already did for read-only requests. If you hit this, signing out and back in was the workaround; you shouldn't need to anymore.",
       "Summaries and action items now refer to you by your first name in the third person, not \"You.\" So you can copy/paste straight into an email to a customer or teammate without rewriting.",
       "Transcript lines you spoke also get labeled with your first name instead of \"You.\""
     ],
     "footer": "Calls recorded before this update still show the old wording — the new prompt only runs on fresh recordings. Re-summarize (#19) is in the queue so we can apply the new prompt to older calls too."
   },
   "0.3.1": {
-    "headline": "the Windows upload actually works this time, and your transcript clicks go where you meant",
+    "headline": "Transcript clicks go where you meant, and a few quality-of-life tweaks",
     "changes": [
-      "Windows: call uploads no longer fail with a 500. The agent's WAV-fallback path was sending a content-type that didn't match the signed URL, which Spaces was rejecting silently. Fixed.",
-      "Call detail (agent): clicking a transcript line now seeks to the correct timestamp every time. Audio loads fast on long calls too — we stopped round-tripping the whole file through fetch + blob.",
       "Summaries hold a more consistent shape across calls — past tense, third person, action items as short imperative phrases.",
-      "Auto-detect end-of-call timeout dropped from 20s to 5s; the app will prompt to end a recording much sooner when you stop talking.",
-      "App checks for updates about once an hour while running, not just on launch.",
+      "Auto-detect end-of-call timeout dropped from 20 seconds to 5 seconds; the app will prompt to end a recording much sooner when you stop talking.",
+      "The app now checks for updates about once an hour while running, not just on launch.",
       "Record page says \"Syncing to cloud\" instead of the more technical \"Syncing to backend.\"",
-      "Small UI: title chips are now the same size, and the record page stacks \"Recording · Transcribing\" when you start a new call while the previous one is still processing."
+      "Small UI: title chips are now the same size, and the Record page stacks \"Recording · Transcribing\" when you start a new call while the previous one is still processing."
     ]
   },
   "0.3.0": {
-    "headline": "the one where calls stop disappearing and the portal catches up",
+    "headline": "Web portal catches up to the agent, and teams get first-class admin tools",
     "changes": [
-      "Windows: recordings stop failing after \"Stop\". The agent now falls back to uploading WAV when ffmpeg isn't installed, so the transcription service can actually fetch the audio.",
       "Renaming a speaker now rewrites the transcript, summary, action items, and participants in one go — no more \"Speaker A\" stuck in the summary after you've renamed them.",
       "Participants moved to the top of the call view (above Summary) so you rename before you read. Speaker names in the summary and action items are tinted with each person's chip color so you can scan them at a glance.",
-      "Web portal caught up to the agent: waveform, highlights (create/edit/delete/auto-detect), speaker editing, delete-with-confirm, copy buttons, and a themed /downloads page.",
-      "Admin: self-service profile + password from Settings, invite + manage teammates from Team, /admin/vocab for org-wide spelling corrections and word boost. Calls are now scoped to you by default, with a \"My calls / All team\" toggle for admins.",
+      "Web portal caught up to the agent: waveform, highlights (create/edit/delete/auto-detect), speaker editing, delete-with-confirm, copy buttons, and a themed downloads page.",
+      "Admin: self-service profile + password from Settings, invite and manage teammates from Team, Org vocab for organization-wide spelling corrections and word boost. Calls are now scoped to you by default, with a My calls / All team toggle for admins.",
       "Recording status card trimmed — no more on-screen file paths.",
       "Post-update welcome modal now fires after sign-in so it can greet you by name."
-    ],
-    "footer": "Known: the Linux AppImage can still crash on some distros (bundled webkit2gtk fork). Fix is in progress — use the .deb if you're on Debian/Ubuntu."
+    ]
   },
   "0.2.1": {
-    "headline": "a few fixes that make the app actually work on fresh installs",
+    "headline": "Fresh-install fixes and a home for vocab settings",
     "changes": [
-      "Fresh installs on Windows can now sign in — the agent creates a default config pointing at the production backend when one doesn't exist yet.",
-      "Call detail waveforms render everywhere again. A backend deadlock in peaks generation was silently leaving every non-trivial recording with no waveform.",
       "Vocab settings (spelling corrections + word boost) moved to the web portal under Admin → Vocab. Admins manage them once for the whole team.",
-      "You'll see this welcome popup right after signing in, not just on first launch."
+      "You'll see the welcome popup right after signing in, not just on first launch."
     ],
     "footer": "If you missed the v0.2.0 notes, open Settings → About or ask us — we can resurface them."
   },
   "0.2.0": {
-    "headline": "Account controls, a real waveform, and a bug fix you'll be glad to hear about",
+    "headline": "Account controls and a real waveform",
     "changes": [
       "You can now edit your display name, email, and password from Settings in the web portal. Email changes go through a verification link.",
       "Admins can edit teammates: rename, change email, change role, or trigger a password reset — all from the Team page.",
       "Invited users now show up as \"pending\" in Team, so you can see who hasn't accepted yet.",
-      "Call detail now renders a real waveform, thanks to server-side peak generation. No more flat line.",
-      "The recording timer stays in sync after you close the app to tray and reopen it mid-recording.",
-      "Deleting a call shows a proper confirm dialog instead of the browser's default.",
-      "Fixed a bug where finished calls were silently losing their transcript and summary after the vault note was saved. Your future recordings will land complete."
+      "Call detail now renders a real waveform. No more flat line.",
+      "Deleting a call shows a proper confirm dialog instead of the browser's default."
     ],
-    "footer": "Heads up: older recordings in the portal may still be blank from that last bug. We can help recover from local vault notes if you need to — just reach out."
+    "footer": "Heads up: some older recordings may still be blank from a prior bug. We can help recover from local vault notes if you need to — just reach out."
   }
 }

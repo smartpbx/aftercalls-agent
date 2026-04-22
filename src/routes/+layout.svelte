@@ -532,6 +532,16 @@
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
           </button>
+          <button
+            class="um-item"
+            role="menuitem"
+            onclick={async () => {
+              closeUserMenu();
+              try { await openUrl("https://aftercalls.io/releases"); } catch {}
+            }}
+          >
+            Release notes <span class="um-ext" aria-hidden="true">↗</span>
+          </button>
           {#if me && (me.role === "admin" || me.role === "superadmin")}
             <div class="um-sep"></div>
             <button
