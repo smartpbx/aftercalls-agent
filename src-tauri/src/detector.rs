@@ -328,6 +328,46 @@ fn windows_mic_consumers() -> Result<Vec<String>, String> {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    // Helper hoisted above the main body so the outer function's tail
+    // expression is the `unsafe { ... }` block and its `Result<Vec<…>, …>`
+    // value flows out directly. (Previously the inner `fn` declaration
+    // followed the unsafe block, which made rustc treat the unsafe
+    // block as a statement and the function's implicit return `()` —
+    // Linux ignores this file via cfg but Windows CI caught it.)
+    #[inline]
+    unsafe fn process_exe_basename(pid: u32) -> Result<String, String> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let handle: HANDLE =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
+
+        let mut buf: [u16; 1024] = [0; 1024];
+        let mut size: u32 = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+
+        let _ = CloseHandle(handle);
+
+        result.map_err(|e| format!("QueryFullProcessImageNameW: {e}"))?;
+
+        let slice = &buf[..size as usize];
+        let full = OsString::from_wide(slice)
+            .to_string_lossy()
+            .into_owned();
+        let base = full
+            .rsplit(|c| c == '\\' || c == '/')
+            .next()
+            .unwrap_or(&full)
+            .to_string();
+        Ok(base)
+    }
+
     unsafe {
         // COM init: per-thread. Ignore RPC_E_CHANGED_MODE (already inited
         // differently) and S_FALSE (already inited same mode).
@@ -428,40 +468,6 @@ fn windows_mic_consumers() -> Result<Vec<String>, String> {
         }
 
         Ok(result)
-    }
-
-    #[inline]
-    unsafe fn process_exe_basename(pid: u32) -> Result<String, String> {
-        use std::ffi::OsString;
-        use std::os::windows::ffi::OsStringExt;
-
-        let handle: HANDLE =
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-                .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
-
-        let mut buf: [u16; 1024] = [0; 1024];
-        let mut size: u32 = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-
-        let _ = CloseHandle(handle);
-
-        result.map_err(|e| format!("QueryFullProcessImageNameW: {e}"))?;
-
-        let slice = &buf[..size as usize];
-        let full = OsString::from_wide(slice)
-            .to_string_lossy()
-            .into_owned();
-        let base = full
-            .rsplit(|c| c == '\\' || c == '/')
-            .next()
-            .unwrap_or(&full)
-            .to_string();
-        Ok(base)
     }
 }
 
