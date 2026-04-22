@@ -519,6 +519,7 @@ struct AppPrefs {
     close_to_tray: bool,
     auto_detect: bool,
     telemetry_enabled: bool,
+    sounds_enabled: bool,
 }
 
 #[tauri::command]
@@ -528,6 +529,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         close_to_tray: cfg.close_to_tray,
         auto_detect: cfg.auto_detect,
         telemetry_enabled: cfg.telemetry_enabled,
+        sounds_enabled: cfg.sounds_enabled,
     })
 }
 
@@ -536,11 +538,13 @@ fn set_app_prefs(
     close_to_tray: bool,
     auto_detect: bool,
     telemetry_enabled: bool,
+    sounds_enabled: bool,
 ) -> Result<(), String> {
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
     cfg.telemetry_enabled = telemetry_enabled;
+    cfg.sounds_enabled = sounds_enabled;
     cfg.save().map_err(|e| e.to_string())
 }
 

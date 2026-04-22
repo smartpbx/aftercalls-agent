@@ -5,6 +5,13 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
   import { onMount, onDestroy } from "svelte";
+  import {
+    notifyRecordStart,
+    notifyRecordStop,
+    notifyPipelineDone,
+    notifyPipelineFailed,
+    notifyAutoDetect,
+  } from "$lib/notify";
 
   type PipelineEvent =
     | { stage: "started"; session_dir: string }
@@ -60,14 +67,23 @@
       const p = evt.payload;
       pipelineError = "";
       pipelineStage = p.stage;
-      if (p.stage === "failed") pipelineError = p.error;
+      if (p.stage === "failed") {
+        pipelineError = p.error;
+        notifyPipelineFailed();
+      }
       if (p.stage === "transcribed") openableCallId = p.call_id;
-      if (p.stage === "done") openableCallId = p.call_id;
+      if (p.stage === "done") {
+        openableCallId = p.call_id;
+        notifyPipelineDone();
+      }
     });
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
       (evt) => {
+        const wasRecording = recording;
         recording = evt.payload.recording;
+        if (recording && !wasRecording) notifyRecordStart();
+        if (!recording && wasRecording) notifyRecordStop();
         if (recording) {
           pipelineStage = "";
           pipelineError = "";
@@ -84,7 +100,11 @@
       },
     );
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
-      prompt = evt.payload.kind === "cleared" ? null : evt.payload;
+      const next = evt.payload.kind === "cleared" ? null : evt.payload;
+      // Audio nudge only when a prompt *newly* appears — suppress
+      // on the cleared-state transition so dismissing doesn't beep.
+      if (next && !prompt) notifyAutoDetect();
+      prompt = next;
     });
 
     // "recording-state" only fires on transitions, so a remount

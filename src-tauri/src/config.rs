@@ -37,6 +37,12 @@ pub struct Config {
     /// machine. See #<telemetry issue>.
     #[serde(default = "default_true")]
     pub telemetry_enabled: bool,
+    /// Short synthesized tones on recording start/stop, pipeline
+    /// complete/failed, auto-detect prompt. Default on. Off silences
+    /// every notification the agent produces (system notifications
+    /// from tauri-plugin-notification are unaffected).
+    #[serde(default = "default_true")]
+    pub sounds_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -79,6 +85,7 @@ impl Config {
                 close_to_tray: true,
                 auto_detect: true,
                 telemetry_enabled: true,
+                sounds_enabled: true,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

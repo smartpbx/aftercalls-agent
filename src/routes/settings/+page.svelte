@@ -43,6 +43,7 @@
   let closeToTray = $state(true);
   let autoDetect = $state(true);
   let telemetryEnabled = $state(true);
+  let soundsEnabled = $state(true);
   let prefsSavedAt = $state(0);
 
   async function loadAppPrefs() {
@@ -51,10 +52,12 @@
         close_to_tray: boolean;
         auto_detect: boolean;
         telemetry_enabled: boolean;
+        sounds_enabled: boolean;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
       telemetryEnabled = p.telemetry_enabled;
+      soundsEnabled = p.sounds_enabled;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -66,6 +69,7 @@
         closeToTray,
         autoDetect,
         telemetryEnabled,
+        soundsEnabled,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
@@ -295,6 +299,31 @@
         <span class="switch-label">
           {autoDetect ? "On" : "Off"}
         </span>
+      </label>
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Notification sounds</span>
+        <span class="pref-hint">
+          Short tones when recording starts and stops, when the
+          pipeline finishes, and when the app detects a call and
+          asks to record. Off silences all of them.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={soundsEnabled}
+          onchange={(e) => {
+            soundsEnabled = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">{soundsEnabled ? "On" : "Off"}</span>
       </label>
     </div>
 

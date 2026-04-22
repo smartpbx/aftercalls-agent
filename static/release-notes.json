@@ -1,4 +1,11 @@
 {
+  "0.3.17": {
+    "headline": "Notification sounds for every moment — and you can turn them off",
+    "changes": [
+      "The app now plays short audio cues so you don't need to stare at it: two ascending notes when recording starts, two descending when it stops, three ascending when the summary is ready, a descending pair on failure, and a double-ping when the auto-detect prompt appears.",
+      "The sounds are synthesized in-browser — no audio files downloaded — and they're all off if you flip Settings → Behavior → Notification sounds to Off."
+    ]
+  },
   "0.3.16": {
     "headline": "Open a call while it's still processing and watch it fill in",
     "changes": [
