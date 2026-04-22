@@ -6,6 +6,57 @@
  * primary UI.
  */
 
+/* Geist (SIL OFL 1.1, https://github.com/vercel/geist-font) is self-hosted
+ * under /fonts/ so the agent + portal never phone fonts.gstatic.com on
+ * launch. Keeping Geist on our own origin (a) honours our "minimal third
+ * parties" claim in the privacy policy, (b) avoids the GDPR-flavoured
+ * CDN-font-IP-leak issue (Munich LG 3.2022), and (c) removes a launch-time
+ * network dependency for the desktop agent running offline. The license
+ * text ships next to the files at /fonts/OFL.txt.
+ */
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Geist-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/Geist-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/Geist-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/Geist-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/GeistMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/GeistMono-Medium.woff2") format("woff2");
+}
+
 /* Theme tokens. The `data-theme` attribute on <html> is set by the inline
  * bootstrap script in app.html before first paint (to avoid a flash) and
  * swapped by the settings UI. Three states:

@@ -1,8 +1,9 @@
 [package]
 name = "agent"
 version = "0.3.23"
-description = "A Tauri App"
-authors = ["you"]
+description = "aftercalls desktop agent — records, transcribes, and files calls"
+authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
+license = "LicenseRef-Proprietary"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

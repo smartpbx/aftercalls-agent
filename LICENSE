@@ -1,0 +1,25 @@
+aftercalls desktop agent — proprietary source license
+Copyright (c) Clayton Mannerow. All rights reserved.
+
+This source code is published in this public mirror for transparency
+and security review. Users who install the desktop agent from
+app.aftercalls.io can audit the exact code that runs on their
+machine, and independent researchers can review how calls are
+captured, stored, and transmitted.
+
+Publication does not grant redistribution or derivative-distribution
+rights. You may read, study, and locally build this source for the
+purpose of evaluating the software. You may not redistribute this
+source (in whole or in part, modified or unmodified), distribute
+derivative works, or distribute compiled binaries built from this
+source, without explicit written permission from the author.
+
+"aftercalls" and related names and marks are the property of the
+author. Nothing in this license grants any trademark rights.
+
+Bundled third-party components (ffmpeg, Tauri, Svelte, Rust crates,
+Geist, etc.) retain their own upstream licenses. See
+THIRD_PARTY_NOTICES.md for the list and for LGPL corresponding-source
+contact information.
+
+Contact: privacy@aftercalls.io

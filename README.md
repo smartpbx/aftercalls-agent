@@ -1,11 +1,14 @@
 # aftercalls — desktop agent
 
-Tauri 2 + SvelteKit desktop app that records, transcribes, and files your
-calls. Runs on Linux, Windows, and macOS.
+Public source mirror for the aftercalls desktop agent (Tauri 2 +
+SvelteKit). Runs on Linux and Windows.
 
-This is the **public** source for the desktop agent. The backend, web
-portal, and deployment live in a separate private repo. Users who just
-want to install the app should go to
+Releases ship via this repo's CI (`.github/workflows/release.yml`).
+The private backend, web portal, and site live at
+[smartpbx/aftercalls](https://github.com/smartpbx/aftercalls) and are
+not public.
+
+End users who just want to install the app should go to
 [app.aftercalls.io/downloads](https://app.aftercalls.io/downloads).
 
 ## Build
@@ -18,28 +21,17 @@ pnpm install
 pnpm tauri build
 ```
 
-On Linux, `pnpm tauri build --bundles deb` skips the AppImage step
-(which is slow and bundles a webkit fork that is unstable on some
-distros — the AppImage is known to crash on Arch + NixOS).
+## ffmpeg sidecar
 
-## Release
-
-Pushing a `v*` tag triggers `.github/workflows/release.yml`:
-
-1. Builds signed installers + updater manifests on Linux + Windows via
-   [tauri-action](https://github.com/tauri-apps/tauri-action).
-2. Packages a system-linked Linux tarball (agent binary + .desktop +
-   icon) for distros where the AppImage's bundled webkit crashes.
-3. Uploads everything to a draft GitHub Release.
-4. Mirrors the assets + rewritten `latest.json` to the DigitalOcean
-   Spaces bucket that running apps poll for updates. Linux entries are
-   stripped from `latest.json` so the auto-updater doesn't clobber
-   manually-installed tarballs with the crashy AppImage.
-
-Per-push master + PR builds run through `.github/workflows/build-agent.yml`
-(Linux-only, no signing) for compile validation.
+The agent shells out to an ffmpeg sidecar, bundled as an
+`externalBin` under the name `ffmpeg-aftercalls`. The sidecar is not
+checked into this repo — it is downloaded in CI per `release.yml`
+from the upstream LGPL builds (John Van Sickle for Linux, gyan.dev
+for Windows) and bundled into the installer. See
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for sourcing +
+LGPL corresponding-source pointers.
 
 ## License
 
-Proprietary. Source is public so users can audit the app that runs on
-their machine and so CI can build without eating private-repo minutes.
+See [`LICENSE`](./LICENSE) and
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
