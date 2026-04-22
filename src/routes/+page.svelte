@@ -3,11 +3,13 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { goto } from "$app/navigation";
   import { onMount, onDestroy } from "svelte";
 
   type PipelineEvent =
     | { stage: "started"; session_dir: string }
     | { stage: "transcribing" }
+    | { stage: "transcribed"; session_dir: string; call_id: string }
     | { stage: "summarizing" }
     | { stage: "writing_note" }
     | { stage: "uploading" }
@@ -24,18 +26,27 @@
   let error = $state("");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
-  let doneCallId = $state("");
+  // Latest known call id for the in-flight pipeline. Populated on
+  // `transcribed` — before summary/action-items finish — so the
+  // user can pop the call open while the rest of the pipeline
+  // keeps working. Overwritten by `done` (same value; explicit).
+  let openableCallId = $state("");
   let prompt = $state<AutoDetectEvent | null>(null);
   let elapsedMs = $state(0);
   let importing = $state(false);
 
   async function openCallInBrowser() {
-    if (!doneCallId) return;
+    if (!openableCallId) return;
     try {
-      await openUrl(`https://app.aftercalls.io/calls/${doneCallId}`);
+      await openUrl(`https://app.aftercalls.io/calls/${openableCallId}`);
     } catch (e) {
       console.warn("openUrl failed", e);
     }
+  }
+
+  async function openCallInApp() {
+    if (!openableCallId) return;
+    await goto(`/calls/${openableCallId}`);
   }
 
   let unlisten: UnlistenFn | null = null;
@@ -50,7 +61,8 @@
       pipelineError = "";
       pipelineStage = p.stage;
       if (p.stage === "failed") pipelineError = p.error;
-      if (p.stage === "done") doneCallId = p.call_id;
+      if (p.stage === "transcribed") openableCallId = p.call_id;
+      if (p.stage === "done") openableCallId = p.call_id;
     });
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
@@ -59,7 +71,7 @@
         if (recording) {
           pipelineStage = "";
           pipelineError = "";
-          doneCallId = "";
+          openableCallId = "";
           startAt = Date.now();
           timer = window.setInterval(
             () => (elapsedMs = Date.now() - startAt),
@@ -113,7 +125,7 @@
       } else {
         pipelineStage = "";
         pipelineError = "";
-        doneCallId = "";
+        openableCallId = "";
         sessionDir = await invoke<string>("start_recording");
       }
     } catch (e) {
@@ -136,7 +148,7 @@
     importing = true;
     pipelineStage = "";
     pipelineError = "";
-    doneCallId = "";
+    openableCallId = "";
     try {
       sessionDir = await invoke<string>("process_imported_file", {
         sourcePath: picked,
@@ -173,6 +185,11 @@
   const pipelineLabels: Record<string, string> = {
     started: "Processing",
     transcribing: "Transcribing",
+    // Transcribed = transcript is in; the call is already openable.
+    // Summarizing fires immediately after, so users see "Drafting
+    // summary" as the ongoing state even though the transcribed
+    // moment briefly lights up this row.
+    transcribed: "Transcript ready",
     summarizing: "Drafting summary",
     writing_note: "Writing vault note",
     uploading: "Syncing to cloud",
@@ -280,10 +297,20 @@
             {pipelineLabels[pipelineStage] ?? pipelineStage}
           </p>
         </div>
-        {#if doneCallId && pipelineStage === "done"}
-          <button class="open-web" onclick={openCallInBrowser}>
-            Open on web ↗
-          </button>
+        <!-- Open buttons appear the moment the transcript lands
+             (openableCallId set by `transcribed`), NOT only on done.
+             The row continues to show Drafting summary / Writing
+             note / Saved beneath; the call-detail page polls for
+             the rest to fill in live. -->
+        {#if openableCallId && pipelineStage !== "failed"}
+          <div class="row-actions">
+            <button class="open-app" onclick={openCallInApp}>
+              Open in app
+            </button>
+            <button class="open-web" onclick={openCallInBrowser}>
+              Open on web ↗
+            </button>
+          </div>
         {/if}
       </div>
     {/if}
@@ -582,8 +609,13 @@
     font-weight: 500;
   }
 
-  .open-web {
+  .row-actions {
+    display: flex;
+    gap: 0.4rem;
     flex-shrink: 0;
+  }
+  .open-web,
+  .open-app {
     padding: 0.35rem 0.75rem;
     border: 1px solid var(--accent);
     border-radius: 6px;
@@ -594,9 +626,19 @@
     cursor: pointer;
     transition: all 0.15s;
   }
+  .open-app {
+    /* Primary action lives in-app — filled accent, external link
+       gets the lighter outlined treatment. */
+    background: var(--accent);
+    color: var(--ink-0);
+  }
   .open-web:hover {
     background: var(--accent);
     color: var(--ink-0);
+  }
+  .open-app:hover {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
   }
 
   .inline-error {

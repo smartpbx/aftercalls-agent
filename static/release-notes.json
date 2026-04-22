@@ -1,4 +1,12 @@
 {
+  "0.3.13": {
+    "headline": "You can open a call the moment the transcript's ready — summary fills in live",
+    "changes": [
+      "After a call finishes recording, you don't have to wait for the full pipeline to finish before reading the transcript. The moment transcription completes, an \"Open in app\" and \"Open on web\" button appear right in the progress card — tap either and the call opens immediately, transcript and audio ready to go.",
+      "The summary and action items pop into view on their own as the backend finishes them (the call page polls every 5 seconds while the pipeline is still working). You can keep reading / renaming speakers / listening while the rest generates.",
+      "The Record page's progress indicator still walks through the stages as before (Transcribing → Drafting summary → Writing vault note → Saved), so you can see what's still in flight."
+    ]
+  },
   "0.3.12": {
     "headline": "Diagnostic telemetry, fixed speaker colors, and you'll see an updated privacy policy",
     "changes": [

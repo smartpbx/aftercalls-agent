@@ -170,7 +170,40 @@
       loading = false;
       trace("onMount end loading=false");
     }
+    // Live-refresh while the call is still being processed. Users
+    // land here as soon as the transcript is in; summary + action
+    // items pop in reactively as the backend finishes them. Stops
+    // polling when status reaches a terminal state.
+    startLivePoll();
   });
+
+  let pollTimer: number | undefined;
+  const TERMINAL_STATES = new Set(["complete", "failed"]);
+
+  function startLivePoll() {
+    if (!call) return;
+    if (TERMINAL_STATES.has(call.status)) return;
+    if (pollTimer !== undefined) return;
+    pollTimer = window.setInterval(async () => {
+      try {
+        const fresh = await invoke<Call>("get_call", {
+          id: page.params.id,
+        });
+        // Keep participants + utterances in sync too — rename
+        // propagation can land while we're polling.
+        call = fresh;
+        if (TERMINAL_STATES.has(fresh.status)) {
+          clearInterval(pollTimer);
+          pollTimer = undefined;
+        }
+      } catch (e) {
+        // Swallow — we'll try again next tick. Terminal errors
+        // won't keep us looping forever since the call row eventually
+        // ends up with status=failed.
+        trace("poll tick failed", e);
+      }
+    }, 5000);
+  }
 
   async function createHighlight(range: { start_ms: number; end_ms: number }) {
     if (!call) return;
@@ -312,6 +345,10 @@
 
   onDestroy(() => {
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
+    if (pollTimer !== undefined) {
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+    }
   });
 
   let downloading = $state(false);

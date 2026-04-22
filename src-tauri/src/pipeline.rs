@@ -32,6 +32,14 @@ pub enum PipelineEvent {
     Started { session_dir: String },
     Uploading,
     Transcribing,
+    /// Emitted the moment the transcribe step returns successfully,
+    /// *before* summarize kicks in. This is when the call has a
+    /// usable transcript but no title/summary/action-items yet —
+    /// enough for the agent UI to surface "Open on web" / "Open in
+    /// app" so the user can start reading while the rest of the
+    /// pipeline fills in live (call-detail page polls until
+    /// status='complete').
+    Transcribed { session_dir: String, call_id: String },
     Summarizing,
     WritingNote,
     Done { session_dir: String, note_path: String, call_id: String },
@@ -131,6 +139,16 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     let transcript_json = portal::transcribe(backend, &created.call_id).await?;
     let transcript: MergedTranscript = serde_json::from_value(transcript_json)
         .context("decode transcript from backend")?;
+    // Signal to the UI that the transcript is in and the call is
+    // now openable — the call-detail route polls for summary /
+    // action-items while the rest of the pipeline continues.
+    emit(
+        app,
+        PipelineEvent::Transcribed {
+            session_dir: session_dir.to_string_lossy().into_owned(),
+            call_id: created.call_id.clone(),
+        },
+    );
 
     // Step 6: backend summarize (OpenAI with the org's key).
     // Vault is optional — if the user hasn't enabled Obsidian
