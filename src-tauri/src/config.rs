@@ -17,6 +17,23 @@ pub struct Config {
     pub vault: Option<Vault>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<Backend>,
+    /// When true (default), clicking the X button hides the window to
+    /// the tray and keeps the process + detector alive. When false, X
+    /// exits the app entirely. Kept as a per-user-machine preference
+    /// rather than an org setting because it reflects personal OS-
+    /// close-button habits.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    /// When true (default), the mic-consumer detector watches for
+    /// known call apps (Zoom, Teams, browser call tabs, etc.) and
+    /// prompts to record. Off disables the prompt AND the poll loop
+    /// — no CPU wasted if the user never wants auto-detection.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -52,6 +69,8 @@ impl Config {
                     url: "https://api.aftercalls.io".to_string(),
                     token: None,
                 }),
+                close_to_tray: true,
+                auto_detect: true,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

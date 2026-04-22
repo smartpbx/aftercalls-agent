@@ -328,26 +328,30 @@
   async function downloadCurrentTrack() {
     const url = audioUrls[track];
     if (!url || !call) return;
+    const base = safeFilename(call.title?.trim() || call.session_id);
+    const suffix = track === "mixed" ? "" : `-${track}`;
+    const filename = `${base}${suffix}.opus`;
+    // Ask the user where to save — native dialog, remembers last dir.
+    let dest: string | null = null;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      dest = await save({
+        defaultPath: filename,
+        filters: [{ name: "Opus audio", extensions: ["opus"] }],
+      });
+    } catch (e) {
+      audioError = `Save dialog failed: ${e}`;
+      return;
+    }
+    if (!dest) return;
     downloading = true;
     audioError = "";
     try {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const blob = await resp.blob();
-      const base = safeFilename(call.title?.trim() || call.session_id);
-      const suffix = track === "mixed" ? "" : `-${track}`;
-      // Files are stored as Opus on Spaces. Opus plays natively in every
-      // major OS's default player (Windows 10+, macOS, Linux) and any
-      // modern media tool (VLC, ffmpeg). No transcode on our side.
-      const filename = `${base}${suffix}.opus`;
-      const href = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = href;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(href), 1500);
+      // Hands off to a Rust command that uses reqwest. Browser
+      // `fetch()` from tauri://localhost to Spaces is CORS-blocked
+      // (native <audio> bypasses CORS; fetch doesn't). Rust-side
+      // reqwest doesn't care about origin.
+      await invoke("download_audio", { url, dest });
     } catch (e) {
       audioError = `Download failed: ${e}`;
     } finally {

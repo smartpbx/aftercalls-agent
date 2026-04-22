@@ -39,6 +39,39 @@
 
   let error = $state("");
 
+  // ── App preferences (per-machine) ───────────────────────────────────
+  let closeToTray = $state(true);
+  let autoDetect = $state(true);
+  let prefsSavedAt = $state(0);
+
+  async function loadAppPrefs() {
+    try {
+      const p = await invoke<{ close_to_tray: boolean; auto_detect: boolean }>(
+        "get_app_prefs",
+      );
+      closeToTray = p.close_to_tray;
+      autoDetect = p.auto_detect;
+    } catch (e) {
+      console.warn("get_app_prefs failed", e);
+    }
+  }
+
+  async function saveAppPrefs() {
+    try {
+      await invoke("set_app_prefs", {
+        closeToTray,
+        autoDetect,
+      });
+      prefsSavedAt = Date.now();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  let prefsSavedRecently = $derived(
+    prefsSavedAt > 0 && Date.now() - prefsSavedAt < 2000,
+  );
+
   // ── Obsidian vault (per-machine) ─────────────────────────────────────
   type VaultSettings = {
     enabled: boolean;
@@ -72,6 +105,8 @@
     } catch (e) {
       console.warn("get_vault_settings failed", e);
     }
+
+    await loadAppPrefs();
   });
 
   async function pickVaultDir() {
@@ -192,6 +227,73 @@
     </div>
   </section>
 
+  <section class="card" style="--i: 1.5">
+    <div class="card-head">
+      <div>
+        <h2>Behavior</h2>
+        <p class="hint">
+          How the app handles window close and automatic call detection.
+          Stored per computer.
+        </p>
+      </div>
+      {#if prefsSavedRecently}<span class="saved">Saved</span>{/if}
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Close button</span>
+        <span class="pref-hint">
+          {closeToTray
+            ? "Clicking ✕ hides the window to the tray and keeps recording available."
+            : "Clicking ✕ exits the app. Tray is still available from re-launch."}
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={closeToTray}
+          onchange={(e) => {
+            closeToTray = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {closeToTray ? "To tray" : "Exit"}
+        </span>
+      </label>
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Auto-detect calls</span>
+        <span class="pref-hint">
+          Watches the mic for apps like Zoom, Teams, SmartPBX, and offers to
+          record. When off, the detector doesn't run at all — you'll only
+          record via the button or the hotkey.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={autoDetect}
+          onchange={(e) => {
+            autoDetect = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {autoDetect ? "On" : "Off"}
+        </span>
+      </label>
+    </div>
+  </section>
+
   <section class="card" style="--i: 2">
     <div class="card-head">
       <div>
@@ -305,6 +407,37 @@
 
   .head {
     margin-bottom: 1.6rem;
+  }
+
+  /* ── Behavior preferences ───────────────────────────────────────── */
+  .pref-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1.2rem;
+    padding: 0.7rem 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .pref-row:first-of-type {
+    border-top: none;
+    padding-top: 0.2rem;
+  }
+  .pref-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+  .pref-title {
+    font-size: 0.9rem;
+    color: var(--bone-0);
+    font-weight: 500;
+  }
+  .pref-hint {
+    font-size: 0.78rem;
+    color: var(--bone-3);
+    line-height: 1.45;
+    max-width: 52ch;
   }
 
   /* ── Vault section ──────────────────────────────────────────────── */

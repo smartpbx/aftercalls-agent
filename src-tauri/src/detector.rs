@@ -84,6 +84,21 @@ async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
 }
 
 fn tick(app: &AppHandle, phase: Phase) -> Phase {
+    // Cheap per-tick config read (the file is tiny) so toggling
+    // auto-detect off in Settings takes effect immediately without
+    // having to restart the app. When off, we clear any in-flight
+    // prompt and return to Idle so the user isn't stuck on an
+    // already-fired banner.
+    let auto_detect_on = crate::config::Config::load()
+        .map(|c| c.auto_detect)
+        .unwrap_or(true);
+    if !auto_detect_on {
+        if !matches!(phase, Phase::Idle) {
+            emit(app, AutoDetectEvent::Cleared);
+        }
+        return Phase::Idle;
+    }
+
     let consumers = interesting_mic_consumers();
     let state = app.state::<Recorder>();
     let is_recording = state.is_active();

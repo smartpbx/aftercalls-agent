@@ -1,4 +1,12 @@
 {
+  "0.3.10": {
+    "headline": "Audio download actually saves the file, and Settings gets two behavior toggles",
+    "changes": [
+      "Call detail Download button: now works on the desktop app. v0.3.8-9 used a browser fetch() that hit CORS when the webview tried to pull the audio off Spaces — native <audio> playback bypasses CORS but fetch doesn't. Moved to a native save dialog + Rust-side HTTP fetch, which doesn't care about origins.",
+      "Settings → Behavior → Close button: choose whether clicking ✕ minimizes to tray (default, same as before) or exits the app. Saves instantly.",
+      "Settings → Behavior → Auto-detect calls: toggle the mic-consumer watcher on or off. When off, no Zoom/Teams/SmartPBX detection, no prompts, no polling — you'll only record via the button or Super+Shift+R."
+    ]
+  },
   "0.3.9": {
     "headline": "Windows titlebar actually works now, and Linux updates stop breaking installs",
     "changes": [

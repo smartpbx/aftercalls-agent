@@ -479,6 +479,52 @@ async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+struct AppPrefs {
+    close_to_tray: bool,
+    auto_detect: bool,
+}
+
+#[tauri::command]
+fn get_app_prefs() -> Result<AppPrefs, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    Ok(AppPrefs {
+        close_to_tray: cfg.close_to_tray,
+        auto_detect: cfg.auto_detect,
+    })
+}
+
+#[tauri::command]
+fn set_app_prefs(close_to_tray: bool, auto_detect: bool) -> Result<(), String> {
+    let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
+    cfg.close_to_tray = close_to_tray;
+    cfg.auto_detect = auto_detect;
+    cfg.save().map_err(|e| e.to_string())
+}
+
+/// Stream an audio URL to a user-chosen file path. Exists because
+/// `fetch()` from the Tauri webview (`tauri://localhost`) to Spaces
+/// is blocked by CORS — Spaces doesn't ack the origin. Native
+/// `<audio>` playback works because media elements bypass CORS, but
+/// the Download button in call-detail needs the bytes and can't get
+/// them browser-side. Going through Rust's reqwest sidesteps the
+/// whole origin check.
+#[tauri::command]
+async fn download_audio(url: String, dest: String) -> Result<(), String> {
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("fetch failed: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read body: {e}"))?;
+    std::fs::write(&dest, &bytes).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_peaks(id: String) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
@@ -668,6 +714,9 @@ pub fn run() {
             get_call,
             get_session_audio_path,
             get_audio_urls,
+            download_audio,
+            get_app_prefs,
+            set_app_prefs,
             get_peaks,
             get_vault_settings,
             set_vault_settings,
@@ -700,8 +749,18 @@ pub fn run() {
         .on_window_event(|win, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if win.label() == "main" {
-                    api.prevent_close();
-                    let _ = win.hide();
+                    // Per-user preference: default true (hide to tray),
+                    // false means the X button really quits. Fallback to
+                    // hide-on-close if config can't be read so users
+                    // can't accidentally lock themselves out of tray
+                    // behavior via a bad config.
+                    let close_to_tray = config::Config::load()
+                        .map(|c| c.close_to_tray)
+                        .unwrap_or(true);
+                    if close_to_tray {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
                 }
             }
         })
