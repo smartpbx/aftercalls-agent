@@ -210,6 +210,39 @@ pub async fn get_call(backend: &Backend, id: &str) -> Result<Value> {
     get_json(backend, &format!("/v1/calls/{id}")).await
 }
 
+/// Narrow lookup used by the orphan-recovery scanner (#63). Returns
+/// Some({id, status}) when the backend has a row for this session,
+/// None on 404 (no row — the session never finished the create_call
+/// step or was deleted). Any other status is an error.
+pub async fn get_call_by_session(
+    backend: &Backend,
+    session_id: &str,
+) -> Result<Option<Value>> {
+    let auth = build_auth_header(backend).await?;
+    let c = client()?;
+    let url = format!(
+        "{}/v1/calls/by-session/{}",
+        backend.url.trim_end_matches('/'),
+        session_id,
+    );
+    let resp = c
+        .get(&url)
+        .header("authorization", auth)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    let v: Value = resp.json().await.context("decode call-by-session")?;
+    Ok(Some(v))
+}
+
 pub async fn update_utterance(
     backend: &Backend,
     id: &str,
@@ -486,6 +519,16 @@ pub async fn post_recording_ack(
 
 pub async fn get_recording_prefs(backend: &Backend) -> Result<Value> {
     get_json(backend, "/v1/org/recording-prefs").await
+}
+
+// ── Org member roster (#65) ──────────────────────────────────────────
+
+/// Slim `[{id, display_name, email}]` roster of active org members.
+/// Used by the speaker-rename picker on the call-detail page. Backend
+/// endpoint is readable by any authed user (not admin-gated), so the
+/// normal `build_auth_header` flow suffices.
+pub async fn list_org_members(backend: &Backend) -> Result<Value> {
+    get_json(backend, "/v1/org/members").await
 }
 
 // ── HTTP primitives ──────────────────────────────────────────────────

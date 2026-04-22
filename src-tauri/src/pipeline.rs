@@ -46,7 +46,33 @@ pub enum PipelineEvent {
     Failed { error: String },
 }
 
+/// Count of pipeline tasks currently in flight. Bumped at the top of
+/// `run` and decremented at the end regardless of success/failure. The
+/// tray "Quit" handler reads this (via is_pipeline_active) so it can
+/// ask for confirmation before exiting while work is still in progress
+/// (#62). AtomicUsize because multiple back-to-back recordings can
+/// pipeline concurrently if the user stops/starts fast.
+static PIPELINE_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn is_pipeline_active() -> bool {
+    PIPELINE_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
 pub async fn run(session_dir: PathBuf, app: AppHandle) {
+    PIPELINE_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    // Scope guard in case any early-return is introduced later —
+    // today the function can't panic mid-body because both branches
+    // of the match already run the telemetry flush, but belt-and-
+    // suspenders keeps the counter honest.
+    struct Decrement;
+    impl Drop for Decrement {
+        fn drop(&mut self) {
+            PIPELINE_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let _guard = Decrement;
+
     crate::tray_set_processing(&app);
     let session_str = session_dir.to_string_lossy().into_owned();
     crate::telemetry::log(

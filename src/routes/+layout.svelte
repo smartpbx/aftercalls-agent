@@ -39,6 +39,24 @@
   // while a recording is live. This slide-out anchors to the rail's
   // Record item so it's visible regardless of current route.
   let autoPrompt = $state<{ app: string } | null>(null);
+
+  // Orphan-session recovery (#63). One-shot check at startup for
+  // session_dirs left behind by a crashed / force-quit previous
+  // session. Non-blocking pill in the top-strip, expandable via
+  // "Review…" into a per-session list. Auto-clean for dirs older
+  // than 7 days happens Rust-side inside list_orphan_sessions.
+  type OrphanSession = {
+    session_id: string;
+    recorded_at: string;
+    age_minutes: number;
+  };
+  let orphans = $state<OrphanSession[]>([]);
+  let orphanReview = $state(false);
+  // Set of session_ids currently being resumed or discarded so the
+  // per-row buttons can show disabled state without hiding the row
+  // before the async work completes.
+  let orphanBusy = $state<Set<string>>(new Set());
+  let orphanBulkBusy = $state(false);
   // PIPEDA ack modal state for the auto-detect start path. The Record
   // page owns its own ack modal for the manual Start Recording
   // button; having a second one here keeps the auto flow self-
@@ -351,6 +369,14 @@
     // (returning session). Otherwise wait for the login event below.
     await maybeShowReleaseNotes();
 
+    // Orphan-recovery scan (#63). Only meaningful when the user is
+    // authed — scan_orphans talks to the backend to distinguish
+    // complete calls from half-processed ones. Skip on the login
+    // page; we'll pick it up again post-login via handleLoginEvent.
+    if (me) {
+      await loadOrphans();
+    }
+
     // The /login page fires this after a successful sign-in so we can
     // refresh the layout's user state + show the release-notes modal
     // personalized with the just-logged-in name.
@@ -362,6 +388,95 @@
       me = await invoke<Me | null>("current_user");
     } catch {}
     await maybeShowReleaseNotes();
+    // Fresh login → check for leftover sessions from a previous run.
+    // Same call as the onMount path; idempotent.
+    await loadOrphans();
+  }
+
+  async function loadOrphans() {
+    try {
+      orphans = await invoke<OrphanSession[]>("list_orphan_sessions");
+    } catch (e) {
+      // Scan failures (missing recordings dir, backend hiccup) aren't
+      // worth surfacing — under-report rather than nag.
+      console.warn("list_orphan_sessions failed", e);
+      orphans = [];
+    }
+  }
+
+  function ageLabel(mins: number): string {
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs} hr ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+  }
+
+  async function resumeOrphan(id: string) {
+    if (orphanBusy.has(id)) return;
+    orphanBusy = new Set([...orphanBusy, id]);
+    try {
+      await invoke("resume_orphan_session", { sessionId: id });
+      orphans = orphans.filter((o) => o.session_id !== id);
+    } catch (e) {
+      console.warn("resume_orphan_session failed", e);
+    } finally {
+      const next = new Set(orphanBusy);
+      next.delete(id);
+      orphanBusy = next;
+      if (orphans.length === 0) orphanReview = false;
+    }
+  }
+
+  async function discardOrphan(id: string) {
+    if (orphanBusy.has(id)) return;
+    orphanBusy = new Set([...orphanBusy, id]);
+    try {
+      await invoke("discard_orphan_session", { sessionId: id });
+      orphans = orphans.filter((o) => o.session_id !== id);
+    } catch (e) {
+      console.warn("discard_orphan_session failed", e);
+    } finally {
+      const next = new Set(orphanBusy);
+      next.delete(id);
+      orphanBusy = next;
+      if (orphans.length === 0) orphanReview = false;
+    }
+  }
+
+  async function resumeAllOrphans() {
+    if (orphanBulkBusy) return;
+    orphanBulkBusy = true;
+    // Sequential so we don't hammer the backend with N parallel
+    // transcribe + summarize jobs. Each call returns once the
+    // pipeline has been spawned server-side (the Tauri command
+    // fire-and-forgets the run), so "sequential" here really just
+    // serializes the resume HTTP handshake, not the full pipeline.
+    for (const o of [...orphans]) {
+      try {
+        await invoke("resume_orphan_session", { sessionId: o.session_id });
+        orphans = orphans.filter((x) => x.session_id !== o.session_id);
+      } catch (e) {
+        console.warn("resume all: session failed", o.session_id, e);
+      }
+    }
+    orphanBulkBusy = false;
+    orphanReview = false;
+  }
+
+  async function discardAllOrphans() {
+    if (orphanBulkBusy) return;
+    orphanBulkBusy = true;
+    for (const o of [...orphans]) {
+      try {
+        await invoke("discard_orphan_session", { sessionId: o.session_id });
+        orphans = orphans.filter((x) => x.session_id !== o.session_id);
+      } catch (e) {
+        console.warn("discard all: session failed", o.session_id, e);
+      }
+    }
+    orphanBulkBusy = false;
+    orphanReview = false;
   }
 
   // Shows the release-notes modal at most once per "new" version per
@@ -648,10 +763,13 @@
             <span class="glyph">{@html it.icon}</span>
             <span class="label">{it.label}</span>
           </a>
-          {#if it.href === "/" && autoPrompt}
-            <!-- Auto-detect slide-out (#59). Anchored to the Record
-                 nav item so it's visible from every route, not just
-                 /record. Doesn't steal focus; doesn't route-change. -->
+          {#if it.href === "/" && autoPrompt && page.url.pathname !== "/"}
+            <!-- Auto-detect slide-out (#59, #60). Shown only when the
+                 user is on a route OTHER than /record — the Record
+                 page has its own inline banner. Anchored to the
+                 Record nav item so it's visible whether the user is
+                 on /calls, /settings, etc. No focus-steal, no route
+                 change. -->
             <div class="auto-slideout" role="dialog" aria-label="Call detected">
               <div class="auto-head">
                 <span class="auto-pip" aria-hidden="true"></span>
@@ -801,6 +919,36 @@
       </div>
 
       <div class="strip-right">
+        {#if orphans.length > 0}
+          <!-- Orphan recovery pill (#63). Same shape as the update
+               pill: a thin rounded chip with status pip + label +
+               primary + dismiss action. Sig-yellow pip so it reads
+               as an interrupt without the warning-red weight. -->
+          <div class="update">
+            <span class="pip sig"></span>
+            <span class="update-label">
+              {orphans.length} unfinished call{orphans.length === 1 ? "" : "s"}
+              from before the last restart
+            </span>
+            <button
+              class="update-install"
+              onclick={resumeAllOrphans}
+              disabled={orphanBulkBusy}
+            >
+              {orphanBulkBusy ? "Working…" : "Resume all"}
+            </button>
+            <button
+              class="update-dismiss"
+              onclick={discardAllOrphans}
+              disabled={orphanBulkBusy}
+            >Discard all</button>
+            <button
+              class="update-dismiss"
+              onclick={() => (orphanReview = !orphanReview)}
+              disabled={orphanBulkBusy}
+            >{orphanReview ? "Hide" : "Review…"}</button>
+          </div>
+        {/if}
         {#if updateAvailable}
           <div class="update">
             {#if updateState === "downloading"}
@@ -914,6 +1062,43 @@
         {/if}
       </div>
     </header>
+
+    {#if orphans.length > 0 && orphanReview}
+      <!-- Expanded per-session review. Docks below the top strip so
+           the user can act on each session individually. Reuses the
+           pill's bone/ink palette for consistency with the pill
+           above it. -->
+      <div class="orphan-review" role="region" aria-label="Unfinished recordings">
+        <ul class="orphan-list">
+          {#each orphans as o (o.session_id)}
+            {@const busy = orphanBusy.has(o.session_id)}
+            <li class="orphan-row">
+              <div class="orphan-meta">
+                <span class="orphan-time">
+                  {new Date(o.recorded_at).toLocaleString(undefined, {
+                    dateStyle: "medium",
+                    timeStyle: "short",
+                  })}
+                </span>
+                <span class="orphan-age">· {ageLabel(o.age_minutes)}</span>
+              </div>
+              <div class="orphan-actions">
+                <button
+                  class="update-install"
+                  onclick={() => resumeOrphan(o.session_id)}
+                  disabled={busy || orphanBulkBusy}
+                >{busy ? "…" : "Resume"}</button>
+                <button
+                  class="update-dismiss"
+                  onclick={() => discardOrphan(o.session_id)}
+                  disabled={busy || orphanBulkBusy}
+                >{busy ? "…" : "Discard"}</button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
 
     <div class="page">
       {@render children()}
@@ -1369,6 +1554,60 @@
   .update-dismiss:hover {
     color: var(--bone-0);
     border-color: var(--hairline-hi);
+  }
+
+  /* ── Orphan recovery (#63) ─────────────────────────────────────────
+     Expanded review panel docks just under the top strip. Bone/ink
+     palette to read as a system notification band rather than shouting
+     for attention. */
+  .orphan-review {
+    border-bottom: 1px solid var(--hairline);
+    background: var(--ink-1);
+  }
+  .orphan-list {
+    list-style: none;
+    margin: 0;
+    padding: 0.5rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .orphan-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-0);
+  }
+  .orphan-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--bone-1);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .orphan-time {
+    font-weight: 500;
+    color: var(--bone-0);
+  }
+  .orphan-age {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-3);
+  }
+  .orphan-actions {
+    display: flex;
+    gap: 0.4rem;
+    flex-shrink: 0;
   }
 
   .pip.sig {

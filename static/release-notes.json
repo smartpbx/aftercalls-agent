@@ -1,4 +1,15 @@
 {
+  "0.3.23": {
+    "headline": "Recovery from crashes, Windows call-detect, tag inline, smarter rename, polish",
+    "changes": [
+      "Crash recovery on launch. If the app crashed or was force-quit while a call was still being transcribed or summarized, the next time you sign in you'll see a small pill offering to resume the unfinished calls. Review, Resume all, or Discard — nothing stays buried in a folder.",
+      "Windows mic-use detection. Starting Zoom, Teams, or a phone-call app on Windows now surfaces the same \"Call detected\" slide-out Linux users have always gotten. No more missed auto-records on Windows.",
+      "Tags now live inline with the title, right next to the source app chip — no whole separate section for them. Remove with ×, click to filter, + Add tag still works.",
+      "Rename a participant and you'll now get an autocomplete of your team alongside the free-form name field. Recently-used teammates float to the top, type to search the full list, Enter still saves whatever you type for external folks not in your org.",
+      "Auto-detect slide-out now suppresses itself when you're already on the Record page — the page's own banner handles it, no duplicate UI.",
+      "Quitting aftercalls while a call is still processing now asks first. Close-to-tray still works the same — only a deliberate Quit triggers the confirm."
+    ]
+  },
   "0.3.22": {
     "headline": "Call-detected now slides in without pulling you off the page",
     "changes": [

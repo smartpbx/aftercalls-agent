@@ -301,10 +301,173 @@ fn raw_mic_consumers() -> Vec<String> {
     result
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn raw_mic_consumers() -> Vec<String> {
-    // TODO(windows): enumerate active WASAPI capture sessions and map each
-    // session's ProcessId to its executable name.
+    match windows_mic_consumers() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("aftercalls: WASAPI session enumeration failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_mic_consumers() -> Result<Vec<String>, String> {
+    use windows::core::{Interface, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE};
+    use windows::Win32::Media::Audio::{
+        eCapture, AudioSessionStateInactive, IAudioSessionControl2, IAudioSessionManager2,
+        IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        // COM init: per-thread. Ignore RPC_E_CHANGED_MODE (already inited
+        // differently) and S_FALSE (already inited same mode).
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if let Err(e) = hr.ok() {
+            if e.code() != RPC_E_CHANGED_MODE {
+                return Err(format!("CoInitializeEx: {e}"));
+            }
+        }
+
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
+
+        let devices = enumerator
+            .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+            .map_err(|e| format!("EnumAudioEndpoints: {e}"))?;
+
+        let device_count = devices
+            .GetCount()
+            .map_err(|e| format!("IMMDeviceCollection::GetCount: {e}"))?;
+
+        let own_pid = std::process::id();
+        let mut result: Vec<String> = Vec::new();
+        let mut seen_pids: HashSet<u32> = HashSet::new();
+
+        for i in 0..device_count {
+            let device = match devices.Item(i) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("aftercalls: IMMDeviceCollection::Item({i}): {e}");
+                    continue;
+                }
+            };
+
+            let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("aftercalls: IMMDevice::Activate IAudioSessionManager2: {e}");
+                    continue;
+                }
+            };
+
+            let session_enum = match session_manager.GetSessionEnumerator() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("aftercalls: GetSessionEnumerator: {e}");
+                    continue;
+                }
+            };
+
+            let session_count = match session_enum.GetCount() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("aftercalls: IAudioSessionEnumerator::GetCount: {e}");
+                    continue;
+                }
+            };
+
+            for s in 0..session_count {
+                let control = match session_enum.GetSession(s) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let control2: IAudioSessionControl2 = match control.cast() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                let pid = match control2.GetProcessId() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                if pid == 0 || pid == own_pid {
+                    continue;
+                }
+
+                // Active use only — skip inactive/expired sessions.
+                if let Ok(state) = control.GetState() {
+                    if state == AudioSessionStateInactive {
+                        continue;
+                    }
+                }
+
+                if !seen_pids.insert(pid) {
+                    continue;
+                }
+
+                match process_exe_basename(pid) {
+                    Ok(name) if !name.is_empty() => result.push(name),
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("aftercalls: process_exe_basename({pid}): {e}");
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    #[inline]
+    unsafe fn process_exe_basename(pid: u32) -> Result<String, String> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let handle: HANDLE =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
+
+        let mut buf: [u16; 1024] = [0; 1024];
+        let mut size: u32 = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+
+        let _ = CloseHandle(handle);
+
+        result.map_err(|e| format!("QueryFullProcessImageNameW: {e}"))?;
+
+        let slice = &buf[..size as usize];
+        let full = OsString::from_wide(slice)
+            .to_string_lossy()
+            .into_owned();
+        let base = full
+            .rsplit(|c| c == '\\' || c == '/')
+            .next()
+            .unwrap_or(&full)
+            .to_string();
+        Ok(base)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn raw_mic_consumers() -> Vec<String> {
+    // macOS + other unsupported platforms: auto-detect is a no-op.
     Vec::new()
 }
 

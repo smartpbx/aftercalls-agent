@@ -140,11 +140,11 @@
       },
     );
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
-      // prompt_start is handled by the layout-level slide-out now
-      // (#59) so the user can see + respond to it from any route.
-      // The Record page still owns prompt_end (mid-recording idle
-      // mic) since the user is almost always on /record while live.
-      if (evt.payload.kind === "prompt_start") return;
+      // prompt_start rendered here as an inline banner when the user
+      // is already on /record (#60). The layout's slide-out suppresses
+      // itself on /record so there's no duplicate UI. prompt_end
+      // (mid-recording idle-mic) always lives here since the user is
+      // almost always on /record during a live recording.
       const next = evt.payload.kind === "cleared" ? null : evt.payload;
       if (next && !prompt) notifyAutoDetect();
       prompt = next;
@@ -345,10 +345,17 @@
     }
   }
 
-  // prompt_start's confirmStart/dismissStart moved to the layout's
-  // auto-detect slide-out (#59). This page keeps confirmEnd +
-  // keepRecording for the mid-recording prompt_end case which is
-  // usually viewed on /record anyway.
+  // prompt_start is rendered inline on this page when the user is
+  // already on /record (#60). The layout's slide-out suppresses
+  // itself on this route so only one UI shows.
+  async function confirmStart() {
+    const ok = await ensureRecordingAcknowledged("auto");
+    if (!ok) return;
+    await invoke("confirm_auto_start");
+  }
+  async function dismissStart() {
+    await invoke("dismiss_auto_start");
+  }
   async function confirmEnd() {
     await invoke("confirm_auto_end");
   }
@@ -390,11 +397,24 @@
     </p>
   </header>
 
-  <!-- Auto-detect banners. prompt_start is handled layout-side
-       (see #59) so it surfaces on any route without a page swap.
-       prompt_end stays here because the user is practically always
-       on /record while a recording is live. -->
-  {#if prompt?.kind === "prompt_end"}
+  <!-- Auto-detect banners. prompt_start fires here when the user is
+       already on /record; the layout slide-out suppresses itself on
+       this route (#60). prompt_end always lives here since the user
+       is practically always on /record while a recording is live. -->
+  {#if prompt?.kind === "prompt_start"}
+    <div class="banner" style="--i: 1">
+      <div class="banner-body">
+        <p class="banner-label">Detected</p>
+        <p class="banner-text">
+          <strong>{prompt.app}</strong> is using the microphone. Record this call?
+        </p>
+      </div>
+      <div class="banner-actions">
+        <button class="btn primary" onclick={confirmStart}>Start recording</button>
+        <button class="btn ghost" onclick={dismissStart}>Dismiss</button>
+      </div>
+    </div>
+  {:else if prompt?.kind === "prompt_end"}
     <div class="banner" style="--i: 1">
       <div class="banner-body">
         <p class="banner-label">Idle mic</p>

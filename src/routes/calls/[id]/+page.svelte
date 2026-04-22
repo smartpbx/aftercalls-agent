@@ -274,6 +274,83 @@
   let speakerEditValue = $state("");
   let savingSpeaker = $state(false);
 
+  // ── Org-member picker for rename (#65) ───────────────────────────────
+  // Fetched once via the `org_members` Tauri command when the user
+  // opens a rename editor; held per-page-instance. Recents are in
+  // localStorage (the Tauri webview supports it) with the same key as
+  // the portal so the UX matches across the two clients.
+  type OrgMember = { id: string; display_name: string; email: string };
+  let memberRoster = $state<OrgMember[]>([]);
+  let memberRosterLoaded = $state(false);
+  const RECENT_KEY = "aftercalls.recentRenames";
+  const RECENT_CAP = 10;
+  type RecentRename = { display_name: string; timestamp: number };
+  function readRecents(): RecentRename[] {
+    try {
+      const raw = localStorage.getItem(RECENT_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr
+        .filter(
+          (e): e is RecentRename =>
+            !!e &&
+            typeof e.display_name === "string" &&
+            typeof e.timestamp === "number",
+        )
+        .slice(0, RECENT_CAP);
+    } catch {
+      return [];
+    }
+  }
+  function pushRecent(name: string) {
+    const now = Date.now();
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const existing = readRecents().filter(
+      (e) => e.display_name.toLowerCase() !== trimmed.toLowerCase(),
+    );
+    const next = [{ display_name: trimmed, timestamp: now }, ...existing].slice(
+      0,
+      RECENT_CAP,
+    );
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+    } catch {}
+  }
+  async function ensureMemberRoster() {
+    if (memberRosterLoaded) return;
+    memberRosterLoaded = true;
+    try {
+      const rows = await invoke<OrgMember[]>("org_members");
+      memberRoster = Array.isArray(rows) ? rows : [];
+    } catch {
+      memberRoster = [];
+    }
+  }
+  let memberDropdownRows = $derived.by<{
+    recent: { name: string }[];
+    all: OrgMember[];
+  }>(() => {
+    if (editingSpeaker === null) return { recent: [], all: [] };
+    const q = speakerEditValue.trim().toLowerCase();
+    const rosterByName = new Map(
+      memberRoster.map((m) => [m.display_name.toLowerCase(), m]),
+    );
+    const recentRows = readRecents()
+      .filter((e) => rosterByName.has(e.display_name.toLowerCase()))
+      .slice(0, 3)
+      .map((e) => ({ name: e.display_name }));
+    const allRows = memberRoster.filter((m) => {
+      if (!q) return true;
+      return (
+        m.display_name.toLowerCase().includes(q) ||
+        m.email.toLowerCase().includes(q)
+      );
+    });
+    return { recent: recentRows, all: allRows };
+  });
+
   // Heavy tracing on this route while we're diagnosing the blank-on-click
   // crash. console.error because webkit2gtk has been swallowing warn/log
   // output intermittently — error shows up reliably.
@@ -770,6 +847,7 @@
   function startSpeakerRename(current: string) {
     editingSpeaker = current;
     speakerEditValue = current;
+    void ensureMemberRoster();
   }
 
   function cancelSpeakerRename() {
@@ -777,10 +855,10 @@
     speakerEditValue = "";
   }
 
-  async function saveSpeakerRename() {
+  async function saveSpeakerRename(override?: string) {
     if (!call || !editingSpeaker) return;
     const from = editingSpeaker;
-    const to = speakerEditValue.trim();
+    const to = (override ?? speakerEditValue).trim();
     if (!to || to === from) {
       cancelSpeakerRename();
       return;
@@ -788,6 +866,7 @@
     savingSpeaker = true;
     try {
       await invoke<number>("rename_speaker", { id: call.id, from, to });
+      pushRecent(to);
       // Refetch the whole call — the backend rename rewrites summary +
       // action items + participants in the same transaction, and
       // locally patching only utterances left the portal-synced bits
@@ -799,6 +878,11 @@
     } finally {
       savingSpeaker = false;
     }
+  }
+
+  function pickMemberForSpeaker(name: string) {
+    speakerEditValue = name;
+    void saveSpeakerRename(name);
   }
 
   // Stable per-speaker accent colors. "You" always gets the brand accent; others
@@ -957,10 +1041,7 @@
               (untitled)
             {/if}
           </h1>
-          <p class="chip-row">
-            {#if call.matched_client}
-              <span class="chip chip-accent">{call.matched_client}</span>
-            {/if}
+          <div class="chip-row">
             {#if prettyApp(call.source_app)}
               <span class="chip" title={sourceKindLabel(call.source_kind)}>
                 <span class="src-dot" aria-hidden="true"></span>
@@ -969,7 +1050,101 @@
             {:else if call.source_kind}
               <span class="chip">{sourceKindLabel(call.source_kind)}</span>
             {/if}
-          </p>
+            <!-- Tags inline with the title metadata (#61). Each chip
+                 grouped by kind via .k-<kind>. Clicking a chip drills
+                 into the calls list filtered on that tag. matched_client
+                 is intentionally NOT rendered as its own chip anymore —
+                 the client tag (kind=client) covers it. -->
+            {#each groupedTags as t (t.kind + ":" + t.value)}
+              <span class="tag-chip k-{t.kind}">
+                <a
+                  class="tag-chip-link"
+                  href="/calls?tag={encodeURIComponent(t.kind + ':' + t.value)}"
+                  title="Filter calls by {t.kind}: {t.value}"
+                >{t.value}</a>
+                {#if canEditTags}
+                  <button
+                    type="button"
+                    class="tag-chip-x"
+                    onclick={() => removeTag(t)}
+                    aria-label="Remove tag {t.value}"
+                    title="Remove"
+                  >×</button>
+                {/if}
+              </span>
+            {/each}
+            {#if canEditTags}
+              <span class="tag-add-wrap">
+                <button
+                  type="button"
+                  class="tag-add-pill"
+                  onclick={openTagAdd}
+                  aria-expanded={tagAddOpen}
+                >+ Add tag</button>
+                {#if tagAddOpen}
+                  <div class="tag-popover" role="dialog" aria-label="Add tag">
+                    <div class="tag-kind-row" role="radiogroup" aria-label="Tag kind">
+                      {#each ["client", "purpose", "topic", "custom"] as k (k)}
+                        <button
+                          type="button"
+                          class="tag-kind-btn k-{k}"
+                          class:active={tagAddKind === k}
+                          role="radio"
+                          aria-checked={tagAddKind === k}
+                          onclick={() => onTagKindChange(k as TagKind)}
+                        >{k}</button>
+                      {/each}
+                    </div>
+                    <div class="tag-input-row">
+                      <input
+                        bind:this={tagInputEl}
+                        class="tag-input"
+                        type="text"
+                        placeholder="Type to search or add new…"
+                        bind:value={tagAddValue}
+                        oninput={onTagInput}
+                        onkeydown={onTagInputKeydown}
+                        autocomplete="off"
+                      />
+                      <button
+                        type="button"
+                        class="tag-save"
+                        disabled={tagAddSaving || !tagAddValue.trim()}
+                        onclick={() => saveNewTag(tagAddValue)}
+                      >
+                        {tagAddSaving ? "Saving…" : "Save"}
+                      </button>
+                      <button
+                        type="button"
+                        class="tag-cancel"
+                        onclick={closeTagAdd}
+                        disabled={tagAddSaving}
+                      >Cancel</button>
+                    </div>
+                    {#if tagSuggestions.length > 0}
+                      <ul class="tag-suggest" role="listbox">
+                        {#each tagSuggestions as s (s.kind + ":" + s.value)}
+                          <li>
+                            <button
+                              type="button"
+                              class="tag-suggest-item"
+                              onclick={() => pickSuggestion(s)}
+                            >
+                              <span class="tag-suggest-value">{s.value}</span>
+                              <span class="tag-suggest-count">· used {s.count}×</span>
+                            </button>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                    {#if tagAddError}
+                      <p class="tag-error">{tagAddError}</p>
+                    {/if}
+                  </div>
+                {/if}
+              </span>
+            {/if}
+          </div>
         </div>
         <button class="delete" disabled={deleting} onclick={askDeleteCall}>
           {deleting ? "Deleting…" : "Delete"}
@@ -1189,25 +1364,57 @@
         <div class="chips">
           {#each speakers as p (p.speaker)}
             {#if editingSpeaker === p.speaker}
-              <div class="chip chip-editing">
-                <input
-                  class="chip-input"
-                  bind:value={speakerEditValue}
-                  onkeydown={(e) => {
-                    if (e.key === "Enter") saveSpeakerRename();
-                    if (e.key === "Escape") cancelSpeakerRename();
-                  }}
-                />
-                <button
-                  class="chip-save"
-                  disabled={savingSpeaker}
-                  onclick={saveSpeakerRename}
-                >
-                  {savingSpeaker ? "…" : "Save"}
-                </button>
-                <button class="chip-cancel" onclick={cancelSpeakerRename}>
-                  Cancel
-                </button>
+              <div class="chip chip-editing member-combo">
+                <div class="combo-row">
+                  <input
+                    class="chip-input"
+                    bind:value={speakerEditValue}
+                    autocomplete="off"
+                    onkeydown={(e) => {
+                      if (e.key === "Enter") saveSpeakerRename();
+                      if (e.key === "Escape") cancelSpeakerRename();
+                    }}
+                  />
+                  <button
+                    class="chip-save"
+                    disabled={savingSpeaker}
+                    onclick={() => saveSpeakerRename()}
+                  >
+                    {savingSpeaker ? "…" : "Save"}
+                  </button>
+                  <button class="chip-cancel" onclick={cancelSpeakerRename}>
+                    Cancel
+                  </button>
+                </div>
+                {#if memberDropdownRows.recent.length > 0 || memberDropdownRows.all.length > 0}
+                  <div class="member-dropdown" role="listbox">
+                    {#if memberDropdownRows.recent.length > 0}
+                      <div class="member-section-hdr">Recently used</div>
+                      {#each memberDropdownRows.recent as r (r.name)}
+                        <button
+                          type="button"
+                          class="member-row"
+                          onclick={() => pickMemberForSpeaker(r.name)}
+                        >
+                          <span class="member-name">{r.name}</span>
+                        </button>
+                      {/each}
+                    {/if}
+                    {#if memberDropdownRows.all.length > 0}
+                      <div class="member-section-hdr">All members</div>
+                      {#each memberDropdownRows.all as m (m.id)}
+                        <button
+                          type="button"
+                          class="member-row"
+                          onclick={() => pickMemberForSpeaker(m.display_name)}
+                        >
+                          <span class="member-name">{m.display_name}</span>
+                          <span class="member-email">{m.email}</span>
+                        </button>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
               </div>
             {:else}
               <button
@@ -1231,119 +1438,6 @@
         </div>
       </section>
     {/if}
-
-    <!-- ── Tags (#57) — mirrors the portal. See design.md §Tag chip
-         for the shared vocabulary; the calls-list filter reuses the
-         same class set. -->
-    <section class="block tags-section" style="--i: 2.5">
-      <div class="block-head">
-        <h2>Tags</h2>
-      </div>
-      {#if (call.tags?.length ?? 0) === 0}
-        <div class="tag-row tag-empty-row">
-          <span class="tag-empty">No tags yet</span>
-          {#if canEditTags}
-            <button
-              type="button"
-              class="tag-add-pill"
-              onclick={openTagAdd}
-              aria-expanded={tagAddOpen}
-            >+ Add tag</button>
-          {/if}
-        </div>
-      {:else}
-        <div class="tag-row">
-          {#each groupedTags as t (t.kind + ":" + t.value)}
-            <span class="tag-chip k-{t.kind}">
-              <a
-                class="tag-chip-link"
-                href="/calls?tag={encodeURIComponent(t.kind + ':' + t.value)}"
-                title="Filter calls by {t.kind}: {t.value}"
-              >{t.value}</a>
-              {#if canEditTags}
-                <button
-                  type="button"
-                  class="tag-chip-x"
-                  onclick={() => removeTag(t)}
-                  aria-label="Remove tag {t.value}"
-                  title="Remove"
-                >×</button>
-              {/if}
-            </span>
-          {/each}
-          {#if canEditTags}
-            <button
-              type="button"
-              class="tag-add-pill"
-              onclick={openTagAdd}
-              aria-expanded={tagAddOpen}
-            >+ Add tag</button>
-          {/if}
-        </div>
-      {/if}
-
-      {#if tagAddOpen && canEditTags}
-        <div class="tag-popover" role="dialog" aria-label="Add tag">
-          <div class="tag-kind-row" role="radiogroup" aria-label="Tag kind">
-            {#each ["client", "purpose", "topic", "custom"] as k (k)}
-              <button
-                type="button"
-                class="tag-kind-btn k-{k}"
-                class:active={tagAddKind === k}
-                role="radio"
-                aria-checked={tagAddKind === k}
-                onclick={() => onTagKindChange(k as TagKind)}
-              >{k}</button>
-            {/each}
-          </div>
-          <div class="tag-input-row">
-            <input
-              bind:this={tagInputEl}
-              class="tag-input"
-              type="text"
-              placeholder="Type to search or add new…"
-              bind:value={tagAddValue}
-              oninput={onTagInput}
-              onkeydown={onTagInputKeydown}
-              autocomplete="off"
-            />
-            <button
-              type="button"
-              class="tag-save"
-              disabled={tagAddSaving || !tagAddValue.trim()}
-              onclick={() => saveNewTag(tagAddValue)}
-            >
-              {tagAddSaving ? "Saving…" : "Save"}
-            </button>
-            <button
-              type="button"
-              class="tag-cancel"
-              onclick={closeTagAdd}
-              disabled={tagAddSaving}
-            >Cancel</button>
-          </div>
-          {#if tagSuggestions.length > 0}
-            <ul class="tag-suggest" role="listbox">
-              {#each tagSuggestions as s (s.kind + ":" + s.value)}
-                <li>
-                  <button
-                    type="button"
-                    class="tag-suggest-item"
-                    onclick={() => pickSuggestion(s)}
-                  >
-                    <span class="tag-suggest-value">{s.value}</span>
-                    <span class="tag-suggest-count">· used {s.count}×</span>
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          {#if tagAddError}
-            <p class="tag-error">{tagAddError}</p>
-          {/if}
-        </div>
-      {/if}
-    </section>
 
     {#if call.summary_text}
       <section class="block" style="--i: 3">
@@ -1603,6 +1697,13 @@
     gap: 0.4rem;
     align-items: center;
   }
+  /* Wrap around the + Add pill so the popover can position absolute
+     relative to the pill (not the whole chip-row). Inline-block so
+     the wrap sits in the flex flow like any other chip. */
+  .tag-add-wrap {
+    position: relative;
+    display: inline-block;
+  }
 
   .src-dot {
     width: 5px;
@@ -1719,6 +1820,66 @@
   .chip-save:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  /* ── Member autocomplete (rename picker #65) ─────────────────────── */
+  .member-combo {
+    position: relative;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.4rem;
+  }
+  .combo-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .member-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 0.35rem;
+    min-width: 18rem;
+    max-height: 16rem;
+    overflow-y: auto;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+    box-shadow: 0 14px 28px -10px rgba(0, 0, 0, 0.55);
+    z-index: 20;
+    padding: 0.3rem 0;
+  }
+  .member-section-hdr {
+    padding: 0.35rem 0.7rem 0.2rem;
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+  }
+  .member-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    width: 100%;
+    padding: 0.35rem 0.7rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-1);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+  .member-row:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .member-name {
+    font-size: 0.85rem;
+  }
+  .member-email {
+    font-size: 0.72rem;
+    color: var(--bone-3);
   }
 
   /* ── Player ────────────────────────────────────────────────────────── */
@@ -2453,13 +2614,21 @@
   }
 
   .tag-popover {
-    margin-top: 0.7rem;
+    /* Floats above content — anchored to the + Add pill via the
+       inline-block .tag-add-wrap. Using left:0 keeps it left-aligned
+       with the pill; flip to right:0 if the popover ever clips the
+       viewport on the right. */
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    left: 0;
+    z-index: 30;
+    width: max(320px, 100%);
+    max-width: 520px;
     padding: 0.9rem 1rem 1rem;
     border: 1px solid var(--hairline-hi);
     border-radius: var(--radius);
     background: var(--ink-1);
     box-shadow: 0 14px 30px -14px rgba(0, 0, 0, 0.5);
-    max-width: 520px;
   }
   .tag-kind-row {
     display: flex;

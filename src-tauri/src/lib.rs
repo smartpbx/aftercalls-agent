@@ -3,6 +3,7 @@ mod detector;
 mod pipeline;
 mod portal;
 mod recorder;
+mod recovery;
 mod summary;
 mod telemetry;
 mod transcription;
@@ -714,6 +715,21 @@ async fn rename_speaker(id: String, from: String, to: String) -> Result<u64, Str
         .map_err(|e| e.to_string())
 }
 
+// Slim org roster for the speaker-rename autocomplete (#65). Any
+// authed member can read; callers that aren't logged in surface the
+// auth-header error which the UI already swallows.
+#[tauri::command]
+async fn org_members() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::list_org_members(backend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn update_call_tags(
     id: String,
@@ -730,6 +746,34 @@ async fn update_call_tags(
 }
 
 
+// ── Orphan session recovery (#63) ────────────────────────────────────
+
+#[tauri::command]
+async fn list_orphan_sessions(app: AppHandle) -> Result<Vec<recovery::OrphanSession>, String> {
+    Ok(recovery::scan_orphans(&app).await)
+}
+
+#[tauri::command]
+async fn resume_orphan_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let path = recovery::resolve_session_dir(&app, &session_id)
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    // Spawn so the frontend's await resolves as soon as the pipeline
+    // has been handed off, rather than blocking until the whole
+    // transcribe+summarize run finishes (minutes).
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        recovery::resume(app_clone, path).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn discard_orphan_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let path = recovery::resolve_session_dir(&app, &session_id)
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    recovery::discard(&path).await
+}
+
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<Recorder>();
     if state.is_active() {
@@ -745,6 +789,58 @@ fn toggle_recording(app: &AppHandle) {
             Err(e) => eprintln!("aftercalls: hotkey start error: {e}"),
         }
     }
+}
+
+/// Tray Quit handler with a confirm dialog when work is in flight
+/// (#62). Close-to-tray path (X button) is separate — that one
+/// intentionally never quits. Only reached from the tray "Quit"
+/// menu item and any future programmatic quit.
+fn quit_with_confirm(app: AppHandle) {
+    // Recorder active or pipeline in flight → ask first. Otherwise
+    // exit immediately so casual quits aren't slowed down by a
+    // popup on every session.
+    let pipeline_busy = pipeline::is_pipeline_active();
+    let recorder_busy = app
+        .try_state::<recorder::Recorder>()
+        .map(|r| r.is_active())
+        .unwrap_or(false);
+    if !pipeline_busy && !recorder_busy {
+        app.exit(0);
+        return;
+    }
+    let body = if recorder_busy && pipeline_busy {
+        "aftercalls is recording and still processing a call. Quit anyway?"
+    } else if recorder_busy {
+        "aftercalls is recording right now. Quit anyway?"
+    } else {
+        "aftercalls is still processing a call in the background. Quit anyway?"
+    };
+    // tauri-plugin-dialog::ask pops a native OS dialog. Running it on
+    // the async runtime so the tray menu callback returns promptly
+    // rather than blocking the event loop.
+    let app_for_dialog = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+        // Show the window so the dialog has a visible parent on Linux
+        // (GTK dialogs can land offscreen when the parent is hidden).
+        show_main_window(&app_for_dialog);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app_for_dialog
+            .dialog()
+            .message(body)
+            .title("Quit aftercalls?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Quit anyway".into(),
+                "Keep running".into(),
+            ))
+            .show(move |confirmed| {
+                let _ = tx.send(confirmed);
+            });
+        if rx.await.unwrap_or(false) {
+            app_for_dialog.exit(0);
+        }
+    });
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -796,7 +892,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 // Frontend listens for this and routes to /settings.
                 let _ = app.emit("tray-open", "settings");
             }
-            "quit" => app.exit(0),
+            "quit" => quit_with_confirm(app.clone()),
             _ => {}
         })
         .on_tray_icon_event(|tray: &tauri::tray::TrayIcon, event| {
@@ -888,10 +984,14 @@ pub fn run() {
             delete_call,
             update_utterance_speaker,
             rename_speaker,
+            org_members,
             update_call_tags,
             get_recording_ack,
             post_recording_ack,
             get_recording_prefs,
+            list_orphan_sessions,
+            resume_orphan_session,
+            discard_orphan_session,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent
