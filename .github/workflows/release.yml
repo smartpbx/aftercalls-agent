@@ -96,16 +96,27 @@ jobs:
         run: |
           set -eux
           mkdir -p src-tauri/binaries
-          # John Van Sickle static build — fully static, works on any
-          # glibc distro without additional libs.
+          # John Van Sickle static build — fully static LGPL build,
+          # works on any glibc distro without additional libs.
+          # TODO(#69): pin to a specific release URL (e.g.
+          # ffmpeg-7.1.1-amd64-static.tar.xz) once we've captured a
+          # known-good sha256 for that version. Today we fetch the
+          # upstream "release" alias (always latest stable) and record
+          # the archive sha256 in the CI log for audit. If the sha256
+          # changes between two builds, that's visible in the run log
+          # and in the artifact diff.
           curl -sSL \
             https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
             -o /tmp/ffmpeg.tar.xz
+          echo "ffmpeg archive sha256:"
+          sha256sum /tmp/ffmpeg.tar.xz
           mkdir -p /tmp/ffmpeg-stage
           tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
           cp /tmp/ffmpeg-stage/ffmpeg \
             src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
           chmod +x src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+          echo "bundled binary sha256:"
+          sha256sum src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
           ls -lh src-tauri/binaries/
 
       - name: Fetch ffmpeg sidecar (Windows)
@@ -115,14 +126,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
           $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-stage"
-          # gyan.dev's "essentials" build is the lightweight one
-          # (~90MB unpacked) and is what gets mirrored by chocolatey.
+          # gyan.dev's "essentials" build is the lightweight LGPL one
+          # (~90MB unpacked) — same license posture as the Linux
+          # John Van Sickle build. See TODO(#69) on the Linux step
+          # for the pin-to-specific-version follow-up.
           Invoke-WebRequest -UseBasicParsing `
             -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
             -OutFile $zip
+          Write-Host "ffmpeg archive sha256:"
+          Get-FileHash -Algorithm SHA256 $zip | Format-List Algorithm,Hash
           Expand-Archive -Path $zip -DestinationPath $stage -Force
           $exe = (Get-ChildItem -Path $stage -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1).FullName
           Copy-Item $exe "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe"
+          Write-Host "bundled binary sha256:"
+          Get-FileHash -Algorithm SHA256 "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe" | Format-List Algorithm,Hash
           Get-ChildItem src-tauri/binaries/
 
       - name: Build + publish signed release

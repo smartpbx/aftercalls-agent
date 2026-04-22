@@ -458,6 +458,11 @@
                     </h3>
                     <div class="entry-meta">
                       {#if call.tags && call.tags.length > 0}
+                        <!-- Show up to 2 tags inline; overflow goes
+                             into a "+N" chip with the hidden tags in
+                             a tooltip (full list is on the detail
+                             page). Clicking a visible chip filters
+                             the list by that tag. -->
                         {#each call.tags.slice(0, 2) as t (t.kind + ":" + t.value)}
                           <button
                             type="button"
@@ -468,6 +473,15 @@
                             <span class="tag-chip-label">{t.kind}: {t.value}</span>
                           </button>
                         {/each}
+                        {#if call.tags.length > 2}
+                          <span
+                            class="tag-chip tag-chip-tight tag-more"
+                            title={call.tags
+                              .slice(2)
+                              .map((t) => `${t.kind}: ${t.value}`)
+                              .join("\n")}
+                          >+{call.tags.length - 2}</span>
+                        {/if}
                       {:else if call.matched_client}
                         <span class="tag-chip tag-client tag-chip-tight">
                           <span class="tag-chip-label">client: {call.matched_client}</span>
@@ -651,6 +665,16 @@
   }
   .tag-chip-row:hover {
     filter: brightness(1.15);
+  }
+  /* Overflow chip for call-list rows when there are more tags than
+     the two that fit inline. Neutral bone styling — not a real tag
+     kind, just a "+N more" indicator. Hidden tags live in the title
+     attribute for a hover preview; the detail page has the full list. */
+  .tag-more {
+    background: var(--ink-2);
+    color: var(--bone-3);
+    font-weight: 500;
+    cursor: help;
   }
 
   /* ── Add-filter button + popover ─────────────────────────────────── */

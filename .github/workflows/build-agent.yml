@@ -97,9 +97,13 @@ jobs:
         run: |
           set -eux
           mkdir -p src-tauri/binaries
+          # LGPL-only John Van Sickle build. See release.yml for the
+          # #69 TODO on pinning to a specific version + sha256 verify.
           curl -sSL \
             https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
             -o /tmp/ffmpeg.tar.xz
+          echo "ffmpeg archive sha256:"
+          sha256sum /tmp/ffmpeg.tar.xz
           mkdir -p /tmp/ffmpeg-stage
           tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
           cp /tmp/ffmpeg-stage/ffmpeg \

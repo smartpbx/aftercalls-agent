@@ -1,4 +1,13 @@
 {
+  "0.3.24": {
+    "headline": "Jumped a few versions? You'll see the full changelog in one place.",
+    "changes": [
+      "The post-update welcome now aggregates every version you skipped since your last launch into one modal. No more catching only the latest headline and missing what happened in the gap.",
+      "Calls list: rows with more than two tags now show a \"+N\" overflow chip instead of silently hiding the extras. Hover to see which tags are folded away; open the call to see them all.",
+      "Fonts are now served from our own servers instead of a third-party CDN, so the app doesn't phone out to a font vendor on launch.",
+      "New \"Licenses\" link in the user menu — opens the third-party notices for ffmpeg (LGPL), Tauri, Svelte, and everything else we bundle."
+    ]
+  },
   "0.3.23": {
     "headline": "Recovery from crashes, Windows call-detect, tag inline, smarter rename, polish",
     "changes": [

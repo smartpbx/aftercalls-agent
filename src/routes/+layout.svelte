@@ -180,11 +180,19 @@
   // is in hand so the greeting can be personal. No key => first install;
   // we still show a welcome with the current version's notes.
   const LAST_SEEN_VERSION_KEY = "aftercalls.lastSeenVersion";
-  let releaseNotes = $state<{
+  // A single release-notes modal showing every version the user
+  // jumped over since their last launch. `entries` is ordered newest-
+  // first so the headline at the top is the version they're now
+  // running. When only one version is in the set the modal looks
+  // identical to the pre-aggregation behaviour.
+  type ReleaseNotesEntry = {
     version: string;
     headline: string;
     changes: string[];
     footer?: string;
+  };
+  let releaseNotes = $state<{
+    entries: ReleaseNotesEntry[];
     firstName: string;
   } | null>(null);
   let releaseNotesChecked = false;
@@ -481,7 +489,11 @@
 
   // Shows the release-notes modal at most once per "new" version per
   // device — regardless of whether we're hit at onMount (returning
-  // user) or from the post-login event (fresh sign-in).
+  // user) or from the post-login event (fresh sign-in). If the user
+  // jumped multiple versions (e.g. 0.3.18 → 0.3.23), aggregate every
+  // versioned entry between lastSeen (exclusive) and current (inclusive)
+  // so they see the full changelog in one modal instead of getting
+  // shown only the latest headline.
   async function maybeShowReleaseNotes() {
     if (releaseNotesChecked) return;
     if (!version || !me) return;
@@ -495,24 +507,42 @@
         string,
         { headline: string; changes: string[]; footer?: string }
       >;
-      const entry = all[version];
-      if (!entry) {
-        // No entry for this version — silently bookmark so the modal
-        // doesn't fire empty next launch.
+      // Collect every entry with version > lastSeen AND <= current
+      // running. When lastSeen is absent (first install), everything
+      // <= current qualifies — but we cap at the newest 3 entries so
+      // the first-ever launch doesn't dump the whole history at them.
+      const FIRST_INSTALL_CAP = 3;
+      const candidates = Object.keys(all)
+        .filter((v) => !semverGt(v, version)) // v <= current
+        .filter((v) => !lastSeen || semverGt(v, lastSeen)) // v > lastSeen
+        // Newest first.
+        .sort((a, b) => (semverGt(a, b) ? -1 : semverGt(b, a) ? 1 : 0));
+      const slice = lastSeen ? candidates : candidates.slice(0, FIRST_INSTALL_CAP);
+      const entries: ReleaseNotesEntry[] = slice.map((v) => ({
+        version: v,
+        headline: all[v].headline,
+        changes: all[v].changes,
+        footer: all[v].footer,
+      }));
+      if (entries.length === 0) {
+        // Nothing to show. Silently bookmark so the modal doesn't
+        // fire empty next launch.
         localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
         return;
       }
       const firstName = (me?.display_name ?? "").split(/\s+/)[0] ?? "";
-      releaseNotes = { version, firstName, ...entry };
+      releaseNotes = { entries, firstName };
     } catch (e) {
       console.warn("release notes load failed", e);
     }
   }
 
   function dismissReleaseNotes() {
-    if (releaseNotes) {
+    // Bookmark the newest version shown (entries[0]) so the user
+    // doesn't see the same aggregate modal again on next launch.
+    if (releaseNotes && releaseNotes.entries.length > 0) {
       try {
-        localStorage.setItem(LAST_SEEN_VERSION_KEY, releaseNotes.version);
+        localStorage.setItem(LAST_SEEN_VERSION_KEY, releaseNotes.entries[0].version);
       } catch {}
     }
     releaseNotes = null;
@@ -865,6 +895,16 @@
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
           </button>
+          <button
+            class="um-item"
+            role="menuitem"
+            onclick={async () => {
+              closeUserMenu();
+              try { await openUrl("https://aftercalls.io/licenses"); } catch {}
+            }}
+          >
+            Licenses <span class="um-ext" aria-hidden="true">↗</span>
+          </button>
           {#if me && (me.role === "admin" || me.role === "superadmin")}
             <div class="um-sep"></div>
             <button
@@ -1127,23 +1167,38 @@
       tabindex="-1"
     >
       <div class="rn-head">
-        <span class="rn-badge">v{releaseNotes.version}</span>
+        <span class="rn-badge">v{releaseNotes.entries[0].version}</span>
         <h2 id="rn-title">
           {#if releaseNotes.firstName}
-            {releaseNotes.firstName}, {releaseNotes.headline}
+            {releaseNotes.firstName}, {releaseNotes.entries[0].headline}
           {:else}
-            {releaseNotes.headline}
+            {releaseNotes.entries[0].headline}
           {/if}
         </h2>
       </div>
-      <ul class="rn-list">
-        {#each releaseNotes.changes as line (line)}
-          <li>{line}</li>
-        {/each}
-      </ul>
-      {#if releaseNotes.footer}
-        <p class="rn-footer">{releaseNotes.footer}</p>
+      {#if releaseNotes.entries.length > 1}
+        <p class="rn-aggregate-caption">
+          You jumped {releaseNotes.entries.length} versions — here's everything since your last launch.
+        </p>
       {/if}
+      {#each releaseNotes.entries as entry, i (entry.version)}
+        {#if i > 0}
+          <!-- Secondary versions get a small version header + their
+               headline in-line so the caller can scan per-version. -->
+          <div class="rn-entry-head">
+            <span class="rn-badge rn-badge-dim">v{entry.version}</span>
+            <span class="rn-entry-headline">{entry.headline}</span>
+          </div>
+        {/if}
+        <ul class="rn-list">
+          {#each entry.changes as line (line)}
+            <li>{line}</li>
+          {/each}
+        </ul>
+        {#if entry.footer}
+          <p class="rn-footer">{entry.footer}</p>
+        {/if}
+      {/each}
       <div class="rn-actions">
         <button
           type="button"
@@ -1747,6 +1802,35 @@
     border-radius: 4px;
     flex-shrink: 0;
     margin-top: 0.25rem;
+  }
+  /* Aggregated release-notes: dimmer badge + per-entry header for
+     every version below the current one when the user jumped
+     multiple releases. */
+  .rn-aggregate-caption {
+    margin: -0.4rem 0 1rem;
+    color: var(--bone-3);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  .rn-entry-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1.4rem 0 0.55rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .rn-badge-dim {
+    margin-top: 0;
+    background: var(--ink-2);
+    color: var(--bone-3);
+  }
+  .rn-entry-headline {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--bone-0);
+    letter-spacing: -0.005em;
+    line-height: 1.35;
   }
   .rn-list {
     margin: 0 0 1rem;
