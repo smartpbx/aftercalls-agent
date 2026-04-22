@@ -638,18 +638,58 @@
     return out;
   }
 
+  // Color allocation is order-based, not hash-based — two speakers
+  // like "Mark" and "Clayton" happened to charcode-sum-mod-5 to the
+  // same palette slot, so they rendered identical. We now walk the
+  // speakers in encounter order (first utterance wins for primacy),
+  // hand the palette out in sequence, and only start reusing colors
+  // after the palette is exhausted (>5 distinct speakers on one
+  // call — rare). When we do reuse, we pick the least-used slot so
+  // back-to-back speakers still get different colors. "You" stays
+  // reserved for the accent.
+  const PALETTE = [
+    "#c9a24a", // saffron
+    "#8faf72", // sage
+    "#d07e4e", // rust
+    "#b06a8c", // wine
+    "#8aa2c0", // slate
+  ];
+
+  let speakerColorMap = $derived.by<Record<string, string>>(() => {
+    const map: Record<string, string> = {};
+    const usage = PALETTE.map(() => 0);
+    const order: string[] = [];
+    // Prefer transcript order (stable). Fall back to participants.
+    if (call?.utterances) {
+      for (const u of call.utterances) {
+        const s = (u.speaker ?? "").trim();
+        if (s && !order.includes(s)) order.push(s);
+      }
+    }
+    if (call?.participants) {
+      for (const p of call.participants) {
+        const s = (p ?? "").trim();
+        if (s && !order.includes(s)) order.push(s);
+      }
+    }
+    for (const name of order) {
+      if (name === "You") {
+        map[name] = "var(--accent)";
+        continue;
+      }
+      let bestIdx = 0;
+      for (let i = 1; i < PALETTE.length; i++) {
+        if (usage[i] < usage[bestIdx]) bestIdx = i;
+      }
+      map[name] = PALETTE[bestIdx];
+      usage[bestIdx]++;
+    }
+    return map;
+  });
+
   function speakerColor(speaker: string | null | undefined): string {
     if (!speaker) return "var(--bone-2)";
-    if (speaker === "You") return "var(--accent)";
-    const hash = [...speaker].reduce((a, c) => a + c.charCodeAt(0), 0);
-    const palette = [
-      "#c9a24a", // saffron
-      "#8faf72", // sage
-      "#d07e4e", // rust
-      "#b06a8c", // wine
-      "#8aa2c0", // slate
-    ];
-    return palette[hash % palette.length];
+    return speakerColorMap[speaker.trim()] ?? "var(--bone-2)";
   }
 
   function fmtDateTitle(iso: string) {

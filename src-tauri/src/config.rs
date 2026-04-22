@@ -30,6 +30,13 @@ pub struct Config {
     /// — no CPU wasted if the user never wants auto-detection.
     #[serde(default = "default_true")]
     pub auto_detect: bool,
+    /// When true (default during dev), the agent ships a ring buffer
+    /// of log entries + pipeline events + panics to
+    /// `/v1/agent/logs/batch` every 30s. Off disables the flush task
+    /// AND the per-event buffer push, so zero trace data leaves the
+    /// machine. See #<telemetry issue>.
+    #[serde(default = "default_true")]
+    pub telemetry_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -71,6 +78,7 @@ impl Config {
                 }),
                 close_to_tray: true,
                 auto_detect: true,
+                telemetry_enabled: true,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

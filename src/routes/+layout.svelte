@@ -169,19 +169,37 @@
     // window + blank devtools). Swallow + log so the UI stays alive.
     // Using console.error (not warn) because some webkit builds filter warns
     // out of the devtools panel by default.
+    // Forward frontend errors into the Rust-side telemetry buffer so
+    // they land in /admin/logs alongside panics + pipeline failures.
+    // Fire-and-forget invoke — telemetry is best-effort and
+    // log_event is a no-op when the user has telemetry off.
+    const sendToTelemetry = (
+      level: "error" | "warn",
+      module: string,
+      message: string,
+      meta?: Record<string, unknown>,
+    ) => {
+      invoke("log_event", {
+        input: { level, module, message, meta },
+      }).catch(() => {});
+    };
     window.addEventListener("unhandledrejection", (ev) => {
       const r: any = ev.reason;
-      console.error(
-        "[unhandledrejection]",
-        r?.stack ?? r?.message ?? String(r),
-      );
+      const msg = r?.stack ?? r?.message ?? String(r);
+      console.error("[unhandledrejection]", msg);
+      sendToTelemetry("error", "webview::unhandledrejection", msg, {
+        url: window.location.href,
+      });
       ev.preventDefault();
     });
     window.addEventListener("error", (ev) => {
-      console.error(
-        "[error]",
-        ev.error?.stack ?? ev.error?.message ?? ev.message,
-      );
+      const msg = ev.error?.stack ?? ev.error?.message ?? ev.message;
+      console.error("[error]", msg);
+      sendToTelemetry("error", "webview::error", String(msg), {
+        url: window.location.href,
+        filename: ev.filename,
+        line: ev.lineno,
+      });
     });
 
     // Route guard: if we have no auth.json, send the user to /login. Do
@@ -496,6 +514,13 @@
         <div class="user-menu" role="menu">
           <button class="um-item" role="menuitem" onclick={openSettings}>
             Settings
+          </button>
+          <button
+            class="um-item"
+            role="menuitem"
+            onclick={() => openPortalLink("/calls")}
+          >
+            Open web app <span class="um-ext" aria-hidden="true">↗</span>
           </button>
           {#if me && (me.role === "admin" || me.role === "superadmin")}
             <div class="um-sep"></div>

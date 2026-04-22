@@ -4,6 +4,7 @@ mod pipeline;
 mod portal;
 mod recorder;
 mod summary;
+mod telemetry;
 mod transcription;
 mod upload;
 mod vault;
@@ -483,6 +484,7 @@ async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
 struct AppPrefs {
     close_to_tray: bool,
     auto_detect: bool,
+    telemetry_enabled: bool,
 }
 
 #[tauri::command]
@@ -491,14 +493,20 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
     Ok(AppPrefs {
         close_to_tray: cfg.close_to_tray,
         auto_detect: cfg.auto_detect,
+        telemetry_enabled: cfg.telemetry_enabled,
     })
 }
 
 #[tauri::command]
-fn set_app_prefs(close_to_tray: bool, auto_detect: bool) -> Result<(), String> {
+fn set_app_prefs(
+    close_to_tray: bool,
+    auto_detect: bool,
+    telemetry_enabled: bool,
+) -> Result<(), String> {
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
+    cfg.telemetry_enabled = telemetry_enabled;
     cfg.save().map_err(|e| e.to_string())
 }
 
@@ -717,6 +725,7 @@ pub fn run() {
             download_audio,
             get_app_prefs,
             set_app_prefs,
+            telemetry::log_event,
             get_peaks,
             get_vault_settings,
             set_vault_settings,
@@ -732,6 +741,21 @@ pub fn run() {
             rename_speaker,
         ])
         .setup(|app| {
+            // Telemetry must start FIRST so panics during subsequent
+            // setup() calls still land in the buffer. The panic hook
+            // runs async flush on its way out; if the process
+            // terminates before flush completes, next launch's first
+            // batch ships what the old process couldn't.
+            telemetry::install_panic_hook();
+            telemetry::start(app.handle().clone());
+            telemetry::log(
+                "info",
+                "agent::startup",
+                format!("agent {} starting on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+                None,
+                None,
+            );
+
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;
             // Drop the native window chrome on Windows so the webview

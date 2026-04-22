@@ -40,36 +40,62 @@ pub enum PipelineEvent {
 
 pub async fn run(session_dir: PathBuf, app: AppHandle) {
     crate::tray_set_processing(&app);
+    let session_str = session_dir.to_string_lossy().into_owned();
+    crate::telemetry::log(
+        "info",
+        "pipeline::start",
+        "pipeline started",
+        None,
+        Some(session_str.clone()),
+    );
     emit(
         &app,
         PipelineEvent::Started {
-            session_dir: session_dir.to_string_lossy().into_owned(),
+            session_dir: session_str.clone(),
         },
     );
     match run_inner(&session_dir, &app).await {
         Ok((note_path, call_id)) => {
             let note_str = note_path.to_string_lossy().into_owned();
             notify_done(&app, &note_path);
+            crate::telemetry::log(
+                "info",
+                "pipeline::done",
+                "pipeline done",
+                Some(serde_json::json!({ "call_id": call_id })),
+                Some(session_str.clone()),
+            );
             emit(
                 &app,
                 PipelineEvent::Done {
-                    session_dir: session_dir.to_string_lossy().into_owned(),
+                    session_dir: session_str.clone(),
                     note_path: note_str,
                     call_id,
                 },
             );
         }
         Err(e) => {
-            eprintln!("aftercalls: pipeline failed: {e:#}");
+            let err_str = format!("{e:#}");
+            eprintln!("aftercalls: pipeline failed: {err_str}");
+            crate::telemetry::log(
+                "error",
+                "pipeline::failed",
+                err_str.clone(),
+                None,
+                Some(session_str.clone()),
+            );
             let _ = app
                 .notification()
                 .builder()
                 .title("aftercalls: transcription failed")
-                .body(format!("{e:#}"))
+                .body(err_str.clone())
                 .show();
-            emit(&app, PipelineEvent::Failed { error: format!("{e:#}") });
+            emit(&app, PipelineEvent::Failed { error: err_str });
         }
     }
+    // Ship whatever's buffered so reported bugs don't wait on the
+    // next 30s tick.
+    let _ = crate::telemetry::flush_now().await;
     crate::tray_set_idle(&app);
 }
 

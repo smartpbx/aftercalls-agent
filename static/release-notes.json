@@ -1,4 +1,12 @@
 {
+  "0.3.12": {
+    "headline": "Diagnostic telemetry, fixed speaker colors, and you'll see an updated privacy policy",
+    "changes": [
+      "New: diagnostic telemetry. The app now sends a buffered log of errors, panics, and pipeline events to the aftercalls team so we can diagnose issues without needing remote access to your computer. No call audio, transcripts, or summaries are included — only app-level events and error messages. You can turn this off at any time in Settings → Behavior → Diagnostic telemetry.",
+      "Two speakers on the same call sometimes rendered with the same color (a hash collision on a 5-color palette). Colors are now assigned in speaker-encounter order — the first few distinct speakers always get distinct colors, and subsequent ones pick the least-used slot.",
+      "On next sign-in to the web portal, you'll be asked to accept an updated privacy policy (v1.1). The only change from v1 is a new paragraph describing the telemetry above."
+    ]
+  },
   "0.3.11": {
     "headline": "Settings moves into a user menu, fixed-width slider labels, and the web portal gains Terms of Service",
     "changes": [
