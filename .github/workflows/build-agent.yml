@@ -87,6 +87,25 @@ jobs:
       - name: Type-check frontend
         run: pnpm check
 
+      # tauri.conf.json declares an externalBin sidecar for ffmpeg.
+      # tauri-action fails fast if the per-triple source file isn't
+      # present, so the per-push build has to fetch it even though
+      # we're not publishing anything — keeps build-agent.yml honest
+      # about whether the bundle would succeed on a tagged release.
+      - name: Fetch ffmpeg sidecar (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          set -eux
+          mkdir -p src-tauri/binaries
+          curl -sSL \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            -o /tmp/ffmpeg.tar.xz
+          mkdir -p /tmp/ffmpeg-stage
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
+          cp /tmp/ffmpeg-stage/ffmpeg \
+            src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
