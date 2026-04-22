@@ -1,4 +1,13 @@
 {
+  "0.3.9": {
+    "headline": "Windows titlebar actually works now, and Linux updates stop breaking installs",
+    "changes": [
+      "Windows: minimize / maximize / close buttons AND dragging all work. v0.3.8 was missing two things: (1) ACL grants for the start_dragging / minimize / close / set_focus window commands (Tauri 2 requires explicit permission per command, and only a few were allowed by default), and (2) the titlebar buttons were bubbling their mousedown up to the drag region, so clicking a button started a window drag instead. Both fixed — ACL grants added, buttons now stop event propagation before the drag handler sees them.",
+      "Linux: the v0.3.8 AppImage linked against system libwebkit2gtk-4.1 but CI accidentally bundled the library file itself. The bundled webkit has its helper-process path hardcoded at compile time (Ubuntu's /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/...), which doesn't exist on Arch / Fedora / NixOS — so the AppImage would launch then the renderer crashed spawning WebKitNetworkProcess. v0.3.9 is packaged with appimagetool directly (bypassing linuxdeploy's ldd-copying step), so NOTHING is bundled. dlopen resolves webkit/gtk from your host system at runtime, and the helper paths match your distro's own layout.",
+      "One-click in-place auto-update on Linux now works end-to-end with the new AppImage."
+    ],
+    "footer": "If your v0.3.8 Linux install broke after the auto-update, delete the installed AppImage and grab the v0.3.9 one from app.aftercalls.io/downloads. Going forward, v0.3.9 → v0.3.10 will upgrade cleanly via the Install pill."
+  },
   "0.3.8": {
     "headline": "One-click Linux updates, Windows titlebar really working, no more phantom windows, and an audio download button",
     "changes": [

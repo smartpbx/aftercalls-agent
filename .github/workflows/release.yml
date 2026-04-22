@@ -141,13 +141,22 @@ jobs:
           VERSION="${TAG#v}"
           APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
 
-          # linuxdeploy is the lower-level tool tauri-bundler wraps;
-          # running it directly lets us skip --plugin gtk.
-          curl -sSL -o linuxdeploy.AppImage \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy.AppImage
+          # Use appimagetool directly — NOT linuxdeploy. linuxdeploy
+          # runs ldd on the binary and bundles every "non-system" lib
+          # it finds, including libwebkit2gtk-4.1.so.0. That bundled
+          # webkit has its helper-process paths (WebKitNetworkProcess
+          # et al) HARDCODED at compile time pointing at Ubuntu's
+          # /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/ layout — which
+          # doesn't exist on Arch / Fedora / NixOS. Result: AppImage
+          # launches but webkit crashes spawning its child processes.
+          # Going direct with appimagetool skips the ldd step entirely:
+          # the AppImage ships ONLY the binary + .desktop + icon, and
+          # at runtime dlopen resolves webkit/gtk from the host's own
+          # package (whose helper paths match its own layout).
+          curl -sSL -o appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
 
-          # Fresh AppDir, assembled from the already-built binary.
           APPDIR=slim-appdir
           rm -rf "$APPDIR" "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig"
           mkdir -p "$APPDIR/usr/bin" \
@@ -157,7 +166,9 @@ jobs:
           chmod +x "$APPDIR/usr/bin/aftercalls"
           cp src-tauri/icons/128x128.png \
              "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png"
-          cat > "$APPDIR/usr/share/applications/aftercalls.desktop" <<DESKTOP
+          # appimagetool expects the .desktop + icon at the AppDir root.
+          cp src-tauri/icons/128x128.png "$APPDIR/aftercalls.png"
+          cat > "$APPDIR/aftercalls.desktop" <<DESKTOP
           [Desktop Entry]
           Name=aftercalls
           Comment=Call recording + transcription
@@ -167,14 +178,20 @@ jobs:
           Type=Application
           Categories=AudioVideo;Recorder;
           DESKTOP
+          # AppRun is the entrypoint appimagetool wires up. Exec the
+          # agent binary with all args forwarded.
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "$HERE/usr/bin/aftercalls" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
 
-          # OUTPUT= renames the final AppImage to match Tauri's naming.
-          OUTPUT="$APPIMAGE_NAME" ./linuxdeploy.AppImage \
-            --appdir "$APPDIR" \
-            --desktop-file "$APPDIR/usr/share/applications/aftercalls.desktop" \
-            --icon-file "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png" \
-            --executable "$APPDIR/usr/bin/aftercalls" \
-            --output appimage
+          # ARCH= is required by appimagetool. --no-appstream skips
+          # the AppStream metadata warning (we don't publish there).
+          ARCH=x86_64 ./appimagetool.AppImage --no-appstream \
+            "$APPDIR" "$APPIMAGE_NAME"
+          chmod +x "$APPIMAGE_NAME"
           ls -la "$APPIMAGE_NAME"
 
           # Sign with the Tauri minisign key. `-k` takes the base64

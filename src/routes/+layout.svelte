@@ -527,11 +527,19 @@
           <!-- Windows-only window controls. The rest of the topstrip is
                the drag region; these buttons opt out so clicks don't
                also drag the window. -->
+          <!-- onmousedown|stopPropagation is the belt half of the
+               belt-and-suspenders: Tauri 2's drag-region handler fires
+               on ancestor mousedown, and without this the button's
+               mousedown bubbles up to .topstrip, drag-region calls
+               start_dragging, the window starts dragging, the
+               button's click event never gets dispatched. pointer-
+               events: none on the <svg> alone wasn't enough. -->
           <div class="win-controls">
             <button
               type="button"
               class="wc-btn"
               aria-label="Minimize"
+              onmousedown={(e) => e.stopPropagation()}
               onclick={minimizeWindow}
             >
               <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2" y="5.4" width="8" height="1.2" fill="currentColor"/></svg>
@@ -540,6 +548,7 @@
               type="button"
               class="wc-btn"
               aria-label={winMaximized ? "Restore" : "Maximize"}
+              onmousedown={(e) => e.stopPropagation()}
               onclick={toggleMaximize}
             >
               {#if winMaximized}
@@ -552,6 +561,7 @@
               type="button"
               class="wc-btn wc-close"
               aria-label="Close"
+              onmousedown={(e) => e.stopPropagation()}
               onclick={closeWindow}
             >
               <svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 3 L9 9 M9 3 L3 9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
