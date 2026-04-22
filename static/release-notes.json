@@ -1,4 +1,11 @@
 {
+  "0.3.19": {
+    "headline": "Recording reliability: mixing + compression now work everywhere",
+    "changes": [
+      "The app bundles its own audio toolkit on Windows and Linux, so mixing your mic and the other side's audio into a single playable track no longer depends on you having a separate install of an audio tool. Previously, if that tool wasn't on your machine, the call still transcribed but the waveform and playback on the call detail page didn't show up.",
+      "Upload size on every call is smaller too — we compress each track locally before sending, so slow or spotty networks finish \"Syncing to cloud\" faster."
+    ]
+  },
   "0.3.18": {
     "headline": "Release notes are one click away from the user menu",
     "changes": [

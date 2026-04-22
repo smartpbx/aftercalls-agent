@@ -189,7 +189,7 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
     // a consistent input. Stored as system.wav so diarization kicks in — a
     // Zoom/Meet export usually has multiple voices mixed together.
     let dest = base.join("system.wav");
-    let status = tokio::process::Command::new("ffmpeg")
+    let status = tokio::process::Command::new(crate::pipeline::ffmpeg_binary())
         .arg("-y")
         .arg("-i")
         .arg(&src)

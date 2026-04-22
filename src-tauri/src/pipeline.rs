@@ -226,6 +226,38 @@ fn emit(app: &AppHandle, event: PipelineEvent) {
     }
 }
 
+/// Locate the ffmpeg binary. Prefers the sidecar bundled with the app
+/// (next to the main executable — Tauri's externalBin mechanism puts
+/// it there at bundle time on every platform), falls back to PATH so
+/// `pnpm tauri:dev` and distros that install ffmpeg via Depends still
+/// work. Returns a string suitable for Command::new.
+///
+/// Rationale: previously we called ffmpeg by bare name, which silently
+/// no-op'd on Windows (where ffmpeg isn't pre-installed) — mix_tracks
+/// failed, mixed.wav never landed, and Spaces stored only mic + system.
+/// The backend now repairs that (see #51), but shipping a working
+/// ffmpeg next to the binary skips the recovery round-trip entirely.
+pub fn ffmpeg_binary() -> std::ffi::OsString {
+    // The sidecar is named `ffmpeg-aftercalls` (not `ffmpeg`) so it
+    // doesn't collide with a system ffmpeg in /usr/bin on Linux .deb
+    // installs. Windows appends `.exe`. Tauri's externalBin drops the
+    // target-triple suffix at bundle time, so on disk it's just the
+    // bare name here.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = if cfg!(windows) {
+                dir.join("ffmpeg-aftercalls.exe")
+            } else {
+                dir.join("ffmpeg-aftercalls")
+            };
+            if sidecar.exists() {
+                return sidecar.into_os_string();
+            }
+        }
+    }
+    std::ffi::OsString::from("ffmpeg")
+}
+
 async fn mix_tracks(session_dir: &Path) -> Result<()> {
     let mic = session_dir.join("mic.wav");
     let system = session_dir.join("system.wav");
@@ -233,7 +265,7 @@ async fn mix_tracks(session_dir: &Path) -> Result<()> {
     if !mic.exists() || !system.exists() {
         return Ok(());
     }
-    let status = tokio::process::Command::new("ffmpeg")
+    let status = tokio::process::Command::new(ffmpeg_binary())
         .arg("-y")
         .arg("-i")
         .arg(&mic)
@@ -263,7 +295,7 @@ async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
         anyhow::bail!("{} not present", input.display());
     }
     let output = input.with_extension("opus");
-    let status = tokio::process::Command::new("ffmpeg")
+    let status = tokio::process::Command::new(ffmpeg_binary())
         .arg("-y")
         .arg("-i")
         .arg(input)

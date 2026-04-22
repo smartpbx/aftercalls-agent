@@ -85,6 +85,46 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Fetch the ffmpeg sidecar for the current target. Tauri's
+      # externalBin picks up src-tauri/binaries/ffmpeg-aftercalls-<triple>
+      # at bundle time and drops it next to the main binary in the
+      # installed app. This removes the need for users to have
+      # ffmpeg on PATH — mix_tracks + compress_for_upload both resolve
+      # the sidecar first, falling back to PATH for dev.
+      - name: Fetch ffmpeg sidecar (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          set -eux
+          mkdir -p src-tauri/binaries
+          # John Van Sickle static build — fully static, works on any
+          # glibc distro without additional libs.
+          curl -sSL \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            -o /tmp/ffmpeg.tar.xz
+          mkdir -p /tmp/ffmpeg-stage
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
+          cp /tmp/ffmpeg-stage/ffmpeg \
+            src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+          ls -lh src-tauri/binaries/
+
+      - name: Fetch ffmpeg sidecar (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-stage"
+          # gyan.dev's "essentials" build is the lightweight one
+          # (~90MB unpacked) and is what gets mirrored by chocolatey.
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $stage -Force
+          $exe = (Get-ChildItem -Path $stage -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1).FullName
+          Copy-Item $exe "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe"
+          Get-ChildItem src-tauri/binaries/
+
       - name: Build + publish signed release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -164,6 +204,14 @@ jobs:
                    "$APPDIR/usr/share/icons/hicolor/128x128/apps"
           cp src-tauri/target/release/agent "$APPDIR/usr/bin/aftercalls"
           chmod +x "$APPDIR/usr/bin/aftercalls"
+          # Sidecar ffmpeg next to the main binary so ffmpeg_binary()
+          # in pipeline.rs resolves it at runtime. Tauri's externalBin
+          # does this automatically for .deb/.rpm/.msi but our hand-
+          # rolled AppImage path bypasses tauri-bundler, so we copy
+          # manually here.
+          cp src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
+             "$APPDIR/usr/bin/ffmpeg-aftercalls"
+          chmod +x "$APPDIR/usr/bin/ffmpeg-aftercalls"
           cp src-tauri/icons/128x128.png \
              "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png"
           # appimagetool expects the .desktop + icon at the AppDir root.
@@ -226,6 +274,9 @@ jobs:
           mkdir -p "$STAGE"
           cp src-tauri/target/release/agent "$STAGE/aftercalls"
           chmod +x "$STAGE/aftercalls"
+          cp src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
+             "$STAGE/ffmpeg-aftercalls"
+          chmod +x "$STAGE/ffmpeg-aftercalls"
           cp src-tauri/icons/128x128.png "$STAGE/aftercalls.png"
           cat > "$STAGE/aftercalls.desktop" <<DESKTOP
           [Desktop Entry]
@@ -249,17 +300,19 @@ jobs:
           - libwebkit2gtk-4.1 (Arch: `webkit2gtk-4.1`; Debian:
             `libwebkit2gtk-4.1-0`)
           - libgtk-3
-          - ffmpeg (optional — agent falls back to raw WAV upload if
-            ffmpeg isn't in PATH)
+
+          ffmpeg is bundled with the app (`ffmpeg-aftercalls` sits
+          next to the main binary) — no separate install needed.
 
           ## Install
 
           ```
           sudo mkdir -p /opt/aftercalls
           sudo cp aftercalls /opt/aftercalls/aftercalls
+          sudo cp ffmpeg-aftercalls /opt/aftercalls/ffmpeg-aftercalls
           sudo cp aftercalls.png /opt/aftercalls/aftercalls.png
           sudo cp aftercalls.desktop /usr/share/applications/aftercalls.desktop
-          sudo chmod +x /opt/aftercalls/aftercalls
+          sudo chmod +x /opt/aftercalls/aftercalls /opt/aftercalls/ffmpeg-aftercalls
           ```
 
           ## Updates
