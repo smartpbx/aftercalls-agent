@@ -3,6 +3,8 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import { getVersion } from "@tauri-apps/api/app";
   import { goto } from "$app/navigation";
   import { onMount, onDestroy } from "svelte";
   import {
@@ -12,6 +14,38 @@
     notifyPipelineFailed,
     notifyAutoDetect,
   } from "$lib/notify";
+
+  // Platform string reported to the backend on recording-ack (#44).
+  // Kept here (not Rust-side) because navigator UA is already in the
+  // webview context and the backend just stores it verbatim for the
+  // audit trail.
+  function detectPlatform(): "windows" | "linux" | "macos" {
+    if (typeof navigator === "undefined") return "macos";
+    const ua = navigator.userAgent;
+    if (/windows/i.test(ua)) return "windows";
+    if (/linux/i.test(ua) && !/android/i.test(ua)) return "linux";
+    return "macos";
+  }
+
+  type RecordingPrefs = {
+    recording_purpose: string;
+    recording_notification_mode: "off" | "user" | "enforced";
+  };
+
+  // Session-cached so we don't roundtrip every Copy-notice click or
+  // every recording-state transition. Fetched lazily on first use.
+  let recordingPrefs: RecordingPrefs | null = null;
+  async function loadRecordingPrefs(): Promise<RecordingPrefs | null> {
+    if (recordingPrefs) return recordingPrefs;
+    try {
+      const p = await invoke<RecordingPrefs>("get_recording_prefs");
+      recordingPrefs = p;
+      return p;
+    } catch (e) {
+      console.warn("get_recording_prefs failed", e);
+      return null;
+    }
+  }
 
   type PipelineEvent =
     | { stage: "started"; session_dir: string }
@@ -41,6 +75,33 @@
   let prompt = $state<AutoDetectEvent | null>(null);
   let elapsedMs = $state(0);
   let importing = $state(false);
+
+  // PIPEDA recording-ack modal (#44). We show it at most once per
+  // user per device; after the POST resolves the backend + auth.json
+  // both mark the user acknowledged and this short-circuits every
+  // subsequent Start Recording click.
+  //
+  // `pendingStart` remembers which path triggered the ack so we can
+  // resume the right action after "I understand" —
+  //   "manual" → invoke start_recording
+  //   "auto"   → invoke confirm_auto_start (the detector prompt's
+  //              "Yes, record" button)
+  let ackModalOpen = $state(false);
+  let ackChecked = $state(false);
+  let ackSubmitting = $state(false);
+  let ackError = $state("");
+  let pendingStart = $state<"manual" | "auto" | null>(null);
+  // Mirror of the cached `recording_acknowledged` flag. Populated
+  // from `current_user` on mount so the ack check is a local lookup
+  // in the common case. Flipped true after a successful POST; the
+  // next time the layout refetches `current_user` this stays in
+  // sync automatically.
+  let ackCached = $state(false);
+
+  // Copy-notice button UX (#45).
+  let copiedNotice = $state(false);
+  let copyingNotice = $state(false);
+  let copyError = $state("");
 
   async function openCallInBrowser() {
     if (!openableCallId) return;
@@ -82,7 +143,7 @@
       (evt) => {
         const wasRecording = recording;
         recording = evt.payload.recording;
-        if (recording && !wasRecording) notifyRecordStart();
+        if (recording && !wasRecording) playStartCueIfEnabled();
         if (!recording && wasRecording) notifyRecordStop();
         if (recording) {
           pipelineStage = "";
@@ -106,6 +167,23 @@
       if (next && !prompt) notifyAutoDetect();
       prompt = next;
     });
+
+    // Cache the user's PIPEDA ack state so the Start Recording
+    // click path can make a local decision (see maybeShowRecordingAck).
+    // We fall back to a backend check on click if this is false, so
+    // a stale auth.json (user acknowledged on another device) doesn't
+    // re-prompt.
+    try {
+      const u = await invoke<{
+        recording_acknowledged?: boolean;
+      } | null>("current_user");
+      ackCached = !!u?.recording_acknowledged;
+    } catch {}
+
+    // Warm the recording-prefs cache so the first Copy-notice click
+    // and the first Start Recording don't stall on a round-trip.
+    // Silently best-effort; any failure is deferred to click-time.
+    loadRecordingPrefs();
 
     // "recording-state" only fires on transitions, so a remount
     // mid-recording (e.g. tray hide+show, route nav) wouldn't know
@@ -142,14 +220,131 @@
     try {
       if (recording) {
         sessionDir = await invoke<string>("stop_recording");
-      } else {
-        pipelineStage = "";
-        pipelineError = "";
-        openableCallId = "";
-        sessionDir = await invoke<string>("start_recording");
+        return;
       }
+      // Gate on PIPEDA ack (#44) before touching the recorder.
+      const ok = await ensureRecordingAcknowledged("manual");
+      if (!ok) return; // Modal opened (or aborted) — resume happens later.
+      await actuallyStartRecording();
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  async function actuallyStartRecording() {
+    pipelineStage = "";
+    pipelineError = "";
+    openableCallId = "";
+    sessionDir = await invoke<string>("start_recording");
+  }
+
+  // Returns true when the caller may proceed with recording
+  // immediately. Returns false when we opened the ack modal (or the
+  // user is signed out); in that case the resume happens inside
+  // submitAck once the POST completes.
+  async function ensureRecordingAcknowledged(
+    source: "manual" | "auto",
+  ): Promise<boolean> {
+    if (ackCached) return true;
+    // Fallback to the backend: the cache might be stale (acked on
+    // another device, or an older auth.json predates the field).
+    try {
+      const ok = await invoke<boolean>("get_recording_ack");
+      if (ok) {
+        ackCached = true;
+        return true;
+      }
+    } catch (e) {
+      // Surface the error in the modal — a user who can't reach the
+      // backend shouldn't silently start recording and then get a
+      // network error three seconds later.
+      console.warn("get_recording_ack failed", e);
+    }
+    pendingStart = source;
+    ackChecked = false;
+    ackError = "";
+    ackModalOpen = true;
+    return false;
+  }
+
+  async function submitAck() {
+    if (!ackChecked || ackSubmitting) return;
+    ackSubmitting = true;
+    ackError = "";
+    try {
+      const agentVersion = await getVersion().catch(() => "unknown");
+      await invoke("post_recording_ack", {
+        agentVersion,
+        platform: detectPlatform(),
+      });
+      ackCached = true;
+      const resume = pendingStart;
+      ackModalOpen = false;
+      pendingStart = null;
+      // Resume the original action the user was trying to take.
+      if (resume === "manual") {
+        await actuallyStartRecording();
+      } else if (resume === "auto") {
+        await invoke("confirm_auto_start");
+      }
+    } catch (e) {
+      ackError = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      ackSubmitting = false;
+    }
+  }
+
+  function cancelAck() {
+    if (ackSubmitting) return;
+    ackModalOpen = false;
+    pendingStart = null;
+    ackChecked = false;
+    ackError = "";
+  }
+
+  async function openConsentGuide() {
+    try {
+      await openUrl("https://aftercalls.io/help#privacy-consent");
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  }
+
+  // Wrapper around notifyRecordStart that respects the org's
+  // recording_notification_mode (#48). 'off' = silent, 'user' = honour
+  // the local sounds_enabled toggle, 'enforced' = play regardless.
+  async function playStartCueIfEnabled() {
+    const prefs = await loadRecordingPrefs();
+    const mode = prefs?.recording_notification_mode ?? "user";
+    if (mode === "off") return;
+    // `force` only on enforced; 'user' mode continues to defer to
+    // the user's sounds_enabled setting.
+    await notifyRecordStart(mode === "enforced");
+  }
+
+  async function copyNotice() {
+    copyError = "";
+    copyingNotice = true;
+    try {
+      const prefs = await loadRecordingPrefs();
+      if (!prefs) {
+        copyError = "Couldn't load your org's recording preferences.";
+        return;
+      }
+      const notice =
+        `Heads up — I'm using aftercalls to record and transcribe this ` +
+        `call for the purpose of ${prefs.recording_purpose}. The recording ` +
+        `is stored on Canadian cloud infrastructure and used only for that ` +
+        `purpose. If you'd prefer I didn't, let me know and I'll stop.`;
+      await writeText(notice);
+      copiedNotice = true;
+      setTimeout(() => {
+        copiedNotice = false;
+      }, 2000);
+    } catch (e) {
+      copyError = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      copyingNotice = false;
     }
   }
 
@@ -181,6 +376,12 @@
   }
 
   async function confirmStart() {
+    // Same ack gate as the manual Start Recording button — the
+    // detector's "Yes, record" banner is semantically identical from
+    // a PIPEDA standpoint, so a first-time user hitting it first
+    // still gets the acknowledgment modal.
+    const ok = await ensureRecordingAcknowledged("auto");
+    if (!ok) return;
     await invoke("confirm_auto_start");
   }
   async function dismissStart() {
@@ -257,31 +458,47 @@
   {/if}
 
   <section class="cta" style="--i: 2">
-    <!-- Primary action — button flips to live state with inline timer. -->
-    <button
-      class="record-btn"
-      class:live={recording}
-      onclick={toggle}
-      aria-label={recording ? "Stop recording" : "Start recording"}
-    >
-      <span class="record-icon">
+    <div class="cta-row">
+      <!-- Primary action — button flips to live state with inline timer. -->
+      <button
+        class="record-btn"
+        class:live={recording}
+        onclick={toggle}
+        aria-label={recording ? "Stop recording" : "Start recording"}
+      >
+        <span class="record-icon">
+          {#if recording}
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+              <rect x="4.5" y="4.5" width="11" height="11" rx="1.5" fill="currentColor" />
+            </svg>
+          {:else}
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+              <circle cx="10" cy="10" r="5" fill="currentColor" />
+            </svg>
+          {/if}
+        </span>
+        <span class="record-text">
+          {recording ? "Stop recording" : "Start recording"}
+        </span>
         {#if recording}
-          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
-            <rect x="4.5" y="4.5" width="11" height="11" rx="1.5" fill="currentColor" />
-          </svg>
-        {:else}
-          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
-            <circle cx="10" cy="10" r="5" fill="currentColor" />
-          </svg>
+          <span class="record-timer">{fmtTimer(elapsedMs)}</span>
         {/if}
-      </span>
-      <span class="record-text">
-        {recording ? "Stop recording" : "Start recording"}
-      </span>
-      {#if recording}
-        <span class="record-timer">{fmtTimer(elapsedMs)}</span>
-      {/if}
-    </button>
+      </button>
+
+      <!-- Copy a PIPEDA-compliant recording notice to the clipboard
+           (#45) so the user can paste it into meeting chat as the
+           "I'm recording, here's why, here's the retention posture"
+           heads-up to other participants. -->
+      <button
+        type="button"
+        class="copy-notice-btn"
+        onclick={copyNotice}
+        disabled={copyingNotice}
+        aria-live="polite"
+      >
+        {copiedNotice ? "Copied ✓" : copyingNotice ? "Copying…" : "Copy notice"}
+      </button>
+    </div>
 
     <div class="cta-secondary">
       <span class="kbd-row">
@@ -294,6 +511,10 @@
         {importing ? "Importing…" : "Import a file"}
       </button>
     </div>
+
+    {#if copyError}
+      <p class="inline-error">{copyError}</p>
+    {/if}
   </section>
 
   <!-- Status lane — stacks so a pipeline still in flight is still
@@ -346,6 +567,80 @@
     {/if}
   </section>
 </main>
+
+<!-- Recording-ack modal (#44). Blocking — the user can only proceed
+     by ticking the box and confirming, or by cancelling (no record).
+     Visual vocabulary (rn-backdrop/rn-modal/rn-head/rn-actions) mirrors
+     the release-notes modal in +layout.svelte so we don't fork styling. -->
+{#if ackModalOpen}
+  <div
+    class="rn-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={cancelAck}
+    onkeydown={(e) => {
+      if (e.key === "Escape") cancelAck();
+    }}
+  >
+    <div
+      class="rn-modal ack-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ack-title"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <h2 id="ack-title">Before you record</h2>
+      </div>
+      <p class="ack-body">
+        Under Canadian PIPEDA — and equivalent privacy laws in most
+        jurisdictions — you are responsible for notifying every
+        participant that the call is being recorded, obtaining their
+        consent, and using the recording only for the purpose you
+        disclosed.
+      </p>
+      <p class="ack-body ack-emph">aftercalls doesn't automate consent. You do.</p>
+
+      <label class="ack-check">
+        <input
+          type="checkbox"
+          bind:checked={ackChecked}
+          disabled={ackSubmitting}
+        />
+        <span>I understand and will get consent from everyone I record.</span>
+      </label>
+
+      <button type="button" class="ack-guide" onclick={openConsentGuide}>
+        See our recording-consent guide <span aria-hidden="true">↗</span>
+      </button>
+
+      {#if ackError}
+        <p class="inline-error ack-err">{ackError}</p>
+      {/if}
+
+      <div class="rn-actions ack-actions">
+        <button
+          type="button"
+          class="ack-cancel"
+          onclick={cancelAck}
+          disabled={ackSubmitting}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="rn-dismiss"
+          onclick={submitAck}
+          disabled={!ackChecked || ackSubmitting}
+        >
+          {ackSubmitting ? "Saving…" : "I understand — start recording"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .page {
@@ -416,6 +711,39 @@
     align-items: flex-start;
     gap: 0.85rem;
     padding: 0.4rem 0 0.8rem;
+  }
+
+  /* Primary + Copy notice share a row; Copy notice is the ghost
+     counterpart to the filled record button. Wraps to stack on very
+     narrow widths so the timer-expanded pill doesn't squeeze Copy
+     notice off the edge. */
+  .cta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+
+  .copy-notice-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.6rem 0.95rem;
+    border-radius: 999px;
+    border: 1px solid var(--hairline-hi);
+    background: transparent;
+    color: var(--bone-1);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .copy-notice-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--bone-0);
+  }
+  .copy-notice-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   .record-btn {
@@ -684,5 +1012,83 @@
     50% {
       opacity: 0.5;
     }
+  }
+
+  /* ── PIPEDA ack modal (#44) ──────────────────────────────────────
+     Reuses the rn-backdrop / rn-modal / rn-head / rn-actions /
+     rn-dismiss visual vocabulary — the same tokens the release-notes
+     modal uses. The shared rules for those classes are hoisted out
+     of both call sites and live in app.css (§Release-notes modal in
+     design.md); local styles below only add the ack-specific bits. */
+
+  .ack-body {
+    margin: 0 0 0.85rem;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: var(--bone-1);
+  }
+  .ack-body.ack-emph {
+    color: var(--bone-0);
+    font-weight: 500;
+  }
+  .ack-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    margin: 0.4rem 0 0.35rem;
+    padding: 0.6rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-0);
+    font-size: 0.9rem;
+    color: var(--bone-0);
+    cursor: pointer;
+  }
+  .ack-check input[type="checkbox"] {
+    margin-top: 0.2rem;
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .ack-guide {
+    appearance: none;
+    background: transparent;
+    border: none;
+    padding: 0.2rem 0 0.6rem;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+    text-align: left;
+    transition: color 0.15s;
+  }
+  .ack-guide:hover {
+    color: var(--accent-hi);
+  }
+  .ack-err {
+    margin-top: 0.5rem;
+  }
+  .ack-actions {
+    margin-top: 0.4rem;
+  }
+  .ack-cancel {
+    padding: 0.55rem 1rem;
+    border: 1px solid var(--hairline-hi);
+    background: transparent;
+    color: var(--bone-1);
+    font-size: 0.88rem;
+    font-weight: 500;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ack-cancel:hover:not(:disabled) {
+    color: var(--bone-0);
+    border-color: var(--bone-3);
+  }
+  .ack-cancel:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 </style>

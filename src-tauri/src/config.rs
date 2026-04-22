@@ -161,6 +161,14 @@ pub struct AuthFile {
     pub org_id: String,
     pub org_slug: String,
     pub org_display_name: String,
+    /// Cached from `/v1/auth/me`'s `recording_acknowledged` at login.
+    /// The Record page uses this as the source of truth to decide
+    /// whether to show the PIPEDA ack modal before Start Recording;
+    /// flipped true locally after a successful POST so future clicks
+    /// short-circuit without a roundtrip. Serde default keeps old
+    /// auth.json files (written before this field existed) readable.
+    #[serde(default)]
+    pub recording_acknowledged: bool,
 }
 
 pub fn read_auth_file() -> Result<Option<AuthFile>> {

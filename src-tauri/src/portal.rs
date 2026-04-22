@@ -34,6 +34,12 @@ struct MeResponse {
     org_id: String,
     org_slug: String,
     org_display_name: String,
+    // Backend added this alongside `pending_tos` for #44 so the agent
+    // can cache the one-time recording-ack state at login time and
+    // avoid a roundtrip every time Start Recording is clicked.
+    // Defaulted to false so older server responses don't break decode.
+    #[serde(default)]
+    recording_acknowledged: bool,
 }
 
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
@@ -102,6 +108,7 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         org_id: p.user.org_id,
         org_slug: p.user.org_slug,
         org_display_name: p.user.org_display_name,
+        recording_acknowledged: p.user.recording_acknowledged,
     }
 }
 
@@ -347,6 +354,57 @@ pub async fn generate_peaks(backend: &Backend, call_id: &str) -> Result<Value> {
         Duration::from_secs(180),
     )
     .await
+}
+
+// ── PIPEDA recording-ack + notice prefs (#44, #45, #48) ──────────────
+
+/// Returns Some(Value) with `accepted_at` when the user has accepted,
+/// None on 404 (not yet accepted). Any other status is an error so
+/// callers don't mistake a network blip for an un-accepted user.
+pub async fn get_recording_ack(backend: &Backend) -> Result<Option<Value>> {
+    let auth = build_auth_header(backend).await?;
+    let c = client()?;
+    let url = format!(
+        "{}/v1/me/recording-ack",
+        backend.url.trim_end_matches('/')
+    );
+    let resp = c
+        .get(&url)
+        .header("authorization", auth)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    let v: Value = resp.json().await.context("decode recording-ack")?;
+    Ok(Some(v))
+}
+
+pub async fn post_recording_ack(
+    backend: &Backend,
+    agent_version: &str,
+    platform: &str,
+) -> Result<()> {
+    post_json(
+        backend,
+        "/v1/me/recording-ack",
+        serde_json::json!({
+            "agent_version": agent_version,
+            "platform": platform,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn get_recording_prefs(backend: &Backend) -> Result<Value> {
+    get_json(backend, "/v1/org/recording-prefs").await
 }
 
 // ── HTTP primitives ──────────────────────────────────────────────────

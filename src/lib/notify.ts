@@ -73,8 +73,21 @@ function playNotes(notes: Note[]) {
   }
 }
 
-export async function notifyRecordStart() {
-  if (!(await soundsEnabled())) return;
+// `force` bypasses the user's sounds_enabled preference. Used by the
+// PIPEDA "enforced" recording-notification mode (#48) where admins
+// require the start cue play regardless of local settings — an org's
+// compliance posture shouldn't be silenceable from Settings. The
+// default path is unchanged so every other caller (stop, pipeline
+// done/failed, auto-detect) still honours the local mute toggle.
+//
+// TODO(#48): speech announcement — "Please note, this call is being
+// recorded" — is NOT implemented yet. Web Audio TTS is inconsistent
+// across Tauri's webview backends (webkit2gtk in particular). Ship
+// the tone + the `force`/mode infrastructure now; add speech when we
+// can evaluate a viable path (bundled sample audio OR the Web Speech
+// API with a graceful fallback for platforms that lack a voice).
+export async function notifyRecordStart(force: boolean = false) {
+  if (!force && !(await soundsEnabled())) return;
   // Two-note ascending: friendly "go" cue.
   playNotes([
     { freq: 523.25, at: 0,    dur: 0.12 }, // C5

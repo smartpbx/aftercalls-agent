@@ -293,3 +293,71 @@ select {
   scrollbar-width: thin;
   scrollbar-color: var(--bone-4) transparent;
 }
+
+/* ── Modal (rn-*) shared vocabulary ────────────────────────────────
+ * The release-notes modal (+layout.svelte) and the PIPEDA
+ * recording-ack modal (Record page) both lean on this shape. Lives
+ * here (not in either component) so each call site can stay
+ * minimal — they ship their own content-specific rules only.
+ * See design.md §Release-notes modal.
+ */
+.rn-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  padding: 1rem;
+  cursor: default;
+}
+.rn-modal {
+  max-width: 520px;
+  width: 100%;
+  padding: 1.6rem 1.7rem 1.3rem;
+  border: 1px solid var(--hairline-hi);
+  border-radius: var(--radius-lg);
+  background: var(--ink-1);
+  box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.6);
+  cursor: auto;
+}
+.rn-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  margin-bottom: 0.9rem;
+}
+.rn-head h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  line-height: 1.35;
+  color: var(--bone-0);
+  font-weight: 600;
+}
+.rn-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+.rn-dismiss {
+  padding: 0.55rem 1.1rem;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--ink-0);
+  font-size: 0.88rem;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+}
+.rn-dismiss:hover:not(:disabled) {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
+.rn-dismiss:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

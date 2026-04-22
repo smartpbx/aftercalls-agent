@@ -323,6 +323,9 @@ struct LoginResult {
     display_name: String,
     role: String,
     org_display_name: String,
+    // Surfaced to the layout + Record page so the PIPEDA ack modal
+    // (#44) knows not to prompt a user who's already acknowledged.
+    recording_acknowledged: bool,
 }
 
 #[tauri::command]
@@ -340,6 +343,7 @@ async fn login(email: String, password: String) -> Result<LoginResult, String> {
         display_name: auth.display_name,
         role: auth.role,
         org_display_name: auth.org_display_name,
+        recording_acknowledged: auth.recording_acknowledged,
     })
 }
 
@@ -361,7 +365,70 @@ fn current_user() -> Result<Option<LoginResult>, String> {
         display_name: a.display_name,
         role: a.role,
         org_display_name: a.org_display_name,
+        recording_acknowledged: a.recording_acknowledged,
     }))
+}
+
+// ── PIPEDA recording-ack + org prefs (#44, #45, #48) ─────────────────
+
+/// Check the backend for an existing recording-ack. Used as the
+/// fallback when the cached `recording_acknowledged` flag says
+/// false — we don't want to re-prompt users who acknowledged on
+/// another device just because their local auth.json predates this
+/// field. Returns true on 200, false on 404, error otherwise.
+#[tauri::command]
+async fn get_recording_ack() -> Result<bool, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    let resp = portal::get_recording_ack(backend)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.is_some())
+}
+
+/// Post the user's ack to the backend and flip the cached flag on
+/// auth.json so future Start Recording clicks don't re-prompt. The
+/// frontend passes the running agent version + platform (it already
+/// has cheaper access to both than Rust does on some paths).
+#[tauri::command]
+async fn post_recording_ack(
+    agent_version: String,
+    platform: String,
+) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::post_recording_ack(backend, &agent_version, &platform)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Best-effort mirror: flip the cached flag in auth.json. If the
+    // write fails (rare — bad perms), we've still succeeded on the
+    // server side and the next `get_recording_ack` call will reflect
+    // reality, so treat this as non-fatal.
+    if let Ok(Some(mut a)) = config::read_auth_file() {
+        if !a.recording_acknowledged {
+            a.recording_acknowledged = true;
+            let _ = config::write_auth_file(&a);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_recording_prefs() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::get_recording_prefs(backend)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -780,6 +847,9 @@ pub fn run() {
             delete_call,
             update_utterance_speaker,
             rename_speaker,
+            get_recording_ack,
+            post_recording_ack,
+            get_recording_prefs,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent

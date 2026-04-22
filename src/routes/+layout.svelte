@@ -497,7 +497,17 @@
         </button>
       {/if}
       {#if version}
-        <span class="version">v{version}</span>
+        <!-- Version doubles as the release-notes entry point — clicking
+             opens the public per-version page in the default browser.
+             Replaces the equivalent user-menu item (redundant). -->
+        <button
+          type="button"
+          class="version"
+          title="See release notes"
+          onclick={async () => {
+            try { await openUrl("https://aftercalls.io/releases"); } catch {}
+          }}
+        >v{version}</button>
       {/if}
 
       {#if userMenuOpen}
@@ -531,16 +541,6 @@
             }}
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
-          </button>
-          <button
-            class="um-item"
-            role="menuitem"
-            onclick={async () => {
-              closeUserMenu();
-              try { await openUrl("https://aftercalls.io/releases"); } catch {}
-            }}
-          >
-            Release notes <span class="um-ext" aria-hidden="true">↗</span>
           </button>
           {#if me && (me.role === "admin" || me.role === "superadmin")}
             <div class="um-sep"></div>
@@ -755,6 +755,15 @@
         <p class="rn-footer">{releaseNotes.footer}</p>
       {/if}
       <div class="rn-actions">
+        <button
+          type="button"
+          class="rn-link"
+          onclick={async () => {
+            try { await openUrl("https://aftercalls.io/releases"); } catch {}
+          }}
+        >
+          See all release notes <span aria-hidden="true">↗</span>
+        </button>
         <button class="rn-dismiss" onclick={dismissReleaseNotes}>
           Got it
         </button>
@@ -921,11 +930,25 @@
   }
 
   .version {
+    /* It's a real <button> now (links to release notes) but we want
+       it to look exactly like the static label it used to be —
+       reset the browser-default button chrome and keep only the
+       text styling. The cursor + hover color signal the affordance. */
+    appearance: none;
+    background: transparent;
+    border: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--bone-4);
     letter-spacing: 0.04em;
     padding: 0.15rem 0.55rem;
+    transition: color 0.15s;
+  }
+  .version:hover {
+    color: var(--bone-1);
   }
 
   nav {
@@ -1193,34 +1216,11 @@
   }
 
   /* ── Release notes modal ─────────────────────────────────────────── */
-  .rn-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 60;
-    padding: 1rem;
-    cursor: default;
-  }
-  .rn-modal {
-    max-width: 520px;
-    width: 100%;
-    padding: 1.6rem 1.7rem 1.3rem;
-    border: 1px solid var(--hairline-hi);
-    border-radius: var(--radius-lg);
-    background: var(--ink-1);
-    box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.6);
-    cursor: auto;
-  }
-  .rn-head {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.7rem;
-    margin-bottom: 0.9rem;
-  }
+  /* Shared shell styles (rn-backdrop / rn-modal / rn-head / rn-actions
+     / rn-dismiss) live in app.css so the ack modal on the Record page
+     can reuse the same vocabulary. Below are only the bits specific
+     to the release-notes variant — the version badge, bullet list,
+     known-issues footer, and the "See all release notes" link. */
   .rn-badge {
     display: inline-block;
     padding: 0.15rem 0.45rem;
@@ -1232,13 +1232,6 @@
     border-radius: 4px;
     flex-shrink: 0;
     margin-top: 0.25rem;
-  }
-  .rn-head h2 {
-    margin: 0;
-    font-size: 1.1rem;
-    line-height: 1.35;
-    color: var(--bone-0);
-    font-weight: 600;
   }
   .rn-list {
     margin: 0 0 1rem;
@@ -1260,22 +1253,18 @@
     line-height: 1.5;
     border-radius: 6px;
   }
-  .rn-actions {
-    display: flex;
-    justify-content: flex-end;
-  }
-  .rn-dismiss {
-    padding: 0.55rem 1.1rem;
-    border: 1px solid var(--accent);
-    background: var(--accent);
-    color: var(--ink-0);
-    font-size: 0.88rem;
-    font-weight: 600;
-    border-radius: 8px;
+  .rn-link {
+    appearance: none;
+    background: transparent;
+    border: none;
     cursor: pointer;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--bone-2);
+    padding: 0.3rem 0;
+    transition: color 0.15s;
   }
-  .rn-dismiss:hover {
-    background: var(--accent-hi);
-    border-color: var(--accent-hi);
+  .rn-link:hover {
+    color: var(--accent-hi);
   }
 </style>

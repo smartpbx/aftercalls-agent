@@ -1,4 +1,13 @@
 {
+  "0.3.20": {
+    "headline": "Recording consent tools + optional start-of-call cue",
+    "changes": [
+      "Before your first recording, the app confirms you understand it's your job to notify participants and get consent. Done once per user — you won't see it again after you accept.",
+      "New \"Copy notice\" button on the Record page drops a customizable heads-up message into your clipboard, ready to paste into the meeting chat. Admins set the purpose wording once in Org settings; everyone on the team uses it.",
+      "Admins: new Org settings under \"Recording\" — a Purpose textarea with live preview of the copied notice, and a Notification Mode toggle (Off / User choice / Enforced). Enforced mode always plays an audio cue when any user starts a recording, which is useful for teams in two-party-consent jurisdictions.",
+      "Admins also get two new audit views: a Recording Acknowledgments roster on the Terms tab (who accepted the consent prompt and when), and a Call Access log on the Logs tab (who opened or listened to a call they didn't record)."
+    ]
+  },
   "0.3.19": {
     "headline": "Recording reliability: mixing + compression now work everywhere",
     "changes": [
