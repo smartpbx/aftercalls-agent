@@ -1,4 +1,11 @@
 {
+  "0.3.25": {
+    "headline": "Unfinished-calls pill is actually unfinished now",
+    "changes": [
+      "The \"unfinished calls from before the last restart\" banner was flagging recordings that had never even been uploaded — dev-test artifacts, pre-sign-in attempts, calls you deliberately stopped before they could sync. The banner now only shows calls the app actually got partway through processing, so the count reflects real work to resume instead of folders you'd intentionally abandoned.",
+      "If both the unfinished-calls banner and an update-available banner appear at the same time, they no longer fight for space in the top bar on a narrow window — they stack on two rows instead of one getting truncated."
+    ]
+  },
   "0.3.24": {
     "headline": "Jumped a few versions? You'll see the full changelog in one place.",
     "changes": [
@@ -22,7 +29,7 @@
   "0.3.22": {
     "headline": "Call-detected now slides in without pulling you off the page",
     "changes": [
-      "When the app detects a call starting from another app (Zoom, Teams, SmartPBX, etc.), it used to switch you to the Record tab. Now it slides a small \"Call detected\" panel out from the Record tab in the left rail — you can choose Record this call or Not now without leaving whatever you were reading. All the consent and notification-mode behaviour is the same; just the way it greets you changed.",
+      "When the app detects a call starting from another app (Zoom, Teams, softphones, etc.), it used to switch you to the Record tab. Now it slides a small \"Call detected\" panel out from the Record tab in the left rail — you can choose Record this call or Not now without leaving whatever you were reading. All the consent and notification-mode behaviour is the same; just the way it greets you changed.",
       "The Install pill in the top bar now always points at the newest available version. If a version or two came out between when you saw the pill and when you clicked Install, we pick up the most recent one so you don't install an intermediate version and restart twice."
     ]
   },

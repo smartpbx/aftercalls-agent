@@ -1564,6 +1564,18 @@
     display: flex;
     align-items: center;
     gap: 0.9rem;
+    /* When both the orphan-recovery pill and the update pill fire
+       at once, the combined width overflows the topstrip on narrow
+       windows. flex-wrap lets the second pill drop to a new row so
+       neither gets truncated or spills past the window-control
+       buttons on the right. */
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 0.4rem;
+    /* Allow the strip to grow vertically when wrapping; the
+       container is sticky-positioned so this just means the
+       content underneath pushes down by one pill's height. */
+    min-height: var(--topbar-h);
   }
 
   .update {

@@ -9,14 +9,23 @@
 //! auto-clean anything older than 7 days so the recordings directory
 //! doesn't grow without bound.
 //!
-//! A session_dir counts as an orphan when BOTH:
+//! A session_dir counts as an orphan when ALL of:
 //!   1. The dir contains mic.wav OR mic.opus AND is older than 5
 //!      minutes (so we don't snapshot a recording still in the act of
 //!      uploading). Age is measured against mic.wav's mtime (most
 //!      robust on filesystems where ctime can drift) with a fallback
 //!      to the dir's ctime.
-//!   2. The backend has no row for this session_id, OR the row exists
-//!      but is in any status other than 'complete'.
+//!   2. The backend HAS a row for this session_id. A missing row
+//!      means the pipeline never reached create_call (step 3 of 9) —
+//!      those are abandoned-before-upload folders, not "crashed
+//!      mid-pipeline." Typical source: dev Start→Stop cycles that
+//!      never got to upload, old recordings from before the user
+//!      signed in, etc. Surfacing those as "unfinished calls" is a
+//!      false-positive that on dev machines accumulates to dozens.
+//!   3. That row's status is not 'complete'. Anything in
+//!      uploading/transcribed/summarizing/failed means the user had
+//!      real intent to process this recording and didn't get to the
+//!      finish line.
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
@@ -176,12 +185,23 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
     for (session_dir, session_id, age_anchor) in candidates {
         let needs_recovery =
             match crate::portal::get_call_by_session(backend, &session_id).await {
-                Ok(Some(v)) => v
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s != "complete")
-                    .unwrap_or(true),
-                Ok(None) => true,
+                Ok(Some(v)) => {
+                    // Backend knows this recording. Orphan iff the row
+                    // didn't reach complete. Missing status field is
+                    // treated as non-complete for safety.
+                    v.get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s != "complete")
+                        .unwrap_or(true)
+                }
+                Ok(None) => {
+                    // No backend row: this folder was abandoned before
+                    // create_call fired. Not a crash to recover —
+                    // probably a Start→Stop dev cycle, a pre-sign-in
+                    // recording, or a session the user explicitly
+                    // chose not to upload. Skip.
+                    false
+                }
                 Err(e) => {
                     // Network / auth failure. Don't surface — we'd
                     // rather under-report orphans than prompt on every
