@@ -242,13 +242,31 @@ fn keep_auto_recording(detector: State<Detector>) {
 }
 
 #[tauri::command]
-async fn list_calls() -> Result<serde_json::Value, String> {
+async fn list_calls(tags: Option<Vec<String>>) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
-    portal::list_calls(backend).await.map_err(|e| e.to_string())
+    let tags = tags.unwrap_or_default();
+    portal::list_calls(backend, &tags)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn tag_suggestions(
+    kind: Option<String>,
+    q: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::tag_suggestions(backend, kind.as_deref(), q.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -319,6 +337,10 @@ fn get_session_audio_path(
 
 #[derive(Serialize)]
 struct LoginResult {
+    // User id mirrored from auth.json so the frontend can gate
+    // call-edit UI (tag edit, speaker rename) against ownership
+    // without a roundtrip to /v1/auth/me.
+    user_id: String,
     email: String,
     display_name: String,
     role: String,
@@ -339,6 +361,7 @@ async fn login(email: String, password: String) -> Result<LoginResult, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(LoginResult {
+        user_id: auth.user_id,
         email: auth.email,
         display_name: auth.display_name,
         role: auth.role,
@@ -361,6 +384,7 @@ async fn logout() -> Result<(), String> {
 fn current_user() -> Result<Option<LoginResult>, String> {
     let auth = config::read_auth_file().map_err(|e| e.to_string())?;
     Ok(auth.map(|a| LoginResult {
+        user_id: a.user_id,
         email: a.email,
         display_name: a.display_name,
         role: a.role,
@@ -690,6 +714,22 @@ async fn rename_speaker(id: String, from: String, to: String) -> Result<u64, Str
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn update_call_tags(
+    id: String,
+    tags: serde_json::Value,
+) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::update_call_tags(backend, &id, &tags)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<Recorder>();
     if state.is_active() {
@@ -824,6 +864,7 @@ pub fn run() {
             logout,
             current_user,
             list_calls,
+            tag_suggestions,
             list_trashed,
             restore_call,
             permadelete_call,
@@ -847,6 +888,7 @@ pub fn run() {
             delete_call,
             update_utterance_speaker,
             rename_speaker,
+            update_call_tags,
             get_recording_ack,
             post_recording_ack,
             get_recording_prefs,

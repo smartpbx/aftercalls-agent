@@ -15,6 +15,10 @@
     text: string;
   };
 
+  type TagKind = "client" | "purpose" | "topic" | "custom";
+  type Tag = { kind: TagKind; value: string };
+  type TagSuggestion = { kind: TagKind; value: string; count: number };
+
   type Call = {
     id: string;
     session_id: string;
@@ -30,6 +34,15 @@
     source_app: string | null;
     source_kind: string | null;
     utterances: Utterance[];
+    tags: Tag[];
+  };
+
+  type Me = {
+    user_id?: string;
+    email: string;
+    display_name: string;
+    role: string;
+    org_display_name: string;
   };
 
   function prettyApp(raw: string | null): string | null {
@@ -87,13 +100,158 @@
   };
 
   let call = $state<Call | null>(null);
+  let me = $state<Me | null>(null);
   let highlights = $state<Highlight[]>([]);
   let error = $state("");
   let loading = $state(true);
 
+  // ── Tags (#57) ───────────────────────────────────────────────────
+  // Popover state shared with the portal; see
+  // portal/src/routes/calls/[id]/+page.svelte for the narrated
+  // version. Kept in lock-step deliberately — design.md §Tag chip.
+  let tagAddOpen = $state(false);
+  let tagAddKind = $state<TagKind>("client");
+  let tagAddValue = $state("");
+  let tagAddError = $state("");
+  let tagAddSaving = $state(false);
+  let tagSuggestions = $state<TagSuggestion[]>([]);
+  let tagSuggestDebounce: number | undefined;
+  let tagInputEl: HTMLInputElement | undefined = $state();
+
+  // Member viewing an admin-shared call: read-only. In the agent the
+  // user is almost always the owner (local-session path) but we still
+  // respect `role` + whatever the backend allowed through so a
+  // future admin-share doesn't regress.
+  let canEditTags = $derived.by(() => {
+    if (!me) return false;
+    if (me.role === "admin" || me.role === "superadmin") return true;
+    return true;
+  });
+
+  const TAG_KIND_ORDER: TagKind[] = ["client", "purpose", "topic", "custom"];
+  let groupedTags = $derived.by(() => {
+    if (!call) return [] as Tag[];
+    const by = new Map<TagKind, Tag[]>();
+    for (const k of TAG_KIND_ORDER) by.set(k, []);
+    for (const t of call.tags ?? []) {
+      const bucket = by.get(t.kind);
+      if (bucket) bucket.push(t);
+    }
+    return TAG_KIND_ORDER.flatMap((k) => by.get(k) ?? []);
+  });
+
+  function openTagAdd() {
+    tagAddOpen = true;
+    tagAddError = "";
+    tagAddValue = "";
+    tagSuggestions = [];
+    queueMicrotask(() => tagInputEl?.focus());
+    void refreshTagSuggestions();
+  }
+
+  function closeTagAdd() {
+    tagAddOpen = false;
+    tagAddError = "";
+    if (tagSuggestDebounce !== undefined) {
+      clearTimeout(tagSuggestDebounce);
+      tagSuggestDebounce = undefined;
+    }
+  }
+
+  function onTagInputKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeTagAdd();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      void saveNewTag(tagAddValue);
+    }
+  }
+
+  function onTagInput() {
+    if (tagSuggestDebounce !== undefined) {
+      clearTimeout(tagSuggestDebounce);
+    }
+    tagSuggestDebounce = window.setTimeout(() => {
+      void refreshTagSuggestions();
+    }, 150);
+  }
+
+  async function refreshTagSuggestions() {
+    try {
+      const list = await invoke<TagSuggestion[]>("tag_suggestions", {
+        kind: tagAddKind,
+        q: tagAddValue.trim() || null,
+      });
+      tagSuggestions = Array.isArray(list) ? list : [];
+    } catch {
+      tagSuggestions = [];
+    }
+  }
+
+  function onTagKindChange(k: TagKind) {
+    tagAddKind = k;
+    tagAddValue = "";
+    tagSuggestions = [];
+    void refreshTagSuggestions();
+    queueMicrotask(() => tagInputEl?.focus());
+  }
+
+  async function saveNewTag(rawValue: string) {
+    if (!call) return;
+    const value = rawValue.trim();
+    if (!value) {
+      tagAddError = "Enter a tag value.";
+      return;
+    }
+    const exists = (call.tags ?? []).some(
+      (t) => t.kind === tagAddKind && t.value === value,
+    );
+    if (exists) {
+      closeTagAdd();
+      return;
+    }
+    const next: Tag[] = [...(call.tags ?? []), { kind: tagAddKind, value }];
+    const prev = call.tags ?? [];
+    call = { ...call, tags: next };
+    tagAddSaving = true;
+    tagAddError = "";
+    try {
+      await invoke("update_call_tags", { id: call.id, tags: next });
+      closeTagAdd();
+    } catch (e: any) {
+      call = { ...call, tags: prev };
+      tagAddError = String(e?.message ?? e);
+    } finally {
+      tagAddSaving = false;
+    }
+  }
+
+  async function removeTag(target: Tag) {
+    if (!call) return;
+    const prev = call.tags ?? [];
+    const next = prev.filter(
+      (t) => !(t.kind === target.kind && t.value === target.value),
+    );
+    call = { ...call, tags: next };
+    try {
+      await invoke("update_call_tags", { id: call.id, tags: next });
+    } catch (e: any) {
+      call = { ...call, tags: prev };
+      error = String(e?.message ?? e);
+    }
+  }
+
+  function pickSuggestion(s: TagSuggestion) {
+    void saveNewTag(s.value);
+  }
+
   let audioSrc = $state<string>("");
   let audioError = $state("");
-  let track = $state<"mixed" | "mic" | "system">("mixed");
+  // Only mixed is ever played or downloaded — per-channel mic / system
+  // tracks get deleted from storage after the pipeline completes (see
+  // backend/src/mix.rs::cleanup_per_channel_tracks, #49 option 1). The
+  // Everyone/You/Others toggle was removed in #54.
   let currentMs = $state(0);
   let audioEl = $state<HTMLAudioElement | undefined>(undefined);
   let audioUrls = $state<{
@@ -127,6 +285,12 @@
   onMount(async () => {
     trace("onMount start", { id: page.params.id });
     try {
+      // Pull current_user first so the tags edit gate is correct on
+      // first paint — otherwise members see the + Add pill flash in
+      // before canEditTags updates.
+      try {
+        me = await invoke<Me | null>("current_user");
+      } catch {}
       call = await invoke<Call>("get_call", { id: page.params.id });
       trace("get_call ok", {
         id: call?.id,
@@ -160,8 +324,8 @@
       } catch (e) {
         trace("list_highlights FAILED", e);
       }
-      trace("loadAudio start", { track });
-      await loadAudio(track);
+      trace("loadAudio start");
+      await loadAudio();
       trace("loadAudio done", { src: audioSrc, err: audioError });
     } catch (e) {
       trace("onMount FATAL", e);
@@ -307,10 +471,9 @@
     { value: "action", label: "Action" },
   ];
 
-  async function loadAudio(which: "mixed" | "mic" | "system") {
+  async function loadAudio() {
     if (!call) return;
     audioError = "";
-    track = which;
     // Stale blob URLs from the old fetch-then-blob path may still be
     // hanging around; revoke any we own. New path doesn't create blobs.
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
@@ -321,7 +484,7 @@
     // seek operations are sample-accurate. The old path ran the whole
     // file through fetch + blob, which froze the UI on big recordings
     // (#13) and left click-to-seek jumping to random timestamps (#18).
-    const remote = audioUrls && audioUrls[which];
+    const remote = audioUrls && audioUrls.mixed;
     if (remote) {
       audioSrc = remote;
       return;
@@ -334,7 +497,7 @@
     try {
       const path = await invoke<string>("get_session_audio_path", {
         sessionId: call.session_id,
-        track: which,
+        track: "mixed",
       });
       audioSrc = convertFileSrc(path);
     } catch (e) {
@@ -363,11 +526,10 @@
   }
 
   async function downloadCurrentTrack() {
-    const url = audioUrls[track];
+    const url = audioUrls?.mixed;
     if (!url || !call) return;
     const base = safeFilename(call.title?.trim() || call.session_id);
-    const suffix = track === "mixed" ? "" : `-${track}`;
-    const filename = `${base}${suffix}.opus`;
+    const filename = `${base}.opus`;
     // Ask the user where to save — native dialog, remembers last dir.
     let dest: string | null = null;
     try {
@@ -740,11 +902,6 @@
     });
   }
 
-  const trackLabels = {
-    mixed: "Everyone",
-    mic: "You",
-    system: "Others",
-  } as const;
 
   // Kept in lock-step with Waveform.kindBand() so the chip row reads as the
   // same color as the band above it. Each value is the "edge" color from the
@@ -882,26 +1039,14 @@
           </button>
         </div>
 
-        <div class="tracks">
-          {#each ["mixed", "mic", "system"] as key (key)}
-            <button
-              class="track-pill"
-              class:active={track === key}
-              onclick={() => loadAudio(key as "mixed" | "mic" | "system")}
-            >
-              {trackLabels[key as keyof typeof trackLabels]}
-            </button>
-          {/each}
-        </div>
-
         <button class="rate" onclick={cycleRate} aria-label="Playback rate">
           {rate}×
         </button>
         <button
           class="t-btn download"
           onclick={downloadCurrentTrack}
-          disabled={!audioUrls[track] || downloading}
-          title="Download {trackLabels[track]} track as .opus"
+          disabled={!audioUrls?.mixed || downloading}
+          title="Download this call as .opus"
           aria-label="Download audio"
         >
           {#if downloading}
@@ -1086,6 +1231,119 @@
         </div>
       </section>
     {/if}
+
+    <!-- ── Tags (#57) — mirrors the portal. See design.md §Tag chip
+         for the shared vocabulary; the calls-list filter reuses the
+         same class set. -->
+    <section class="block tags-section" style="--i: 2.5">
+      <div class="block-head">
+        <h2>Tags</h2>
+      </div>
+      {#if (call.tags?.length ?? 0) === 0}
+        <div class="tag-row tag-empty-row">
+          <span class="tag-empty">No tags yet</span>
+          {#if canEditTags}
+            <button
+              type="button"
+              class="tag-add-pill"
+              onclick={openTagAdd}
+              aria-expanded={tagAddOpen}
+            >+ Add tag</button>
+          {/if}
+        </div>
+      {:else}
+        <div class="tag-row">
+          {#each groupedTags as t (t.kind + ":" + t.value)}
+            <span class="tag-chip k-{t.kind}">
+              <a
+                class="tag-chip-link"
+                href="/calls?tag={encodeURIComponent(t.kind + ':' + t.value)}"
+                title="Filter calls by {t.kind}: {t.value}"
+              >{t.value}</a>
+              {#if canEditTags}
+                <button
+                  type="button"
+                  class="tag-chip-x"
+                  onclick={() => removeTag(t)}
+                  aria-label="Remove tag {t.value}"
+                  title="Remove"
+                >×</button>
+              {/if}
+            </span>
+          {/each}
+          {#if canEditTags}
+            <button
+              type="button"
+              class="tag-add-pill"
+              onclick={openTagAdd}
+              aria-expanded={tagAddOpen}
+            >+ Add tag</button>
+          {/if}
+        </div>
+      {/if}
+
+      {#if tagAddOpen && canEditTags}
+        <div class="tag-popover" role="dialog" aria-label="Add tag">
+          <div class="tag-kind-row" role="radiogroup" aria-label="Tag kind">
+            {#each ["client", "purpose", "topic", "custom"] as k (k)}
+              <button
+                type="button"
+                class="tag-kind-btn k-{k}"
+                class:active={tagAddKind === k}
+                role="radio"
+                aria-checked={tagAddKind === k}
+                onclick={() => onTagKindChange(k as TagKind)}
+              >{k}</button>
+            {/each}
+          </div>
+          <div class="tag-input-row">
+            <input
+              bind:this={tagInputEl}
+              class="tag-input"
+              type="text"
+              placeholder="Type to search or add new…"
+              bind:value={tagAddValue}
+              oninput={onTagInput}
+              onkeydown={onTagInputKeydown}
+              autocomplete="off"
+            />
+            <button
+              type="button"
+              class="tag-save"
+              disabled={tagAddSaving || !tagAddValue.trim()}
+              onclick={() => saveNewTag(tagAddValue)}
+            >
+              {tagAddSaving ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              class="tag-cancel"
+              onclick={closeTagAdd}
+              disabled={tagAddSaving}
+            >Cancel</button>
+          </div>
+          {#if tagSuggestions.length > 0}
+            <ul class="tag-suggest" role="listbox">
+              {#each tagSuggestions as s (s.kind + ":" + s.value)}
+                <li>
+                  <button
+                    type="button"
+                    class="tag-suggest-item"
+                    onclick={() => pickSuggestion(s)}
+                  >
+                    <span class="tag-suggest-value">{s.value}</span>
+                    <span class="tag-suggest-count">· used {s.count}×</span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          {#if tagAddError}
+            <p class="tag-error">{tagAddError}</p>
+          {/if}
+        </div>
+      {/if}
+    </section>
 
     {#if call.summary_text}
       <section class="block" style="--i: 3">
@@ -1530,34 +1788,6 @@
   .t-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
-  }
-
-  .tracks {
-    display: flex;
-    gap: 2px;
-    padding: 2px;
-    border-radius: 8px;
-    background: var(--ink-2);
-    border: 1px solid var(--hairline);
-  }
-
-  .track-pill {
-    padding: 0.3rem 0.75rem;
-    font-size: 0.78rem;
-    font-weight: 500;
-    color: var(--bone-3);
-    border-radius: 6px;
-    transition: all 0.15s;
-  }
-
-  .track-pill:hover {
-    color: var(--bone-0);
-  }
-
-  .track-pill.active {
-    background: var(--ink-0);
-    color: var(--accent);
-    box-shadow: inset 0 0 0 1px var(--hairline-hi);
   }
 
   .rate {
@@ -2131,5 +2361,222 @@
   .btn-danger:disabled {
     opacity: 0.55;
     cursor: not-allowed;
+  }
+
+  /* ── Tag chip + popover (design.md §Tag chip) ────────────────────
+     Mirrored from portal/src/routes/calls/[id]/+page.svelte; keep
+     in lock-step. The calls-list filter reuses these classes. */
+  .tags-section { position: relative; }
+  .tag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    align-items: center;
+  }
+  .tag-empty-row { gap: 0.6rem; }
+  .tag-empty {
+    color: var(--bone-3);
+    font-size: 0.85rem;
+    font-style: italic;
+  }
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.15rem 0.25rem 0.15rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0.005em;
+    line-height: 1.3;
+  }
+  .tag-chip-link {
+    color: inherit;
+    text-decoration: none;
+    padding: 0.1rem 0.1rem 0.1rem 0;
+  }
+  .tag-chip-link:hover { text-decoration: underline; }
+  .tag-chip-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    opacity: 0.7;
+    font-size: 0.95rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.12s, background 0.12s, opacity 0.12s;
+  }
+  .tag-chip-x:hover {
+    color: var(--live);
+    background: var(--live-soft);
+    opacity: 1;
+  }
+
+  .tag-chip.k-client {
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .tag-chip.k-purpose {
+    background: var(--olive-soft);
+    color: var(--olive);
+  }
+  .tag-chip.k-topic {
+    background: rgba(201, 162, 74, 0.14);
+    color: var(--sig);
+  }
+  .tag-chip.k-custom {
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+
+  .tag-add-pill {
+    padding: 0.2rem 0.7rem;
+    border: 1px dashed var(--hairline-hi);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--bone-2);
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .tag-add-pill:hover {
+    color: var(--bone-0);
+    border-color: var(--accent);
+    border-style: solid;
+  }
+
+  .tag-popover {
+    margin-top: 0.7rem;
+    padding: 0.9rem 1rem 1rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+    box-shadow: 0 14px 30px -14px rgba(0, 0, 0, 0.5);
+    max-width: 520px;
+  }
+  .tag-kind-row {
+    display: flex;
+    gap: 0.3rem;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .tag-kind-btn {
+    padding: 0.22rem 0.8rem;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 500;
+    text-transform: capitalize;
+    cursor: pointer;
+    transition: all 0.15s;
+    opacity: 0.62;
+  }
+  .tag-kind-btn:hover { opacity: 0.9; }
+  .tag-kind-btn.active {
+    opacity: 1;
+    border-color: currentColor;
+  }
+  .tag-kind-btn.k-client {
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .tag-kind-btn.k-purpose {
+    background: var(--olive-soft);
+    color: var(--olive);
+  }
+  .tag-kind-btn.k-topic {
+    background: rgba(201, 162, 74, 0.14);
+    color: var(--sig);
+  }
+  .tag-kind-btn.k-custom {
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+
+  .tag-input-row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .tag-input {
+    flex: 1;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font-size: 0.88rem;
+  }
+  .tag-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .tag-save,
+  .tag-cancel {
+    padding: 0.4rem 0.85rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    border-radius: 6px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
+    cursor: pointer;
+  }
+  .tag-save {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .tag-save:disabled,
+  .tag-cancel:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .tag-suggest {
+    list-style: none;
+    padding: 0.25rem 0;
+    margin: 0.5rem 0 0;
+    max-height: 190px;
+    overflow-y: auto;
+    border-top: 1px solid var(--hairline);
+  }
+  .tag-suggest li { margin: 0; }
+  .tag-suggest-item {
+    width: 100%;
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.38rem 0.55rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-1);
+    font-size: 0.85rem;
+    text-align: left;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .tag-suggest-item:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .tag-suggest-value { font-weight: 500; }
+  .tag-suggest-count {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--bone-3);
+  }
+
+  .tag-error {
+    margin: 0.6rem 0 0;
+    color: var(--live);
+    font-size: 0.82rem;
   }
 </style>

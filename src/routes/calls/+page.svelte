@@ -2,6 +2,20 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
 
+  // #57 Tag-aware filter bar.
+  //
+  // The bar is two parts: a title-only text input and a tag-chip row.
+  // Tag filters live on the URL as repeated `?tag=kind:value` params
+  // (the backend accepts this shape natively), so refresh + share-link
+  // preserve the filter set. We re-fetch whenever the tag set changes;
+  // the title input filters the already-fetched rows client-side.
+  //
+  // TODO(refactor): the Add-filter popover duplicates markup with the
+  // call-detail Add-tag flow. When the parallel agent extracts a shared
+  // TagChip / TagAutocomplete component, switch to importing that.
+
+  type Tag = { kind: string; value: string };
+
   type Call = {
     id: string;
     session_id: string;
@@ -12,10 +26,12 @@
     status: string;
     source_app: string | null;
     source_kind: string | null;
+    tags?: Tag[];
   };
 
-  // Tidy a raw app binary or application-name into something human. Unknown
-  // apps fall through unchanged so we don't hide information.
+  type TagSuggestion = { kind: string; value: string; count: number };
+
+  // Tidy a raw app binary or application-name into something human.
   function prettyApp(raw: string | null): string | null {
     if (!raw) return null;
     const key = raw.toLowerCase();
@@ -63,24 +79,153 @@
   let loading = $state(true);
   let query = $state("");
 
-  onMount(async () => {
+  // Active tag filters, each as "kind:value". Kept in sync with the URL.
+  let tagFilters = $state<string[]>([]);
+
+  // Add-filter popover state.
+  let popoverOpen = $state(false);
+  let popoverKind = $state<string>("");
+  let popoverQuery = $state("");
+  let suggestions = $state<TagSuggestion[]>([]);
+  let suggestLoading = $state(false);
+
+  function parseTagParam(raw: string): { kind: string; value: string } | null {
+    const i = raw.indexOf(":");
+    if (i <= 0 || i === raw.length - 1) return null;
+    return { kind: raw.slice(0, i), value: raw.slice(i + 1) };
+  }
+
+  function tagLabel(t: string) {
+    const p = parseTagParam(t);
+    return p ? `${p.kind}: ${p.value}` : t;
+  }
+
+  function tagKind(t: string): string {
+    return parseTagParam(t)?.kind ?? "custom";
+  }
+
+  function readTagsFromUrl(): string[] {
+    if (typeof window === "undefined") return [];
+    const params = new URL(window.location.href).searchParams;
+    return params.getAll("tag").filter((t) => !!parseTagParam(t));
+  }
+
+  function syncUrl() {
+    if (typeof window === "undefined") return;
+    const u = new URL(window.location.href);
+    u.searchParams.delete("tag");
+    for (const t of tagFilters) u.searchParams.append("tag", t);
+    // replaceState so toggling filters doesn't flood the back button.
+    window.history.replaceState(window.history.state, "", u.toString());
+  }
+
+  async function load() {
+    loading = true;
+    error = "";
     try {
-      calls = await invoke<Call[]>("list_calls");
+      calls = await invoke<Call[]>("list_calls", { tags: tagFilters });
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
     }
+  }
+
+  async function addTagFilter(kind: string, value: string) {
+    const k = kind.trim();
+    const v = value.trim();
+    if (!k || !v) return;
+    const entry = `${k}:${v}`;
+    if (tagFilters.includes(entry)) {
+      popoverOpen = false;
+      return;
+    }
+    tagFilters = [...tagFilters, entry];
+    syncUrl();
+    popoverOpen = false;
+    popoverQuery = "";
+    popoverKind = "";
+    await load();
+  }
+
+  async function removeTagFilter(entry: string) {
+    tagFilters = tagFilters.filter((t) => t !== entry);
+    syncUrl();
+    await load();
+  }
+
+  async function clearFilters() {
+    tagFilters = [];
+    query = "";
+    syncUrl();
+    await load();
+  }
+
+  async function refreshSuggestions() {
+    suggestLoading = true;
+    try {
+      suggestions = await invoke<TagSuggestion[]>("tag_suggestions", {
+        kind: popoverKind || null,
+        q: popoverQuery.trim() || null,
+      });
+    } catch {
+      suggestions = [];
+    } finally {
+      suggestLoading = false;
+    }
+  }
+
+  async function openPopover() {
+    popoverOpen = true;
+    popoverQuery = "";
+    popoverKind = "";
+    await refreshSuggestions();
+  }
+
+  function onPopoverKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      popoverOpen = false;
+    } else if (e.key === "Enter") {
+      const v = popoverQuery.trim();
+      if (v && popoverKind) {
+        e.preventDefault();
+        void addTagFilter(popoverKind, v);
+      } else if (suggestions.length > 0) {
+        e.preventDefault();
+        const s = suggestions[0];
+        void addTagFilter(s.kind, s.value);
+      }
+    }
+  }
+
+  // Focus the popover's search input when it opens. Using a Svelte action
+  // keeps us off of raw `autofocus`, which is an a11y smell — we only
+  // pull focus inside a user-opened popover, not on page load.
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
+  }
+
+  let suggestTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    if (!popoverOpen) return;
+    popoverKind;
+    popoverQuery;
+    if (suggestTimer) clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(() => {
+      void refreshSuggestions();
+    }, 120);
+  });
+
+  onMount(async () => {
+    tagFilters = readTagsFromUrl();
+    await load();
   });
 
   let filtered = $derived.by(() => {
     if (!query.trim()) return calls;
     const q = query.trim().toLowerCase();
-    return calls.filter(
-      (c) =>
-        (c.title ?? "").toLowerCase().includes(q) ||
-        (c.matched_client ?? "").toLowerCase().includes(q),
-    );
+    // Title-only now — client lives in the tag-filter bar above.
+    return calls.filter((c) => (c.title ?? "").toLowerCase().includes(q));
   });
 
   // Group by LOCAL yyyy-mm-dd. Using toISOString here would bucket a call
@@ -105,8 +250,6 @@
   });
 
   function fmtDay(key: string) {
-    // Parse yyyy-mm-dd as a local date. `new Date("2026-04-21")` would
-    // parse as UTC midnight and drift back a day in western timezones.
     const [y, m, dd] = key.split("-").map(Number);
     const d = new Date(y, m - 1, dd);
     const today = new Date();
@@ -141,6 +284,12 @@
     if (m === 0) return `${r}s`;
     return `${m}:${String(r).padStart(2, "0")}`;
   }
+
+  async function promoteRowTag(e: MouseEvent, t: Tag) {
+    e.preventDefault();
+    e.stopPropagation();
+    await addTagFilter(t.kind, t.value);
+  }
 </script>
 
 <main class="page reveal">
@@ -151,7 +300,10 @@
         {calls.length} {calls.length === 1 ? "call" : "calls"} in your archive
       </p>
     </div>
+    <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
+  </header>
 
+  <div class="filter-bar" style="--i: 1">
     <div class="search">
       <span class="search-glyph" aria-hidden="true">
         <svg viewBox="0 0 16 16" width="13" height="13">
@@ -161,19 +313,114 @@
       </span>
       <input
         type="text"
-        placeholder="Filter by title or client"
+        placeholder="Filter by title"
         bind:value={query}
       />
     </div>
-    <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
-  </header>
+    <div class="chip-row">
+      {#each tagFilters as t (t)}
+        <span class="tag-chip tag-{tagKind(t)}">
+          <span class="tag-chip-label">{tagLabel(t)}</span>
+          <button
+            type="button"
+            class="tag-chip-x"
+            aria-label="Remove filter {tagLabel(t)}"
+            onclick={() => removeTagFilter(t)}
+          >×</button>
+        </span>
+      {/each}
+      <div class="add-wrap">
+        <button
+          type="button"
+          class="add-filter"
+          onclick={() => (popoverOpen ? (popoverOpen = false) : openPopover())}
+          aria-haspopup="dialog"
+          aria-expanded={popoverOpen}
+        >
+          + Add filter
+        </button>
+        {#if popoverOpen}
+          <div
+            class="pop-backdrop"
+            role="button"
+            tabindex="-1"
+            aria-label="Close filter picker"
+            onclick={() => (popoverOpen = false)}
+            onkeydown={(e) => e.key === "Escape" && (popoverOpen = false)}
+          ></div>
+          <div class="pop" role="dialog" aria-label="Add tag filter">
+            <div class="pop-kinds" role="radiogroup" aria-label="Tag kind">
+              {#each [
+                { k: "", label: "Any" },
+                { k: "client", label: "Client" },
+                { k: "purpose", label: "Purpose" },
+                { k: "topic", label: "Topic" },
+                { k: "custom", label: "Custom" },
+              ] as opt (opt.k)}
+                <button
+                  type="button"
+                  class="pop-kind"
+                  class:active={popoverKind === opt.k}
+                  role="radio"
+                  aria-checked={popoverKind === opt.k}
+                  onclick={() => (popoverKind = opt.k)}
+                >{opt.label}</button>
+              {/each}
+            </div>
+            <input
+              class="pop-search"
+              type="text"
+              placeholder={popoverKind ? `Search ${popoverKind}…` : "Search tags…"}
+              bind:value={popoverQuery}
+              onkeydown={onPopoverKeydown}
+              use:focusOnMount
+            />
+            <ul class="pop-list">
+              {#if suggestLoading}
+                <li class="pop-empty">Loading…</li>
+              {:else if suggestions.length === 0}
+                {#if popoverQuery.trim() && popoverKind}
+                  <li>
+                    <button
+                      type="button"
+                      class="pop-item pop-item-create"
+                      onclick={() => addTagFilter(popoverKind, popoverQuery)}
+                    >
+                      Filter by <b>{popoverKind}: {popoverQuery.trim()}</b>
+                    </button>
+                  </li>
+                {:else}
+                  <li class="pop-empty">No matching tags</li>
+                {/if}
+              {:else}
+                {#each suggestions as s (s.kind + ":" + s.value)}
+                  <li>
+                    <button
+                      type="button"
+                      class="pop-item"
+                      onclick={() => addTagFilter(s.kind, s.value)}
+                    >
+                      <span class="tag-chip tag-{s.kind} tag-chip-tight">
+                        <span class="tag-chip-label">{s.kind}: {s.value}</span>
+                      </span>
+                      <span class="pop-count">{s.count}</span>
+                    </button>
+                  </li>
+                {/each}
+              {/if}
+            </ul>
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
 
   {#if loading}
-    <p class="state" style="--i: 1">Loading…</p>
+    <p class="state" style="--i: 2">Loading…</p>
   {:else if error}
-    <p class="state err" style="--i: 1">{error}</p>
-  {:else if calls.length === 0}
-    <div class="empty" style="--i: 1">
+    <p class="state err" style="--i: 2">{error}</p>
+  {:else if calls.length === 0 && tagFilters.length === 0 && !query.trim()}
+    <div class="empty" style="--i: 2">
       <p class="empty-title">No calls yet</p>
       <p class="empty-sub">
         Go to Record to capture your first call.
@@ -181,11 +428,18 @@
       <a href="/" class="empty-cta">Go to Record →</a>
     </div>
   {:else if filtered.length === 0}
-    <p class="state" style="--i: 1">No calls match "{query}".</p>
+    <div class="empty" style="--i: 2">
+      <p class="empty-title">No calls match these filters</p>
+      <p class="empty-sub">
+        <button type="button" class="empty-clear" onclick={clearFilters}>
+          Clear filters
+        </button>
+      </p>
+    </div>
   {:else}
     <div class="groups">
       {#each groups as [day, items], idx (day)}
-        <section class="group" style="--i: {idx + 1}">
+        <section class="group" style="--i: {idx + 2}">
           <div class="group-head">
             <span class="day">{fmtDay(day)}</span>
             <span class="day-count">
@@ -203,8 +457,21 @@
                       {call.title ?? "(untitled)"}
                     </h3>
                     <div class="entry-meta">
-                      {#if call.matched_client}
-                        <span class="chip chip-accent">{call.matched_client}</span>
+                      {#if call.tags && call.tags.length > 0}
+                        {#each call.tags.slice(0, 2) as t (t.kind + ":" + t.value)}
+                          <button
+                            type="button"
+                            class="tag-chip tag-{t.kind} tag-chip-tight tag-chip-row"
+                            onclick={(e) => promoteRowTag(e, t)}
+                            title="Filter by {t.kind}: {t.value}"
+                          >
+                            <span class="tag-chip-label">{t.kind}: {t.value}</span>
+                          </button>
+                        {/each}
+                      {:else if call.matched_client}
+                        <span class="tag-chip tag-client tag-chip-tight">
+                          <span class="tag-chip-label">client: {call.matched_client}</span>
+                        </span>
                       {/if}
                       {#if prettyApp(call.source_app)}
                         <span class="chip" title={sourceKindLabel(call.source_kind)}>
@@ -243,7 +510,7 @@
     align-items: flex-end;
     justify-content: space-between;
     gap: 1.5rem;
-    margin-bottom: 1.6rem;
+    margin-bottom: 1.2rem;
   }
   .trash-link {
     font-size: 0.8rem;
@@ -268,6 +535,15 @@
     margin: 0;
     color: var(--bone-3);
     font-size: 0.82rem;
+  }
+
+  /* ── Filter bar ──────────────────────────────────────────────────── */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.7rem;
+    margin-bottom: 1.6rem;
   }
 
   .search {
@@ -304,7 +580,209 @@
     border-color: var(--accent);
   }
 
-  /* ── States ────────────────────────────────────────────────────────── */
+  .chip-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  /* ── Tag chips (kind-colored, matches design.md Tag chip pattern) ── */
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.18rem 0.55rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    border-radius: 999px;
+    background: var(--ink-3);
+    color: var(--bone-1);
+    border: 1px solid transparent;
+    line-height: 1.2;
+  }
+  .tag-chip-tight {
+    padding: 0.08rem 0.45rem;
+    font-size: 0.7rem;
+  }
+  .tag-chip-label {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 26ch;
+  }
+  .tag-client {
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .tag-purpose {
+    background: var(--olive-soft);
+    color: var(--olive);
+  }
+  .tag-topic {
+    background: rgba(201, 162, 74, 0.14);
+    color: var(--sig);
+  }
+  .tag-custom {
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+  .tag-chip-x {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: inherit;
+    font-size: 0.95rem;
+    line-height: 1;
+    padding: 0 0.1rem;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.12s;
+  }
+  .tag-chip-x:hover {
+    opacity: 1;
+  }
+  .tag-chip-row {
+    appearance: none;
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .tag-chip-row:hover {
+    filter: brightness(1.15);
+  }
+
+  /* ── Add-filter button + popover ─────────────────────────────────── */
+  .add-wrap {
+    position: relative;
+  }
+  .add-filter {
+    appearance: none;
+    background: transparent;
+    border: 1px dashed var(--hairline-hi);
+    color: var(--bone-2);
+    font-family: inherit;
+    font-size: 0.75rem;
+    padding: 0.22rem 0.65rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .add-filter:hover {
+    color: var(--bone-0);
+    border-color: var(--accent);
+  }
+  .pop-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    background: transparent;
+  }
+  .pop {
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    left: 0;
+    z-index: 11;
+    width: 280px;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    box-shadow: 0 14px 30px -10px rgba(0, 0, 0, 0.55);
+    padding: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .pop-kinds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem;
+  }
+  .pop-kind {
+    appearance: none;
+    background: transparent;
+    color: var(--bone-2);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.15rem 0.55rem;
+    font-size: 0.72rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .pop-kind:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+  }
+  .pop-kind.active {
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    border-color: transparent;
+  }
+  .pop-search {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font-family: inherit;
+    font-size: 0.82rem;
+  }
+  .pop-search:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .pop-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 240px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pop-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    width: 100%;
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--bone-1);
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.4rem;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .pop-item:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .pop-item-create {
+    color: var(--bone-2);
+    font-style: italic;
+  }
+  .pop-count {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--bone-3);
+  }
+  .pop-empty {
+    color: var(--bone-3);
+    font-size: 0.8rem;
+    padding: 0.4rem;
+    text-align: center;
+    list-style: none;
+  }
+
+  /* ── States ──────────────────────────────────────────────────────── */
   .state {
     color: var(--bone-3);
     font-size: 0.9rem;
@@ -345,8 +823,22 @@
     background: var(--accent);
     color: var(--ink-0);
   }
+  .empty-clear {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 0.88rem;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .empty-clear:hover {
+    color: var(--accent-hi);
+  }
 
-  /* ── Groups ────────────────────────────────────────────────────────── */
+  /* ── Groups ──────────────────────────────────────────────────────── */
   .groups {
     display: flex;
     flex-direction: column;
@@ -426,7 +918,8 @@
 
   .entry-meta {
     display: flex;
-    gap: 0.4rem;
+    gap: 0.35rem;
+    flex-wrap: wrap;
   }
 
   .chip {
@@ -440,12 +933,6 @@
     background: var(--ink-3);
     color: var(--bone-1);
     border: 1px solid var(--hairline);
-  }
-
-  .chip-accent {
-    border-color: rgba(58, 155, 146, 0.32);
-    background: var(--accent-soft);
-    color: var(--accent-hi);
   }
 
   .chip-sig {

@@ -1,4 +1,12 @@
 {
+  "0.3.21": {
+    "headline": "Auto-tag your calls, then filter the list by tag",
+    "changes": [
+      "Every call now gets a small set of structured tags generated automatically as part of the summary step — typically a client or counterparty, a meeting type (sales review, support, planning, 1:1, etc.), and one or two specific topics. No extra processing cost; tags ride along with the summary.",
+      "Open a call and you can add or remove tags as chips below Participants. Pick a kind (client / purpose / topic / custom), type a value, autocomplete from what's already in use across the team. Click a tag chip to jump to the Calls list pre-filtered to that tag.",
+      "The Calls list filter bar now has a tag-based filter alongside the title search. Stack multiple filters (every selected tag must be present) and the URL keeps them so the filtered view survives a refresh or a shared link."
+    ]
+  },
   "0.3.20": {
     "headline": "Recording consent tools + optional start-of-call cue",
     "changes": [

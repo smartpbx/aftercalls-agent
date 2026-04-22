@@ -159,8 +159,23 @@ pub async fn logout(backend: &Backend) -> Result<()> {
 
 // ── Existing routes, migrated to the auth-aware header ───────────────
 
-pub async fn list_calls(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/calls").await
+pub async fn list_calls(backend: &Backend, tags: &[String]) -> Result<Value> {
+    // Tag filters are passed as repeated ?tag= params; missing = no filter.
+    // Shares `urlencoding_minimal` with tag_suggestions below.
+    let mut path = String::from("/v1/calls");
+    if !tags.is_empty() {
+        path.push('?');
+        let mut first = true;
+        for t in tags {
+            if !first {
+                path.push('&');
+            }
+            first = false;
+            path.push_str("tag=");
+            path.push_str(&urlencoding_minimal(t));
+        }
+    }
+    get_json(backend, &path).await
 }
 
 pub async fn list_trashed(backend: &Backend) -> Result<Value> {
@@ -312,6 +327,72 @@ pub async fn get_peaks(backend: &Backend, id: &str) -> Result<Value> {
 
 pub async fn delete_call(backend: &Backend, id: &str) -> Result<()> {
     delete_nop(backend, &format!("/v1/calls/{id}")).await
+}
+
+// ── Tags (#57) ───────────────────────────────────────────────────────
+
+/// Replace the whole tag array on a call. Backend validates kind +
+/// non-empty value; bad input surfaces as a 400 the UI displays inline.
+pub async fn update_call_tags(
+    backend: &Backend,
+    id: &str,
+    tags: &Value,
+) -> Result<()> {
+    patch_nop(
+        backend,
+        &format!("/v1/calls/{id}/tags"),
+        serde_json::json!({ "tags": tags }),
+    )
+    .await
+}
+
+/// Prefix-match tag suggestions for the Add-tag popover autocomplete.
+/// `kind` + `q` are optional but the UI always passes both.
+pub async fn tag_suggestions(
+    backend: &Backend,
+    kind: Option<&str>,
+    q: Option<&str>,
+) -> Result<Value> {
+    let mut path = String::from("/v1/calls/tag-suggestions");
+    let mut first = true;
+    let mut push = |k: &str, v: &str| {
+        let sep = if first { '?' } else { '&' };
+        // Percent-encoding via url::form_urlencoded would be cleaner
+        // but pulling a new dep for two known-safe params isn't worth
+        // it. Kind + q both reach the backend via Axum's query parser
+        // which URL-decodes, so a simple replace of special chars
+        // keeps us safe.
+        let ev = urlencoding_minimal(v);
+        path.push_str(&format!("{sep}{k}={ev}"));
+        first = false;
+    };
+    if let Some(k) = kind {
+        push("kind", k);
+    }
+    if let Some(v) = q {
+        push("q", v);
+    }
+    get_json(backend, &path).await
+}
+
+/// Tiny URL-encoder for the handful of characters we need to escape
+/// in a tag kind / query string. Full form-urlencoded would need a
+/// dep; the backend only sees ASCII + short unicode here so this is
+/// enough for safety.
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '&' => out.push_str("%26"),
+            '=' => out.push_str("%3D"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '+' => out.push_str("%2B"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ── Pipeline (new; the transcription + summary work used to run on the
