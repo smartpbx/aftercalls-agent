@@ -156,6 +156,34 @@ pub async fn list_calls(backend: &Backend) -> Result<Value> {
     get_json(backend, "/v1/calls").await
 }
 
+pub async fn list_trashed(backend: &Backend) -> Result<Value> {
+    get_json(backend, "/v1/calls/trashed").await
+}
+
+pub async fn restore_call(backend: &Backend, id: &str) -> Result<()> {
+    post_json(backend, &format!("/v1/calls/{id}/restore"), serde_json::json!({})).await?;
+    Ok(())
+}
+
+pub async fn permadelete_call(backend: &Backend, id: &str) -> Result<()> {
+    // Matches the same auth-header wiring delete_call uses.
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/v1/calls/{}?permanent=true",
+        backend.url.trim_end_matches('/'),
+        id,
+    );
+    let resp = client
+        .delete(&url)
+        .header("Authorization", build_auth_header(backend).await?)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("permadelete call returned {}", resp.status());
+    }
+    Ok(())
+}
+
 pub async fn get_call(backend: &Backend, id: &str) -> Result<Value> {
     get_json(backend, &format!("/v1/calls/{id}")).await
 }

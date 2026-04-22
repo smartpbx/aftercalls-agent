@@ -165,6 +165,7 @@
         bind:value={query}
       />
     </div>
+    <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
   </header>
 
   {#if loading}
@@ -243,6 +244,20 @@
     justify-content: space-between;
     gap: 1.5rem;
     margin-bottom: 1.6rem;
+  }
+  .trash-link {
+    font-size: 0.8rem;
+    color: var(--bone-3);
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    text-decoration: none;
+    transition: all 0.15s;
+    align-self: center;
+  }
+  .trash-link:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
   }
 
   .head h1 {

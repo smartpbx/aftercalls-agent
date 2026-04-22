@@ -1,4 +1,12 @@
 {
+  "0.3.14": {
+    "headline": "Recycle bin for deleted calls, and a Help link in the user menu",
+    "changes": [
+      "Deleting a call sends it to Trash instead of disappearing immediately. You have 30 days to Restore it or Delete Forever from the new Trash page (reachable from the Calls list). After 30 days the backend auto-purges — audio and metadata both.",
+      "The user menu adds a Help link that opens the new knowledge base at app.aftercalls.io/help — full walkthrough of every feature on both desktop and web.",
+      "The user menu also gets \"Open web app\" as a direct link to app.aftercalls.io in your default browser."
+    ]
+  },
   "0.3.13": {
     "headline": "You can open a call the moment the transcript's ready — summary fills in live",
     "changes": [

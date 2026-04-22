@@ -252,6 +252,40 @@ async fn list_calls() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn list_trashed() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::list_trashed(backend).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn restore_call(id: String) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::restore_call(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn permadelete_call(id: String) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::permadelete_call(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_call(id: String) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
@@ -719,6 +753,9 @@ pub fn run() {
             logout,
             current_user,
             list_calls,
+            list_trashed,
+            restore_call,
+            permadelete_call,
             get_call,
             get_session_audio_path,
             get_audio_urls,
