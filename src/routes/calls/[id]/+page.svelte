@@ -10,6 +10,7 @@
   import SpeakerRenamePicker, {
     type SpeakerPick,
   } from "$lib/SpeakerRenamePicker.svelte";
+  import SummaryText from "$lib/SummaryText.svelte";
 
   type Utterance = {
     idx: number;
@@ -335,6 +336,14 @@
     mixed?: string;
     peaks_available?: boolean;
   }>({});
+  // Distinguish "get_audio_urls threw" from "backend said there is no
+  // remote mixed track yet". A transient 5xx / token refresh race would
+  // otherwise masquerade as "no remote" and push loadAudio into the
+  // local-file branch — which on week-old calls leaks a raw
+  // "not found: …/mixed.wav" to the UI (#98). We retry once in onMount;
+  // if that still throws we flag this and let the UI offer a manual retry
+  // instead of silently pretending the call has no audio.
+  let audioUrlsError = $state(false);
   let peaks = $state<Float32Array | null>(null);
   let playing = $state(false);
   let rate = $state(1);
@@ -490,9 +499,23 @@
       notesInitialized = true;
       try {
         audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+        audioUrlsError = false;
         trace("get_audio_urls ok", audioUrls);
       } catch (e) {
-        trace("get_audio_urls FAILED (fallback to local)", e);
+        // Transient 5xx / token refresh race is the common cause. Retry
+        // once after a short delay before falling through — without this
+        // a single blip permanently hides the remote audio on the detail
+        // page (the detail page doesn't reload get_audio_urls otherwise).
+        trace("get_audio_urls FAILED, retrying once", e);
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+          audioUrlsError = false;
+          trace("get_audio_urls ok (retry)", audioUrls);
+        } catch (e2) {
+          trace("get_audio_urls FAILED after retry", e2);
+          audioUrlsError = true;
+        }
       }
       if (audioUrls.peaks_available) {
         try {
@@ -685,6 +708,29 @@
       return;
     }
 
+    // No remote URL. Two very different situations hide behind this:
+    //
+    // 1. Call is still being processed (status != complete/failed) — the
+    //    local session_dir on this machine is the only copy. Serve it
+    //    via the Tauri asset protocol so webkit streams it.
+    // 2. Call is complete/failed — the remote SHOULD exist. If we're
+    //    here it means either `get_audio_urls` errored (see
+    //    `audioUrlsError`) or the backend row has no `mixed_audio_key`.
+    //    Falling back to the local path is wrong on machines that
+    //    didn't record the call, and on machines that did, `scan_orphans`
+    //    has almost certainly cleaned the session_dir after 7 days. The
+    //    raw `not found: /abs/path/mixed.wav` string used to leak here
+    //    (#98). Show a user-sensible message instead.
+    const terminal =
+      call.status === "complete" || call.status === "failed";
+    if (terminal) {
+      audioError = audioUrlsError
+        ? "Couldn't load audio — retry."
+        : "Audio unavailable — try again shortly.";
+      audioSrc = "";
+      return;
+    }
+
     // Fallback: call was recorded on THIS machine and the remote upload
     // hasn't completed yet (or failed). Serve the local file via the
     // Tauri asset protocol instead of reading the whole thing into a
@@ -696,9 +742,43 @@
       });
       audioSrc = convertFileSrc(path);
     } catch (e) {
-      audioError = String(e);
+      // Non-terminal call with no remote AND no local file — rare (only
+      // happens when the local session_dir was already cleaned but the
+      // call hasn't reached a terminal status). Give the user the same
+      // "try again shortly" message rather than the raw path.
+      trace("get_session_audio_path failed", e);
+      audioError = "Audio unavailable — try again shortly.";
       audioSrc = "";
     }
+  }
+
+  // Retry button target for the "Couldn't load audio — retry." state.
+  // Re-runs the same onMount flow for audio only (URLs, peaks, then
+  // wires up the <audio> src). Safe to call multiple times.
+  async function retryAudio() {
+    if (!call) return;
+    audioError = "";
+    audioUrlsError = false;
+    try {
+      audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+      trace("get_audio_urls ok (manual retry)", audioUrls);
+    } catch (e) {
+      trace("get_audio_urls FAILED (manual retry)", e);
+      audioUrlsError = true;
+    }
+    if (audioUrls.peaks_available && (!peaks || peaks.length === 0)) {
+      try {
+        const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+          id: page.params.id,
+        });
+        if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
+          peaks = new Float32Array(doc.peaks);
+        }
+      } catch (e) {
+        trace("get_peaks FAILED (manual retry)", e);
+      }
+    }
+    await loadAudio();
   }
 
   onDestroy(() => {
@@ -1076,42 +1156,6 @@
     }
   }
 
-  // Stable per-speaker accent colors. "You" always gets the brand accent; others
-  // pick from a muted palette tuned for the warm dark surface. Must tolerate
-  // null/undefined speaker strings — one bad row otherwise took down the whole
-  // call-detail render tree when `[...null]` threw at template time.
-  // Called from {@html ...}. Escapes HTML, then wraps each matching
-  // speaker name (longest-first so full names beat prefixes) in a
-  // colored span. Shares behavior with the portal.
-  function renderWithSpeakers(text: string | null | undefined): string {
-    if (!text) return "";
-    const esc = (s: string) =>
-      s
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    let out = esc(text);
-    const names = speakers
-      .map((s) => ({ name: s.speaker, color: speakerColor(s.speaker) }))
-      .sort((a, b) => b.name.length - a.name.length);
-    for (const { name, color } of names) {
-      if (!name) continue;
-      const escName = esc(name);
-      const reName = escName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(
-        `(^|[^A-Za-z0-9_])(${reName})(?=[^A-Za-z0-9_]|$)`,
-        "g",
-      );
-      out = out.replace(
-        re,
-        (_m, lead: string, match: string) =>
-          `${lead}<span class="spk" style="color:${color}">${match}</span>`,
-      );
-    }
-    return out;
-  }
-
   // Color allocation is order-based, not hash-based — two speakers
   // like "Mark" and "Clayton" happened to charcode-sum-mod-5 to the
   // same palette slot, so they rendered identical. We now walk the
@@ -1451,7 +1495,14 @@
       </div>
 
       {#if audioError}
-        <p class="inline-err">{audioError}</p>
+        <p class="inline-err">
+          {audioError}
+          {#if audioUrlsError}
+            <button type="button" class="inline-retry" onclick={retryAudio}>
+              Retry
+            </button>
+          {/if}
+        </p>
       {/if}
 
       <audio
@@ -1629,7 +1680,13 @@
             {copiedLabel === "summary" ? "Copied" : "Copy"}
           </button>
         </div>
-        <p class="summary">{@html renderWithSpeakers(call.summary_text)}</p>
+        <p class="summary">
+          <SummaryText
+            text={call.summary_text}
+            users={memberRoster}
+            colorFor={speakerColor}
+          />
+        </p>
       </section>
     {:else if call.status !== "complete" && call.status !== "failed"}
       <section class="block" style="--i: 3">
@@ -1688,7 +1745,13 @@
           {#each call.action_items as item, i (i)}
             <li>
               <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
-              <span>{@html renderWithSpeakers(item)}</span>
+              <span>
+                <SummaryText
+                  text={item}
+                  users={memberRoster}
+                  colorFor={speakerColor}
+                />
+              </span>
             </li>
           {/each}
         </ul>
@@ -1779,7 +1842,7 @@
                 }}
               >
                 <Avatar name={u.speaker} color={speakerColor(u.speaker)} size={20} />
-                {u.speaker}
+                <span class="utt-speaker-name">{u.speaker}</span>
               </button>
               <span class="utt-text">{u.text}</span>
             </div>
@@ -2158,6 +2221,23 @@
     margin: 0.6rem 0 0;
     color: var(--live);
     font-size: 0.85rem;
+  }
+
+  .inline-retry {
+    margin-left: 0.5rem;
+    padding: 0.15rem 0.55rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--bone-1);
+    background: var(--ink-2);
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .inline-retry:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
   }
 
   .player .hint {
@@ -2569,10 +2649,20 @@
     font-weight: 500;
     text-align: left;
     transition: background 0.15s;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .utt-speaker:hover {
     background: var(--ink-2);
+  }
+
+  .utt-speaker-name {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .utt-text {

@@ -41,6 +41,8 @@
   // The parent decides what to do with either — this component does
   // NOT call the API itself.
 
+  import Avatar from "./Avatar.svelte";
+
   type Props = {
     value: string;
     roster: OrgMemberLite[];
@@ -259,10 +261,16 @@
           onclick={() => pickRow(row)}
         >
           {#if row.kind === "recent"}
-            <span class="srp-name">{row.name}</span>
+            <Avatar name={row.name} size={20} />
+            <span class="srp-stack">
+              <span class="srp-name">{row.name}</span>
+            </span>
           {:else}
-            <span class="srp-name">{row.member.display_name}</span>
-            <span class="srp-email">{row.member.email}</span>
+            <Avatar name={row.member.display_name} size={20} />
+            <span class="srp-stack">
+              <span class="srp-name">{row.member.display_name}</span>
+              <span class="srp-email">{row.member.email}</span>
+            </span>
           {/if}
         </button>
       {/each}
@@ -342,7 +350,7 @@
     border: 1px solid var(--hairline-hi);
     border-radius: var(--radius);
     background: var(--ink-1);
-    box-shadow: 0 14px 28px -10px rgba(0, 0, 0, 0.55);
+    box-shadow: 0 10px 24px -8px rgba(0, 0, 0, 0.45);
     z-index: 20;
     padding: 0.3rem 0;
   }
@@ -367,8 +375,9 @@
 
   .srp-row-btn {
     display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.6rem;
     width: 100%;
     padding: 0.35rem 0.7rem;
     border: none;
@@ -381,8 +390,15 @@
   }
   .srp-row-btn:hover,
   .srp-row-btn.active {
-    background: var(--ink-2);
+    background: var(--accent-soft);
     color: var(--bone-0);
+  }
+
+  .srp-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
   }
 
   .srp-name {

@@ -1,4 +1,11 @@
 {
+  "0.3.32": {
+    "headline": "Clickable name chips in summaries + polish on the speaker rename picker",
+    "changes": [
+      "Summaries and action items now show your teammates as colored clickable name chips (with avatars) instead of plain text. Click a chip to see that teammate. External people in a call render as styled text so you can tell them apart from your team. Legacy calls keep their existing summaries unchanged.",
+      "Speaker rename picker: avatars now show for every teammate in the dropdown. Cleaner visual polish — softer shadow, nicer hover state, the teammate/email stack sits next to the avatar. Long speaker names in the transcript no longer wrap to two lines — they truncate with a tooltip."
+    ]
+  },
   "0.3.31": {
     "headline": "First + last names, smarter speaker rename, mic picker, quieter while recording",
     "changes": [
