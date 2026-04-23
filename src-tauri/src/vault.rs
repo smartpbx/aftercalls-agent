@@ -108,7 +108,21 @@ fn render_markdown(summary: &Summary, transcript: &MergedTranscript, session_dir
     if !summary.action_items.is_empty() {
         md.push_str("## Action Items\n\n");
         for item in &summary.action_items {
-            md.push_str(&format!("- {}\n", item.trim()));
+            // Prefix the assignee when the LLM resolved one. Keep the
+            // description as-is (still contains any `<name>` markers
+            // for OTHER people mentioned in the body — stripping
+            // those is intentionally deferred; vault notes go to an
+            // Obsidian-like renderer that tolerates loose HTML and
+            // the tags stay machine-readable for future tooling).
+            let desc = item.description.trim();
+            match &item.assignee_name {
+                Some(who) if !who.trim().is_empty() => {
+                    md.push_str(&format!("- {}: {}\n", who.trim(), desc));
+                }
+                _ => {
+                    md.push_str(&format!("- {}\n", desc));
+                }
+            }
         }
         md.push('\n');
     }

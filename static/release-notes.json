@@ -1,4 +1,14 @@
 {
+  "0.4.0": {
+    "headline": "Assign, edit, and complete action items — one page for every task across every call",
+    "changes": [
+      "Action items now carry an assignee and a status. The AI reads who owns a task and tags your teammate to it with an avatar chip. Items track as Open until someone checks them off; checked items stay on the record so you can see what was done.",
+      "New Action items page in the sidebar (portal) and in the desktop agent's rail. Lists every item assigned to you across all your team's calls. Filter Open / Done / All. Check an item off from there and it reflects on the origin call. Click a row to jump to the call.",
+      "Regenerate summary and AI action items. On the call detail page, click Regenerate to re-run the AI against the transcript if the first pass missed the mark. Items you've added manually and items you've already checked off are preserved.",
+      "Edit anything inline. Click the pencil on the summary to rewrite it, or on any action item to change the description or the assignee. Saves are immediate; no regeneration needed.",
+      "Add or delete action items by hand. An Add item button in the action-items block lets you capture a task that didn't come out of the transcript. Pick an assignee from your team, or leave it unassigned. Hover a row to delete with an inline confirm."
+    ]
+  },
   "0.3.32": {
     "headline": "Clickable name chips in summaries + polish on the speaker rename picker",
     "changes": [

@@ -11,6 +11,7 @@
     type SpeakerPick,
   } from "$lib/SpeakerRenamePicker.svelte";
   import SummaryText from "$lib/SummaryText.svelte";
+  import ActionItem from "$lib/ActionItem.svelte";
 
   type Utterance = {
     idx: number;
@@ -29,6 +30,23 @@
   type Tag = { kind: TagKind; value: string };
   type TagSuggestion = { kind: TagKind; value: string; count: number };
 
+  // Phase 1 of the v0.4.0 action-items bundle (#10 #19 #104 #105).
+  // Structured rows — mirrors the backend `ActionItem` DTO and the
+  // portal's `api.ActionItem` type. Fields line up 1:1 so the
+  // shared `ActionItem.svelte` mirror pair can consume either.
+  type ActionItemRow = {
+    id: string;
+    call_id: string;
+    description: string;
+    assignee_user_id: string | null;
+    status: "open" | "done";
+    completed_at: string | null;
+    completed_by_user_id: string | null;
+    source: "llm" | "manual";
+    created_at: string;
+    order_index: number;
+  };
+
   type Call = {
     id: string;
     session_id: string;
@@ -37,7 +55,7 @@
     title: string | null;
     matched_client: string | null;
     summary_text: string | null;
-    action_items: string[];
+    action_items: ActionItemRow[];
     participants: string[];
     note_markdown_path: string | null;
     status: string;
@@ -203,6 +221,393 @@
     if (me.role === "admin" || me.role === "superadmin") return true;
     return true;
   });
+
+  // Phase 2 (#19): summary-body + action-item editing gate. Same
+  // ownership model as the portal — owner / admin edits. Derived
+  // separately so a future admin-share feature doesn't have to
+  // rewrite the gate in two places.
+  let canEditSummary = $derived.by(() => {
+    if (!me) return false;
+    if (me.role === "admin" || me.role === "superadmin") return true;
+    return true;
+  });
+
+  // ── Phase 2 (#19): regenerate + edit-in-place state ─────────────
+  let regenConfirmOpen = $state(false);
+  let regenInFlight = $state(false);
+  let regenModalError = $state("");
+  let regenCooldownSeconds = $state(0);
+  let regenCooldownTimer: number | undefined;
+  let regenCooldownMsg = $state("");
+
+  function startCooldownTicker(seconds: number) {
+    stopCooldownTicker();
+    regenCooldownSeconds = Math.max(1, Math.floor(seconds));
+    regenCooldownTimer = window.setInterval(() => {
+      regenCooldownSeconds = Math.max(0, regenCooldownSeconds - 1);
+      if (regenCooldownSeconds <= 0) {
+        stopCooldownTicker();
+        regenCooldownMsg = "";
+      }
+    }, 1000);
+  }
+  function stopCooldownTicker() {
+    if (regenCooldownTimer !== undefined) {
+      clearInterval(regenCooldownTimer);
+      regenCooldownTimer = undefined;
+    }
+  }
+  function openRegenConfirm() {
+    if (regenCooldownSeconds > 0) return;
+    regenModalError = "";
+    regenConfirmOpen = true;
+    queueMicrotask(() => {
+      const primary =
+        document.querySelector<HTMLButtonElement>(".regen-modal .rn-primary");
+      primary?.focus();
+    });
+  }
+  function dismissRegenConfirm() {
+    if (regenInFlight) return;
+    regenConfirmOpen = false;
+    regenModalError = "";
+  }
+  async function confirmRegenerate() {
+    if (!call || regenInFlight) return;
+    regenInFlight = true;
+    regenModalError = "";
+    try {
+      const fresh = (await invoke("resummarize_call", { id: call.id })) as Call;
+      // Preserve the local notes buffer — server copy might be stale
+      // vs. what the user just typed.
+      fresh.notes = notesBuffer;
+      call = fresh;
+      regenConfirmOpen = false;
+      startCooldownTicker(30);
+    } catch (e: any) {
+      // Tauri errors round-trip as plain strings. Our resummarize
+      // command shapes 429s as `cooldown:{N}` so we can parse the
+      // retry window out. Everything else surfaces as a modal error.
+      const msg = String(e?.message ?? e ?? "");
+      const cooldownMatch = msg.match(/^cooldown:(\d+)$/);
+      if (cooldownMatch) {
+        regenConfirmOpen = false;
+        const retry = Number(cooldownMatch[1]);
+        regenCooldownMsg = "cooldown";
+        startCooldownTicker(retry > 0 ? retry : 30);
+      } else {
+        regenModalError = msg;
+      }
+    } finally {
+      regenInFlight = false;
+    }
+  }
+
+  // Inline summary edit ─────────────────────────────────────────────
+  let summaryEditing = $state(false);
+  let summaryDraft = $state("");
+  let summarySaving = $state(false);
+  let summaryError = $state("");
+
+  function startSummaryEdit() {
+    if (!call) return;
+    summaryDraft = call.summary_text ?? "";
+    summaryError = "";
+    summaryEditing = true;
+  }
+  function cancelSummaryEdit() {
+    summaryEditing = false;
+    summaryDraft = "";
+    summaryError = "";
+  }
+  async function saveSummaryEdit() {
+    if (!call) return;
+    summarySaving = true;
+    summaryError = "";
+    try {
+      const trimmed = summaryDraft.trim();
+      const fresh = (await invoke("patch_call", {
+        id: call.id,
+        body: { summary_text: trimmed.length === 0 ? null : summaryDraft },
+      })) as Call;
+      fresh.notes = notesBuffer;
+      call = fresh;
+      summaryEditing = false;
+    } catch (e: any) {
+      summaryError = "Save failed. Check your connection and try again.";
+      console.warn("summary save failed", e);
+    } finally {
+      summarySaving = false;
+    }
+  }
+  function onSummaryKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelSummaryEdit();
+      return;
+    }
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void saveSummaryEdit();
+      return;
+    }
+  }
+
+  // Inline action-item edit ─────────────────────────────────────────
+  let editingActionItemId = $state<string | null>(null);
+  let actionItemSaving = $state(false);
+  let actionItemErrors = $state<Record<string, string>>({});
+
+  function onActionItemEditStart(payload: { item: ActionItemRow }) {
+    editingActionItemId = payload.item.id;
+    actionItemErrors = {};
+  }
+  function onActionItemCancel() {
+    editingActionItemId = null;
+    actionItemErrors = {};
+  }
+  async function onActionItemSave(payload: {
+    itemId: string;
+    description: string;
+    assigneeUserId: string | null;
+  }) {
+    if (!call || actionItemSaving) return;
+    actionItemSaving = true;
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const updated = (await invoke("patch_action_item", {
+        callId: call.id,
+        itemId: payload.itemId,
+        body: {
+          description: payload.description,
+          assignee_user_id: payload.assigneeUserId,
+        },
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === updated.id ? updated : ai,
+        ),
+      };
+      editingActionItemId = null;
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg =
+        /workspace|team|member/i.test(raw)
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      console.warn("action item save failed", e);
+    } finally {
+      actionItemSaving = false;
+    }
+  }
+
+  // ── Phase 3 (#104): manual add composer ──────────────────────────
+  //
+  // Ghost "Add item" button in the Action items `.block-head-actions`
+  // toggles a composer appended at the bottom of the list
+  // (ui-phase-3 §A). Mirrors the portal implementation; Tauri invoke
+  // takes the place of fetch, every other behaviour identical.
+  let addingItem = $state(false);
+  let addSaving = $state(false);
+  let addError = $state("");
+  let addDescDraft = $state("");
+  let addAssigneeDraft = $state<string | null>(null);
+  let addAssigneeValue = $state("");
+
+  let canAddActionItem = $derived.by(() => {
+    if (!canEditSummary) return false;
+    if (!call) return false;
+    return call.status === "complete" || call.status === "failed";
+  });
+
+  function openAddComposer() {
+    if (!canAddActionItem) return;
+    addingItem = true;
+    addError = "";
+    addDescDraft = "";
+    addAssigneeDraft = null;
+    addAssigneeValue = "";
+    queueMicrotask(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>(
+        ".ai-composer-desc",
+      );
+      ta?.focus();
+    });
+  }
+  function cancelAddComposer() {
+    if (addSaving) return;
+    addingItem = false;
+    addError = "";
+    addDescDraft = "";
+    addAssigneeDraft = null;
+    addAssigneeValue = "";
+  }
+  function onAddPickerPick(pick: SpeakerPick) {
+    if (pick.user) {
+      addAssigneeDraft = pick.user.id;
+      addAssigneeValue = pick.user.display_name;
+    } else {
+      addAssigneeDraft = null;
+      addAssigneeValue = pick.freeText;
+    }
+  }
+  function clearAddAssignee() {
+    addAssigneeDraft = null;
+    addAssigneeValue = "";
+  }
+  async function saveAddComposer() {
+    if (!call || addSaving) return;
+    const trimmed = addDescDraft.trim();
+    if (!trimmed) return;
+    addSaving = true;
+    addError = "";
+    try {
+      const created = (await invoke("add_action_item", {
+        callId: call.id,
+        body: {
+          description: trimmed,
+          assignee_user_id: addAssigneeDraft,
+        },
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: [...call.action_items, created],
+      };
+      addingItem = false;
+      addDescDraft = "";
+      addAssigneeDraft = null;
+      addAssigneeValue = "";
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg =
+        /workspace|team|member/i.test(raw)
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
+      addError = msg;
+      console.warn("action item add failed", e);
+    } finally {
+      addSaving = false;
+    }
+  }
+  function onAddComposerKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelAddComposer();
+      return;
+    }
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void saveAddComposer();
+      return;
+    }
+  }
+
+  // ── Phase 3 (#104): row-level delete with inline confirm ─────────
+  let confirmingDeleteId = $state<string | null>(null);
+  let deletingId = $state<string | null>(null);
+  let deleteErrors = $state<Record<string, string>>({});
+
+  function onActionItemDeleteRequest(payload: { item: ActionItemRow }) {
+    confirmingDeleteId = payload.item.id;
+    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
+  }
+  function onActionItemDeleteCancel(payload: { item: ActionItemRow }) {
+    if (deletingId === payload.item.id) return;
+    if (confirmingDeleteId === payload.item.id) confirmingDeleteId = null;
+    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
+  }
+  async function onActionItemDeleteConfirm(payload: {
+    item: ActionItemRow;
+  }) {
+    if (!call || deletingId) return;
+    deletingId = payload.item.id;
+    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
+    try {
+      // The Rust-side `delete_action_item` converts 404 to Ok(())
+      // so "already gone" is indistinguishable from "deleted" here.
+      await invoke("delete_action_item", {
+        callId: call.id,
+        itemId: payload.item.id,
+      });
+      call = {
+        ...call,
+        action_items: call.action_items.filter(
+          (ai) => ai.id !== payload.item.id,
+        ),
+      };
+      confirmingDeleteId = null;
+    } catch (e: any) {
+      deleteErrors = {
+        ...deleteErrors,
+        [payload.item.id]: "Delete failed. Try again.",
+      };
+      console.warn("action item delete failed", e);
+    } finally {
+      deletingId = null;
+    }
+  }
+
+  // ── Phase 4 (#105): row check-off on call-detail ─────────────────
+  //
+  // Mirrors the portal's `onActionItemToggle` — Decision E flips the
+  // check-off ON wherever ActionItem renders in the Phase 4 pass.
+  // Optimistic local flip + rollback on failure; no filter-aware
+  // removal here (call-detail shows every item for one call).
+  let togglingItemIds = $state<Set<string>>(new Set());
+  let togglingError = $state("");
+
+  async function onActionItemToggle(payload: {
+    item: ActionItemRow;
+    nextStatus: "open" | "done";
+  }) {
+    if (!call) return;
+    if (togglingItemIds.has(payload.item.id)) return;
+    togglingItemIds = new Set([...togglingItemIds, payload.item.id]);
+
+    const prevItems = call.action_items;
+    const patchedAt = new Date().toISOString();
+    call = {
+      ...call,
+      action_items: prevItems.map((ai) =>
+        ai.id === payload.item.id
+          ? {
+              ...ai,
+              status: payload.nextStatus,
+              completed_at:
+                payload.nextStatus === "done" ? patchedAt : null,
+            }
+          : ai,
+      ),
+    };
+    try {
+      const updated = (await invoke("patch_action_item", {
+        callId: call.id,
+        itemId: payload.item.id,
+        body: { status: payload.nextStatus },
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === updated.id ? updated : ai,
+        ),
+      };
+    } catch (e: any) {
+      call = { ...call, action_items: prevItems };
+      togglingError = "Couldn't save. Try again.";
+      setTimeout(() => {
+        togglingError = "";
+      }, 3000);
+      console.warn("action item toggle failed", e);
+    } finally {
+      togglingItemIds = new Set(
+        [...togglingItemIds].filter((id) => id !== payload.item.id),
+      );
+    }
+  }
 
   const TAG_KIND_ORDER: TagKind[] = ["client", "purpose", "topic", "custom"];
   let groupedTags = $derived.by(() => {
@@ -787,6 +1192,7 @@
       clearInterval(pollTimer);
       pollTimer = undefined;
     }
+    stopCooldownTicker();
   });
 
   let downloading = $state(false);
@@ -869,8 +1275,24 @@
   function copyActionItems() {
     if (!call) return;
     const items = call.action_items;
-    const plain = items.map((a) => `• ${a}`).join("\n");
-    const html = `<ul>${items.map((a) => `<li>${escapeHtml(a)}</li>`).join("")}</ul>`;
+    // Phase 1 of v0.4.0 bundle: strip `<name>...</name>` markers
+    // from the description for clipboard output, and prefix with
+    // the assignee's display name when the FK resolves in-roster.
+    // Matches the vault-note rendering on the Tauri side.
+    const lines = items.map((a) => {
+      const bare = a.description
+        .replace(/<name>([^<]+)<\/name>/g, "$1")
+        .trim();
+      const assignee = a.assignee_user_id
+        ? memberRoster.find((u) => u.id === a.assignee_user_id)
+        : null;
+      const prefix = assignee ? `${assignee.display_name}: ` : "";
+      return `${prefix}${bare}`;
+    });
+    const plain = lines.map((p) => `• ${p}`).join("\n");
+    const html = `<ul>${lines
+      .map((p) => `<li>${escapeHtml(p)}</li>`)
+      .join("")}</ul>`;
     copyRich(html, plain, "actions");
   }
 
@@ -1669,24 +2091,139 @@
       </section>
     {/if}
 
-    {#if call.summary_text}
+    {#if call.summary_text || regenInFlight}
       <section class="block" style="--i: 3">
+        {#if regenCooldownMsg && regenCooldownSeconds > 0}
+          <p class="regen-callout" role="status">
+            Just regenerated — try again in {regenCooldownSeconds} seconds.
+          </p>
+        {/if}
         <div class="block-head">
           <h2>Summary</h2>
-          <button
-            class="copy-btn"
-            onclick={() => copy(call!.summary_text ?? "", "summary")}
-          >
-            {copiedLabel === "summary" ? "Copied" : "Copy"}
-          </button>
+          {#if !summaryEditing}
+            <div class="block-head-actions">
+              <button
+                class="copy-btn"
+                onclick={() => copy(call!.summary_text ?? "", "summary")}
+                disabled={regenInFlight}
+              >
+                {copiedLabel === "summary" ? "Copied" : "Copy"}
+              </button>
+              <button
+                type="button"
+                class="regen-btn"
+                onclick={openRegenConfirm}
+                disabled={regenInFlight || regenCooldownSeconds > 0 || call.status !== "complete"}
+                aria-disabled={regenCooldownSeconds > 0 ? "true" : undefined}
+                title={regenCooldownSeconds > 0
+                  ? `Available again in ${regenCooldownSeconds} seconds`
+                  : call.status !== "complete"
+                    ? "Wait until the first summary finishes."
+                    : undefined}
+              >
+                <svg
+                  class="regen-ico"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M13.5 3v3h-3" />
+                  <path d="M2.5 13v-3h3" />
+                  <path d="M3.2 6.6a5 5 0 0 1 9-.6L13.5 6" />
+                  <path d="M12.8 9.4a5 5 0 0 1-9 .6L2.5 10" />
+                </svg>
+                {#if regenInFlight}
+                  Regenerating…
+                {:else if regenCooldownSeconds > 0}
+                  Regenerate — {regenCooldownSeconds}s
+                {:else}
+                  Regenerate
+                {/if}
+              </button>
+              {#if canEditSummary && call.summary_text}
+                <button
+                  type="button"
+                  class="summary-edit"
+                  aria-label="Edit summary"
+                  onclick={startSummaryEdit}
+                  disabled={regenInFlight}
+                >
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" />
+                  </svg>
+                </button>
+              {/if}
+            </div>
+          {/if}
         </div>
-        <p class="summary">
-          <SummaryText
-            text={call.summary_text}
-            users={memberRoster}
-            colorFor={speakerColor}
-          />
-        </p>
+        {#if regenInFlight}
+          <div class="gen-shimmer">
+            <div class="gen-line"></div>
+            <div class="gen-line"></div>
+            <div class="gen-line short"></div>
+            <p class="gen-caption">
+              Writing summary<span class="gen-dots"></span>
+            </p>
+          </div>
+        {:else if summaryEditing}
+          <div class="summary-editor-wrap">
+            <textarea
+              class="summary-editor"
+              bind:value={summaryDraft}
+              onkeydown={onSummaryKeydown}
+              disabled={summarySaving}
+              aria-label="Summary body"
+            ></textarea>
+            <p class="summary-hint">
+              <code>&lt;name&gt;Firstname L.&lt;/name&gt;</code> marks a teammate chip. Edit the tag to match the roster name.
+            </p>
+            {#if summaryError}
+              <p class="summary-err" role="alert">{summaryError}</p>
+            {/if}
+            <div class="summary-edit-actions">
+              <button
+                type="button"
+                class="summary-save"
+                onclick={saveSummaryEdit}
+                disabled={summarySaving}
+              >
+                {summarySaving ? "Saving…" : "Save"}
+              </button>
+              <button
+                type="button"
+                class="summary-cancel"
+                onclick={cancelSummaryEdit}
+                disabled={summarySaving}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {:else if call.summary_text}
+          <p class="summary">
+            <SummaryText
+              text={call.summary_text}
+              users={memberRoster}
+              colorFor={speakerColor}
+            />
+          </p>
+        {/if}
       </section>
     {:else if call.status !== "complete" && call.status !== "failed"}
       <section class="block" style="--i: 3">
@@ -1737,24 +2274,236 @@
       <section class="block" style="--i: 4">
         <div class="block-head">
           <h2>Action items</h2>
-          <button class="copy-btn" onclick={copyActionItems}>
-            {copiedLabel === "actions" ? "Copied" : "Copy"}
-          </button>
+          <div class="block-head-actions">
+            <button
+              class="copy-btn"
+              onclick={copyActionItems}
+              disabled={regenInFlight}
+            >
+              {copiedLabel === "actions" ? "Copied" : "Copy"}
+            </button>
+            {#if canEditSummary}
+              <button
+                type="button"
+                class="add-item-btn"
+                onclick={openAddComposer}
+                disabled={addingItem || !canAddActionItem || regenInFlight}
+                aria-label="Add action item"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                  class="add-item-ico"
+                >
+                  <path d="M8 3.5v9" />
+                  <path d="M3.5 8h9" />
+                </svg>
+                Add item
+              </button>
+            {/if}
+          </div>
         </div>
         <ul class="actions">
-          {#each call.action_items as item, i (i)}
-            <li>
-              <span class="action-idx">{String(i + 1).padStart(2, "0")}</span>
-              <span>
-                <SummaryText
-                  text={item}
-                  users={memberRoster}
-                  colorFor={speakerColor}
-                />
-              </span>
-            </li>
+          {#each call.action_items as item, i (item.id)}
+            {#if regenInFlight && item.source === "llm" && item.status === "open"}
+              <!-- Hidden while regenerating — the backend's narrow
+                   delete will replace these rows. Manual + done rows
+                   stay so the user sees preserved content. -->
+            {:else}
+              <ActionItem
+                {item}
+                users={memberRoster}
+                callId={call.id}
+                index={i}
+                colorFor={speakerColor}
+                canEdit={canEditSummary}
+                editing={editingActionItemId === item.id}
+                saving={actionItemSaving && editingActionItemId === item.id}
+                editError={actionItemErrors[item.id] ?? ""}
+                confirmingDelete={confirmingDeleteId === item.id}
+                deleting={deletingId === item.id}
+                deleteError={deleteErrors[item.id] ?? ""}
+                onedit={onActionItemEditStart}
+                onsave={onActionItemSave}
+                oncancel={onActionItemCancel}
+                ondeleterequest={onActionItemDeleteRequest}
+                ondeleteconfirm={onActionItemDeleteConfirm}
+                ondeletecancel={onActionItemDeleteCancel}
+                ontoggle={canEditSummary ? onActionItemToggle : undefined}
+              />
+            {/if}
           {/each}
         </ul>
+        {#if addingItem}
+          <!-- Phase 3 (#104): inline add composer. Same shape as the
+               portal's — textarea + picker + Save/Cancel. -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <form
+            class="ai-composer"
+            onkeydown={onAddComposerKeydown}
+            onsubmit={(e) => e.preventDefault()}
+            aria-label="Add action item"
+          >
+            <textarea
+              class="ai-composer-desc"
+              bind:value={addDescDraft}
+              disabled={addSaving}
+              rows="3"
+              placeholder="Describe the task…"
+              aria-label="New action item description"
+            ></textarea>
+            <div class="ai-composer-picker">
+              <SpeakerRenamePicker
+                bind:value={addAssigneeValue}
+                roster={memberRoster}
+                rosterLoaded={memberRosterLoaded}
+                saving={false}
+                variant="stack"
+                autofocus={false}
+                placeholder="Assign to a teammate…"
+                noMatchHint="No match — leave empty to keep this item unassigned."
+                savingLabel="Pick"
+                onpick={onAddPickerPick}
+                oncancel={clearAddAssignee}
+              />
+            </div>
+            {#if addError}
+              <p class="ai-composer-err" role="alert">{addError}</p>
+            {/if}
+            <div class="ai-composer-actions">
+              <button
+                type="button"
+                class="ai-composer-save"
+                disabled={addSaving || addDescDraft.trim().length === 0}
+                onclick={saveAddComposer}
+              >
+                {addSaving ? "Saving…" : "Save"}
+              </button>
+              <button
+                type="button"
+                class="ai-composer-cancel"
+                disabled={addSaving}
+                onclick={cancelAddComposer}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {/if}
+        {#if regenInFlight}
+          <div class="gen-shimmer gen-shimmer-actions">
+            <div class="gen-line short"></div>
+            <div class="gen-line"></div>
+            <p class="gen-caption">
+              Replacing action items<span class="gen-dots"></span>
+            </p>
+          </div>
+        {/if}
+      </section>
+    {:else if call.status === "complete" && call.utterances && call.utterances.length > 0}
+      <!-- Phase 3 (#104): pipeline is done but the org has auto
+           action items off (or the LLM returned zero). Show the
+           Add item affordance so users can type in a task without
+           regenerating. -->
+      <section class="block" style="--i: 4">
+        <div class="block-head">
+          <h2>Action items</h2>
+          <div class="block-head-actions">
+            {#if canEditSummary}
+              <button
+                type="button"
+                class="add-item-btn"
+                onclick={openAddComposer}
+                disabled={addingItem || !canAddActionItem}
+                aria-label="Add action item"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                  class="add-item-ico"
+                >
+                  <path d="M8 3.5v9" />
+                  <path d="M3.5 8h9" />
+                </svg>
+                Add item
+              </button>
+            {/if}
+          </div>
+        </div>
+        {#if !addingItem}
+          <p class="empty-hint">
+            No action items for this call yet. Add one if you want to
+            track a follow-up task for this conversation.
+          </p>
+        {/if}
+        {#if addingItem}
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <form
+            class="ai-composer"
+            onkeydown={onAddComposerKeydown}
+            onsubmit={(e) => e.preventDefault()}
+            aria-label="Add action item"
+          >
+            <textarea
+              class="ai-composer-desc"
+              bind:value={addDescDraft}
+              disabled={addSaving}
+              rows="3"
+              placeholder="Describe the task…"
+              aria-label="New action item description"
+            ></textarea>
+            <div class="ai-composer-picker">
+              <SpeakerRenamePicker
+                bind:value={addAssigneeValue}
+                roster={memberRoster}
+                rosterLoaded={memberRosterLoaded}
+                saving={false}
+                variant="stack"
+                autofocus={false}
+                placeholder="Assign to a teammate…"
+                noMatchHint="No match — leave empty to keep this item unassigned."
+                savingLabel="Pick"
+                onpick={onAddPickerPick}
+                oncancel={clearAddAssignee}
+              />
+            </div>
+            {#if addError}
+              <p class="ai-composer-err" role="alert">{addError}</p>
+            {/if}
+            <div class="ai-composer-actions">
+              <button
+                type="button"
+                class="ai-composer-save"
+                disabled={addSaving || addDescDraft.trim().length === 0}
+                onclick={saveAddComposer}
+              >
+                {addSaving ? "Saving…" : "Save"}
+              </button>
+              <button
+                type="button"
+                class="ai-composer-cancel"
+                disabled={addSaving}
+                onclick={cancelAddComposer}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {/if}
       </section>
     {:else if call.status !== "complete" && call.status !== "failed"}
       <!-- While the pipeline still runs, surface that action items
@@ -1852,6 +2601,74 @@
     </section>
   {/if}
 </main>
+
+{#if regenConfirmOpen && call}
+  <!-- Regenerate confirm dialog. Reuses the shared .rn-* shell from
+       #87 (app.css §Release-notes modal) so we don't introduce a
+       third modal skeleton. Not tab-trapped — matches the #87
+       follow-up note. -->
+  <div
+    class="rn-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={dismissRegenConfirm}
+    onkeydown={(e) => {
+      if (e.key === "Escape") dismissRegenConfirm();
+    }}
+  >
+    <div
+      class="rn-modal regen-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="regen-title"
+      aria-describedby="regen-body1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        if (e.key === "Escape") {
+          dismissRegenConfirm();
+          return;
+        }
+        e.stopPropagation();
+      }}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <h2 id="regen-title">Regenerate summary and action items?</h2>
+      </div>
+      <div class="rn-body">
+        <p id="regen-body1">
+          This replaces the summary and the AI-generated action items
+          on this call.
+        </p>
+        <p>
+          Items you've added manually, and items already marked done,
+          stay where they are.
+        </p>
+        {#if regenModalError}
+          <p class="regen-modal-err" role="alert">{regenModalError}</p>
+        {/if}
+      </div>
+      <div class="rn-actions">
+        <button
+          type="button"
+          class="rn-link"
+          onclick={dismissRegenConfirm}
+          disabled={regenInFlight}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="rn-dismiss rn-primary"
+          onclick={confirmRegenerate}
+          disabled={regenInFlight}
+        >
+          {regenInFlight ? "Regenerating…" : "Regenerate"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if confirmingDelete && call}
   <div
@@ -2480,6 +3297,178 @@
     border-color: var(--accent);
     color: var(--accent);
   }
+  .copy-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  /* ── Phase 2 (#19): Regenerate + edit-in-place ────────────────── */
+
+  .block-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+  }
+
+  .regen-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--bone-2);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    transition: all 0.15s;
+  }
+  .regen-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .regen-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .regen-ico {
+    flex: 0 0 auto;
+  }
+
+  .summary-edit {
+    padding: 0.28rem 0.4rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-2);
+    cursor: pointer;
+    border-radius: 4px;
+    line-height: 0;
+    transition: color 0.15s, background 0.15s;
+  }
+  .summary-edit:hover:not(:disabled) {
+    color: var(--accent);
+    background: var(--ink-2);
+  }
+  .summary-edit:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .regen-callout {
+    margin: 0 0 0.7rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    background: var(--live-soft);
+    color: var(--live);
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .summary-editor-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .summary-editor {
+    width: 100%;
+    min-height: 8.5rem;
+    padding: 0.7rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: 10px;
+    background: var(--ink-1);
+    color: var(--bone-0);
+    font: inherit;
+    font-size: 0.95rem;
+    line-height: 1.6;
+    resize: vertical;
+  }
+  .summary-editor:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .summary-editor:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .summary-hint {
+    margin: 0;
+    font-size: 0.78rem;
+    color: var(--bone-3);
+    line-height: 1.5;
+  }
+  .summary-hint code {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.08rem 0.3rem;
+    border-radius: 3px;
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+  .summary-err {
+    margin: 0;
+    padding: 0.45rem 0.6rem;
+    border-radius: 6px;
+    background: var(--live-soft);
+    color: var(--live);
+    font-size: 0.82rem;
+  }
+  .summary-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.45rem;
+  }
+  .summary-save,
+  .summary-cancel {
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+  .summary-save {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .summary-save:disabled,
+  .summary-cancel:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .gen-shimmer-actions {
+    border-top: 1px solid var(--hairline);
+    padding-top: 0.55rem;
+    margin-top: 0.35rem;
+  }
+
+  .regen-modal .rn-primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .regen-modal .rn-primary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .regen-modal-err {
+    margin: 0.8rem 0 0;
+    padding: 0.5rem 0.65rem;
+    border-radius: 6px;
+    background: var(--live-soft);
+    color: var(--live);
+    font-size: 0.85rem;
+  }
 
   /* ── Generating placeholders (mirrors portal styles) ─────────────
      While the pipeline is still mid-flight, title + summary +
@@ -2504,6 +3493,147 @@
     75%  { content: "..."; }
     100% { content: ""; }
   }
+  /* ── Phase 3 (#104): Add-item button + composer ──────────────── */
+
+  /* Ghost "Add item" button in the Action-items `.block-head-actions`
+     cluster. Shape mirrors `.copy-btn` + `.regen-btn` — 0.85rem /
+     500 / hairline border / `--bone-2` → `--accent` hover. */
+  .add-item-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--bone-2);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+  .add-item-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .add-item-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .add-item-ico {
+    flex: 0 0 auto;
+  }
+
+  /* Empty-hint message for the zero-items-but-complete branch.
+     Matches the portal's `.empty-hint` shape so the feel is
+     consistent between surfaces. */
+  .empty-hint {
+    margin: 0;
+    color: var(--bone-3);
+    font-size: 0.88rem;
+    line-height: 1.6;
+    max-width: 56ch;
+  }
+
+  /* Inline-add composer. Rhythm mirrors `.ai-editor` inside
+     `ActionItem.svelte`: textarea, picker, optional error, Save +
+     Cancel. Duplicated here rather than lifted because the composer
+     is page-scoped (ui-phase-3 Decision B — don't proliferate mirror
+     pairs). */
+  .ai-composer {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    width: 100%;
+    min-width: 0;
+    padding: 0.75rem 0 0.2rem;
+    border-top: 1px solid var(--hairline);
+    margin-top: 0.3rem;
+    animation: ai-composer-in 150ms ease-out;
+  }
+  @keyframes ai-composer-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-composer {
+      animation: none;
+    }
+  }
+
+  .ai-composer-desc {
+    width: 100%;
+    min-height: 5.5rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: 10px;
+    background: var(--ink-1);
+    color: var(--bone-0);
+    font: inherit;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .ai-composer-desc:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .ai-composer-desc:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .ai-composer-picker {
+    position: relative;
+  }
+
+  .ai-composer-err {
+    margin: 0;
+    padding: 0.4rem 0.55rem;
+    border-radius: 6px;
+    background: var(--live-soft);
+    color: var(--live);
+    font-size: 0.82rem;
+  }
+
+  .ai-composer-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .ai-composer-save,
+  .ai-composer-cancel {
+    padding: 0.38rem 0.9rem;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-1);
+  }
+  .ai-composer-save {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .ai-composer-save:disabled,
+  .ai-composer-cancel:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
   .gen-shimmer {
     padding: 0.2rem 0;
   }
@@ -2554,7 +3684,10 @@
     font-weight: 400;
   }
 
-  /* ── Actions ───────────────────────────────────────────────────────── */
+  /* ── Actions ─────────────────────────────────────────────────────────
+     Phase 1 of v0.4.0 bundle: the row itself (grid, borders, idx
+     pill) is owned by the new `ActionItem.svelte` mirror-pair
+     component. This shell stays for the list container. */
   .actions {
     list-style: none;
     padding: 0;
@@ -2562,28 +3695,6 @@
     display: flex;
     flex-direction: column;
     gap: 0;
-  }
-
-  .actions li {
-    display: grid;
-    grid-template-columns: 32px 1fr;
-    gap: 0.8rem;
-    padding: 0.6rem 0;
-    border-bottom: 1px solid var(--hairline);
-    color: var(--bone-1);
-    font-size: 0.9rem;
-    line-height: 1.5;
-  }
-  .actions li:last-child {
-    border-bottom: none;
-  }
-
-  .action-idx {
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    color: var(--accent);
-    letter-spacing: 0.04em;
-    padding-top: 0.22rem;
   }
 
   /* ── Chips row (participants) ──────────────────────────────────────── */

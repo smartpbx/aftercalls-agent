@@ -977,6 +977,121 @@ async fn update_call_tags(
         .map_err(|e| e.to_string())
 }
 
+// ── Phase 2 (#19): resummarize + edit-in-place ────────────────────
+
+/// POST /v1/calls/{id}/resummarize. Returns the updated CallDetail
+/// on success; on 429 cooldown the error string is shaped as
+/// `cooldown:{N}` so the front-end can split it back into a
+/// numeric retry_after_seconds + render a countdown.
+#[tauri::command]
+async fn resummarize_call(id: String) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::resummarize_call(backend, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// PATCH /v1/calls/{id}. Accepts tri-state fields verbatim from the
+/// front-end JSON; forwarded to the backend without re-shaping so
+/// the TS side is the authoritative definition of "absent vs null
+/// vs value".
+#[tauri::command]
+async fn patch_call(
+    id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::patch_call(backend, &id, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// PATCH /v1/calls/{id}/action-items/{item_id}. Returns the updated
+/// row; cross-org assignee writes bubble up as 400 which the caller
+/// renders as an inline picker error.
+#[tauri::command]
+async fn patch_action_item(
+    call_id: String,
+    item_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::patch_action_item(backend, &call_id, &item_id, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// POST /v1/calls/{id}/action-items/manual — Phase 3 (#104) manual
+/// add. Body is forwarded verbatim; frontend pre-shapes
+/// `{description, assignee_user_id?}`. Backend returns 201 with the
+/// created row which the caller appends to local state.
+#[tauri::command]
+async fn add_action_item(
+    call_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::add_action_item(backend, &call_id, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// GET /v1/me/action-items — Phase 4 (#105). Returns the caller's
+/// own action items across every call in their org. Cursor-paginated;
+/// the frontend passes `cursor=null` for the first page and feeds
+/// `next_cursor` back on follow-up pages.
+#[tauri::command]
+async fn list_me_action_items(
+    status: String,
+    cursor: Option<String>,
+    limit: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    let resolved_limit = limit.unwrap_or(50);
+    portal::list_me_action_items(backend, &status, cursor.as_deref(), resolved_limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// DELETE /v1/calls/{id}/action-items/{item_id} — Phase 3 (#104).
+/// 404 is converted to Ok(()) on the portal helper side so the TS
+/// frontend's deleteActionItem matches the portal's "silent success
+/// on already-gone" behaviour (ui-phase-3 §G).
+#[tauri::command]
+async fn delete_action_item(
+    call_id: String,
+    item_id: String,
+) -> Result<(), String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::delete_action_item(backend, &call_id, &item_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 
 // ── Orphan session recovery (#63) ────────────────────────────────────
 
@@ -1312,6 +1427,12 @@ pub fn run() {
             rename_speaker,
             org_members,
             update_call_tags,
+            resummarize_call,
+            patch_call,
+            patch_action_item,
+            add_action_item,
+            delete_action_item,
+            list_me_action_items,
             get_recording_ack,
             post_recording_ack,
             get_recording_prefs,

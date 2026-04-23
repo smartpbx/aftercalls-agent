@@ -59,6 +59,14 @@
     // dropdown positions relative to the input — variant is cosmetic.
     variant?: "chip" | "stack";
     autofocus?: boolean;
+    // v0.4.0 Phase 2 (#19): action-item assignee picker reuses this
+    // component with different empty-state vocabulary. Default copy
+    // stays verbatim from the speaker-rename surface; call sites that
+    // want different wording pass `placeholder` + `noMatchHint`.
+    // Added via "add a prop, don't fork the component" per the
+    // ui-phase-2 spec — keeps the mirror-pair count at one.
+    placeholder?: string;
+    noMatchHint?: string;
   };
 
   let {
@@ -73,6 +81,8 @@
     oncancel,
     variant = "stack",
     autofocus = true,
+    placeholder = "Name or teammate…",
+    noMatchHint = "No match — press Enter to save as free-form name.",
   }: Props = $props();
 
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -207,7 +217,7 @@
     <input
       class="srp-input"
       type="text"
-      placeholder="Name or teammate…"
+      {placeholder}
       autocomplete="off"
       aria-label="Rename speaker — start typing or choose a teammate"
       role="combobox"
@@ -240,7 +250,7 @@
       <div class="srp-hint">No teammates in your org yet.</div>
     {:else if rows.length === 0}
       <div class="srp-hint">
-        No match — press Enter to save as free-form name.
+        {noMatchHint}
       </div>
     {:else}
       {#each rows as row, i (row.kind === "member" ? "m:" + row.member.id : "r:" + row.name)}

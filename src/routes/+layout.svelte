@@ -808,6 +808,16 @@
       match: (p) => p.startsWith("/calls"),
       icon: `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
     },
+    // v0.4.0 Phase 4 (#105): /actions portfolio view. Peer with
+    // Calls, not a submenu — ui-phase-4 §A flagged the decision.
+    // Checkmark-in-circle glyph matches the stroke-based 16px
+    // vocabulary of the other rail items.
+    {
+      href: "/actions",
+      label: "Action items",
+      match: (p) => p.startsWith("/actions"),
+      icon: `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="m7 10 2 2 4-4.5"/></svg>`,
+    },
     // Settings moved out of the primary nav and into the user-menu
     // dropdown in the rail foot — account-level knobs don't belong
     // next to Record and Calls (the main workflow). See #33.
@@ -863,6 +873,7 @@
     if (p === "/") return "Record";
     if (p === "/calls") return "Calls";
     if (p.startsWith("/calls/")) return "Call";
+    if (p.startsWith("/actions")) return "Action items";
     if (p.startsWith("/settings")) return "Settings";
     return "aftercalls";
   });

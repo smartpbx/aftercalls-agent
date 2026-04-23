@@ -485,6 +485,159 @@ pub async fn update_call_tags(
     .await
 }
 
+// ── Phase 2 (#19): resummarize + edit-in-place ────────────────────────
+
+/// POST /v1/calls/{id}/resummarize — regenerate summary + AI action
+/// items against the call's stored transcript. Backend enforces a
+/// 30s per-call cooldown; when we hit it the backend returns 429
+/// with `{error: "cooldown", retry_after_seconds: N}`. Surface the
+/// retry window by prefixing the error message with "cooldown:{N}"
+/// so the Tauri IPC layer can parse it and render a countdown,
+/// matching the portal's Error.retryAfterSeconds shape.
+pub async fn resummarize_call(backend: &Backend, id: &str) -> Result<Value> {
+    // Same 600s ceiling as transcribe/summarize: the LLM call can
+    // take a minute or two on a real call, and an agent user that
+    // triggered the regenerate shouldn't see an IPC timeout before
+    // the backend finishes.
+    let auth = build_auth_header(backend).await?;
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
+    let url = format!(
+        "{}/v1/calls/{id}/resummarize",
+        backend.url.trim_end_matches('/'),
+    );
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return serde_json::from_str(&text).context("decode resummarize");
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Parse the retry window from the body first, then the
+        // Retry-After header as a fallback. Fold it into the error
+        // message using a prefix the Tauri command can split back
+        // out on the Rust side; ts-side error messages flow through
+        // `e.toString()` which only carries the string.
+        let retry_header = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let text = resp.text().await.unwrap_or_default();
+        let retry_body: Option<u64> = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("retry_after_seconds").and_then(|n| n.as_u64()));
+        let retry = retry_body.or(retry_header).unwrap_or(0);
+        anyhow::bail!("cooldown:{retry}");
+    }
+    let t = resp.text().await.unwrap_or_default();
+    anyhow::bail!("backend {status}: {t}");
+}
+
+/// PATCH /v1/calls/{id} — partial update of summary_text / title /
+/// matched_client. Tri-state server-side: each field is either
+/// absent, null (clear), or a string (set). The Tauri front-end
+/// passes pre-shaped JSON so we forward verbatim.
+pub async fn patch_call(backend: &Backend, id: &str, body: &Value) -> Result<Value> {
+    patch_json(backend, &format!("/v1/calls/{id}"), body.clone()).await
+}
+
+/// PATCH /v1/calls/{id}/action-items/{item_id} — edit one action
+/// item row. Cross-org assignee writes surface as 400 per #82, which
+/// the UI renders as an inline error beneath the assignee picker.
+pub async fn patch_action_item(
+    backend: &Backend,
+    call_id: &str,
+    item_id: &str,
+    body: &Value,
+) -> Result<Value> {
+    patch_json(
+        backend,
+        &format!("/v1/calls/{call_id}/action-items/{item_id}"),
+        body.clone(),
+    )
+    .await
+}
+
+/// POST /v1/calls/{id}/action-items/manual — manual-add (#104).
+/// `body` carries `{description, assignee_user_id?}`. Backend returns
+/// 201 with the fully-stitched row. Cross-org assignee FK surfaces
+/// as 400 with the usual "teammate isn't in your workspace" message
+/// shape.
+pub async fn add_action_item(
+    backend: &Backend,
+    call_id: &str,
+    body: &Value,
+) -> Result<Value> {
+    post_json(
+        backend,
+        &format!("/v1/calls/{call_id}/action-items/manual"),
+        body.clone(),
+    )
+    .await
+}
+
+/// GET /v1/me/action-items — Phase 4 (#105) me-scoped list for the
+/// /actions page. Query params are passed opaquely so the shape stays
+/// in sync with the portal helper automatically; the frontend builds
+/// a normalized string (`?status=…&limit=…&cursor=…`) before
+/// invoking.
+pub async fn list_me_action_items(
+    backend: &Backend,
+    status: &str,
+    cursor: Option<&str>,
+    limit: i64,
+) -> Result<Value> {
+    let mut path = String::from("/v1/me/action-items?");
+    path.push_str("status=");
+    path.push_str(&urlencoding_minimal(status));
+    path.push_str("&limit=");
+    path.push_str(&limit.to_string());
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            path.push_str("&cursor=");
+            path.push_str(&urlencoding_minimal(c));
+        }
+    }
+    get_json(backend, &path).await
+}
+
+/// DELETE /v1/calls/{id}/action-items/{item_id} — hard delete (#104).
+/// Backend returns 204 on success, 404 when the row is already gone;
+/// we map 404 to Ok(()) so the frontend's flow matches the portal's
+/// `calls.deleteActionItem` (ui-phase-3 §G "404 is silent success").
+/// Every other non-2xx is a real error.
+pub async fn delete_action_item(
+    backend: &Backend,
+    call_id: &str,
+    item_id: &str,
+) -> Result<()> {
+    let auth = build_auth_header(backend).await?;
+    let c = client()?;
+    let url = format!(
+        "{}/v1/calls/{call_id}/action-items/{item_id}",
+        backend.url.trim_end_matches('/'),
+    );
+    let resp = c
+        .delete(&url)
+        .header("authorization", auth)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let t = resp.text().await.unwrap_or_default();
+    anyhow::bail!("backend {status}: {t}");
+}
+
 /// Prefix-match tag suggestions for the Add-tag popover autocomplete.
 /// `kind` + `q` are optional but the UI always passes both.
 pub async fn tag_suggestions(
