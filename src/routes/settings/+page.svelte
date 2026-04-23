@@ -526,6 +526,23 @@
   </section>
 
   {#if error}<p class="error" style="--i: 4">{error}</p>{/if}
+
+  <footer class="legal-footer" style="--i: 5">
+    <a
+      href="https://aftercalls.io/licenses"
+      onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/licenses"); }}
+    >Licenses</a>
+    <span class="sep" aria-hidden="true">·</span>
+    <a
+      href="https://aftercalls.io/terms"
+      onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/terms"); }}
+    >Terms</a>
+    <span class="sep" aria-hidden="true">·</span>
+    <a
+      href="https://aftercalls.io/privacy"
+      onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/privacy"); }}
+    >Privacy</a>
+  </footer>
 </main>
 
 <style>
@@ -558,6 +575,7 @@
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+    flex: 1 1 auto;
     min-width: 0;
   }
   .pref-title {
@@ -670,8 +688,7 @@
      width so the Behavior section's right column stays visually
      aligned across rows. */
   .num-input {
-    width: 7rem;
-    flex-shrink: 0;
+    flex: 0 0 7rem;
     text-align: right;
   }
   .hint.small code {
@@ -936,5 +953,28 @@
   .error {
     color: var(--live);
     font-size: 0.83rem;
+  }
+
+  .legal-footer {
+    margin-top: 2.4rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--hairline);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--bone-3);
+  }
+  .legal-footer a {
+    color: var(--bone-3);
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+  .legal-footer a:hover {
+    color: var(--bone-0);
+    text-decoration: underline;
+  }
+  .legal-footer .sep {
+    color: var(--bone-4);
   }
 </style>

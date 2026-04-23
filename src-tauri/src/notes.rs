@@ -59,3 +59,19 @@ pub fn load_notes(app: AppHandle, session_id: String) -> Result<String, String> 
     }
     Ok(read_from_dir(&dir))
 }
+
+/// PATCH the notes field on an existing call row. Called from the
+/// call-detail page after the pipeline has completed, so the
+/// session_dir on disk is no longer the source of truth — the
+/// backend row is.
+#[tauri::command]
+pub async fn update_call_notes(call_id: String, notes: String) -> Result<(), String> {
+    let cfg = crate::config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    crate::portal::update_call_notes(backend, &call_id, &notes)
+        .await
+        .map_err(|e| e.to_string())
+}

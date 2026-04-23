@@ -1,4 +1,14 @@
 {
+  "0.3.28": {
+    "headline": "WYSIWYG notes editor, team-aware calls list, edit notes after the call, cleaner start cue",
+    "changes": [
+      "Notes editor is now true WYSIWYG — type bold, see bold; no more markdown stars or dashes cluttering the page. Headings, lists, quotes, code, and links all render inline, exactly as they'll look when saved. Toolbar + keyboard shortcuts (Ctrl/Cmd+B, I, E, K) for the common formatting moves.",
+      "Notes on the call detail page. You can now edit your notes any time after a call is recorded, not just during — open the call, edit inline, autosaves to the cloud.",
+      "All team view in the calls list (admins). Toggle between My calls and All team; every row shows who recorded it, and a new By person filter narrows to one teammate.",
+      "Start-recording tone no longer ends up in the recording. We now play the cue before the recorder engages, so the beep doesn't get captured into the call audio.",
+      "Max-recording-length setting label no longer wraps character-by-character on narrower windows."
+    ]
+  },
   "0.3.27": {
     "headline": "Formatting toolbar on notes, owner-aware team views for admins",
     "changes": [

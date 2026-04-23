@@ -153,7 +153,11 @@
       (evt) => {
         const wasRecording = recording;
         recording = evt.payload.recording;
-        if (recording && !wasRecording) playStartCueIfEnabled();
+        // Start cue plays BEFORE start_recording (see
+        // actuallyStartRecording / confirmAutoStart) so the system
+        // loopback doesn't capture it. Stop cue still plays on the
+        // transition — no capture concern after the recorder has
+        // stopped.
         if (!recording && wasRecording) notifyRecordStop();
         if (recording) {
           pipelineStage = "";
@@ -271,6 +275,15 @@
     pipelineStage = "";
     pipelineError = "";
     openableCallId = "";
+    // Play the start cue BEFORE invoking the recorder so the system
+    // loopback doesn't capture the beep. Await blocks for ~350ms
+    // when sounds are enabled; no-op when off. Any failure here is
+    // swallowed so a flaky audio stack never blocks recording.
+    try {
+      await playStartCueIfEnabled();
+    } catch (e) {
+      console.warn("start cue failed", e);
+    }
     sessionDir = await invoke<string>("start_recording");
   }
 
@@ -321,6 +334,11 @@
       if (resume === "manual") {
         await actuallyStartRecording();
       } else if (resume === "auto") {
+        try {
+          await playStartCueIfEnabled();
+        } catch (e) {
+          console.warn("start cue failed", e);
+        }
         await invoke("confirm_auto_start");
       }
     } catch (e) {
@@ -405,6 +423,11 @@
   async function confirmStart() {
     const ok = await ensureRecordingAcknowledged("auto");
     if (!ok) return;
+    try {
+      await playStartCueIfEnabled();
+    } catch (e) {
+      console.warn("start cue failed", e);
+    }
     await invoke("confirm_auto_start");
   }
   async function dismissStart() {
@@ -551,7 +574,7 @@
   {#if manualNotesEnabled && recording && currentSessionId}
     <section class="notes" style="--i: 3">
       {#key currentSessionId}
-        <NotesPanel onChange={scheduleNotesSave} />
+        <NotesPanel onchange={scheduleNotesSave} />
       {/key}
     </section>
   {/if}

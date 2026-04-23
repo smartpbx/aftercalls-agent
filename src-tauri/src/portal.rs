@@ -159,20 +159,41 @@ pub async fn logout(backend: &Backend) -> Result<()> {
 
 // ── Existing routes, migrated to the auth-aware header ───────────────
 
-pub async fn list_calls(backend: &Backend, tags: &[String]) -> Result<Value> {
-    // Tag filters are passed as repeated ?tag= params; missing = no filter.
-    // Shares `urlencoding_minimal` with tag_suggestions below.
+pub async fn list_calls(
+    backend: &Backend,
+    scope: Option<&str>,
+    user_id: Option<&str>,
+    tags: &[String],
+) -> Result<Value> {
+    // Tag filters are passed as repeated ?tag= params; missing = no
+    // filter. scope=all restricts to admin/superadmin; user= narrows
+    // scope=all to one member's calls.
     let mut path = String::from("/v1/calls");
-    if !tags.is_empty() {
+    let mut params: Vec<(String, String)> = Vec::new();
+    if let Some(s) = scope {
+        if !s.is_empty() {
+            params.push(("scope".into(), s.into()));
+        }
+    }
+    if let Some(u) = user_id {
+        if !u.is_empty() {
+            params.push(("user".into(), u.into()));
+        }
+    }
+    for t in tags {
+        params.push(("tag".into(), t.clone()));
+    }
+    if !params.is_empty() {
         path.push('?');
         let mut first = true;
-        for t in tags {
+        for (k, v) in &params {
             if !first {
                 path.push('&');
             }
             first = false;
-            path.push_str("tag=");
-            path.push_str(&urlencoding_minimal(t));
+            path.push_str(k);
+            path.push('=');
+            path.push_str(&urlencoding_minimal(v));
         }
     }
     get_json(backend, &path).await
@@ -363,6 +384,23 @@ pub async fn delete_call(backend: &Backend, id: &str) -> Result<()> {
 }
 
 // ── Tags (#57) ───────────────────────────────────────────────────────
+
+/// Replace the notes body on a call. Used by the call-detail page
+/// for post-pipeline edits (#73). Separate from the recording-screen
+/// notes save path, which writes to the session_dir on disk and lets
+/// the pipeline's create_call ship the initial value.
+pub async fn update_call_notes(
+    backend: &Backend,
+    id: &str,
+    notes: &str,
+) -> Result<()> {
+    patch_nop(
+        backend,
+        &format!("/v1/calls/{id}/notes"),
+        serde_json::json!({ "notes": notes }),
+    )
+    .await
+}
 
 /// Replace the whole tag array on a call. Backend validates kind +
 /// non-empty value; bad input surfaces as a 400 the UI displays inline.

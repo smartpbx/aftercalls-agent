@@ -5,6 +5,7 @@
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
   import Waveform from "$lib/Waveform.svelte";
+  import NotesPanel from "$lib/NotesPanel.svelte";
 
   type Utterance = {
     idx: number;
@@ -35,6 +36,9 @@
     source_kind: string | null;
     utterances: Utterance[];
     tags: Tag[];
+    // Manual notes markdown (#73). Server always returns a string
+    // (empty when untouched). Editable via update_call_notes.
+    notes?: string;
   };
 
   type Me = {
@@ -104,6 +108,65 @@
   let highlights = $state<Highlight[]>([]);
   let error = $state("");
   let loading = $state(true);
+
+  // ── Manual notes on call detail (#73) ────────────────────────────
+  // Local buffer + debounced save via the update_call_notes Tauri
+  // command. Mirrors the portal's flow; differs only in that we go
+  // through a Tauri command (which PATCHes the backend) rather than
+  // fetch() so auth flows through the agent's native credentials.
+  let notesBuffer = $state("");
+  let notesStatus = $state<"idle" | "saving" | "saved" | "error">("idle");
+  let notesError = $state("");
+  let notesInitialized = $state(false);
+  let notesSaveTimer: number | undefined;
+  let notesSavedFadeTimer: number | undefined;
+  const NOTES_MAX = 100_000;
+
+  let canEditNotes = $derived.by(() => {
+    if (!me) return false;
+    return true;
+  });
+
+  function scheduleNotesSaveDetail() {
+    if (!canEditNotes) return;
+    if (notesSaveTimer !== undefined) clearTimeout(notesSaveTimer);
+    notesStatus = "saving";
+    notesError = "";
+    notesSaveTimer = window.setTimeout(() => {
+      void saveNotesNow();
+    }, 1000);
+  }
+
+  async function saveNotesNow() {
+    if (!call || !canEditNotes) return;
+    if (notesBuffer.length > NOTES_MAX) {
+      notesStatus = "error";
+      notesError = `Notes exceed ${NOTES_MAX.toLocaleString()} chars.`;
+      return;
+    }
+    try {
+      await invoke("update_call_notes", {
+        callId: call.id,
+        notes: notesBuffer,
+      });
+      call = { ...call, notes: notesBuffer };
+      notesStatus = "saved";
+      notesError = "";
+      if (notesSavedFadeTimer !== undefined) clearTimeout(notesSavedFadeTimer);
+      notesSavedFadeTimer = window.setTimeout(() => {
+        if (notesStatus === "saved") notesStatus = "idle";
+      }, 2000);
+    } catch (e: any) {
+      notesStatus = "error";
+      notesError = String(e?.message ?? e);
+    }
+  }
+
+  function onNotesChangeDetail(next: string) {
+    if (!notesInitialized) return;
+    notesBuffer = next;
+    scheduleNotesSaveDetail();
+  }
 
   // ── Tags (#57) ───────────────────────────────────────────────────
   // Popover state shared with the portal; see
@@ -403,6 +466,11 @@
         id: call?.id,
         utterances: call?.utterances?.length,
       });
+      // Seed the notes editor once — subsequent poll refreshes keep
+      // the local buffer authoritative so mid-type saves aren't
+      // clobbered by a stale server value.
+      notesBuffer = call.notes ?? "";
+      notesInitialized = true;
       try {
         audioUrls = await invoke("get_audio_urls", { id: page.params.id });
         trace("get_audio_urls ok", audioUrls);
@@ -461,7 +529,10 @@
           id: page.params.id,
         });
         // Keep participants + utterances in sync too — rename
-        // propagation can land while we're polling.
+        // propagation can land while we're polling. Preserve the
+        // local notesBuffer so a server copy that's stale relative
+        // to mid-type edits doesn't clobber in-flight keystrokes.
+        fresh.notes = notesBuffer;
         call = fresh;
         if (TERMINAL_STATES.has(fresh.status)) {
           clearInterval(pollTimer);
@@ -1440,8 +1511,12 @@
                     Cancel
                   </button>
                 </div>
-                {#if memberDropdownRows.recent.length > 0 || memberDropdownRows.all.length > 0}
-                  <div class="member-dropdown" role="listbox">
+                <div class="member-dropdown" role="listbox">
+                  {#if !memberRosterLoaded}
+                    <div class="member-section-hdr">Loading teammates…</div>
+                  {:else if memberRoster.length === 0}
+                    <div class="member-section-hdr">No teammates in your org yet</div>
+                  {:else}
                     {#if memberDropdownRows.recent.length > 0}
                       <div class="member-section-hdr">Recently used</div>
                       {#each memberDropdownRows.recent as r (r.name)}
@@ -1466,9 +1541,11 @@
                           <span class="member-email">{m.email}</span>
                         </button>
                       {/each}
+                    {:else}
+                      <div class="member-section-hdr">No matches</div>
                     {/if}
-                  </div>
-                {/if}
+                  {/if}
+                </div>
               </div>
             {:else}
               <button
@@ -1519,6 +1596,35 @@
             Writing summary<span class="gen-dots"></span>
           </p>
         </div>
+      </section>
+    {/if}
+
+    <!-- Manual notes (#73). Private markdown scratch space that ships
+         with the call row and can be edited post-pipeline. Debounced
+         1s save via the update_call_notes Tauri command. -->
+    {#if notesInitialized}
+      <section class="block notes-block" style="--i: 3.5">
+        <div class="block-head">
+          <h2>Notes</h2>
+          <div class="notes-head-right">
+            {#if notesStatus === "saving"}
+              <span class="notes-status saving">Saving…</span>
+            {:else if notesStatus === "saved"}
+              <span class="notes-status saved">Saved</span>
+            {:else if notesStatus === "error"}
+              <span class="notes-status error" title={notesError}>Save failed</span>
+            {/if}
+          </div>
+        </div>
+        <NotesPanel
+          value={notesBuffer}
+          readonly={!canEditNotes}
+          showHeader={false}
+          onchange={onNotesChangeDetail}
+        />
+        {#if notesStatus === "error" && notesError}
+          <p class="notes-error-line">{notesError}</p>
+        {/if}
       </section>
     {/if}
 
@@ -2254,6 +2360,36 @@
   /* ── Block common ──────────────────────────────────────────────────── */
   .block {
     margin-bottom: 2rem;
+  }
+
+  /* ── Notes block (#73) ───────────────────────────────────────────── */
+  .notes-head-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .notes-status {
+    font-size: 0.72rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    letter-spacing: 0.02em;
+  }
+  .notes-status.saving {
+    color: var(--bone-2);
+    background: var(--ink-2);
+  }
+  .notes-status.saved {
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+  }
+  .notes-status.error {
+    color: var(--live);
+    background: rgba(255, 80, 50, 0.12);
+  }
+  .notes-error-line {
+    margin: 0.5rem 0 0;
+    font-size: 0.8rem;
+    color: var(--live);
   }
 
   .block-head {

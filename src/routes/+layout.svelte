@@ -655,12 +655,18 @@
 
   async function triggerAutoStart() {
     try {
+      // Play the start cue BEFORE invoking the recorder so the
+      // system loopback doesn't capture the beep. Await blocks for
+      // ~350ms when sounds are enabled; no-op when off. Failure
+      // here is swallowed — we'd rather start the recording than
+      // miss it because of a flaky audio subsystem.
+      try {
+        await playStartCueIfEnabled();
+      } catch (e) {
+        console.warn("start cue failed", e);
+      }
       await invoke("confirm_auto_start");
       autoPrompt = null;
-      // Fire the start cue per the org's notification mode. Non-
-      // blocking — if the audio subsystem is flaky we'd rather start
-      // the recording than miss it.
-      playStartCueIfEnabled().catch(() => {});
     } catch (e) {
       console.warn("confirm_auto_start failed", e);
     }
@@ -920,16 +926,6 @@
             }}
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
-          </button>
-          <button
-            class="um-item"
-            role="menuitem"
-            onclick={async () => {
-              closeUserMenu();
-              try { await openUrl("https://aftercalls.io/licenses"); } catch {}
-            }}
-          >
-            Licenses <span class="um-ext" aria-hidden="true">↗</span>
           </button>
           {#if me && (me.role === "admin" || me.role === "superadmin")}
             <div class="um-sep"></div>

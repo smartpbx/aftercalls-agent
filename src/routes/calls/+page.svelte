@@ -27,9 +27,23 @@
     source_app: string | null;
     source_kind: string | null;
     tags?: Tag[];
+    // Owner metadata (populated when scope=all). Optional so legacy
+    // responses don't break the type.
+    user_id?: string;
+    user_display_name?: string;
   };
 
   type TagSuggestion = { kind: string; value: string; count: number };
+
+  type Me = {
+    email: string;
+    display_name: string;
+    role: string;
+    org_display_name: string;
+    user_id?: string;
+  };
+
+  type OrgMember = { id: string; display_name: string; email: string };
 
   // Tidy a raw app binary or application-name into something human.
   function prettyApp(raw: string | null): string | null {
@@ -78,9 +92,42 @@
   let error = $state("");
   let loading = $state(true);
   let query = $state("");
+  let me = $state<Me | null>(null);
+  let scope = $state<"mine" | "all">("mine");
+
+  let canSeeAll = $derived(
+    !!me && (me.role === "admin" || me.role === "superadmin"),
+  );
 
   // Active tag filters, each as "kind:value". Kept in sync with the URL.
   let tagFilters = $state<string[]>([]);
+
+  // Admin-only: filter the All-team list to a single member.
+  let userFilter = $state<{ id: string; name: string } | null>(null);
+  let memberRoster = $state<OrgMember[]>([]);
+  let memberRosterLoaded = $state(false);
+  let userPopoverOpen = $state(false);
+  let userPopoverQuery = $state("");
+
+  async function ensureMemberRoster() {
+    if (memberRosterLoaded) return;
+    memberRosterLoaded = true;
+    try {
+      memberRoster = await invoke<OrgMember[]>("org_members");
+    } catch {
+      memberRoster = [];
+    }
+  }
+
+  let filteredMembers = $derived.by(() => {
+    const q = userPopoverQuery.trim().toLowerCase();
+    if (!q) return memberRoster;
+    return memberRoster.filter(
+      (m) =>
+        m.display_name.toLowerCase().includes(q) ||
+        m.email.toLowerCase().includes(q),
+    );
+  });
 
   // Add-filter popover state.
   let popoverOpen = $state(false);
@@ -123,12 +170,31 @@
     loading = true;
     error = "";
     try {
-      calls = await invoke<Call[]>("list_calls", { tags: tagFilters });
+      calls = await invoke<Call[]>("list_calls", {
+        scope,
+        user: scope === "all" ? (userFilter?.id ?? null) : null,
+        tags: tagFilters,
+      });
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
     }
+  }
+
+  async function setScope(next: "mine" | "all") {
+    if (scope === next) return;
+    scope = next;
+    if (scope !== "all") userFilter = null;
+    if (scope === "all") void ensureMemberRoster();
+    await load();
+  }
+
+  async function setUserFilter(m: OrgMember | null) {
+    userFilter = m ? { id: m.id, name: m.display_name } : null;
+    userPopoverOpen = false;
+    userPopoverQuery = "";
+    await load();
   }
 
   async function addTagFilter(kind: string, value: string) {
@@ -157,6 +223,7 @@
   async function clearFilters() {
     tagFilters = [];
     query = "";
+    userFilter = null;
     syncUrl();
     await load();
   }
@@ -217,7 +284,11 @@
   });
 
   onMount(async () => {
+    try {
+      me = await invoke<Me | null>("current_user");
+    } catch {}
     tagFilters = readTagsFromUrl();
+    if (scope === "all" && canSeeAll) void ensureMemberRoster();
     await load();
   });
 
@@ -297,10 +368,33 @@
     <div>
       <h1>Calls</h1>
       <p class="sub">
-        {calls.length} {calls.length === 1 ? "call" : "calls"} in your archive
+        {calls.length} {calls.length === 1 ? "call" : "calls"}
+        {scope === "all" ? "across the team" : "in your archive"}
       </p>
     </div>
-    <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
+    <div class="head-actions">
+      {#if canSeeAll}
+        <div class="scope-toggle" role="group" aria-label="Scope">
+          <button
+            type="button"
+            class="scope-opt"
+            class:active={scope === "mine"}
+            onclick={() => setScope("mine")}
+          >
+            My calls
+          </button>
+          <button
+            type="button"
+            class="scope-opt"
+            class:active={scope === "all"}
+            onclick={() => setScope("all")}
+          >
+            All team
+          </button>
+        </div>
+      {/if}
+      <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
+    </div>
   </header>
 
   <div class="filter-bar" style="--i: 1">
@@ -329,6 +423,84 @@
           >×</button>
         </span>
       {/each}
+      {#if userFilter}
+        <span class="tag-chip tag-person">
+          <span class="tag-chip-label">by: {userFilter.name}</span>
+          <button
+            type="button"
+            class="tag-chip-x"
+            aria-label="Clear person filter"
+            onclick={() => setUserFilter(null)}
+          >×</button>
+        </span>
+      {/if}
+      {#if scope === "all" && canSeeAll}
+        <div class="add-wrap">
+          <button
+            type="button"
+            class="add-filter"
+            onclick={async () => {
+              if (userPopoverOpen) {
+                userPopoverOpen = false;
+              } else {
+                await ensureMemberRoster();
+                userPopoverQuery = "";
+                userPopoverOpen = true;
+              }
+            }}
+            aria-haspopup="dialog"
+            aria-expanded={userPopoverOpen}
+          >
+            + By person
+          </button>
+          {#if userPopoverOpen}
+            <div
+              class="pop-backdrop"
+              role="button"
+              tabindex="-1"
+              aria-label="Close person picker"
+              onclick={() => (userPopoverOpen = false)}
+              onkeydown={(e) => e.key === "Escape" && (userPopoverOpen = false)}
+            ></div>
+            <div class="pop" role="dialog" aria-label="Filter by person">
+              <input
+                class="pop-search"
+                type="text"
+                placeholder="Search team…"
+                bind:value={userPopoverQuery}
+                use:focusOnMount
+                onkeydown={(e) => {
+                  if (e.key === "Escape") userPopoverOpen = false;
+                  else if (e.key === "Enter" && filteredMembers.length > 0) {
+                    e.preventDefault();
+                    void setUserFilter(filteredMembers[0]);
+                  }
+                }}
+              />
+              <ul class="pop-list">
+                {#if filteredMembers.length === 0}
+                  <li class="pop-empty">
+                    {memberRoster.length === 0 ? "Loading…" : "No matching teammates"}
+                  </li>
+                {:else}
+                  {#each filteredMembers as m (m.id)}
+                    <li>
+                      <button
+                        type="button"
+                        class="pop-item"
+                        onclick={() => setUserFilter(m)}
+                      >
+                        <span class="person-name">{m.display_name}</span>
+                        <span class="person-email">{m.email}</span>
+                      </button>
+                    </li>
+                  {/each}
+                {/if}
+              </ul>
+            </div>
+          {/if}
+        </div>
+      {/if}
       <div class="add-wrap">
         <button
           type="button"
@@ -457,6 +629,18 @@
                       {call.title ?? "(untitled)"}
                     </h3>
                     <div class="entry-meta">
+                      {#if scope === "all" && call.user_display_name}
+                        <span
+                          class="owner-chip"
+                          title="Recorded by {call.user_display_name}"
+                        >
+                          <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                            <circle cx="8" cy="5.5" r="2.8" fill="currentColor"/>
+                            <path d="M2.5 14 C3 10.5 5.5 9.5 8 9.5 C10.5 9.5 13 10.5 13.5 14 Z" fill="currentColor"/>
+                          </svg>
+                          {call.user_display_name}
+                        </span>
+                      {/if}
                       {#if call.tags && call.tags.length > 0}
                         <!-- Show up to 2 tags inline; overflow goes
                              into a "+N" chip with the hidden tags in
@@ -525,6 +709,33 @@
     justify-content: space-between;
     gap: 1.5rem;
     margin-bottom: 1.2rem;
+  }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+  .scope-toggle {
+    display: inline-flex;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .scope-opt {
+    padding: 0.35rem 0.7rem;
+    font-size: 0.78rem;
+    color: var(--bone-2);
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--hairline);
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+  }
+  .scope-opt:last-child { border-right: none; }
+  .scope-opt:hover { color: var(--bone-0); background: var(--ink-2); }
+  .scope-opt.active {
+    color: var(--accent-hi);
+    background: var(--accent-soft);
   }
   .trash-link {
     font-size: 0.8rem;
@@ -642,6 +853,36 @@
     background: var(--ink-2);
     color: var(--bone-1);
   }
+  .tag-person {
+    background: rgba(58, 155, 146, 0.14);
+    color: var(--accent-hi);
+  }
+
+  .owner-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.1rem 0.5rem;
+    font-size: 0.72rem;
+    color: var(--bone-2);
+    background: var(--ink-2);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+  }
+  .owner-chip svg { color: var(--bone-3); }
+
+  .person-name {
+    display: block;
+    font-size: 0.9rem;
+    color: var(--bone-1);
+  }
+  .person-email {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--bone-3);
+    margin-top: 0.1rem;
+  }
+
   .tag-chip-x {
     appearance: none;
     background: transparent;

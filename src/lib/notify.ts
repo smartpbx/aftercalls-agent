@@ -73,6 +73,20 @@ function playNotes(notes: Note[]) {
   }
 }
 
+// Await the scheduled note sequence so callers can block until the
+// last note has finished playing. Used by the start-cue path before
+// starting the recorder so the system loopback doesn't capture the
+// beep. Falls through with a no-op wait when no AudioContext is
+// available (headless test environments).
+function playNotesAwait(notes: Note[]): Promise<void> {
+  playNotes(notes);
+  const totalSec =
+    notes.length === 0
+      ? 0
+      : Math.max(...notes.map((n) => n.at + n.dur)) + 0.05;
+  return new Promise((resolve) => setTimeout(resolve, totalSec * 1000));
+}
+
 // `force` bypasses the user's sounds_enabled preference. Used by the
 // PIPEDA "enforced" recording-notification mode (#48) where admins
 // require the start cue play regardless of local settings — an org's
@@ -88,8 +102,10 @@ function playNotes(notes: Note[]) {
 // API with a graceful fallback for platforms that lack a voice).
 export async function notifyRecordStart(force: boolean = false) {
   if (!force && !(await soundsEnabled())) return;
-  // Two-note ascending: friendly "go" cue.
-  playNotes([
+  // Two-note ascending: friendly "go" cue. Awaits the full note
+  // duration so start_recording can be invoked AFTER the cue plays —
+  // otherwise the system loopback captures the beep on every call.
+  await playNotesAwait([
     { freq: 523.25, at: 0,    dur: 0.12 }, // C5
     { freq: 783.99, at: 0.13, dur: 0.18 }, // G5
   ]);

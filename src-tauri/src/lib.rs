@@ -287,14 +287,18 @@ fn keep_auto_recording(detector: State<Detector>) {
 }
 
 #[tauri::command]
-async fn list_calls(tags: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+async fn list_calls(
+    scope: Option<String>,
+    user: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
     let tags = tags.unwrap_or_default();
-    portal::list_calls(backend, &tags)
+    portal::list_calls(backend, scope.as_deref(), user.as_deref(), &tags)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1051,6 +1055,7 @@ pub fn run() {
             discard_orphan_session,
             notes::save_notes,
             notes::load_notes,
+            notes::update_call_notes,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent
