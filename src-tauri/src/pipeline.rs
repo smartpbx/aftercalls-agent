@@ -284,6 +284,21 @@ pub fn ffmpeg_binary() -> std::ffi::OsString {
     std::ffi::OsString::from("ffmpeg")
 }
 
+/// Suppress the transient console window Windows allocates for console-
+/// subsystem children (#91). Must be applied to every ffmpeg spawn on
+/// Windows — `stdio::null()` doesn't suppress the window, only the
+/// CREATE_NO_WINDOW creation flag does. No-op on non-Windows.
+#[cfg(windows)]
+pub fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+#[cfg(not(windows))]
+pub fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    cmd
+}
+
 async fn mix_tracks(session_dir: &Path) -> Result<()> {
     let mic = session_dir.join("mic.wav");
     let system = session_dir.join("system.wav");
@@ -291,8 +306,8 @@ async fn mix_tracks(session_dir: &Path) -> Result<()> {
     if !mic.exists() || !system.exists() {
         return Ok(());
     }
-    let status = tokio::process::Command::new(ffmpeg_binary())
-        .arg("-y")
+    let mut cmd = tokio::process::Command::new(ffmpeg_binary());
+    cmd.arg("-y")
         .arg("-i")
         .arg(&mic)
         .arg("-i")
@@ -304,9 +319,9 @@ async fn mix_tracks(session_dir: &Path) -> Result<()> {
         .arg(&mixed)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await?;
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    let status = cmd.status().await?;
     if !status.success() {
         anyhow::bail!("ffmpeg amix failed: {status}");
     }
@@ -321,8 +336,8 @@ async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
         anyhow::bail!("{} not present", input.display());
     }
     let output = input.with_extension("opus");
-    let status = tokio::process::Command::new(ffmpeg_binary())
-        .arg("-y")
+    let mut cmd = tokio::process::Command::new(ffmpeg_binary());
+    cmd.arg("-y")
         .arg("-i")
         .arg(input)
         .arg("-ac")
@@ -336,10 +351,9 @@ async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
         .arg(&output)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .context("run ffmpeg")?;
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    let status = cmd.status().await.context("run ffmpeg")?;
     if !status.success() {
         anyhow::bail!("ffmpeg exited with {status}");
     }

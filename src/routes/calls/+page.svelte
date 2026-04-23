@@ -37,13 +37,26 @@
 
   type Me = {
     email: string;
+    // #96: structured first/last alongside display_name. Optional
+    // because older auth.json files may predate the split.
+    first_name?: string;
+    last_name?: string;
     display_name: string;
     role: string;
     org_display_name: string;
     user_id?: string;
   };
 
-  type OrgMember = { id: string; display_name: string; email: string };
+  // #96: OrgMember now carries first_name + last_name alongside the
+  // display_name the picker renders. Unused here; kept in the type so
+  // TS doesn't drift from the API shape.
+  type OrgMember = {
+    id: string;
+    first_name: string;
+    last_name: string;
+    display_name: string;
+    email: string;
+  };
 
   // Tidy a raw app binary or application-name into something human.
   function prettyApp(raw: string | null): string | null {

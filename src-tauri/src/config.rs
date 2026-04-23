@@ -58,6 +58,27 @@ pub struct Config {
     /// minimal for users who don't take notes.
     #[serde(default)]
     pub manual_notes_enabled: bool,
+    /// Tracks whether the Linux in-app note under the Super+Shift+R
+    /// kbd-row has been dismissed. The note explains that the global
+    /// hotkey only reaches an unfocused app on most desktop
+    /// environments when the shortcut is bound in the user's own
+    /// keyboard-shortcut config (via the `aftercalls --toggle-recording`
+    /// CLI). Defaults to false so fresh installs see the note once;
+    /// serde-default covers existing config.toml files without the
+    /// key.
+    #[serde(default)]
+    pub wayland_hotkey_notice_dismissed: bool,
+    /// Preferred microphone identified by its cpal-reported `name()`.
+    /// `None` (key absent from config.toml) means "use system default"
+    /// — this is both the fresh-install state and the explicit-reset
+    /// state (the Settings UI clears the key by selecting "System
+    /// default"). cpal has no stable cross-platform device ID, so we
+    /// store the name and resolve it at `recorder::begin()` time;
+    /// miss → silent fall-through to `host.default_input_device()`
+    /// with a one-time `mic-fallback` toast on the Record page. See
+    /// #3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -107,6 +128,8 @@ impl Config {
                 sounds_enabled: true,
                 max_recording_minutes: default_max_recording_minutes(),
                 manual_notes_enabled: false,
+                wayland_hotkey_notice_dismissed: false,
+                input_device: None,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;
@@ -177,6 +200,14 @@ pub struct AuthFile {
     pub refresh_expires_at: chrono::DateTime<chrono::Utc>,
     pub user_id: String,
     pub email: String,
+    /// Structured names (#96). Serde defaults so old auth.json files
+    /// written before the split still parse — backend backfill means
+    /// the next login populates them. Meanwhile display_name remains
+    /// authoritative for rendering.
+    #[serde(default)]
+    pub first_name: String,
+    #[serde(default)]
+    pub last_name: String,
     pub display_name: String,
     pub role: String,
     pub org_id: String,

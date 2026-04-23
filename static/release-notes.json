@@ -1,4 +1,16 @@
 {
+  "0.3.31": {
+    "headline": "First + last names, smarter speaker rename, mic picker, quieter while recording",
+    "changes": [
+      "First + last names. Profile settings now have separate inputs for first and last name. Summaries and action items render teammates as 'First L.' (e.g., 'Clayton M.') so people with the same first name don't read as the same person. Existing accounts are pre-filled from your old display name — adjust on your profile if the split looks wrong.",
+      "Speaker rename picker lists your teammates. Typing in the transcript speaker-rename field opens a searchable dropdown of people in your team with small avatars. Pick a teammate and the call remembers who they are across the app; free-form names for external folks still work.",
+      "Audio input device picker. Settings → Behavior now lets you choose which microphone to record from. If your saved mic isn't plugged in, the app quietly falls back to the system default and surfaces a one-time notice on the Record page.",
+      "Global shortcut on Linux (Wayland). Super+Shift+R still works on X11, Windows, and macOS. On Wayland, bind 'aftercalls --toggle-recording' in your desktop environment's keyboard-shortcut settings to trigger the recorder from anywhere — see the help page for instructions.",
+      "Notification chimes stay silent while a call is recording or its transcript is still processing. The recording-start tone still plays because it's a compliance cue.",
+      "The update notice no longer surfaces during a call or mid-processing — it waits until the pipeline finishes, then pops up right away.",
+      "Admin user edit. When an admin renames a teammate from the admin console, the first + last name fields come along, keeping the structured names in sync with the display name."
+    ]
+  },
   "0.3.30": {
     "headline": "Launch aftercalls with your computer; every speaker gets an avatar",
     "changes": [

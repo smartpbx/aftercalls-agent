@@ -18,6 +18,12 @@
 
   type Me = {
     email: string;
+    // #96: structured first/last ride alongside display_name. Optional
+    // because older auth.json files may be missing them (serde
+    // default on the Rust side); release-notes greeting prefers
+    // first_name but falls back to a split of display_name.
+    first_name?: string;
+    last_name?: string;
     display_name: string;
     role: string;
     org_display_name: string;
@@ -94,7 +100,7 @@
     return false;
   }
 
-  async function pollForUpdate() {
+  async function pollForUpdate(opts?: { userInitiated?: boolean }) {
     // Don't clobber an in-flight install — the Update object is the
     // one being downloaded right now and swapping it out would break
     // the progress callback. We DO still re-check in the
@@ -102,6 +108,25 @@
     // replaces a stale cached object (#58: user on 0.3.18 seeing a
     // "0.3.19 available" pill that never updates to 0.3.20).
     if (updateState === "downloading") return;
+    // #79: gate the prompt while the agent is busy (recording or the
+    // post-recording pipeline is still running). We do NOT touch
+    // updateAvailable / linuxUpdateAvailable when deferring — if a
+    // pill was already on screen from an earlier poll, it stays.
+    // Manual "Check for updates" from the user menu bypasses via
+    // userInitiated — the user asked, surface the answer.
+    if (!opts?.userInitiated) {
+      try {
+        const busy = await invoke<boolean>("is_processing");
+        if (busy) {
+          updateCheckDeferred = true;
+          return;
+        }
+      } catch (e) {
+        // If the probe fails for any reason, fall through to the
+        // normal poll rather than suppressing updates silently.
+        console.warn("is_processing probe failed", e);
+      }
+    }
     // Primary path: Tauri's updater plugin. Works for Windows, macOS,
     // and AppImage Linux. Returns null for non-AppImage Linux installs.
     try {
@@ -180,6 +205,11 @@
   let updateDownloaded = $state(0);
   let updateTotal = $state(0);
   let version = $state("");
+  // #79: when an auto-poll lands mid-call / mid-pipeline, skip the
+  // prompt and remember we owe the user a re-check. The pipeline /
+  // recording-state listeners clear this and re-poll the moment work
+  // finishes so latency is ~0s instead of up to 60min.
+  let updateCheckDeferred = false;
   // Linux has no in-place updater (see pollForUpdate). When we detect a
   // newer version on the manifest we stash the *new* version string here
   // and the topstrip renders a "v0.x.y out — get it" pill that opens
@@ -208,6 +238,23 @@
     firstName: string;
   } | null>(null);
   let releaseNotesChecked = false;
+  // Refs for initial focus so keyboard cycles start on the primary
+  // dismiss button. The `.rn-modal` carries `overflow: hidden` with a
+  // `.rn-body` scroll region, so without this the first Tab lands on
+  // the scroll container itself and the footer link — neither is the
+  // obvious "commit" target.
+  let rnDismissBtn = $state<HTMLButtonElement | null>(null);
+  let autoAckDismissBtn = $state<HTMLButtonElement | null>(null);
+  $effect(() => {
+    if (releaseNotes && rnDismissBtn) {
+      rnDismissBtn.focus();
+    }
+  });
+  $effect(() => {
+    if (autoAckOpen && autoAckDismissBtn) {
+      autoAckDismissBtn.focus();
+    }
+  });
 
   // On Windows the backend drops native decorations so we draw our
   // own titlebar inside the webview. Detected once via UA; native
@@ -300,11 +347,31 @@
 
     unlistenState = await listen<{ recording: boolean }>(
       "recording-state",
-      (evt) => (recording = evt.payload.recording),
+      (evt) => {
+        recording = evt.payload.recording;
+        // #79: a very short recording may stop before the pipeline
+        // ever engages (auto-detect false start, cancelled session).
+        // If we deferred a poll and no pipeline event comes along to
+        // clear the flag, the stop transition does it here. If the
+        // pipeline listener beats us to it the flag is already
+        // cleared so this is a no-op.
+        if (!recording && updateCheckDeferred) {
+          updateCheckDeferred = false;
+          pollForUpdate();
+        }
+      },
     );
     unlistenPipeline = await listen<{ stage: string }>("pipeline", (evt) => {
       pipelineStage = evt.payload.stage ?? "";
       if (pipelineStage === "done" || pipelineStage === "failed") {
+        // #79: pipeline finished → if we deferred an update poll
+        // while work was in flight, re-run it now so the pill
+        // surfaces within ~1s of completion instead of waiting up
+        // to 60min for the next hourly tick.
+        if (updateCheckDeferred) {
+          updateCheckDeferred = false;
+          pollForUpdate();
+        }
         setTimeout(() => {
           if (pipelineStage === "done" || pipelineStage === "failed")
             pipelineStage = "";
@@ -553,7 +620,13 @@
         localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
         return;
       }
-      const firstName = (me?.display_name ?? "").split(/\s+/)[0] ?? "";
+      // #96: prefer the structured first_name; fall back to splitting
+      // display_name so a stale auth.json (pre-migration) still
+      // yields a greeting.
+      const firstName =
+        me?.first_name ||
+        (me?.display_name ?? "").split(/\s+/)[0] ||
+        "";
       releaseNotes = { entries, firstName };
     } catch (e) {
       console.warn("release notes load failed", e);
@@ -762,7 +835,9 @@
   }
   async function manualUpdateCheck() {
     closeUserMenu();
-    await pollForUpdate();
+    // #79: explicit user action bypasses the processing gate. If
+    // they asked, surface the answer even mid-call.
+    await pollForUpdate({ userInitiated: true });
   }
   async function signOut() {
     closeUserMenu();
@@ -992,7 +1067,10 @@
                as an interrupt without the warning-red weight. -->
           <div class="update">
             <span class="pip sig"></span>
-            <span class="update-label">
+            <span
+              class="update-label"
+              title={`${orphans.length} unfinished call${orphans.length === 1 ? "" : "s"} from before the last restart`}
+            >
               {orphans.length} unfinished call{orphans.length === 1 ? "" : "s"}
               from before the last restart
             </span>
@@ -1019,7 +1097,10 @@
           <div class="update">
             {#if updateState === "downloading"}
               <span class="pip working"></span>
-              <span class="update-label">
+              <span
+                class="update-label"
+                title={`Updating to v${updateAvailable.version}…${updateTotal > 0 ? ` ${Math.min(100, Math.round((updateDownloaded / updateTotal) * 100))}%` : ""}`}
+              >
                 Updating to v{updateAvailable.version}…
                 {#if updateTotal > 0}
                   {Math.min(100, Math.round((updateDownloaded / updateTotal) * 100))}%
@@ -1027,14 +1108,17 @@
               </span>
             {:else if updateState === "ready"}
               <span class="pip done"></span>
-              <span class="update-label">Restarting…</span>
+              <span class="update-label" title="Restarting…">Restarting…</span>
             {:else if updateState === "error"}
               <span class="pip failed"></span>
               <span class="update-label" title={updateError}>Update failed</span>
               <button class="update-dismiss" onclick={dismissUpdate}>Dismiss</button>
             {:else}
               <span class="pip sig"></span>
-              <span class="update-label">
+              <span
+                class="update-label"
+                title={`v${updateAvailable.version} available`}
+              >
                 v{updateAvailable.version} available
               </span>
               <button class="update-install" onclick={installUpdate}>Install</button>
@@ -1044,7 +1128,10 @@
         {:else if linuxUpdateAvailable}
           <div class="update">
             <span class="pip sig"></span>
-            <span class="update-label">
+            <span
+              class="update-label"
+              title={`v${linuxUpdateAvailable} available`}
+            >
               v{linuxUpdateAvailable} available
             </span>
             <button class="update-install" onclick={openDownloadsPage}>
@@ -1189,7 +1276,15 @@
       aria-modal="true"
       aria-labelledby="rn-title"
       onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        // Esc must bubble out so the modal dismisses even when focus
+        // is trapped inside the scroll container or on the dismiss
+        // button; previously the plain stopPropagation() here silently
+        // swallowed it. All other keys stay contained so they don't
+        // reach the rail's route-switch / shortcut handlers underneath.
+        if (e.key === "Escape") { dismissReleaseNotes(); return; }
+        e.stopPropagation();
+      }}
       tabindex="-1"
     >
       <div class="rn-head">
@@ -1202,29 +1297,32 @@
           {/if}
         </h2>
       </div>
-      {#if releaseNotes.entries.length > 1}
-        <p class="rn-aggregate-caption">
-          You jumped {releaseNotes.entries.length} versions — here's everything since your last launch.
-        </p>
-      {/if}
-      {#each releaseNotes.entries as entry, i (entry.version)}
-        {#if i > 0}
-          <!-- Secondary versions get a small version header + their
-               headline in-line so the caller can scan per-version. -->
-          <div class="rn-entry-head">
-            <span class="rn-badge rn-badge-dim">v{entry.version}</span>
-            <span class="rn-entry-headline">{entry.headline}</span>
-          </div>
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div class="rn-body" tabindex="0" role="region" aria-label="Release notes">
+        {#if releaseNotes.entries.length > 1}
+          <p class="rn-aggregate-caption">
+            You jumped {releaseNotes.entries.length} versions — here's everything since your last launch.
+          </p>
         {/if}
-        <ul class="rn-list">
-          {#each entry.changes as line (line)}
-            <li>{line}</li>
-          {/each}
-        </ul>
-        {#if entry.footer}
-          <p class="rn-footer">{entry.footer}</p>
-        {/if}
-      {/each}
+        {#each releaseNotes.entries as entry, i (entry.version)}
+          {#if i > 0}
+            <!-- Secondary versions get a small version header + their
+                 headline in-line so the caller can scan per-version. -->
+            <div class="rn-entry-head">
+              <span class="rn-badge rn-badge-dim">v{entry.version}</span>
+              <span class="rn-entry-headline">{entry.headline}</span>
+            </div>
+          {/if}
+          <ul class="rn-list">
+            {#each entry.changes as line (line)}
+              <li>{line}</li>
+            {/each}
+          </ul>
+          {#if entry.footer}
+            <p class="rn-footer">{entry.footer}</p>
+          {/if}
+        {/each}
+      </div>
       <div class="rn-actions">
         <button
           type="button"
@@ -1235,7 +1333,7 @@
         >
           See all release notes <span aria-hidden="true">↗</span>
         </button>
-        <button class="rn-dismiss" onclick={dismissReleaseNotes}>
+        <button class="rn-dismiss" bind:this={rnDismissBtn} onclick={dismissReleaseNotes}>
           Got it
         </button>
       </div>
@@ -1262,33 +1360,42 @@
       aria-modal="true"
       aria-labelledby="auto-ack-title"
       onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        // Esc cancels the ack prompt (equivalent to clicking backdrop
+        // or the Cancel button). All other keys stay contained so the
+        // checkbox space-toggle doesn't leak into rail shortcuts.
+        if (e.key === "Escape") { cancelAutoAck(); return; }
+        e.stopPropagation();
+      }}
       tabindex="-1"
     >
       <div class="rn-head">
         <h2 id="auto-ack-title">Before you record</h2>
       </div>
-      <p class="auto-ack-body">
-        Under Canadian PIPEDA — and equivalent privacy laws in most
-        jurisdictions — you are responsible for notifying every
-        participant that the call is being recorded, obtaining their
-        consent, and using the recording only for the purpose you
-        disclosed.
-      </p>
-      <p class="auto-ack-body">
-        aftercalls doesn't automate consent. You do.
-      </p>
-      <label class="auto-ack-check">
-        <input
-          type="checkbox"
-          bind:checked={autoAckChecked}
-          disabled={autoAckSubmitting}
-        />
-        <span>I understand and will get consent from everyone I record.</span>
-      </label>
-      {#if autoAckError}
-        <p class="auto-ack-err">{autoAckError}</p>
-      {/if}
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div class="rn-body" tabindex="0" role="region" aria-label="Recording acknowledgment">
+        <p class="auto-ack-body">
+          Under Canadian PIPEDA — and equivalent privacy laws in most
+          jurisdictions — you are responsible for notifying every
+          participant that the call is being recorded, obtaining their
+          consent, and using the recording only for the purpose you
+          disclosed.
+        </p>
+        <p class="auto-ack-body">
+          aftercalls doesn't automate consent. You do.
+        </p>
+        <label class="auto-ack-check">
+          <input
+            type="checkbox"
+            bind:checked={autoAckChecked}
+            disabled={autoAckSubmitting}
+          />
+          <span>I understand and will get consent from everyone I record.</span>
+        </label>
+        {#if autoAckError}
+          <p class="auto-ack-err">{autoAckError}</p>
+        {/if}
+      </div>
       <div class="rn-actions">
         <button
           type="button"
@@ -1305,6 +1412,7 @@
           <button
             type="button"
             class="rn-dismiss"
+            bind:this={autoAckDismissBtn}
             onclick={submitAutoAck}
             disabled={!autoAckChecked || autoAckSubmitting}
           >{autoAckSubmitting ? "Saving…" : "I understand — start recording"}</button>
@@ -1563,7 +1671,11 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    height: var(--topbar-h);
+    /* Was `height: var(--topbar-h)`; when `.strip-right` wraps on narrow
+       windows the wrapped row needs vertical room, so use min-height to
+       let the strip grow. The 40 px floor is preserved for the common
+       no-wrap case (closes #88). */
+    min-height: var(--topbar-h);
     padding: 0 1.5rem;
     border-bottom: 1px solid var(--hairline);
     /* Translucent background tracks the active theme — was hard-coded
@@ -1579,8 +1691,13 @@
   }
   .topstrip.has-win-controls {
     /* No outer padding on the right so the window controls go
-       edge-to-edge like a native titlebar. */
-    padding: 0 0 0 1.5rem;
+       edge-to-edge like a native titlebar. The 138px right-side
+       reservation (3 × 46px buttons, see .wc-btn width) keeps the
+       pills + indicator from rendering underneath the absolute-
+       positioned .win-controls (see block below). Windows-only —
+       non-Windows topstrip has no .has-win-controls class and keeps
+       its normal `padding: 0 1.5rem` + inline layout. */
+    padding: 0 calc(46px * 3) 0 1.5rem;
     -webkit-user-select: none;
     user-select: none;
   }
@@ -1614,6 +1731,11 @@
        container is sticky-positioned so this just means the
        content underneath pushes down by one pill's height. */
     min-height: var(--topbar-h);
+    /* Let this flex item shrink below its content's intrinsic
+       width so pill children (with their own min-width:0 +
+       truncation) can ellipsize cleanly on narrow windows (#88). */
+    min-width: 0;
+    flex: 1 1 auto;
   }
 
   .update {
@@ -1628,10 +1750,21 @@
     font-size: 0.7rem;
     letter-spacing: 0.02em;
     color: var(--bone-1);
+    /* Let the pill shrink in its flex parent so long labels ellipsize
+       instead of forcing the pill to max-content width (#88). */
+    min-width: 0;
+    max-width: 100%;
   }
 
   .update-label {
     color: var(--bone-1);
+    /* Truncate instead of forcing the pill to its intrinsic width.
+       The parent <span title="…"> carries the full text for tooltip
+       + screen-reader access on overflow (#88). */
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .update-install,
@@ -1738,6 +1871,20 @@
   }
 
   /* ── Windows custom titlebar controls ──────────────────────────── */
+  /* Scoped under .topstrip.has-win-controls so the absolute pin only
+     applies when the Windows titlebar branch is mounted. Non-Windows
+     never has the .has-win-controls class (nor a .win-controls element),
+     so its topstrip layout is unaffected (#88). The 40 px topstrip
+     is position:sticky which establishes a containing block; the
+     buttons anchor to its top-right corner and sit out of the
+     .strip-right flex-wrap container entirely, so they stay pinned
+     even when the pills wrap to a second row. */
+  .topstrip.has-win-controls .win-controls {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
+  }
   .win-controls {
     display: flex;
     align-items: stretch;

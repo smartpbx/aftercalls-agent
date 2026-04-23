@@ -89,6 +89,84 @@
   // via the save_notes Tauri command. The pipeline picks that up at
   // create_call time so the backend gets the notes + include flag.
   let manualNotesEnabled = $state(false);
+
+  // Linux-only in-app note that explains why Super+Shift+R doesn't
+  // fire when the app is unfocused on most desktop environments (the
+  // X11 grab through XWayland doesn't receive unfocused keystrokes)
+  // and points the user at the help page for the CLI-bound
+  // workaround. `hotkeyNoteOS` is populated on mount from
+  // `platform_os`; the note renders only when it equals "linux" AND
+  // the dismiss pref is false. `hotkeyNoteAppPrefs` caches the full
+  // AppPrefs snapshot so the Dismiss click can round-trip every
+  // other pref untouched (mirrors the settings-page pattern).
+  let hotkeyNoteOS = $state("");
+  let hotkeyNoteDismissed = $state(true); // default hidden until mount resolves
+  let hotkeyNoteAppPrefs = $state<{
+    close_to_tray: boolean;
+    auto_detect: boolean;
+    telemetry_enabled: boolean;
+    sounds_enabled: boolean;
+    max_recording_minutes: number;
+    manual_notes_enabled: boolean;
+    wayland_hotkey_notice_dismissed: boolean;
+    input_device: string | null;
+  } | null>(null);
+
+  // Mic-fallback toast (#3). Fired by the agent when a saved
+  // input-device pref doesn't resolve and we silently fell back to
+  // the system default. Dedupe is handled Rust-side per session per
+  // saved name, so this listener can render unconditionally on every
+  // event without nagging. Auto-dismisses after 12s; user can also
+  // dismiss manually.
+  type MicFallback = {
+    saved: string;
+    reason: "not_found" | "enumeration_failed";
+  };
+  let micFallback = $state<MicFallback | null>(null);
+  let micFallbackTimer = 0;
+  let showHotkeyNote = $derived(
+    hotkeyNoteOS === "linux" && !hotkeyNoteDismissed,
+  );
+
+  async function openHotkeyHelp() {
+    try {
+      await openUrl("https://aftercalls.io/help#global-shortcut-linux");
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  }
+
+  async function dismissHotkeyNote() {
+    // Optimistic hide; roll back if the save fails so the note
+    // doesn't appear to "stick dismissed" when the config write
+    // actually didn't persist.
+    const prev = hotkeyNoteDismissed;
+    hotkeyNoteDismissed = true;
+    const prefs = hotkeyNoteAppPrefs;
+    if (!prefs) return;
+    try {
+      await invoke("set_app_prefs", {
+        closeToTray: prefs.close_to_tray,
+        autoDetect: prefs.auto_detect,
+        telemetryEnabled: prefs.telemetry_enabled,
+        soundsEnabled: prefs.sounds_enabled,
+        maxRecordingMinutes: prefs.max_recording_minutes,
+        manualNotesEnabled: prefs.manual_notes_enabled,
+        waylandHotkeyNoticeDismissed: true,
+        // Round-trip the input-device pref untouched (#3). Dropping
+        // it here would clear the user's chosen mic any time they
+        // dismiss the hotkey note.
+        inputDevice: prefs.input_device,
+      });
+      hotkeyNoteAppPrefs = {
+        ...prefs,
+        wayland_hotkey_notice_dismissed: true,
+      };
+    } catch (e) {
+      hotkeyNoteDismissed = prev;
+      console.warn("dismiss hotkey note failed", e);
+    }
+  }
   let currentSessionId = $derived(
     sessionDir ? sessionDir.split(/[\\/]/).filter(Boolean).pop() ?? "" : "",
   );
@@ -130,8 +208,17 @@
   let unlisten: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
   let unlistenAuto: UnlistenFn | null = null;
+  let unlistenMicFallback: UnlistenFn | null = null;
   let timer = 0;
   let startAt = 0;
+
+  function dismissMicFallback() {
+    micFallback = null;
+    if (micFallbackTimer) {
+      clearTimeout(micFallbackTimer);
+      micFallbackTimer = 0;
+    }
+  }
 
   onMount(async () => {
     unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
@@ -174,6 +261,18 @@
         }
       },
     );
+    unlistenMicFallback = await listen<MicFallback>("mic-fallback", (evt) => {
+      // Rust dedupes per-session-per-name, so every event we receive
+      // is one the user hasn't seen yet this run. Reset the auto-
+      // dismiss timer on each arrival so the full 12s applies to the
+      // most recent one.
+      micFallback = evt.payload;
+      if (micFallbackTimer) clearTimeout(micFallbackTimer);
+      micFallbackTimer = window.setTimeout(() => {
+        micFallback = null;
+        micFallbackTimer = 0;
+      }, 12000);
+    });
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
       // prompt_start rendered here as an inline banner when the user
       // is already on /record (#60). The layout's slide-out suppresses
@@ -203,14 +302,39 @@
     loadRecordingPrefs();
 
     // Load manual_notes_enabled so the record page knows whether to
-    // render the notes panel during active recording. Failures here
-    // default to `false` (panel hidden) which matches the pref's
-    // fresh-install default.
+    // render the notes panel during active recording, and
+    // wayland_hotkey_notice_dismissed so we know whether to show the
+    // Linux in-app hotkey note below the kbd-row. Failures here
+    // default to `false` (panel hidden) / `true` (note hidden) —
+    // silent-failure of a pref load should never surface a new UI
+    // element the user hasn't seen before.
     try {
-      const prefs = await invoke<{ manual_notes_enabled?: boolean }>("get_app_prefs");
+      const prefs = await invoke<{
+        close_to_tray: boolean;
+        auto_detect: boolean;
+        telemetry_enabled: boolean;
+        sounds_enabled: boolean;
+        max_recording_minutes: number;
+        manual_notes_enabled: boolean;
+        wayland_hotkey_notice_dismissed: boolean;
+        input_device: string | null;
+      }>("get_app_prefs");
       manualNotesEnabled = !!prefs?.manual_notes_enabled;
+      hotkeyNoteAppPrefs = prefs;
+      hotkeyNoteDismissed = !!prefs?.wayland_hotkey_notice_dismissed;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
+    }
+
+    // Platform detection for the Linux-only hotkey note. Tauri
+    // exposes std::env::consts::OS via the `platform_os` command,
+    // which is cheaper and more reliable than `navigator.platform`
+    // (Tauri's bundled webview can report varying UA strings across
+    // distros).
+    try {
+      hotkeyNoteOS = await invoke<string>("platform_os");
+    } catch (e) {
+      console.warn("platform_os failed", e);
     }
 
     // "recording-state" only fires on transitions, so a remount
@@ -240,6 +364,11 @@
     unlisten?.();
     unlistenState?.();
     unlistenAuto?.();
+    unlistenMicFallback?.();
+    if (micFallbackTimer) {
+      clearTimeout(micFallbackTimer);
+      micFallbackTimer = 0;
+    }
     clearInterval(timer);
     // Flush any pending debounced notes save so a route-nav
     // mid-type doesn't drop the last few keystrokes.
@@ -474,6 +603,34 @@
     </p>
   </header>
 
+  <!-- Mic-fallback banner (#3). Fires when a saved input-device
+       pref didn't resolve and we silently fell back to the system
+       default. Rust dedupes per-session-per-name so this only
+       appears once per stale device per launch. Sig-gold accent —
+       a heads-up, not an error. Reuses the .banner pattern the
+       auto-detect notices already use on this page. -->
+  {#if micFallback}
+    <div class="banner" style="--i: 0.5" role="status" aria-live="polite">
+      <div class="banner-body">
+        <p class="banner-label">Mic fallback</p>
+        <p class="banner-text">
+          {#if micFallback.reason === "enumeration_failed"}
+            Couldn't check saved mic
+            <strong title={micFallback.saved}>"{micFallback.saved}"</strong>
+            — using system default.
+          {:else}
+            Saved mic
+            <strong title={micFallback.saved}>"{micFallback.saved}"</strong>
+            not found — using system default.
+          {/if}
+        </p>
+      </div>
+      <div class="banner-actions">
+        <button class="btn ghost" onclick={dismissMicFallback}>Dismiss</button>
+      </div>
+    </div>
+  {/if}
+
   <!-- Auto-detect banners. prompt_start fires here when the user is
        already on /record; the layout slide-out suppresses itself on
        this route (#60). prompt_end always lives here since the user
@@ -560,6 +717,39 @@
         {importing ? "Importing…" : "Import a file"}
       </button>
     </div>
+
+    <!-- Linux-only persistent-dismissible note (#6). Points users at
+         the help page for the compositor-bound CLI workaround — the
+         in-app plugin hotkey doesn't reach the app when it's
+         unfocused on most Linux desktop environments. Copy stays
+         vendor-opaque (no compositor/DE names); the help page is
+         where specifics live. -->
+    {#if showHotkeyNote}
+      <div class="hotkey-note" role="note">
+        <p class="hotkey-note-text">
+          For this shortcut to work when the app isn't focused, you'll
+          need to set it up in your desktop environment's keyboard
+          shortcut settings.
+          <button
+            type="button"
+            class="hotkey-note-link"
+            onclick={openHotkeyHelp}
+          >
+            See the help page
+          </button>
+          for instructions.
+        </p>
+        <button
+          type="button"
+          class="hotkey-note-dismiss"
+          onclick={dismissHotkeyNote}
+          aria-label="Dismiss"
+          title="Dismiss"
+        >
+          ×
+        </button>
+      </div>
+    {/if}
 
     {#if copyError}
       <p class="inline-error">{copyError}</p>
@@ -920,6 +1110,63 @@
   .link:disabled {
     opacity: 0.6;
     cursor: default;
+  }
+
+  /* ── Dismissible inline note ───────────────────────────────────────── */
+  /* Persistent, pref-backed variant of .banner — small, ambient, and
+     dismissed to a user pref (not just local component state) so it
+     doesn't come back on the next restart. See design.md §Dismissible
+     inline note. */
+  .hotkey-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+    margin-top: 0.1rem;
+  }
+  .hotkey-note-text {
+    flex: 1;
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    color: var(--bone-2);
+  }
+  .hotkey-note-link {
+    color: var(--accent);
+    font: inherit;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .hotkey-note-link:hover {
+    color: var(--accent-hi);
+  }
+  .hotkey-note-dismiss {
+    flex-shrink: 0;
+    width: 1.4rem;
+    height: 1.4rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--bone-3);
+    font-size: 1.1rem;
+    line-height: 1;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+  }
+  .hotkey-note-dismiss:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
   }
 
   /* ── Shared button ─────────────────────────────────────────────────── */

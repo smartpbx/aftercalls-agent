@@ -7,6 +7,9 @@
   import Waveform from "$lib/Waveform.svelte";
   import NotesPanel from "$lib/NotesPanel.svelte";
   import Avatar from "$lib/Avatar.svelte";
+  import SpeakerRenamePicker, {
+    type SpeakerPick,
+  } from "$lib/SpeakerRenamePicker.svelte";
 
   type Utterance = {
     idx: number;
@@ -15,6 +18,10 @@
     start_ms: number;
     end_ms: number;
     text: string;
+    // #82: FK to the org user this speaker resolves to, when the
+    // rename picker matched a teammate. Null for free-form / legacy
+    // rows.
+    speaker_user_id: string | null;
   };
 
   type TagKind = "client" | "purpose" | "topic" | "custom";
@@ -45,6 +52,10 @@
   type Me = {
     user_id?: string;
     email: string;
+    // #96: structured first/last alongside display_name. Optional —
+    // old auth.json files may predate the split.
+    first_name?: string;
+    last_name?: string;
     display_name: string;
     role: string;
     org_display_name: string;
@@ -367,15 +378,39 @@
   let editingSpeaker = $state<string | null>(null);
   let speakerEditValue = $state("");
   let savingSpeaker = $state(false);
+  // #82: tracks the roster FK the picker currently has selected for
+  // the active editor. Null = free-form text. Drives both the
+  // "Apply to all" label variant and the FK carried onto save.
+  let editingSpeakerUserId = $state<string | null>(null);
+  let editingSpeakerUserName = $state<string | null>(null);
 
   // ── Org-member picker for rename (#65) ───────────────────────────────
   // Fetched once via the `org_members` Tauri command when the user
   // opens a rename editor; held per-page-instance. Recents are in
   // localStorage (the Tauri webview supports it) with the same key as
   // the portal so the UX matches across the two clients.
-  type OrgMember = { id: string; display_name: string; email: string };
+  // #96: OrgMember grew first_name + last_name on the API. Unused
+  // here (picker still matches on display_name); kept in the type so
+  // TS doesn't complain about the extra fields on the wire.
+  type OrgMember = {
+    id: string;
+    first_name: string;
+    last_name: string;
+    display_name: string;
+    email: string;
+  };
   let memberRoster = $state<OrgMember[]>([]);
   let memberRosterLoaded = $state(false);
+  let memberRosterError = $state(false);
+  // Cached "recently used" rows the picker component consumes — kept
+  // in $state and refreshed on rename-open so the 3 most recent names
+  // stay accurate across edits.
+  let recentRows = $state<{ name: string }[]>([]);
+  function refreshRecentRows() {
+    recentRows = readRecents()
+      .slice(0, 3)
+      .map((r) => ({ name: r.display_name }));
+  }
   const RECENT_KEY = "aftercalls.recentRenames";
   const RECENT_CAP = 10;
   type RecentRename = { display_name: string; timestamp: number };
@@ -414,36 +449,17 @@
   }
   async function ensureMemberRoster() {
     if (memberRosterLoaded) return;
-    memberRosterLoaded = true;
     try {
       const rows = await invoke<OrgMember[]>("org_members");
       memberRoster = Array.isArray(rows) ? rows : [];
+      memberRosterError = false;
     } catch {
       memberRoster = [];
+      memberRosterError = true;
+    } finally {
+      memberRosterLoaded = true;
     }
   }
-  let memberDropdownRows = $derived.by<{
-    recent: { name: string }[];
-    all: OrgMember[];
-  }>(() => {
-    if (editingSpeaker === null) return { recent: [], all: [] };
-    const q = speakerEditValue.trim().toLowerCase();
-    const rosterByName = new Map(
-      memberRoster.map((m) => [m.display_name.toLowerCase(), m]),
-    );
-    const recentRows = readRecents()
-      .filter((e) => rosterByName.has(e.display_name.toLowerCase()))
-      .slice(0, 3)
-      .map((e) => ({ name: e.display_name }));
-    const allRows = memberRoster.filter((m) => {
-      if (!q) return true;
-      return (
-        m.display_name.toLowerCase().includes(q) ||
-        m.email.toLowerCase().includes(q)
-      );
-    });
-    return { recent: recentRows, all: allRows };
-  });
 
   // Heavy tracing on this route while we're diagnosing the blank-on-click
   // crash. console.error because webkit2gtk has been swallowing warn/log
@@ -796,12 +812,34 @@
     editingIdx = u.idx;
     editValue = u.speaker;
     applyToAll = false;
+    editingSpeakerUserId = u.speaker_user_id ?? null;
+    editingSpeakerUserName = null;
+    refreshRecentRows();
+    void ensureMemberRoster();
   }
 
   function cancelEdit() {
     editingIdx = null;
     editValue = "";
     applyToAll = false;
+    editingSpeakerUserId = null;
+    editingSpeakerUserName = null;
+  }
+
+  function onUtteranceEditorPick(pick: SpeakerPick) {
+    // Lift the picker's selection into parent state so the
+    // Apply-to-all label / Save button can see it; saveEdit does the
+    // actual network write.
+    if (pick.user) {
+      editValue = pick.user.display_name;
+      editingSpeakerUserId = pick.user.id;
+      editingSpeakerUserName = pick.user.display_name;
+    } else {
+      editValue = pick.freeText;
+      editingSpeakerUserId = null;
+      editingSpeakerUserName = null;
+    }
+    void saveEdit();
   }
 
   async function saveEdit() {
@@ -809,7 +847,14 @@
     const current = call.utterances.find((x) => x.idx === editingIdx);
     if (!current) return;
     const to = editValue.trim();
-    if (!to || to === current.speaker) {
+    const userId = editingSpeakerUserId;
+    if (!to) {
+      cancelEdit();
+      return;
+    }
+    // Skip the round-trip when neither the display name nor the FK
+    // actually changed.
+    if (to === current.speaker && userId === (current.speaker_user_id ?? null)) {
       cancelEdit();
       return;
     }
@@ -821,7 +866,9 @@
           id: call.id,
           from,
           to,
+          toUserId: userId,
         });
+        pushRecent(to);
         // Refetch — rename also rewrites summary + action items.
         call = await invoke<Call>("get_call", { id: call.id });
       } else {
@@ -829,9 +876,13 @@
           id: call.id,
           idx: editingIdx,
           speaker: to,
+          speakerUserId: userId,
         });
+        pushRecent(to);
         call.utterances = call.utterances.map((u) =>
-          u.idx === editingIdx ? { ...u, speaker: to } : u,
+          u.idx === editingIdx
+            ? { ...u, speaker: to, speaker_user_id: userId }
+            : u,
         );
       }
       cancelEdit();
@@ -917,7 +968,15 @@
     return -1;
   });
 
-  type SpeakerStat = { speaker: string; count: number; totalMs: number };
+  type SpeakerStat = {
+    speaker: string;
+    count: number;
+    totalMs: number;
+    // #82: first non-null speaker_user_id seen for this display
+    // name, if any. Drives the participants-chip linked/unlinked cue
+    // and seeds the picker's selection when a chip is opened.
+    userId: string | null;
+  };
 
   let speakers = $derived.by<SpeakerStat[]>(() => {
     if (!call || !Array.isArray(call.utterances)) return [];
@@ -929,12 +988,16 @@
       if (existing) {
         existing.count++;
         existing.totalMs += (u.end_ms ?? 0) - (u.start_ms ?? 0);
+        if (!existing.userId && u.speaker_user_id) {
+          existing.userId = u.speaker_user_id;
+        }
       } else {
         order.push(name);
         map.set(name, {
           speaker: name,
           count: 1,
           totalMs: (u.end_ms ?? 0) - (u.start_ms ?? 0),
+          userId: u.speaker_user_id ?? null,
         });
       }
     }
@@ -949,29 +1012,57 @@
     return `${m}m ${r}s`;
   }
 
-  function startSpeakerRename(current: string) {
+  function startSpeakerRename(current: string, currentUserId: string | null) {
     editingSpeaker = current;
     speakerEditValue = current;
+    editingSpeakerUserId = currentUserId;
+    editingSpeakerUserName = null;
+    refreshRecentRows();
     void ensureMemberRoster();
   }
 
   function cancelSpeakerRename() {
     editingSpeaker = null;
     speakerEditValue = "";
+    editingSpeakerUserId = null;
+    editingSpeakerUserName = null;
   }
 
-  async function saveSpeakerRename(override?: string) {
+  function onParticipantPick(pick: SpeakerPick) {
+    if (pick.user) {
+      void saveSpeakerRenameCommit(pick.user.display_name, pick.user.id);
+    } else {
+      void saveSpeakerRenameCommit(pick.freeText, null);
+    }
+  }
+
+  async function saveSpeakerRenameCommit(
+    to: string,
+    toUserId: string | null,
+  ) {
     if (!call || !editingSpeaker) return;
     const from = editingSpeaker;
-    const to = (override ?? speakerEditValue).trim();
-    if (!to || to === from) {
+    const trimmed = to.trim();
+    if (!trimmed) {
+      cancelSpeakerRename();
+      return;
+    }
+    if (trimmed === from && !toUserId) {
       cancelSpeakerRename();
       return;
     }
     savingSpeaker = true;
     try {
-      await invoke<number>("rename_speaker", { id: call.id, from, to });
-      pushRecent(to);
+      // #82: forward the optional FK through the Tauri bridge. The
+      // backend validates org-membership — cross-org UUIDs 400 with
+      // no row modification.
+      await invoke<number>("rename_speaker", {
+        id: call.id,
+        from,
+        to: trimmed,
+        toUserId,
+      });
+      pushRecent(trimmed);
       // Refetch the whole call — the backend rename rewrites summary +
       // action items + participants in the same transaction, and
       // locally patching only utterances left the portal-synced bits
@@ -983,11 +1074,6 @@
     } finally {
       savingSpeaker = false;
     }
-  }
-
-  function pickMemberForSpeaker(name: string) {
-    speakerEditValue = name;
-    void saveSpeakerRename(name);
   }
 
   // Stable per-speaker accent colors. "You" always gets the brand accent; others
@@ -1493,71 +1579,29 @@
         <div class="chips">
           {#each speakers as p (p.speaker)}
             {#if editingSpeaker === p.speaker}
-              <div class="chip chip-editing member-combo">
-                <div class="combo-row">
-                  <input
-                    class="chip-input"
-                    bind:value={speakerEditValue}
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key === "Enter") saveSpeakerRename();
-                      if (e.key === "Escape") cancelSpeakerRename();
-                    }}
-                  />
-                  <button
-                    class="chip-save"
-                    disabled={savingSpeaker}
-                    onclick={() => saveSpeakerRename()}
-                  >
-                    {savingSpeaker ? "…" : "Save"}
-                  </button>
-                  <button class="chip-cancel" onclick={cancelSpeakerRename}>
-                    Cancel
-                  </button>
-                </div>
-                <div class="member-dropdown" role="listbox">
-                  {#if !memberRosterLoaded}
-                    <div class="member-section-hdr">Loading teammates…</div>
-                  {:else if memberRoster.length === 0}
-                    <div class="member-section-hdr">No teammates in your org yet</div>
-                  {:else}
-                    {#if memberDropdownRows.recent.length > 0}
-                      <div class="member-section-hdr">Recently used</div>
-                      {#each memberDropdownRows.recent as r (r.name)}
-                        <button
-                          type="button"
-                          class="member-row"
-                          onclick={() => pickMemberForSpeaker(r.name)}
-                        >
-                          <span class="member-name">{r.name}</span>
-                        </button>
-                      {/each}
-                    {/if}
-                    {#if memberDropdownRows.all.length > 0}
-                      <div class="member-section-hdr">All members</div>
-                      {#each memberDropdownRows.all as m (m.id)}
-                        <button
-                          type="button"
-                          class="member-row"
-                          onclick={() => pickMemberForSpeaker(m.display_name)}
-                        >
-                          <span class="member-name">{m.display_name}</span>
-                          <span class="member-email">{m.email}</span>
-                        </button>
-                      {/each}
-                    {:else}
-                      <div class="member-section-hdr">No matches</div>
-                    {/if}
-                  {/if}
-                </div>
+              <div class="chip chip-editing">
+                <SpeakerRenamePicker
+                  bind:value={speakerEditValue}
+                  roster={memberRoster}
+                  rosterLoaded={memberRosterLoaded}
+                  rosterError={memberRosterError}
+                  recents={recentRows}
+                  saving={savingSpeaker}
+                  variant="chip"
+                  onpick={onParticipantPick}
+                  oncancel={cancelSpeakerRename}
+                />
               </div>
             {:else}
               <button
                 type="button"
                 class="chip speaker-chip"
+                class:speaker-unlinked={p.userId === null}
                 style="--c: {speakerColor(p.speaker)}"
-                title="Rename {p.speaker}"
-                onclick={() => startSpeakerRename(p.speaker)}
+                title={p.userId
+                  ? `${p.speaker} — linked teammate. Click to rename.`
+                  : `Rename ${p.speaker}`}
+                onclick={() => startSpeakerRename(p.speaker, p.userId)}
               >
                 <span class="chip-dot"></span>
                 <span class="chip-body">
@@ -1680,17 +1724,24 @@
         {#each (call.utterances ?? []) as u (u.idx)}
           {#if editingIdx === u.idx}
             <div class="utt-editor">
-              <input
-                class="speaker-input"
+              <SpeakerRenamePicker
                 bind:value={editValue}
-                onkeydown={(e) => {
-                  if (e.key === "Enter") saveEdit();
-                  if (e.key === "Escape") cancelEdit();
-                }}
+                roster={memberRoster}
+                rosterLoaded={memberRosterLoaded}
+                rosterError={memberRosterError}
+                recents={recentRows}
+                saving={savingEdit}
+                variant="stack"
+                onpick={onUtteranceEditorPick}
+                oncancel={cancelEdit}
               />
               <label class="apply-all">
                 <input type="checkbox" bind:checked={applyToAll} />
-                Apply to all "{u.speaker}"
+                {#if editingSpeakerUserName}
+                  Apply to every "{u.speaker}" — and link them to {editingSpeakerUserName}
+                {:else}
+                  Apply to every "{u.speaker}"
+                {/if}
               </label>
               <div class="editor-buttons">
                 <button class="ed-save" disabled={savingEdit} onclick={saveEdit}>
@@ -1717,8 +1768,11 @@
               <button
                 type="button"
                 class="utt-speaker"
+                class:speaker-unlinked={(u.speaker_user_id ?? null) === null}
                 style="--c: {speakerColor(u.speaker)}"
-                title="Click to rename"
+                title={u.speaker_user_id
+                  ? `${u.speaker} — linked teammate. Click to rename.`
+                  : `${u.speaker}. Click to rename.`}
                 onclick={(e) => {
                   e.stopPropagation();
                   startEdit(u);
@@ -1951,99 +2005,26 @@
   }
 
   .chip-editing {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .chip-input {
-    padding: 0.35rem 0.55rem;
-    border-radius: 6px;
-    border: 1px solid var(--hairline);
-    background: var(--ink-0);
-    color: var(--bone-0);
-    font-size: 0.85rem;
-    width: 10rem;
-  }
-
-  .chip-save,
-  .chip-cancel {
-    padding: 0.35rem 0.7rem;
-    font-size: 0.78rem;
-    border-radius: 6px;
-    border: 1px solid var(--hairline);
-    background: var(--ink-2);
-    color: var(--bone-1);
-  }
-
-  .chip-save {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: var(--ink-0);
-    font-weight: 500;
-  }
-  .chip-save:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  /* ── Member autocomplete (rename picker #65) ─────────────────────── */
-  .member-combo {
     position: relative;
     flex-direction: column;
     align-items: stretch;
     gap: 0.4rem;
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
-  .combo-row {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
+
+  /* #82 unlinked-avatar cue — mirrors the portal's scoped styling.
+     The chip-dot acts as the avatar disc on the Participants chip; the
+     transcript row uses the Avatar component. Keeping the styles in
+     each page's <style> block (not app.css) preserves the
+     byte-identical mirror invariant this run. */
+  .speaker-chip.speaker-unlinked .chip-dot {
+    opacity: 0.75;
+    border-color: var(--hairline-hi);
   }
-  .member-dropdown {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    margin-top: 0.35rem;
-    min-width: 18rem;
-    max-height: 16rem;
-    overflow-y: auto;
-    border: 1px solid var(--hairline-hi);
-    border-radius: var(--radius);
-    background: var(--ink-1);
-    box-shadow: 0 14px 28px -10px rgba(0, 0, 0, 0.55);
-    z-index: 20;
-    padding: 0.3rem 0;
-  }
-  .member-section-hdr {
-    padding: 0.35rem 0.7rem 0.2rem;
-    font-size: 0.68rem;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--bone-3);
-  }
-  .member-row {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    width: 100%;
-    padding: 0.35rem 0.7rem;
-    border: none;
-    background: transparent;
-    color: var(--bone-1);
-    text-align: left;
-    cursor: pointer;
-    font: inherit;
-  }
-  .member-row:hover {
-    background: var(--ink-2);
-    color: var(--bone-0);
-  }
-  .member-name {
-    font-size: 0.85rem;
-  }
-  .member-email {
-    font-size: 0.72rem;
-    color: var(--bone-3);
+  .utt-speaker.speaker-unlinked :global(.avatar) {
+    opacity: 0.75;
+    border-color: var(--hairline-hi);
   }
 
   /* ── Player ────────────────────────────────────────────────────────── */
@@ -2614,16 +2595,6 @@
     border: 1px solid var(--accent);
     border-radius: var(--radius);
     background: var(--accent-soft);
-  }
-
-  .speaker-input {
-    padding: 0.45rem 0.65rem;
-    border-radius: 6px;
-    border: 1px solid var(--hairline);
-    background: var(--ink-0);
-    color: var(--bone-0);
-    font-size: 0.9rem;
-    max-width: 18rem;
   }
 
   .apply-all {

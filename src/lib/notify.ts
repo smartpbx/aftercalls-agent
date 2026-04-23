@@ -42,6 +42,34 @@ async function soundsEnabled(): Promise<boolean> {
   }
 }
 
+// #92: gate "normal" chimes on busy-state as well as the user pref.
+// Reads `is_processing` (lib.rs:237-239, shipped in #79) which is the
+// single source of truth for "agent is actively recording OR the
+// post-recording pipeline is still running". When busy, suppress the
+// tone so:
+//   - a stray `pipeline=done` chime from a prior call doesn't play
+//     mid-new-recording and get captured by the system loopback,
+//   - auto-detect pings don't fire while a user is already in a call.
+// Fail-open on IPC error: falls back to pref-only behaviour (same
+// discipline as #79) so a Tauri hiccup can't silence the agent
+// permanently.
+//
+// NOTE: `notifyRecordStart(force=true)` deliberately bypasses BOTH
+// this helper and the pref — PIPEDA "enforced" compliance cues from
+// #48 must remain unsilenceable by local state. Only the four
+// "normal" emitters (stop, pipeline done/failed, auto-detect) and
+// the `force=false` branch of `notifyRecordStart` route through here.
+async function shouldPlayTone(): Promise<boolean> {
+  if (!(await soundsEnabled())) return false;
+  try {
+    const busy = await invoke<boolean>("is_processing");
+    return !busy;
+  } catch {
+    // Fail-open: on IPC error, honour pref-only behaviour.
+    return true;
+  }
+}
+
 type Note = {
   freq: number; // Hz
   at: number;   // start offset seconds
@@ -101,7 +129,11 @@ function playNotesAwait(notes: Note[]): Promise<void> {
 // can evaluate a viable path (bundled sample audio OR the Web Speech
 // API with a graceful fallback for platforms that lack a voice).
 export async function notifyRecordStart(force: boolean = false) {
-  if (!force && !(await soundsEnabled())) return;
+  // #92: force=true (PIPEDA "enforced" mode, #48) bypasses BOTH the
+  // sounds_enabled pref AND the busy gate — compliance cues must play
+  // regardless of local state. force=false takes the normal
+  // pref + busy-state path.
+  if (!force && !(await shouldPlayTone())) return;
   // Two-note ascending: friendly "go" cue. Awaits the full note
   // duration so start_recording can be invoked AFTER the cue plays —
   // otherwise the system loopback captures the beep on every call.
@@ -112,7 +144,7 @@ export async function notifyRecordStart(force: boolean = false) {
 }
 
 export async function notifyRecordStop() {
-  if (!(await soundsEnabled())) return;
+  if (!(await shouldPlayTone())) return;
   // Two-note descending — complement of start.
   playNotes([
     { freq: 783.99, at: 0,    dur: 0.12 }, // G5
@@ -121,7 +153,7 @@ export async function notifyRecordStop() {
 }
 
 export async function notifyPipelineDone() {
-  if (!(await soundsEnabled())) return;
+  if (!(await shouldPlayTone())) return;
   // Three ascending notes — triumphant "done" chord.
   playNotes([
     { freq: 523.25, at: 0,    dur: 0.1 },  // C5
@@ -131,7 +163,7 @@ export async function notifyPipelineDone() {
 }
 
 export async function notifyPipelineFailed() {
-  if (!(await soundsEnabled())) return;
+  if (!(await shouldPlayTone())) return;
   // Descending minor — failure cue. Quieter than done.
   playNotes([
     { freq: 440,    at: 0,    dur: 0.12, gain: 0.14 }, // A4
@@ -140,7 +172,7 @@ export async function notifyPipelineFailed() {
 }
 
 export async function notifyAutoDetect() {
-  if (!(await soundsEnabled())) return;
+  if (!(await shouldPlayTone())) return;
   // Double-ping — attention cue. Higher pitch to stand out from
   // the system-audio that's already playing (the call source).
   playNotes([

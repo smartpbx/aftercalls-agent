@@ -10,12 +10,73 @@
 
   type Me = {
     email: string;
+    // #96: structured first/last ride alongside display_name so the
+    // Profile card can edit them. Optional on the type so older
+    // auth.json files (before the column existed) still typecheck.
+    first_name?: string;
+    last_name?: string;
     display_name: string;
     role: string;
     org_display_name: string;
   };
   let me = $state<Me | null>(null);
   let signingOut = $state(false);
+
+  // ── Profile (#96) ──────────────────────────────────────────────────
+  let firstDraft = $state("");
+  let lastDraft = $state("");
+  let savingName = $state(false);
+  let nameMsg = $state("");
+  let nameErr = $state("");
+  let firstBlurErr = $state(false);
+
+  let canSaveName = $derived(
+    !!me &&
+      !savingName &&
+      firstDraft.trim().length > 0 &&
+      (firstDraft.trim() !== (me.first_name ?? "") ||
+        lastDraft.trim() !== (me.last_name ?? "")),
+  );
+
+  async function saveName() {
+    if (!me || !canSaveName) return;
+    const first = firstDraft.trim();
+    const last = lastDraft.trim();
+    savingName = true;
+    nameMsg = "";
+    nameErr = "";
+    firstBlurErr = false;
+    try {
+      const next = await invoke<Me>("update_me", {
+        firstName: first,
+        lastName: last,
+      });
+      me = next;
+      firstDraft = next.first_name ?? "";
+      lastDraft = next.last_name ?? "";
+      nameMsg = "Saved.";
+      setTimeout(() => (nameMsg = ""), 2200);
+    } catch (e: any) {
+      nameErr = String(e?.message ?? e);
+    } finally {
+      savingName = false;
+    }
+  }
+
+  function onNameKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      saveName();
+    }
+  }
+
+  function onFirstBlur() {
+    firstBlurErr = firstDraft.trim().length === 0;
+  }
+
+  function onFirstInput() {
+    if (firstBlurErr && firstDraft.trim().length > 0) firstBlurErr = false;
+  }
 
   async function signOut() {
     signingOut = true;
@@ -107,6 +168,85 @@
     }
   }
 
+  // Mirror of the config.toml `wayland_hotkey_notice_dismissed` pref.
+  // The Settings UI doesn't expose this directly — the Record page's
+  // in-app hotkey note owns the only user-facing dismiss control —
+  // but `saveAppPrefs` must round-trip the value so toggling any
+  // other pref here doesn't reset it to false.
+  let waylandHotkeyNoticeDismissed = $state(false);
+
+  // ── Input microphone (#3) ──────────────────────────────────────────
+  // Saved cpal device name — null means "use system default" (the
+  // fresh-install state). Persisted in config.toml via set_app_prefs.
+  let inputDevice = $state<string | null>(null);
+  type DeviceEntry = { name: string; is_default: boolean };
+  let inputDevices = $state<DeviceEntry[]>([]);
+  // Loading / error / empty states for the device enumeration. The
+  // <select> is disabled whenever loading or error is set; empty
+  // shows a hint under the row instead of an error.
+  let micListLoading = $state(true);
+  let micListError = $state("");
+  // Pre-compute the set of names we know about after load so the
+  // "saved name no longer enumerates" detection is a cheap lookup.
+  // Populated after loadInputDevices().
+  let inputDeviceNames = $derived(new Set(inputDevices.map((d) => d.name)));
+  let savedDeviceIsStale = $derived(
+    !!inputDevice && !micListLoading && !micListError &&
+      !inputDeviceNames.has(inputDevice),
+  );
+  // Resolves the cpal-reported name of the currently-defaulted device
+  // so the "System default (currently: X)" label can surface it. Falls
+  // back to a generic phrasing when the default isn't in the list
+  // (e.g. enumeration skipped it for some reason).
+  let currentDefaultName = $derived(
+    inputDevices.find((d) => d.is_default)?.name ?? "",
+  );
+  // Display labels with per-collision (1)(2)... suffixes (decisions.md
+  // Q1). Suffix is DISPLAY ONLY — the underlying cpal name is what's
+  // stored, so the resolver walks devices in enumeration order and
+  // binds to the first match of the same name. Duplicates with unique
+  // names get no suffix.
+  let inputDeviceLabels = $derived.by(() => {
+    const counts = new Map<string, number>();
+    return inputDevices.map((d) => {
+      const seen = counts.get(d.name) ?? 0;
+      counts.set(d.name, seen + 1);
+      // First occurrence: no suffix. Second+: (1), (2)...
+      const suffix = seen === 0 ? "" : ` (${seen})`;
+      const defaultTag = d.is_default ? "  ·  system default" : "";
+      return {
+        value: d.name,
+        label: `${d.name}${suffix}${defaultTag}`,
+      };
+    });
+  });
+
+  async function loadInputDevices() {
+    micListLoading = true;
+    micListError = "";
+    try {
+      inputDevices = await invoke<DeviceEntry[]>("list_input_devices");
+    } catch (e) {
+      // Command-level failure — either cpal couldn't walk the host's
+      // device list (rare) or the invoke itself rejected. Surface the
+      // "Couldn't load devices" state; user can retry without
+      // leaving Settings.
+      micListError = "Couldn't load input devices.";
+      console.warn("list_input_devices failed", e);
+    } finally {
+      micListLoading = false;
+    }
+  }
+
+  function onInputDeviceChange(value: string) {
+    // Empty string = "System default" option (we emit "" as the
+    // option value for System default since native <select> coerces
+    // null to "null"). Round-trip to null on the way to Rust; Rust
+    // also coerces empty-to-None defensively.
+    inputDevice = value === "" ? null : value;
+    saveAppPrefs();
+  }
+
   async function loadAppPrefs() {
     try {
       const p = await invoke<{
@@ -116,6 +256,8 @@
         sounds_enabled: boolean;
         max_recording_minutes: number;
         manual_notes_enabled: boolean;
+        wayland_hotkey_notice_dismissed: boolean;
+        input_device: string | null;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -123,6 +265,8 @@
       soundsEnabled = p.sounds_enabled;
       maxRecordingMinutes = p.max_recording_minutes ?? 120;
       manualNotesEnabled = p.manual_notes_enabled ?? false;
+      waylandHotkeyNoticeDismissed = p.wayland_hotkey_notice_dismissed ?? false;
+      inputDevice = p.input_device ?? null;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -144,6 +288,8 @@
         soundsEnabled,
         maxRecordingMinutes: mins,
         manualNotesEnabled,
+        waylandHotkeyNoticeDismissed,
+        inputDevice,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
@@ -179,6 +325,10 @@
 
     try {
       me = await invoke<Me | null>("current_user");
+      if (me) {
+        firstDraft = me.first_name ?? "";
+        lastDraft = me.last_name ?? "";
+      }
     } catch (e) {
       console.warn("current_user failed", e);
     }
@@ -191,6 +341,7 @@
 
     await loadAppPrefs();
     await loadAutostart();
+    await loadInputDevices();
   });
 
   async function pickVaultDir() {
@@ -261,7 +412,71 @@
   </header>
 
   {#if me}
+    <!-- Profile card (#96). First + Last side-by-side on wide,
+         stacked below 540px. Sits above Account because the user's
+         own data-to-edit logically precedes identity/session
+         context. -->
     <section class="card" style="--i: 0.5">
+      <div class="card-head">
+        <div>
+          <h2>Profile</h2>
+          <p class="hint">
+            Your name as it appears on summaries, the team picker, and
+            transcripts.
+          </p>
+        </div>
+      </div>
+      <div class="name-row">
+        <label class="name-field">
+          <span class="field-label">First name</span>
+          <input
+            class="input"
+            id="first-name"
+            type="text"
+            bind:value={firstDraft}
+            disabled={savingName}
+            maxlength="120"
+            autocomplete="given-name"
+            aria-invalid={firstBlurErr ? "true" : undefined}
+            onblur={onFirstBlur}
+            oninput={onFirstInput}
+            onkeydown={onNameKeydown}
+          />
+          {#if firstBlurErr}
+            <p class="error-inline name-err" role="alert">
+              First name is required.
+            </p>
+          {/if}
+        </label>
+        <label class="name-field">
+          <span class="field-label">Last name</span>
+          <input
+            class="input"
+            id="last-name"
+            type="text"
+            bind:value={lastDraft}
+            disabled={savingName}
+            maxlength="120"
+            autocomplete="family-name"
+            onkeydown={onNameKeydown}
+          />
+        </label>
+      </div>
+      <div class="name-actions">
+        <button
+          type="button"
+          class="save"
+          disabled={!canSaveName}
+          onclick={saveName}
+        >
+          {savingName ? "Saving…" : "Save"}
+        </button>
+        {#if nameMsg}<span class="saved">{nameMsg}</span>{/if}
+        {#if nameErr}<span class="error-inline">{nameErr}</span>{/if}
+      </div>
+    </section>
+
+    <section class="card" style="--i: 0.75">
       <div class="card-head">
         <div>
           <h2>Account</h2>
@@ -413,6 +628,82 @@
         </span>
       </label>
     </div>
+
+    <!-- Input microphone (#3). Capture concern, sits next to auto-
+         detect so multi-mic users can pin recordings to the device
+         they want without hunting in their OS settings. Native
+         <select> reuses the .input class — no new primitive, no CSS
+         change. Stale-saved devices are appended to the list with a
+         "(not connected)" suffix so the user sees why fallback
+         fires. -->
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title" id="mic-select-label">Input microphone</span>
+        <span class="pref-hint" id="mic-select-hint">
+          Which microphone the agent records from. "System default"
+          follows your OS default; picking a specific device pins
+          recordings to that microphone.
+        </span>
+      </div>
+      <select
+        class="input mic-select"
+        aria-labelledby="mic-select-label"
+        aria-describedby="mic-select-hint"
+        disabled={micListLoading || !!micListError}
+        value={inputDevice ?? ""}
+        onchange={(e) =>
+          onInputDeviceChange((e.currentTarget as HTMLSelectElement).value)}
+      >
+        {#if micListLoading}
+          <option value="">Loading devices…</option>
+        {:else if micListError}
+          <option value="">Couldn't load devices</option>
+        {:else if inputDevices.length === 0}
+          <option value="">No input devices found</option>
+        {:else}
+          <!-- Standalone "System default" option (decisions.md Q2 —
+               native <optgroup>, no separator hack). The "(currently:
+               X)" suffix shows which physical device the system
+               default would resolve to right now so the user knows
+               what they're picking. -->
+          <option value="">
+            {currentDefaultName
+              ? `System default (currently: ${currentDefaultName})`
+              : "System default"}
+          </option>
+          <optgroup label="Devices">
+            {#each inputDeviceLabels as opt (opt.value + opt.label)}
+              <option value={opt.value} title={opt.value}>
+                {opt.label}
+              </option>
+            {/each}
+          </optgroup>
+          {#if savedDeviceIsStale && inputDevice}
+            <!-- Stale saved device — keep visible so the user sees
+                 what's currently breaking, and can re-pick when the
+                 device returns. Picking System default or a live
+                 device clears it on next save. -->
+            <optgroup label="Not connected">
+              <option value={inputDevice} title={inputDevice}>
+                {inputDevice} — (not connected)
+              </option>
+            </optgroup>
+          {/if}
+        {/if}
+      </select>
+    </div>
+    {#if micListError}
+      <p class="error-inline mic-error" role="alert">
+        Couldn't load input devices.
+        <button type="button" class="add mic-retry" onclick={loadInputDevices}>
+          Try again
+        </button>
+      </p>
+    {:else if !micListLoading && inputDevices.length === 0}
+      <p class="pref-hint mic-empty-hint">
+        No microphone is available. Connect one, then reopen Settings.
+      </p>
+    {/if}
 
     <div class="pref-row">
       <div class="pref-label">
@@ -648,6 +939,45 @@
     margin-bottom: 1.6rem;
   }
 
+  /* #96: Profile card — First + Last side-by-side on wide, stack
+     below 540px. Scoped to this file (mirror of portal's settings
+     .name-row); app.css untouched so the byte-identity invariant
+     stays satisfied. */
+  .name-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  @media (max-width: 540px) {
+    .name-row {
+      grid-template-columns: 1fr;
+    }
+  }
+  .name-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+  .name-field .input {
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+    /* Geist sans for human names — `.input` in this file defaults
+       to the mono stack for technical values. Names are not
+       technical. */
+    font-family: inherit;
+  }
+  .name-err {
+    margin: 0.2rem 0 0;
+  }
+  .name-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-top: 0.9rem;
+  }
+
   /* ── Behavior preferences ───────────────────────────────────────── */
   .pref-row {
     display: flex;
@@ -780,6 +1110,37 @@
   .num-input {
     flex: 0 0 7rem;
     text-align: right;
+  }
+  /* Mic-device dropdown (#3). Wider than .num-input because device
+     names are long; truncates rather than pushes the row layout
+     around. Matches `.input` styling otherwise — no new primitive. */
+  .mic-select {
+    flex: 0 0 16rem;
+    min-width: 0;
+    max-width: 16rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Native <select> needs explicit cursor + appearance hints to
+       look like a control on Linux/GTK. Keep the right-edge caret
+       affordance — `appearance: auto` (the default) is fine. */
+    cursor: pointer;
+  }
+  .mic-select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  /* Inline retry / empty hint slide under the mic row on a new
+     line so the row layout itself stays stable when they appear,
+     mirroring the .autostart-error pattern. */
+  .mic-error,
+  .mic-empty-hint {
+    margin: 0.25rem 0 0.5rem;
+  }
+  .mic-retry {
+    margin-left: 0.6rem;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
   }
   .hint.small code {
     font-family: var(--font-mono);

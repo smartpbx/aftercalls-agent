@@ -29,6 +29,13 @@ struct AuthResponsePayload {
 struct MeResponse {
     id: String,
     email: String,
+    // Structured names (#96). Serde defaults cover backend responses
+    // that predate the column (shouldn't happen once deployed, but
+    // keeps local dev against a stale backend from panicking).
+    #[serde(default)]
+    first_name: String,
+    #[serde(default)]
+    last_name: String,
     display_name: String,
     role: String,
     org_id: String,
@@ -103,6 +110,8 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         refresh_expires_at: p.refresh_expires_at,
         user_id: p.user.id,
         email: p.user.email,
+        first_name: p.user.first_name,
+        last_name: p.user.last_name,
         display_name: p.user.display_name,
         role: p.user.role,
         org_id: p.user.org_id,
@@ -137,6 +146,48 @@ pub async fn login(
     let auth = merge_auth(payload);
     write_auth_file(&auth)?;
     Ok(auth)
+}
+
+/// #96: PATCH /v1/auth/me with structured first/last name. On success
+/// the backend returns the updated MeResponse; we merge it into the
+/// cached auth.json so `current_user` and any downstream reads pick up
+/// the new first/last/display_name without requiring a re-login.
+/// Returns the refreshed AuthFile (UI renders its `display_name`).
+pub async fn update_me(
+    backend: &Backend,
+    first_name: &str,
+    last_name: &str,
+) -> Result<AuthFile> {
+    let body = serde_json::json!({
+        "first_name": first_name,
+        "last_name": last_name,
+    });
+    let resp = patch_json(backend, "/v1/auth/me", body).await?;
+    // The endpoint returns MeResponse — same shape as AuthResponsePayload.user.
+    let me: MeResponse = serde_json::from_value(resp).context("decode update_me")?;
+    let existing = read_auth_file()?
+        .ok_or_else(|| anyhow!("no auth on disk — please sign in again"))?;
+    // Preserve the tokens (the backend doesn't reissue them on a
+    // profile edit); just merge the renamed identity fields so the
+    // next `current_user` / autofill sees the new values.
+    let merged = AuthFile {
+        access_token: existing.access_token,
+        access_expires_at: existing.access_expires_at,
+        refresh_token: existing.refresh_token,
+        refresh_expires_at: existing.refresh_expires_at,
+        user_id: me.id,
+        email: me.email,
+        first_name: me.first_name,
+        last_name: me.last_name,
+        display_name: me.display_name,
+        role: me.role,
+        org_id: me.org_id,
+        org_slug: me.org_slug,
+        org_display_name: me.org_display_name,
+        recording_acknowledged: me.recording_acknowledged,
+    };
+    write_auth_file(&merged)?;
+    Ok(merged)
 }
 
 /// Revoke the refresh token on the server and wipe auth.json locally.
@@ -269,11 +320,19 @@ pub async fn update_utterance(
     id: &str,
     idx: i32,
     speaker: &str,
+    speaker_user_id: Option<&str>,
 ) -> Result<()> {
+    // #82: forward the optional FK. When `None` the field is still
+    // emitted as `null` so the backend's `Option<Uuid>` deserializer
+    // keeps the current (speaker-only) behaviour. An older backend
+    // ignores the unknown field via serde's default-deny.
     patch_nop(
         backend,
         &format!("/v1/calls/{id}/utterances/{idx}"),
-        serde_json::json!({ "speaker": speaker }),
+        serde_json::json!({
+            "speaker": speaker,
+            "speaker_user_id": speaker_user_id,
+        }),
     )
     .await
 }
@@ -283,11 +342,20 @@ pub async fn rename_speaker(
     id: &str,
     from: &str,
     to: &str,
+    to_user_id: Option<&str>,
 ) -> Result<u64> {
+    // Only include `to_user_id` in the payload when we have one.
+    // Omitting it on the wire leaves existing FKs on matching rows
+    // untouched (backend `Option<Uuid>` with `#[serde(default)]`) —
+    // important for text-only renames of already-linked speakers.
+    let mut payload = serde_json::json!({ "from": from, "to": to });
+    if let Some(uid) = to_user_id {
+        payload["to_user_id"] = serde_json::Value::String(uid.to_string());
+    }
     let body: Value = post_json(
         backend,
         &format!("/v1/calls/{id}/rename-speaker"),
-        serde_json::json!({ "from": from, "to": to }),
+        payload,
     )
     .await?;
     Ok(body.get("updated").and_then(|v| v.as_u64()).unwrap_or(0))
@@ -662,6 +730,29 @@ async fn patch_nop(backend: &Backend, path: &str, body: Value) -> Result<()> {
         anyhow::bail!("backend {s}: {t}");
     }
     Ok(())
+}
+
+async fn patch_json(backend: &Backend, path: &str, body: Value) -> Result<Value> {
+    let auth = build_auth_header(backend).await?;
+    let c = client()?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .patch(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("backend {s}: {t}");
+    }
+    let text = resp.text().await.unwrap_or_default();
+    if text.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text).context("decode patch")
 }
 
 async fn delete_nop(backend: &Backend, path: &str) -> Result<()> {

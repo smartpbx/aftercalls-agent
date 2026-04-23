@@ -122,8 +122,22 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
         .join("recordings");
-    let path = state.start(base)?;
+    // Pull the saved input-device preference (#3). `None` means "use
+    // system default" — both the fresh-install state and the explicit
+    // reset state. Config read failures fall through to `None` so a
+    // bad config can never block a recording.
+    let saved_device = config::Config::load()
+        .ok()
+        .and_then(|c| c.input_device);
+    let path = state.start(base, saved_device)?;
     emit_state(app, true);
+    // If the saved-name preference didn't resolve, surface a one-time
+    // toast on the Record page. Dedupe lives inside the Recorder
+    // (HashSet<String>), so repeat Start/Stop in the same session with
+    // the same stale name stays quiet.
+    if let Some(fallback) = state.take_last_fallback() {
+        let _ = app.emit("mic-fallback", &fallback);
+    }
     // Hard ceiling watchdog (#75). Reads the per-user cap from config
     // once at spawn (runtime changes take effect on the next session),
     // polls every 30s, and fires do_stop via the same code path the
@@ -213,6 +227,17 @@ fn is_recording(state: State<Recorder>) -> RecordingStatus {
     }
 }
 
+// Used by the updater-prompt gate in +layout.svelte (#79). Returns
+// true when the agent is either actively recording OR still running
+// the post-recording pipeline (upload/transcribe/summarize/write-note).
+// Mirrors the exact pair `quit_with_confirm` (#62) checks — keeping a
+// single source of truth for "work in flight" so the two paths can
+// never disagree.
+#[tauri::command]
+fn is_processing(state: State<Recorder>) -> bool {
+    state.is_active() || pipeline::is_pipeline_active()
+}
+
 #[tauri::command]
 async fn process_imported_file(app: AppHandle, source_path: String) -> Result<String, String> {
     let src = std::path::PathBuf::from(&source_path);
@@ -235,8 +260,8 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
     // a consistent input. Stored as system.wav so diarization kicks in — a
     // Zoom/Meet export usually has multiple voices mixed together.
     let dest = base.join("system.wav");
-    let status = tokio::process::Command::new(crate::pipeline::ffmpeg_binary())
-        .arg("-y")
+    let mut cmd = tokio::process::Command::new(crate::pipeline::ffmpeg_binary());
+    cmd.arg("-y")
         .arg("-i")
         .arg(&src)
         .arg("-ac")
@@ -248,7 +273,9 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
         .arg(&dest)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::pipeline::no_console(&mut cmd);
+    let status = cmd
         .status()
         .await
         .map_err(|e| format!("run ffmpeg: {e}"))?;
@@ -398,6 +425,11 @@ struct LoginResult {
     // without a roundtrip to /v1/auth/me.
     user_id: String,
     email: String,
+    // Structured names (#96) ride alongside display_name. Serde-
+    // defaulted to "" in AuthFile so old auth.json files stay
+    // parseable; once the user re-logs in they're populated.
+    first_name: String,
+    last_name: String,
     display_name: String,
     role: String,
     org_display_name: String,
@@ -419,6 +451,8 @@ async fn login(email: String, password: String) -> Result<LoginResult, String> {
     Ok(LoginResult {
         user_id: auth.user_id,
         email: auth.email,
+        first_name: auth.first_name,
+        last_name: auth.last_name,
         display_name: auth.display_name,
         role: auth.role,
         org_display_name: auth.org_display_name,
@@ -442,11 +476,42 @@ fn current_user() -> Result<Option<LoginResult>, String> {
     Ok(auth.map(|a| LoginResult {
         user_id: a.user_id,
         email: a.email,
+        first_name: a.first_name,
+        last_name: a.last_name,
         display_name: a.display_name,
         role: a.role,
         org_display_name: a.org_display_name,
         recording_acknowledged: a.recording_acknowledged,
     }))
+}
+
+/// #96: profile-edit Save handler. PATCHes /v1/auth/me with
+/// structured first/last, merges the returned user into auth.json,
+/// and returns the updated LoginResult so the UI re-renders the
+/// user-menu and rail-foot without a page reload.
+#[tauri::command]
+async fn update_me(
+    first_name: String,
+    last_name: String,
+) -> Result<LoginResult, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    let auth = portal::update_me(backend, &first_name, &last_name)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(LoginResult {
+        user_id: auth.user_id,
+        email: auth.email,
+        first_name: auth.first_name,
+        last_name: auth.last_name,
+        display_name: auth.display_name,
+        role: auth.role,
+        org_display_name: auth.org_display_name,
+        recording_acknowledged: auth.recording_acknowledged,
+    })
 }
 
 // ── PIPEDA recording-ack + org prefs (#44, #45, #48) ─────────────────
@@ -669,6 +734,11 @@ struct AppPrefs {
     sounds_enabled: bool,
     max_recording_minutes: u32,
     manual_notes_enabled: bool,
+    wayland_hotkey_notice_dismissed: bool,
+    // Saved cpal name of the preferred input microphone (#3). None
+    // means "use system default". Surfaced to the Settings dropdown
+    // so a mounted form reflects what's actually on disk.
+    input_device: Option<String>,
 }
 
 #[tauri::command]
@@ -681,6 +751,8 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         sounds_enabled: cfg.sounds_enabled,
         max_recording_minutes: cfg.max_recording_minutes,
         manual_notes_enabled: cfg.manual_notes_enabled,
+        wayland_hotkey_notice_dismissed: cfg.wayland_hotkey_notice_dismissed,
+        input_device: cfg.input_device,
     })
 }
 
@@ -692,12 +764,22 @@ fn set_app_prefs(
     sounds_enabled: bool,
     max_recording_minutes: u32,
     manual_notes_enabled: bool,
+    wayland_hotkey_notice_dismissed: bool,
+    input_device: Option<String>,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
     // absurd value (0 would auto-stop immediately; u32::MAX would
     // overflow the Duration arithmetic in the watchdog).
     let max_recording_minutes = max_recording_minutes.clamp(5, 1440);
+    // Treat an empty/whitespace-only string the same as None so the UI
+    // can send a cleared select as either null or "" without a
+    // separate "reset" command. `skip_serializing_if` on the config
+    // field then keeps the TOML key absent entirely — matches "fresh
+    // install" / "use system default".
+    let input_device = input_device
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
@@ -705,7 +787,30 @@ fn set_app_prefs(
     cfg.sounds_enabled = sounds_enabled;
     cfg.max_recording_minutes = max_recording_minutes;
     cfg.manual_notes_enabled = manual_notes_enabled;
+    cfg.wayland_hotkey_notice_dismissed = wayland_hotkey_notice_dismissed;
+    cfg.input_device = input_device;
     cfg.save().map_err(|e| e.to_string())
+}
+
+/// Enumerate input microphones for the Settings dropdown (#3). Returns
+/// a list of `{ name, is_default }` entries, with PipeWire monitor
+/// sources and any device where `default_input_config()` fails
+/// filtered out. Enumeration failure is surfaced as a command error so
+/// the Settings UI can render the "Couldn't load devices" state with
+/// a Try-again button.
+#[tauri::command]
+fn list_input_devices() -> Result<Vec<recorder::DeviceEntry>, String> {
+    recorder::enumerate_input_devices()
+}
+
+/// Platform-detection helper for the Linux-only in-app hotkey note.
+/// The Svelte layer uses this to decide whether to render the
+/// "configure this in your desktop environment" copy. Returns the
+/// same strings `std::env::consts::OS` produces ("linux", "windows",
+/// "macos", etc.) — callers match on "linux" specifically.
+#[tauri::command]
+fn platform_os() -> &'static str {
+    std::env::consts::OS
 }
 
 // ── Launch-at-sign-in (#4) ───────────────────────────────────────────
@@ -809,25 +914,35 @@ async fn update_utterance_speaker(
     id: String,
     idx: i32,
     speaker: String,
+    // #82: optional FK forwarded to the backend. Tauri's JS -> Rust
+    // bridge is snake-case by convention (camelCase from the JS side
+    // maps to snake_case Rust args), so the UI invokes this with
+    // `speakerUserId`.
+    speaker_user_id: Option<String>,
 ) -> Result<(), String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
-    portal::update_utterance(backend, &id, idx, &speaker)
+    portal::update_utterance(backend, &id, idx, &speaker, speaker_user_id.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn rename_speaker(id: String, from: String, to: String) -> Result<u64, String> {
+async fn rename_speaker(
+    id: String,
+    from: String,
+    to: String,
+    to_user_id: Option<String>,
+) -> Result<u64, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
-    portal::rename_speaker(backend, &id, &from, &to)
+    portal::rename_speaker(backend, &id, &from, &to, to_user_id.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -889,6 +1004,72 @@ async fn discard_orphan_session(app: AppHandle, session_id: String) -> Result<()
     let path = recovery::resolve_session_dir(&app, &session_id)
         .ok_or_else(|| format!("session not found: {session_id}"))?;
     recovery::discard(&path).await
+}
+
+/// Recognized CLI flags handed to a second aftercalls launch. Parsed
+/// out of argv inside the `tauri-plugin-single-instance` callback so
+/// the running process — not the new one — performs the action. This
+/// is how Wayland users route a compositor-bound hotkey (e.g.
+/// `bind = SUPER SHIFT, R, exec, aftercalls --toggle-recording`)
+/// into the recorder when the agent window is unfocused: the second
+/// launch's argv is delivered to the original process, the callback
+/// dispatches, and the second process exits without ever creating a
+/// window.
+///
+/// Unknown argv → `None`, which preserves the pre-existing
+/// "double-launch raises the window" semantics for the naked
+/// `aftercalls` invocation and any future flags we haven't taught
+/// this parser yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliAction {
+    ToggleRecording,
+    Start,
+    Stop,
+}
+
+fn parse_cli_action(argv: &[String]) -> Option<CliAction> {
+    // Explicit allowlist: unknown flags fall through to `None`, which
+    // is the "raise the window" branch. Argv[0] is the binary path
+    // and must be skipped.
+    for arg in argv.iter().skip(1) {
+        match arg.as_str() {
+            "--toggle-recording" => return Some(CliAction::ToggleRecording),
+            "--start" => return Some(CliAction::Start),
+            "--stop" => return Some(CliAction::Stop),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Dispatch a parsed `CliAction` against the running recorder.
+/// Deliberately returns nothing — `--start` when already recording
+/// and `--stop` when idle are no-ops by design (scripts may call
+/// them preemptively to ensure a known state).
+fn run_cli_action(app: &AppHandle, action: CliAction) {
+    let state = app.state::<Recorder>();
+    match action {
+        CliAction::ToggleRecording => toggle_recording(app),
+        CliAction::Start => {
+            if state.is_active() {
+                return;
+            }
+            match do_start(&state, app) {
+                Ok(path) => {
+                    write_session_source(std::path::Path::new(&path), "manual", None);
+                }
+                Err(e) => eprintln!("aftercalls: cli start error: {e}"),
+            }
+        }
+        CliAction::Stop => {
+            if !state.is_active() {
+                return;
+            }
+            if let Err(e) = do_stop(&state, app) {
+                eprintln!("aftercalls: cli stop error: {e}");
+            }
+        }
+    }
 }
 
 fn toggle_recording(app: &AppHandle) {
@@ -1052,7 +1233,21 @@ pub fn run() {
         // user saw on Linux. When a second launch happens the callback
         // fires in the original process; we just re-show the existing
         // main window and let the second process exit.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A second launch that carries one of our recognized CLI
+            // flags (e.g. `aftercalls --toggle-recording`, wired from
+            // a compositor keybind) MUST NOT raise the main window —
+            // that would defeat the "invisible global hotkey" UX on
+            // Wayland (issue #6). Unknown argv falls through to the
+            // pre-existing `show_main_window` behaviour, which is
+            // what plain double-launches from a tray/.desktop click
+            // expect. The parser is an explicit allowlist so future
+            // flags we haven't taught it about don't silently swallow
+            // the relaunch.
+            if let Some(action) = parse_cli_action(&argv) {
+                run_cli_action(app, action);
+                return;
+            }
             show_main_window(app);
         }))
         // Launch-at-sign-in (#4). MacosLauncher::LaunchAgent is inert on
@@ -1078,6 +1273,7 @@ pub fn run() {
             start_recording,
             stop_recording,
             is_recording,
+            is_processing,
             process_imported_file,
             confirm_auto_start,
             dismiss_auto_start,
@@ -1086,6 +1282,7 @@ pub fn run() {
             login,
             logout,
             current_user,
+            update_me,
             list_calls,
             tag_suggestions,
             list_trashed,
@@ -1097,6 +1294,8 @@ pub fn run() {
             download_audio,
             get_app_prefs,
             set_app_prefs,
+            list_input_devices,
+            platform_os,
             telemetry::log_event,
             get_peaks,
             get_vault_settings,

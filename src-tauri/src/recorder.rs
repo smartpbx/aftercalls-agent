@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat};
+use cpal::{Device, Host, SampleFormat};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
+use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -13,6 +15,27 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 type SharedWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
+
+/// Reason we fell back to the system-default mic instead of using the
+/// saved-name preference. Serialized as the `reason` field on the
+/// `mic-fallback` Tauri event the Record page listens for. Kept as a
+/// string enum (not a free-form error message) so the frontend can
+/// branch on it if we ever grow different copy per reason.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicFallbackReason {
+    /// Saved name did not match any currently-enumerated input device.
+    NotFound,
+    /// `host.input_devices()` itself failed — rare, but we still want
+    /// the user to know the saved pref couldn't even be checked.
+    EnumerationFailed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MicFallback {
+    pub saved: String,
+    pub reason: MicFallbackReason,
+}
 
 pub struct Recorder {
     inner: Mutex<Inner>,
@@ -28,6 +51,21 @@ pub struct Recorder {
     // from the previous session. Cheaper + simpler than a Weak/Arc
     // cancellation token.
     session_seq: AtomicI64,
+    // Per-session dedupe for `mic-fallback` toasts (#3, decisions Q3).
+    // Holds the set of saved device names we've already surfaced a
+    // fallback toast for THIS process run. First recording with a
+    // missing saved mic fires the toast; subsequent recordings in the
+    // same session with the same stale name stay quiet. Restart
+    // re-arms. A different stale name (user edited the pref mid-run)
+    // is a new entry and fires once.
+    fallback_seen: Mutex<HashSet<String>>,
+    // Captured at `begin()` time and drained by `take_last_fallback()`
+    // after a successful `start()` resolves. The worker thread writes
+    // it; `lib.rs::do_start` reads it once, and the "once per session
+    // per stale name" dedupe in `fallback_seen` gates whether it's
+    // actually emitted. Mutex (not atomic) because the value isn't
+    // Copy.
+    pending_fallback: Mutex<Option<MicFallback>>,
 }
 
 struct Inner {
@@ -35,10 +73,19 @@ struct Inner {
     _worker: JoinHandle<()>,
 }
 
+// Reply shape for a Start command. On success we carry the session
+// directory AND an optional `MicFallback` describing whether the
+// recorder had to fall back from a saved-name preference. `lib.rs`
+// consumes the fallback via `take_last_fallback()` after `start()`
+// returns; it's surfaced to the webview as a `mic-fallback` event
+// (deduped per-session-per-name in `fallback_seen`).
+type StartOk = (PathBuf, Option<MicFallback>);
+
 enum Command_ {
     Start {
         base_dir: PathBuf,
-        reply: Sender<Result<PathBuf, String>>,
+        saved_device: Option<String>,
+        reply: Sender<Result<StartOk, String>>,
     },
     Stop {
         reply: Sender<Result<PathBuf, String>>,
@@ -63,6 +110,11 @@ struct Active {
     cpal_tracks: Vec<CpalTrack>,
     system: Option<SystemCapture>,
     session_dir: PathBuf,
+    // Non-None when the saved-name preference didn't resolve and we
+    // recorded from `host.default_input_device()` instead. Threaded
+    // back to `lib.rs::do_start` via the Start reply so it can emit a
+    // `mic-fallback` event (deduped per-session).
+    fallback: Option<MicFallback>,
 }
 
 impl Recorder {
@@ -77,6 +129,8 @@ impl Recorder {
             active: AtomicBool::new(false),
             started_at_ms: AtomicI64::new(0),
             session_seq: AtomicI64::new(0),
+            fallback_seen: Mutex::new(HashSet::new()),
+            pending_fallback: Mutex::new(None),
         }
     }
 
@@ -99,7 +153,11 @@ impl Recorder {
         }
     }
 
-    pub fn start(&self, base_dir: PathBuf) -> Result<PathBuf, String> {
+    pub fn start(
+        &self,
+        base_dir: PathBuf,
+        saved_device: Option<String>,
+    ) -> Result<PathBuf, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.inner
             .lock()
@@ -107,21 +165,45 @@ impl Recorder {
             .tx
             .send(Command_::Start {
                 base_dir,
+                saved_device,
                 reply: reply_tx,
             })
             .map_err(|e| e.to_string())?;
         let result = reply_rx.recv().map_err(|e| e.to_string())?;
-        if result.is_ok() {
-            self.started_at_ms
-                .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-            self.active.store(true, Ordering::Relaxed);
-            // Bump the session seq so any still-pending watchdog from
-            // a prior session sees a mismatch and exits. The new
-            // watchdog (spawned by lib.rs after start()) captures the
-            // updated value below.
-            self.session_seq.fetch_add(1, Ordering::Relaxed);
+        match result {
+            Ok((path, fallback)) => {
+                self.started_at_ms
+                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+                self.active.store(true, Ordering::Relaxed);
+                // Bump the session seq so any still-pending watchdog
+                // from a prior session sees a mismatch and exits. The
+                // new watchdog (spawned by lib.rs after start())
+                // captures the updated value below.
+                self.session_seq.fetch_add(1, Ordering::Relaxed);
+                // Stash the fallback info (if any) for the caller to
+                // consume via `take_last_fallback()`. Dedupe happens
+                // there, not here, so `start()` stays a pure
+                // "this-session-fell-back" signal.
+                *self.pending_fallback.lock().unwrap() = fallback;
+                Ok(path)
+            }
+            Err(e) => Err(e),
         }
-        result
+    }
+
+    /// Pop the most recent successful start's fallback info, gated by
+    /// the per-session HashSet<String> so the same stale name only
+    /// fires a toast once per process run (decisions.md Q3). Returns
+    /// None when there was no fallback OR when this saved name has
+    /// already been surfaced this session.
+    pub fn take_last_fallback(&self) -> Option<MicFallback> {
+        let pending = self.pending_fallback.lock().unwrap().take()?;
+        let mut seen = self.fallback_seen.lock().unwrap();
+        if seen.contains(&pending.saved) {
+            return None;
+        }
+        seen.insert(pending.saved.clone());
+        Some(pending)
     }
 
     pub fn stop(&self) -> Result<PathBuf, String> {
@@ -148,16 +230,21 @@ fn worker_loop(rx: Receiver<Command_>) {
     let mut active: Option<Active> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Command_::Start { base_dir, reply } => {
+            Command_::Start {
+                base_dir,
+                saved_device,
+                reply,
+            } => {
                 if active.is_some() {
                     let _ = reply.send(Err("recording already in progress".into()));
                     continue;
                 }
-                match begin(&base_dir) {
+                match begin(&base_dir, saved_device.as_deref()) {
                     Ok(rec) => {
                         let path = rec.session_dir.clone();
+                        let fallback = rec.fallback.clone();
                         active = Some(rec);
-                        let _ = reply.send(Ok(path));
+                        let _ = reply.send(Ok((path, fallback)));
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e.to_string()));
@@ -177,14 +264,12 @@ fn worker_loop(rx: Receiver<Command_>) {
     }
 }
 
-fn begin(base_dir: &Path) -> Result<Active> {
+fn begin(base_dir: &Path, saved_device: Option<&str>) -> Result<Active> {
     let session_dir = base_dir.join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
     fs::create_dir_all(&session_dir).context("create session dir")?;
 
     let host = cpal::default_host();
-    let mic_device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+    let (mic_device, fallback) = resolve_input_device(&host, saved_device)?;
     let mic_track = build_cpal_track(&mic_device, session_dir.join("mic.wav"))
         .context("build mic track")?;
     eprintln!(
@@ -212,7 +297,129 @@ fn begin(base_dir: &Path) -> Result<Active> {
         cpal_tracks: vec![mic_track],
         system,
         session_dir,
+        fallback,
     })
+}
+
+/// Resolves the mic device to open. Saved name → walk
+/// `host.input_devices()` for a first-match; on miss OR on
+/// enumeration failure, fall back to `host.default_input_device()`.
+/// Returns the `Option<MicFallback>` alongside the device so
+/// `begin()` can thread it out to `lib.rs` for the `mic-fallback`
+/// event (#3). Fresh installs (saved == None) never produce a
+/// fallback.
+fn resolve_input_device(
+    host: &Host,
+    saved: Option<&str>,
+) -> Result<(Device, Option<MicFallback>)> {
+    let Some(saved_name) = saved else {
+        let dev = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?;
+        return Ok((dev, None));
+    };
+
+    // Try to match the saved name first. `input_devices()` can fail
+    // on some hosts (WASAPI endpoint enumeration, PipeWire registry
+    // churn); treat that as a fallback with a distinct reason so the
+    // UI copy can branch on it.
+    match host.input_devices() {
+        Ok(iter) => {
+            for dev in iter {
+                if dev.name().ok().as_deref() == Some(saved_name) {
+                    return Ok((dev, None));
+                }
+            }
+            // Saved name no longer enumerates — most common: USB mic
+            // unplugged, or PipeWire graph renumbered it on reboot.
+            let dev = host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("no default input device"))?;
+            Ok((
+                dev,
+                Some(MicFallback {
+                    saved: saved_name.to_string(),
+                    reason: MicFallbackReason::NotFound,
+                }),
+            ))
+        }
+        Err(e) => {
+            eprintln!("aftercalls: input_devices() failed: {e}");
+            let dev = host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("no default input device"))?;
+            Ok((
+                dev,
+                Some(MicFallback {
+                    saved: saved_name.to_string(),
+                    reason: MicFallbackReason::EnumerationFailed,
+                }),
+            ))
+        }
+    }
+}
+
+/// One row of the Settings → Input microphone dropdown. `name` is the
+/// cpal-reported device name (the persisted-pref primitive);
+/// `is_default` marks the currently-defaulted input so the UI can
+/// display "currently: X" under "System default" without a second
+/// enumeration roundtrip. Duplicate-name disambiguation (decisions.md
+/// Q1) is computed client-side from enumeration order.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeviceEntry {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Walks `host.input_devices()`, filters out PipeWire monitor sources
+/// (and equivalents on other backends) via two layers:
+///   1. Primary: `device.default_input_config().is_ok()` — monitor
+///      nodes fail this on PipeWire because they expose an output
+///      format, not an input one. Real mics pass.
+///   2. Backup: suffix blocklist against the device name
+///      (`.monitor`, `.monitor.*`, ALSA-naming edge cases). Belt-and-
+///      -suspenders for hosts where the config probe surprises us.
+///
+/// Returns early on `host.input_devices()` failure — callers surface
+/// this as the "Couldn't load devices" state. A Some-but-empty list
+/// is the "no mics connected" state, also surfaced by the UI.
+pub fn enumerate_input_devices() -> Result<Vec<DeviceEntry>, String> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.name().ok());
+    let iter = host.input_devices().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for dev in iter {
+        let Ok(name) = dev.name() else {
+            continue;
+        };
+        // Filter monitor sources. PipeWire exposes the default sink's
+        // monitor (e.g. `alsa_output.*.monitor`) via input_devices()
+        // because it IS a capturable node, but it's not a microphone
+        // and we don't want it in the mic dropdown.
+        if is_monitor_source_name(&name) {
+            continue;
+        }
+        if dev.default_input_config().is_err() {
+            continue;
+        }
+        let is_default = default_name.as_deref() == Some(name.as_str());
+        out.push(DeviceEntry { name, is_default });
+    }
+    Ok(out)
+}
+
+/// Name-suffix backup filter used in tandem with the
+/// `default_input_config` probe. Covers the common PipeWire /
+/// PulseAudio monitor-source naming conventions. Kept generous so an
+/// unexpected `.monitor.something` variant still gets filtered.
+fn is_monitor_source_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".monitor")
+        || lower.contains(".monitor.")
+        || lower.ends_with(" monitor")
+        || lower.ends_with(" monitor of built-in audio")
 }
 
 fn finish(rec: Active) -> Result<PathBuf> {
