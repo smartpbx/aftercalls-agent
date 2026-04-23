@@ -1,9 +1,16 @@
 {
+  "0.3.27": {
+    "headline": "Formatting toolbar on notes, owner-aware team views for admins",
+    "changes": [
+      "Notes editor now has a formatting toolbar: bold, italic, code, headings, bullet and numbered lists, quote, link. Keyboard shortcuts too — Ctrl/Cmd+B, I, E, K. Markdown syntax stays visible and styled inline so what you see is what gets saved. Notes stay private to you — they never feed the AI summary.",
+      "Admins viewing All team calls now see an owner chip on every row showing whose call it is, plus a new By person filter to scope the list to one teammate."
+    ]
+  },
   "0.3.26": {
     "headline": "Take notes during a call, cap runaway recordings, tune the playback volume",
     "changes": [
-      "Manual notes panel. Turn it on in Settings and you'll get a live markdown editor on the record screen during an active call — headings, bold, italics, bullet lists render as you type in the Obsidian \"Live Preview\" style. Notes save with the call and can optionally feed into the AI summary as primary context for what mattered. Edit them after the fact on the call detail page.",
-      "Playback volume slider. The audio player on call detail now has a volume control next to the speed toggle — slide to mute or fine-tune without touching your system output. Your chosen level persists across calls and across the web portal.",
+      "Manual notes panel. Turn it on in Settings and you'll get a markdown editor on the record screen during an active call. Notes save with the call and are editable from the call detail page afterwards.",
+      "Playback volume slider. The audio player on call detail now has a volume control next to the speed toggle. Your chosen level persists across calls and across the web portal.",
       "Max recording length. New Settings field caps any single recording at a configurable ceiling (default 2 hours, range 5 minutes to 24 hours). If a softphone holds the mic open long after a call ends, the agent auto-stops at the limit so you don't discover a runaway multi-hour file."
     ]
   },

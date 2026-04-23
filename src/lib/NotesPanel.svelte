@@ -1,101 +1,122 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { EditorState, RangeSetBuilder } from '@codemirror/state';
+  import { EditorSelection, EditorState } from '@codemirror/state';
   import {
     EditorView,
     keymap,
     placeholder as cmPlaceholder,
-    Decoration,
-    type DecorationSet,
-    ViewPlugin,
-    type ViewUpdate,
   } from '@codemirror/view';
   import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-  import {
-    HighlightStyle,
-    syntaxHighlighting,
-    syntaxTree,
-  } from '@codemirror/language';
+  import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
   import { markdown } from '@codemirror/lang-markdown';
   import { tags as t } from '@lezer/highlight';
 
-  // Manual notes editor for the record screen (#73). Shares the live-
-  // preview decoration approach with the portal's NotesEditor — the
-  // decoration plugin walks the Lezer markdown tree and hides mark
-  // characters (**/*/#/-/>) on every line except the one the cursor is
-  // on, so as-you-type formatting feels like Obsidian's Live Preview.
+  // Manual notes editor for the record screen (#73). Same design as
+  // the portal NotesEditor: markdown source stays visible, syntax
+  // highlighting gives visual weight, a toolbar covers common
+  // formatting gestures, Cmd/Ctrl+B/I/E/K shortcuts cover power users.
+  //
+  // Notes are private to the user and do NOT feed the summarizer.
 
   type Props = {
     initialNotes?: string;
-    initialInclude?: boolean;
-    onChange: (notes: string, includeInSummary: boolean) => void;
+    onChange: (notes: string) => void;
   };
-  let { initialNotes = '', initialInclude = true, onChange }: Props = $props();
+  let { initialNotes = '', onChange }: Props = $props();
 
   let host: HTMLDivElement | undefined = $state();
   let view: EditorView | null = null;
-  let include = $state(initialInclude);
-  let currentText = initialNotes;
 
-  // ── Live-preview decoration plugin ─────────────────────────────────
-  const HIDE = Decoration.replace({});
-
-  function buildLivePreviewDecorations(view: EditorView): DecorationSet {
-    const builder = new RangeSetBuilder<Decoration>();
-    const { state } = view;
-    const activeLines = new Set<number>();
-    for (const r of state.selection.ranges) {
-      activeLines.add(state.doc.lineAt(r.from).number);
-      if (r.from !== r.to) {
-        activeLines.add(state.doc.lineAt(r.to).number);
+  function wrapSelection(v: EditorView, before: string, after = before) {
+    const spec = v.state.changeByRange((range) => {
+      const doc = v.state.doc;
+      if (range.empty) {
+        return {
+          changes: { from: range.from, insert: before + after },
+          range: EditorSelection.cursor(range.from + before.length),
+        };
       }
-    }
-
-    for (const { from, to } of view.visibleRanges) {
-      syntaxTree(state).iterate({
-        from,
-        to,
-        enter: (node) => {
-          const name = node.name;
-          const isMark =
-            name === 'EmphasisMark' ||
-            name === 'StrongEmphasisMark' ||
-            name === 'StrikethroughMark' ||
-            name === 'HeaderMark' ||
-            name === 'ListMark' ||
-            name === 'QuoteMark' ||
-            name === 'LinkMark' ||
-            name === 'CodeMark';
-          if (!isMark) return;
-          const lineNum = state.doc.lineAt(node.from).number;
-          if (activeLines.has(lineNum)) return;
-          builder.add(node.from, node.to, HIDE);
-        },
-      });
-    }
-    return builder.finish();
+      const head = doc.sliceString(
+        Math.max(0, range.from - before.length),
+        range.from,
+      );
+      const tail = doc.sliceString(range.to, range.to + after.length);
+      if (head === before && tail === after) {
+        return {
+          changes: [
+            { from: range.from - before.length, to: range.from, insert: '' },
+            { from: range.to, to: range.to + after.length, insert: '' },
+          ],
+          range: EditorSelection.range(
+            range.from - before.length,
+            range.to - before.length,
+          ),
+        };
+      }
+      return {
+        changes: [
+          { from: range.from, insert: before },
+          { from: range.to, insert: after },
+        ],
+        range: EditorSelection.range(
+          range.from + before.length,
+          range.to + before.length,
+        ),
+      };
+    });
+    v.dispatch(spec);
+    v.focus();
   }
 
-  const livePreviewPlugin = ViewPlugin.fromClass(
-    class {
-      decorations: DecorationSet;
-      constructor(view: EditorView) {
-        this.decorations = buildLivePreviewDecorations(view);
-      }
-      update(u: ViewUpdate) {
-        if (u.docChanged || u.selectionSet || u.viewportChanged) {
-          this.decorations = buildLivePreviewDecorations(u.view);
-        }
-      }
-    },
-    { decorations: (v) => v.decorations },
-  );
+  function togglePrefix(v: EditorView, prefix: string) {
+    const { state } = v;
+    const ranges = state.selection.ranges;
+    const touchedLines = new Set<number>();
+    for (const r of ranges) {
+      const startLine = state.doc.lineAt(r.from).number;
+      const endLine = state.doc.lineAt(r.to).number;
+      for (let i = startLine; i <= endLine; i++) touchedLines.add(i);
+    }
+    const lines = [...touchedLines]
+      .sort((a, b) => a - b)
+      .map((n) => state.doc.line(n));
+    const allHavePrefix = lines.every((l) => l.text.startsWith(prefix));
+    const changes = lines.map((l) =>
+      allHavePrefix
+        ? { from: l.from, to: l.from + prefix.length, insert: '' }
+        : { from: l.from, insert: prefix },
+    );
+    v.dispatch({ changes });
+    v.focus();
+  }
 
-  // ── Syntax-driven visual weight (bold / italic / headings / links) ──
+  function doBold() { if (view) wrapSelection(view, '**'); }
+  function doItalic() { if (view) wrapSelection(view, '*'); }
+  function doCode() { if (view) wrapSelection(view, '`'); }
+  function doH1() { if (view) togglePrefix(view, '# '); }
+  function doH2() { if (view) togglePrefix(view, '## '); }
+  function doBullet() { if (view) togglePrefix(view, '- '); }
+  function doNumbered() { if (view) togglePrefix(view, '1. '); }
+  function doQuote() { if (view) togglePrefix(view, '> '); }
+  function doLink() {
+    if (!view) return;
+    const { state } = view;
+    const r = state.selection.main;
+    const selected = state.sliceDoc(r.from, r.to);
+    const label = selected || 'text';
+    const insert = `[${label}](url)`;
+    const urlStart = r.from + label.length + 3;
+    view.dispatch({
+      changes: { from: r.from, to: r.to, insert },
+      selection: EditorSelection.range(urlStart, urlStart + 3),
+    });
+    view.focus();
+  }
+
   const notesHighlight = HighlightStyle.define([
-    { tag: t.heading1, fontSize: '1.35em', fontWeight: '700', color: 'var(--bone-0)' },
-    { tag: t.heading2, fontSize: '1.2em', fontWeight: '700', color: 'var(--bone-0)' },
-    { tag: t.heading3, fontSize: '1.08em', fontWeight: '600', color: 'var(--bone-0)' },
+    { tag: t.heading1, fontSize: '1.4em', fontWeight: '700', color: 'var(--bone-0)' },
+    { tag: t.heading2, fontSize: '1.22em', fontWeight: '700', color: 'var(--bone-0)' },
+    { tag: t.heading3, fontSize: '1.1em', fontWeight: '600', color: 'var(--bone-0)' },
     { tag: t.heading4, fontWeight: '600', color: 'var(--bone-0)' },
     { tag: t.heading5, fontWeight: '600', color: 'var(--bone-0)' },
     { tag: t.heading6, fontWeight: '600', color: 'var(--bone-0)' },
@@ -135,14 +156,8 @@
         backgroundColor: 'var(--accent-soft)',
       },
       '.cm-selectionBackground': { backgroundColor: 'var(--accent-soft)' },
-      '.cm-placeholder': {
-        color: 'var(--bone-3)',
-        fontStyle: 'italic',
-      },
-      '.cm-scroller': {
-        fontFamily: 'var(--font-sans)',
-        overflow: 'auto',
-      },
+      '.cm-placeholder': { color: 'var(--bone-3)', fontStyle: 'italic' },
+      '.cm-scroller': { fontFamily: 'var(--font-sans)', overflow: 'auto' },
       '.cm-editor': { height: '100%' },
     },
     { dark: true },
@@ -150,21 +165,37 @@
 
   onMount(() => {
     if (!host) return;
+    const toolbarKeymap = keymap.of([
+      { key: 'Mod-b', run: (v) => { wrapSelection(v, '**'); return true; } },
+      { key: 'Mod-i', run: (v) => { wrapSelection(v, '*'); return true; } },
+      { key: 'Mod-e', run: (v) => { wrapSelection(v, '`'); return true; } },
+      { key: 'Mod-k', run: (v) => {
+        const r = v.state.selection.main;
+        const selected = v.state.sliceDoc(r.from, r.to);
+        const label = selected || 'text';
+        const insert = `[${label}](url)`;
+        const urlStart = r.from + label.length + 3;
+        v.dispatch({
+          changes: { from: r.from, to: r.to, insert },
+          selection: EditorSelection.range(urlStart, urlStart + 3),
+        });
+        return true;
+      } },
+    ]);
     const state = EditorState.create({
       doc: initialNotes,
       extensions: [
         history(),
+        toolbarKeymap,
         keymap.of([...defaultKeymap, ...historyKeymap]),
         markdown(),
         syntaxHighlighting(notesHighlight),
-        livePreviewPlugin,
         EditorView.lineWrapping,
         cmPlaceholder('Take notes during the call…'),
         agentTheme,
         EditorView.updateListener.of((u) => {
           if (!u.docChanged) return;
-          currentText = u.state.doc.toString();
-          onChange(currentText, include);
+          onChange(u.state.doc.toString());
         }),
       ],
     });
@@ -174,22 +205,57 @@
   onDestroy(() => {
     view?.destroy();
   });
-
-  function toggleInclude() {
-    include = !include;
-    onChange(currentText, include);
-  }
 </script>
 
 <section class="notes-panel">
   <header class="notes-header">
     <strong>Notes</strong>
-    <label class="include-toggle" title="When on, your notes feed into the AI summary alongside the transcript.">
-      <input type="checkbox" checked={include} onchange={toggleInclude} />
-      Include in summary
-    </label>
   </header>
   <div class="notes-wrap">
+    <div class="toolbar" role="toolbar" aria-label="Formatting">
+      <button type="button" class="tb-btn" onclick={doBold} title="Bold (Ctrl+B)"><strong>B</strong></button>
+      <button type="button" class="tb-btn" onclick={doItalic} title="Italic (Ctrl+I)"><em>I</em></button>
+      <button type="button" class="tb-btn mono" onclick={doCode} title="Inline code (Ctrl+E)">{"</>"}</button>
+      <span class="divider" aria-hidden="true"></span>
+      <button type="button" class="tb-btn" onclick={doH1} title="Heading 1">H1</button>
+      <button type="button" class="tb-btn" onclick={doH2} title="Heading 2">H2</button>
+      <span class="divider" aria-hidden="true"></span>
+      <button type="button" class="tb-btn" onclick={doBullet} title="Bullet list" aria-label="Bullet list">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <circle cx="2.5" cy="4" r="1.3" fill="currentColor"/>
+          <rect x="6" y="3.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+          <circle cx="2.5" cy="8" r="1.3" fill="currentColor"/>
+          <rect x="6" y="7.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+          <circle cx="2.5" cy="12" r="1.3" fill="currentColor"/>
+          <rect x="6" y="11.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+        </svg>
+      </button>
+      <button type="button" class="tb-btn" onclick={doNumbered} title="Numbered list" aria-label="Numbered list">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <text x="0.5" y="5.5" font-size="4.5" font-family="monospace" fill="currentColor" font-weight="600">1.</text>
+          <rect x="6" y="3.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+          <text x="0.5" y="9.5" font-size="4.5" font-family="monospace" fill="currentColor" font-weight="600">2.</text>
+          <rect x="6" y="7.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+          <text x="0.5" y="13.5" font-size="4.5" font-family="monospace" fill="currentColor" font-weight="600">3.</text>
+          <rect x="6" y="11.25" width="8" height="1.5" rx="0.5" fill="currentColor"/>
+        </svg>
+      </button>
+      <button type="button" class="tb-btn" onclick={doQuote} title="Quote" aria-label="Quote">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <rect x="2" y="2" width="1.6" height="12" rx="0.3" fill="currentColor"/>
+          <rect x="5.5" y="3" width="8.5" height="1.5" rx="0.5" fill="currentColor"/>
+          <rect x="5.5" y="7.25" width="6" height="1.5" rx="0.5" fill="currentColor"/>
+          <rect x="5.5" y="11.5" width="7" height="1.5" rx="0.5" fill="currentColor"/>
+        </svg>
+      </button>
+      <span class="divider" aria-hidden="true"></span>
+      <button type="button" class="tb-btn" onclick={doLink} title="Link (Ctrl+K)" aria-label="Link">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path d="M7 9 a3 3 0 0 1 0 -4 L9 3 a3 3 0 0 1 4 4 L12 8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+          <path d="M9 7 a3 3 0 0 1 0  4 L7 13 a3 3 0 0 1 -4 -4 L4 8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
     <div class="notes-host" bind:this={host}></div>
   </div>
 </section>
@@ -207,24 +273,12 @@
     justify-content: space-between;
     gap: 1rem;
   }
-  .include-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    font-size: 0.85rem;
-    color: var(--bone-2);
-    cursor: pointer;
-    user-select: none;
-  }
-  .include-toggle input {
-    cursor: pointer;
-  }
   .notes-wrap {
     border: 1px solid var(--hairline);
     border-radius: 8px;
     background: var(--ink-1);
-    min-height: 200px;
-    height: 200px;
+    min-height: 240px;
+    height: 240px;
     resize: vertical;
     overflow: hidden;
     transition: border-color 0.15s;
@@ -235,6 +289,57 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-glow);
   }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid var(--hairline);
+    background: var(--ink-2);
+    flex-wrap: wrap;
+  }
+  .tb-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    height: 26px;
+    padding: 0 0.45rem;
+    font-size: 0.82rem;
+    color: var(--bone-2);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.1s, color 0.1s, border-color 0.1s;
+    font-family: var(--font-sans);
+    line-height: 1;
+  }
+  .tb-btn.mono {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+  }
+  .tb-btn:hover {
+    color: var(--bone-0);
+    background: var(--ink-3);
+    border-color: var(--hairline-hi);
+  }
+  .tb-btn:active {
+    background: var(--ink-0);
+  }
+  .tb-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .divider {
+    display: inline-block;
+    width: 1px;
+    height: 16px;
+    margin: 0 0.25rem;
+    background: var(--hairline-hi);
+  }
+
   .notes-host {
     flex: 1;
     min-height: 0;

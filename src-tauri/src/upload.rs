@@ -42,7 +42,6 @@ pub async fn create_call(
         .unwrap_or_default();
     let recorded_at = parse_session_timestamp(&session_id);
     let source = read_source_json(session_dir);
-    let loaded_notes = crate::notes::read_from_dir(session_dir);
 
     let body = CreateCall {
         session_id: session_id.clone(),
@@ -57,8 +56,7 @@ pub async fn create_call(
         source_kind: source.kind,
         source_app: source.app,
         utterances: Vec::new(),
-        notes: loaded_notes.notes,
-        notes_in_summary: loaded_notes.include_in_summary,
+        notes: crate::notes::read_from_dir(session_dir),
     };
 
     let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
@@ -244,7 +242,6 @@ struct CreateCall {
     source_app: Option<String>,
     utterances: Vec<serde_json::Value>,
     notes: String,
-    notes_in_summary: bool,
 }
 
 #[derive(Deserialize, Default)]

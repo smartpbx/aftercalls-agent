@@ -93,20 +93,19 @@
     sessionDir ? sessionDir.split(/[\\/]/).filter(Boolean).pop() ?? "" : "",
   );
   let notesSaveTimer = 0;
-  let notesPending: { text: string; include: boolean } | null = null;
-  function scheduleNotesSave(text: string, include: boolean) {
+  let notesPending: string | null = null;
+  function scheduleNotesSave(text: string) {
     if (!currentSessionId) return;
-    notesPending = { text, include };
+    notesPending = text;
     clearTimeout(notesSaveTimer);
     notesSaveTimer = window.setTimeout(async () => {
-      if (!notesPending || !currentSessionId) return;
+      if (notesPending === null || !currentSessionId) return;
       const payload = notesPending;
       notesPending = null;
       try {
         await invoke("save_notes", {
           sessionId: currentSessionId,
-          notes: payload.text,
-          includeInSummary: payload.include,
+          notes: payload,
         });
       } catch (e) {
         console.warn("save_notes failed", e);
@@ -240,15 +239,14 @@
     clearInterval(timer);
     // Flush any pending debounced notes save so a route-nav
     // mid-type doesn't drop the last few keystrokes.
-    if (notesPending && currentSessionId) {
+    if (notesPending !== null && currentSessionId) {
       const payload = notesPending;
       const sid = currentSessionId;
       notesPending = null;
       clearTimeout(notesSaveTimer);
       invoke("save_notes", {
         sessionId: sid,
-        notes: payload.text,
-        includeInSummary: payload.include,
+        notes: payload,
       }).catch((e) => console.warn("save_notes (flush) failed", e));
     }
   });
