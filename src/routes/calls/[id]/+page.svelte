@@ -852,7 +852,10 @@
     deleting = true;
     confirmingDelete = false;
     try {
-      await invoke("delete_call", { id: call.id });
+      await invoke("delete_call", {
+        id: call.id,
+        sessionId: call.session_id,
+      });
       window.location.href = "/calls";
     } catch (e) {
       error = String(e);

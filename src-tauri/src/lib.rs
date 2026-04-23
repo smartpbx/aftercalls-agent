@@ -341,7 +341,11 @@ async fn restore_call(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn permadelete_call(id: String) -> Result<(), String> {
+async fn permadelete_call(
+    app: AppHandle,
+    id: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
@@ -349,7 +353,9 @@ async fn permadelete_call(id: String) -> Result<(), String> {
         .ok_or_else(|| "no backend configured".to_string())?;
     portal::permadelete_call(backend, &id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    cleanup_local_session(&app, session_id.as_deref()).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -737,7 +743,11 @@ async fn get_peaks(id: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn delete_call(id: String) -> Result<(), String> {
+async fn delete_call(
+    app: AppHandle,
+    id: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
@@ -745,7 +755,27 @@ async fn delete_call(id: String) -> Result<(), String> {
         .ok_or_else(|| "no backend configured".to_string())?;
     portal::delete_call(backend, &id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Soft-deleted calls are filtered out by the backend's
+    // get_call_by_session (deleted_at IS NULL), so leaving the local
+    // session_dir on disk makes scan_orphans flag it as an unfinished
+    // call and the "N unfinished calls" chip reappears. Restore from
+    // the recycle bin replays audio from cloud storage, so the local
+    // dir isn't needed to recover.
+    cleanup_local_session(&app, session_id.as_deref()).await;
+    Ok(())
+}
+
+/// Best-effort removal of a session_dir after a call has been deleted
+/// (soft or hard). Used by delete_call + permadelete_call. Silent on
+/// failure: backend truth already reflects the deletion, a leftover
+/// folder is strictly a cleanup concern.
+async fn cleanup_local_session(app: &AppHandle, session_id: Option<&str>) {
+    let Some(sid) = session_id else { return };
+    let Some(dir) = recovery::resolve_session_dir(app, sid) else { return };
+    if let Err(e) = recovery::discard(&dir).await {
+        eprintln!("aftercalls: delete_call local cleanup failed for {sid}: {e}");
+    }
 }
 
 #[tauri::command]

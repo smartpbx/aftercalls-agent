@@ -60,7 +60,10 @@
     if (!ok) return;
     busy[row.id] = true;
     try {
-      await invoke("permadelete_call", { id: row.id });
+      await invoke("permadelete_call", {
+        id: row.id,
+        sessionId: row.session_id,
+      });
       rows = rows.filter((r) => r.id !== row.id);
     } catch (e) {
       error = String(e);
