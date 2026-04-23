@@ -21,6 +21,13 @@ pub struct Recorder {
     // the UI rebuild the running timer after a webview remount (tray
     // hide+show, route nav) without persisting state to disk.
     started_at_ms: AtomicI64,
+    // Monotonic session counter, bumped on every successful start().
+    // The auto-stop watchdog (see lib.rs) captures the value at spawn
+    // time and only fires if it still matches — that way a manual
+    // stop followed by a new start can't be nuked by a stale timer
+    // from the previous session. Cheaper + simpler than a Weak/Arc
+    // cancellation token.
+    session_seq: AtomicI64,
 }
 
 struct Inner {
@@ -69,7 +76,16 @@ impl Recorder {
             }),
             active: AtomicBool::new(false),
             started_at_ms: AtomicI64::new(0),
+            session_seq: AtomicI64::new(0),
         }
+    }
+
+    /// Current session sequence. Bumped on every successful start().
+    /// The watchdog spawned in `do_start` captures this value and
+    /// aborts if it ever drifts (manual stop, then new start) — so a
+    /// stale timer from a prior session can't kill a new one.
+    pub fn session_seq(&self) -> i64 {
+        self.session_seq.load(Ordering::Relaxed)
     }
 
     pub fn is_active(&self) -> bool {
@@ -99,6 +115,11 @@ impl Recorder {
             self.started_at_ms
                 .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
             self.active.store(true, Ordering::Relaxed);
+            // Bump the session seq so any still-pending watchdog from
+            // a prior session sees a mismatch and exits. The new
+            // watchdog (spawned by lib.rs after start()) captures the
+            // updated value below.
+            self.session_seq.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -115,6 +136,9 @@ impl Recorder {
         if result.is_ok() {
             self.active.store(false, Ordering::Relaxed);
             self.started_at_ms.store(0, Ordering::Relaxed);
+            // Bump on stop too so the currently-running watchdog's
+            // captured seq goes stale and its next tick is a no-op.
+            self.session_seq.fetch_add(1, Ordering::Relaxed);
         }
         result
     }

@@ -159,6 +159,17 @@
   }
 
   let isLoginPage = $derived(page.url.pathname.startsWith("/login"));
+  // True when the current route is the Record page (`/`). Used to
+  // suppress the layout-level auto-detect slide-out (#74 dup-toast),
+  // since the Record page renders its own inline DETECTED banner and
+  // we don't want both firing. We check BOTH pathname and route.id
+  // so an early-launch paint where pathname is briefly empty (bare
+  // tauri://localhost/ load before SvelteKit's client router has
+  // normalized) still matches — route.id is `/` for the root page
+  // from the first render.
+  let isRecordPage = $derived(
+    page.url.pathname === "/" || page.route?.id === "/",
+  );
 
   // Auto-update state. Sits in the top strip as an unobtrusive nudge, then
   // flips into a progress row while downloading, then into a restart prompt.
@@ -314,6 +325,17 @@
       | { kind: "cleared" }
     >("auto-detect", (evt) => {
       if (evt.payload.kind === "prompt_start") {
+        // Belt-and-braces on top of the `isRecordPage` render guard
+        // below (#74): when the user is already on the Record page,
+        // don't even populate `autoPrompt`. The Record page's own
+        // inline banner covers the prompt, its own listener plays
+        // the chime, and keeping the state empty here means no
+        // double-chime, no phantom slide-out if the render guard
+        // ever misses a tick during initial hydration.
+        if (isRecordPage) {
+          autoPrompt = null;
+          return;
+        }
         // Only chime when the prompt newly appears — re-emissions
         // (e.g. the detector re-confirming the same session) shouldn't
         // repeat the sound.
@@ -793,13 +815,17 @@
             <span class="glyph">{@html it.icon}</span>
             <span class="label">{it.label}</span>
           </a>
-          {#if it.href === "/" && autoPrompt && page.url.pathname !== "/"}
-            <!-- Auto-detect slide-out (#59, #60). Shown only when the
-                 user is on a route OTHER than /record — the Record
-                 page has its own inline banner. Anchored to the
-                 Record nav item so it's visible whether the user is
-                 on /calls, /settings, etc. No focus-steal, no route
-                 change. -->
+          {#if it.href === "/" && autoPrompt && !isRecordPage}
+            <!-- Auto-detect slide-out (#59, #60, #74). Shown only when
+                 the user is on a route OTHER than the Record page —
+                 the Record page has its own inline DETECTED banner.
+                 Anchored to the Record nav item so it's visible
+                 whether the user is on /calls, /settings, etc. No
+                 focus-steal, no route change. Using the derived
+                 `isRecordPage` (pathname OR route.id) so an early-
+                 launch paint where pathname is empty before SvelteKit
+                 client-route normalization can't show a phantom
+                 slide-out (#74). -->
             <div class="auto-slideout" role="dialog" aria-label="Call detected">
               <div class="auto-head">
                 <span class="auto-pip" aria-hidden="true"></span>

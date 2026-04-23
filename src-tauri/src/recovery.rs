@@ -15,17 +15,14 @@
 //!      uploading). Age is measured against mic.wav's mtime (most
 //!      robust on filesystems where ctime can drift) with a fallback
 //!      to the dir's ctime.
-//!   2. The backend HAS a row for this session_id. A missing row
-//!      means the pipeline never reached create_call (step 3 of 9) —
-//!      those are abandoned-before-upload folders, not "crashed
-//!      mid-pipeline." Typical source: dev Start→Stop cycles that
-//!      never got to upload, old recordings from before the user
-//!      signed in, etc. Surfacing those as "unfinished calls" is a
-//!      false-positive that on dev machines accumulates to dozens.
-//!   3. That row's status is not 'complete'. Anything in
-//!      uploading/transcribed/summarizing/failed means the user had
-//!      real intent to process this recording and didn't get to the
-//!      finish line.
+//!   2. The backend has no 'complete' row for this session_id. Two
+//!      flavours: backend-row-exists-but-not-complete (classic
+//!      mid-pipeline crash), and no-backend-row-at-all (crash before
+//!      create_call fired — the audio on disk is still a real
+//!      recording the user produced, just never registered upstream).
+//!      Both get surfaced: on-disk audio without a complete row is
+//!      recoverable intent, full stop. Discard is a user decision, not
+//!      ours.
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
@@ -195,12 +192,13 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                         .unwrap_or(true)
                 }
                 Ok(None) => {
-                    // No backend row: this folder was abandoned before
-                    // create_call fired. Not a crash to recover —
-                    // probably a Start→Stop dev cycle, a pre-sign-in
-                    // recording, or a session the user explicitly
-                    // chose not to upload. Skip.
-                    false
+                    // No backend row: pipeline crashed before
+                    // create_call fired. Still an orphan — the audio
+                    // on disk is real user intent we haven't given up
+                    // on. Resume will push it through the full
+                    // pipeline (create_call is idempotent on
+                    // session_id).
+                    true
                 }
                 Err(e) => {
                     // Network / auth failure. Don't surface — we'd

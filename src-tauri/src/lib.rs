@@ -1,5 +1,6 @@
 mod config;
 mod detector;
+mod notes;
 mod pipeline;
 mod portal;
 mod recorder;
@@ -122,6 +123,49 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
         .join("recordings");
     let path = state.start(base)?;
     emit_state(app, true);
+    // Hard ceiling watchdog (#75). Reads the per-user cap from config
+    // once at spawn (runtime changes take effect on the next session),
+    // polls every 30s, and fires do_stop via the same code path the
+    // UI / tray / hotkey use. Guarded by session_seq so a manual
+    // stop-then-start sequence can't let a stale watchdog kill the
+    // new session.
+    let max_minutes = config::Config::load()
+        .map(|c| c.max_recording_minutes)
+        .unwrap_or(120);
+    let captured_seq = app.state::<Recorder>().session_seq();
+    let app_for_watchdog = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(max_minutes as u64 * 60);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let rec = app_for_watchdog.state::<Recorder>();
+            // Session changed out from under us — manual stop (and
+            // possibly a new start). Stale watchdog; bail.
+            if rec.session_seq() != captured_seq {
+                return;
+            }
+            if !rec.is_active() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "aftercalls: recording hit max_recording_minutes={max_minutes}; auto-stopping"
+                );
+                telemetry::log(
+                    "info",
+                    "recorder::max_length_auto_stop",
+                    format!("auto-stopped after {max_minutes} minutes"),
+                    None,
+                    None,
+                );
+                if let Err(e) = do_stop(&rec, &app_for_watchdog) {
+                    eprintln!("aftercalls: watchdog auto-stop failed: {e}");
+                }
+                return;
+            }
+        }
+    });
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -612,6 +656,8 @@ struct AppPrefs {
     auto_detect: bool,
     telemetry_enabled: bool,
     sounds_enabled: bool,
+    max_recording_minutes: u32,
+    manual_notes_enabled: bool,
 }
 
 #[tauri::command]
@@ -622,6 +668,8 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         auto_detect: cfg.auto_detect,
         telemetry_enabled: cfg.telemetry_enabled,
         sounds_enabled: cfg.sounds_enabled,
+        max_recording_minutes: cfg.max_recording_minutes,
+        manual_notes_enabled: cfg.manual_notes_enabled,
     })
 }
 
@@ -631,12 +679,21 @@ fn set_app_prefs(
     auto_detect: bool,
     telemetry_enabled: bool,
     sounds_enabled: bool,
+    max_recording_minutes: u32,
+    manual_notes_enabled: bool,
 ) -> Result<(), String> {
+    // Clamp to the same [5, 1440] range the Settings UI enforces so a
+    // hand-edited config.toml or a future caller can't pass an
+    // absurd value (0 would auto-stop immediately; u32::MAX would
+    // overflow the Duration arithmetic in the watchdog).
+    let max_recording_minutes = max_recording_minutes.clamp(5, 1440);
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
     cfg.telemetry_enabled = telemetry_enabled;
     cfg.sounds_enabled = sounds_enabled;
+    cfg.max_recording_minutes = max_recording_minutes;
+    cfg.manual_notes_enabled = manual_notes_enabled;
     cfg.save().map_err(|e| e.to_string())
 }
 
@@ -992,6 +1049,8 @@ pub fn run() {
             list_orphan_sessions,
             resume_orphan_session,
             discard_orphan_session,
+            notes::save_notes,
+            notes::load_notes,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent

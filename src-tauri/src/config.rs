@@ -43,10 +43,29 @@ pub struct Config {
     /// from tauri-plugin-notification are unaffected).
     #[serde(default = "default_true")]
     pub sounds_enabled: bool,
+    /// Hard upper bound on a single recording's length, in minutes.
+    /// When elapsed time crosses this threshold the recorder auto-
+    /// stops via the same path as manual Stop. Protects against a
+    /// softphone that holds the mic open long after a call ended and
+    /// prevents a runaway multi-gigabyte WAV. Default 120min (2h);
+    /// validated in the UI to [5, 1440].
+    #[serde(default = "default_max_recording_minutes")]
+    pub max_recording_minutes: u32,
+    /// When true, the record screen exposes a manual notes panel during
+    /// an active recording. Notes persist to the session_dir and ride
+    /// into create_call; the backend optionally feeds them into the
+    /// summarizer. Off by default — opt-in so the record screen stays
+    /// minimal for users who don't take notes.
+    #[serde(default)]
+    pub manual_notes_enabled: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_recording_minutes() -> u32 {
+    120
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -86,6 +105,8 @@ impl Config {
                 auto_detect: true,
                 telemetry_enabled: true,
                 sounds_enabled: true,
+                max_recording_minutes: default_max_recording_minutes(),
+                manual_notes_enabled: false,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

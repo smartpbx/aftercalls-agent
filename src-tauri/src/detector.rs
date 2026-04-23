@@ -25,6 +25,11 @@ const MIC_CONSUMER_BLACKLIST: &[&str] = &[
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the mic consumer must be gone before we prompt to end.
 const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(5);
+/// Safety net for a crashed / force-quit softphone (#74). If the
+/// consumer has been gone this long and the user hasn't answered the
+/// end-prompt, the recording is force-stopped via the same code path
+/// as manual Stop. Six consecutive polls at POLL_INTERVAL=5s.
+const CONSUMER_GONE_FORCE_STOP: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
 pub enum UserDecision {
@@ -55,7 +60,12 @@ enum Phase {
     Idle,
     AwaitingStartConfirm { consumer: String },
     Recording { consumer: String, gone_since: Option<Instant> },
-    AwaitingEndConfirm { consumer: String },
+    /// `gone_since` is inherited from Recording so the 30s force-stop
+    /// watchdog (#74) measures total consumer-absence, not just time
+    /// spent waiting on the user. Without this a user who walks away
+    /// from an end-prompt would keep the recorder running until they
+    /// returned.
+    AwaitingEndConfirm { consumer: String, gone_since: Instant },
     /// User explicitly said no to recording this consumer. Release when the
     /// consumer stops using the mic — they may come back for another call.
     Suppressed { consumer: String },
@@ -133,19 +143,35 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                     eprintln!("aftercalls: '{consumer}' stopped using mic — prompting to end");
                     emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
                     show_window(app);
-                    Phase::AwaitingEndConfirm { consumer }
+                    Phase::AwaitingEndConfirm { consumer, gone_since: since }
                 } else {
                     Phase::Recording { consumer, gone_since: Some(since) }
                 }
             }
         }
-        Phase::AwaitingEndConfirm { consumer } => {
+        Phase::AwaitingEndConfirm { consumer, gone_since } => {
             if consumers.contains(&consumer) {
                 // Consumer came back — user rejoined. Cancel the end prompt.
                 emit(app, AutoDetectEvent::Cleared);
                 Phase::Recording { consumer, gone_since: None }
+            } else if gone_since.elapsed() >= CONSUMER_GONE_FORCE_STOP {
+                // Safety net (#74): consumer has been dead for
+                // CONSUMER_GONE_FORCE_STOP and the user never answered
+                // the prompt. Force-stop via the same path as manual
+                // Stop so a crashed softphone can't pin the recorder
+                // open indefinitely.
+                eprintln!(
+                    "aftercalls: '{consumer}' gone for {}s and no user response — force-stopping",
+                    gone_since.elapsed().as_secs()
+                );
+                let state = app.state::<Recorder>();
+                if state.is_active() {
+                    let _ = crate::do_stop(&state, app);
+                }
+                emit(app, AutoDetectEvent::Cleared);
+                Phase::Idle
             } else {
-                Phase::AwaitingEndConfirm { consumer }
+                Phase::AwaitingEndConfirm { consumer, gone_since }
             }
         }
         Phase::Suppressed { consumer } => {
@@ -172,7 +198,7 @@ fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phas
             emit(app, AutoDetectEvent::Cleared);
             Phase::Suppressed { consumer }
         }
-        (Phase::AwaitingEndConfirm { consumer }, false) => {
+        (Phase::AwaitingEndConfirm { consumer, .. }, false) => {
             emit(app, AutoDetectEvent::Cleared);
             Phase::Suppressed { consumer }
         }
@@ -216,7 +242,7 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
             emit(app, AutoDetectEvent::Cleared);
             Phase::Idle
         }
-        (Phase::AwaitingEndConfirm { consumer }, UserDecision::KeepRecording) => {
+        (Phase::AwaitingEndConfirm { consumer, .. }, UserDecision::KeepRecording) => {
             emit(app, AutoDetectEvent::Cleared);
             Phase::Recording { consumer, gone_since: None }
         }

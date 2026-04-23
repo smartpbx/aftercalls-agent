@@ -18,6 +18,7 @@
     loadRecordingPrefs,
     playStartCueIfEnabled,
   } from "$lib/compliance";
+  import NotesPanel from "$lib/NotesPanel.svelte";
 
   // Platform string reported to the backend on recording-ack (#44).
   // Kept here (not Rust-side) because navigator UA is already in the
@@ -81,6 +82,37 @@
   let copiedNotice = $state(false);
   let copyingNotice = $state(false);
   let copyError = $state("");
+
+  // Manual notes panel (#73). Opt-in per user via Settings. When on,
+  // the record page shows a CodeMirror editor during an active
+  // recording; text is debounced-saved to notes.md in the session_dir
+  // via the save_notes Tauri command. The pipeline picks that up at
+  // create_call time so the backend gets the notes + include flag.
+  let manualNotesEnabled = $state(false);
+  let currentSessionId = $derived(
+    sessionDir ? sessionDir.split(/[\\/]/).filter(Boolean).pop() ?? "" : "",
+  );
+  let notesSaveTimer = 0;
+  let notesPending: { text: string; include: boolean } | null = null;
+  function scheduleNotesSave(text: string, include: boolean) {
+    if (!currentSessionId) return;
+    notesPending = { text, include };
+    clearTimeout(notesSaveTimer);
+    notesSaveTimer = window.setTimeout(async () => {
+      if (!notesPending || !currentSessionId) return;
+      const payload = notesPending;
+      notesPending = null;
+      try {
+        await invoke("save_notes", {
+          sessionId: currentSessionId,
+          notes: payload.text,
+          includeInSummary: payload.include,
+        });
+      } catch (e) {
+        console.warn("save_notes failed", e);
+      }
+    }, 500);
+  }
 
   async function openCallInBrowser() {
     if (!openableCallId) return;
@@ -167,6 +199,17 @@
     // Silently best-effort; any failure is deferred to click-time.
     loadRecordingPrefs();
 
+    // Load manual_notes_enabled so the record page knows whether to
+    // render the notes panel during active recording. Failures here
+    // default to `false` (panel hidden) which matches the pref's
+    // fresh-install default.
+    try {
+      const prefs = await invoke<{ manual_notes_enabled?: boolean }>("get_app_prefs");
+      manualNotesEnabled = !!prefs?.manual_notes_enabled;
+    } catch (e) {
+      console.warn("get_app_prefs failed", e);
+    }
+
     // "recording-state" only fires on transitions, so a remount
     // mid-recording (e.g. tray hide+show, route nav) wouldn't know
     // the truth. Ask the backend directly + rebuild the timer from
@@ -195,6 +238,19 @@
     unlistenState?.();
     unlistenAuto?.();
     clearInterval(timer);
+    // Flush any pending debounced notes save so a route-nav
+    // mid-type doesn't drop the last few keystrokes.
+    if (notesPending && currentSessionId) {
+      const payload = notesPending;
+      const sid = currentSessionId;
+      notesPending = null;
+      clearTimeout(notesSaveTimer);
+      invoke("save_notes", {
+        sessionId: sid,
+        notes: payload.text,
+        includeInSummary: payload.include,
+      }).catch((e) => console.warn("save_notes (flush) failed", e));
+    }
   });
 
   async function toggle() {
@@ -489,9 +545,22 @@
     {/if}
   </section>
 
+  <!-- Manual notes panel (#73). Opt-in via Settings; only visible
+       during an active recording so there's no empty editor on the
+       page when idle. Keyed on session_id so a new recording gets a
+       fresh editor state (the CodeMirror instance is destroyed + re-
+       created rather than carrying stale text between calls). -->
+  {#if manualNotesEnabled && recording && currentSessionId}
+    <section class="notes" style="--i: 3">
+      {#key currentSessionId}
+        <NotesPanel onChange={scheduleNotesSave} />
+      {/key}
+    </section>
+  {/if}
+
   <!-- Status lane — stacks so a pipeline still in flight is still
        visible while the user records the next call. -->
-  <section class="status" style="--i: 3">
+  <section class="status" style="--i: 4">
     {#if recording}
       <div class="row row-live">
         <span class="row-dot live"></span>
@@ -857,6 +926,11 @@
   }
   .btn.ghost {
     background: transparent;
+  }
+
+  /* ── Notes panel (#73) ─────────────────────────────────────────────── */
+  .notes {
+    display: block;
   }
 
   /* ── Status lane ───────────────────────────────────────────────────── */

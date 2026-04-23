@@ -263,6 +263,36 @@
   let peaks = $state<Float32Array | null>(null);
   let playing = $state(false);
   let rate = $state(1);
+  // Playback volume slider. Persisted in localStorage so a user who
+  // drops to 0.3 for one call doesn't get blasted on the next. Key is
+  // shared with the portal (same UX, same storage key) so volume
+  // survives between the two clients if a user switches mid-session.
+  const VOLUME_KEY = "aftercalls.playbackVolume";
+  function readStoredVolume(): number {
+    try {
+      const raw = localStorage.getItem(VOLUME_KEY);
+      if (raw === null) return 1;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return 1;
+      return Math.min(1, Math.max(0, n));
+    } catch {
+      return 1;
+    }
+  }
+  let volume = $state(readStoredVolume());
+  function onVolumeChange(e: Event) {
+    const v = Number((e.currentTarget as HTMLInputElement).value);
+    volume = Math.min(1, Math.max(0, Number.isFinite(v) ? v : 1));
+    if (audioEl) audioEl.volume = volume;
+    try {
+      localStorage.setItem(VOLUME_KEY, String(volume));
+    } catch {}
+  }
+  // Apply volume whenever the audio element (re)mounts so a fresh nav
+  // or src swap picks up the stored preference immediately.
+  $effect(() => {
+    if (audioEl) audioEl.volume = volume;
+  });
   let deleting = $state(false);
   let copiedLabel = $state("");
   let editingIdx = $state<number | null>(null);
@@ -1214,6 +1244,30 @@
           </button>
         </div>
 
+        <div class="volume" title="Playback volume">
+          <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+            {#if volume === 0}
+              <path d="M3 7 h3 L10 4 v12 L6 13 H3 Z" fill="currentColor" />
+              <path d="M13 7 L17 11 M17 7 L13 11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/>
+            {:else if volume < 0.5}
+              <path d="M3 7 h3 L10 4 v12 L6 13 H3 Z" fill="currentColor" />
+              <path d="M13 8 Q14.5 10 13 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/>
+            {:else}
+              <path d="M3 7 h3 L10 4 v12 L6 13 H3 Z" fill="currentColor" />
+              <path d="M13 8 Q14.5 10 13 12 M15 6 Q17.5 10 15 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/>
+            {/if}
+          </svg>
+          <input
+            type="range"
+            class="volume-range"
+            min="0"
+            max="1"
+            step="0.01"
+            value={volume}
+            oninput={onVolumeChange}
+            aria-label="Playback volume"
+          />
+        </div>
         <button class="rate" onclick={cycleRate} aria-label="Playback rate">
           {rate}×
         </button>
@@ -1952,7 +2006,6 @@
   }
 
   .rate {
-    margin-left: auto;
     padding: 0.35rem 0.75rem;
     font-family: var(--font-mono);
     font-size: 0.78rem;
@@ -1965,6 +2018,45 @@
   .rate:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+
+  .volume {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.6rem;
+    color: var(--bone-2);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-2);
+  }
+  .volume-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 84px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--hairline-hi);
+    cursor: pointer;
+  }
+  .volume-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--ink-1);
+    cursor: pointer;
+  }
+  .volume-range::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--ink-1);
+    cursor: pointer;
   }
 
   audio {

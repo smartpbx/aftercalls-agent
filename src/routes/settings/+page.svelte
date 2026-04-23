@@ -44,6 +44,15 @@
   let autoDetect = $state(true);
   let telemetryEnabled = $state(true);
   let soundsEnabled = $state(true);
+  // Hard recording-length ceiling (#75). Default 120 min; Rust clamps
+  // to [5, 1440] on save. Kept as a plain number so the <input> binds
+  // cleanly; we coerce to integer inside saveAppPrefs before sending.
+  let maxRecordingMinutes = $state(120);
+  // Manual notes panel (#73). When on, the record screen shows a
+  // CodeMirror editor during active recording; notes ride into
+  // create_call and optionally feed into the summary. Off by default
+  // so the record screen stays minimal for non-note-takers.
+  let manualNotesEnabled = $state(false);
   let prefsSavedAt = $state(0);
 
   async function loadAppPrefs() {
@@ -53,11 +62,15 @@
         auto_detect: boolean;
         telemetry_enabled: boolean;
         sounds_enabled: boolean;
+        max_recording_minutes: number;
+        manual_notes_enabled: boolean;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
       telemetryEnabled = p.telemetry_enabled;
       soundsEnabled = p.sounds_enabled;
+      maxRecordingMinutes = p.max_recording_minutes ?? 120;
+      manualNotesEnabled = p.manual_notes_enabled ?? false;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -65,11 +78,20 @@
 
   async function saveAppPrefs() {
     try {
+      // Round + clamp on the JS side so a partially-typed value (e.g.
+      // empty input while the user is mid-edit) can't ship 0 to Rust
+      // and trigger an immediate auto-stop on the next recording.
+      const mins = Math.min(
+        1440,
+        Math.max(5, Math.round(Number(maxRecordingMinutes) || 120)),
+      );
       await invoke("set_app_prefs", {
         closeToTray,
         autoDetect,
         telemetryEnabled,
         soundsEnabled,
+        maxRecordingMinutes: mins,
+        manualNotesEnabled,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
@@ -299,6 +321,53 @@
         <span class="switch-label">
           {autoDetect ? "On" : "Off"}
         </span>
+      </label>
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Max recording length (minutes)</span>
+        <span class="pref-hint">
+          Hard ceiling on a single recording. If a softphone holds the
+          mic open long after a call ends, the agent auto-stops at this
+          limit so you don't end up with a runaway multi-hour file.
+          Minimum 5, maximum 1440 (24 hours). Default 120.
+        </span>
+      </div>
+      <input
+        class="input num-input"
+        type="number"
+        min="5"
+        max="1440"
+        step="5"
+        bind:value={maxRecordingMinutes}
+        onchange={saveAppPrefs}
+      />
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Manual notes panel</span>
+        <span class="pref-hint">
+          Shows a notes editor on the record screen during an active
+          recording. Notes are saved with the call and can optionally
+          be fed into the AI summary as primary context. Edit after
+          the fact on the call detail page.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={manualNotesEnabled}
+          onchange={(e) => {
+            manualNotesEnabled = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">{manualNotesEnabled ? "On" : "Off"}</span>
       </label>
     </div>
 
@@ -596,6 +665,14 @@
   .input:focus {
     outline: none;
     border-color: var(--accent);
+  }
+  /* Narrow slot for the minutes input — matches the .switch control
+     width so the Behavior section's right column stays visually
+     aligned across rows. */
+  .num-input {
+    width: 7rem;
+    flex-shrink: 0;
+    text-align: right;
   }
   .hint.small code {
     font-family: var(--font-mono);

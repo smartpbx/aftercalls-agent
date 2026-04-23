@@ -1,37 +1,52 @@
 # aftercalls — desktop agent
 
-Public source mirror for the aftercalls desktop agent (Tauri 2 +
-SvelteKit). Runs on Linux and Windows.
+Tauri 2 + SvelteKit app that records a call on the user's machine,
+uploads the per-channel tracks to the backend, and surfaces the
+transcript + summary + action items the moment they land.
 
-Releases ship via this repo's CI (`.github/workflows/release.yml`).
-The private backend, web portal, and site live at
-[smartpbx/aftercalls](https://github.com/smartpbx/aftercalls) and are
-not public.
+This directory is mirrored to the public repo at
+[smartpbx/aftercalls-agent](https://github.com/smartpbx/aftercalls-agent)
+for signed-release CI. Do not tag `v*` on this private repo —
+releases are cut from the public mirror. See `memory/release_flow.md`
+in the Claude session memory (or ask the maintainer) for the copy
+procedure.
 
-End users who just want to install the app should go to
-[app.aftercalls.io/downloads](https://app.aftercalls.io/downloads).
+## Run locally
 
-## Build
-
-Requires Rust stable, Node 20, pnpm 10, and the platform's Tauri
-prerequisites ([docs](https://tauri.app/start/prerequisites/)).
-
-```
+```bash
 pnpm install
-pnpm tauri build
+pnpm tauri:dev
 ```
+
+The `tauri:dev` script sets `AFTERCALLS_PROFILE=dev`, so the agent
+writes config to `~/.config/aftercalls-dev/` — isolated from an
+installed production-profile copy on the same machine.
+
+Linux: requires `libwebkit2gtk-4.1` and `libgtk-3` on the host. On
+Arch: `pacman -S webkit2gtk-4.1 gtk3`. On Debian/Ubuntu:
+`apt install libwebkit2gtk-4.1-0 libgtk-3-0`.
 
 ## ffmpeg sidecar
 
-The agent shells out to an ffmpeg sidecar, bundled as an
-`externalBin` under the name `ffmpeg-aftercalls`. The sidecar is not
-checked into this repo — it is downloaded in CI per `release.yml`
-from the upstream LGPL builds (John Van Sickle for Linux, gyan.dev
-for Windows) and bundled into the installer. See
-[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for sourcing +
-LGPL corresponding-source pointers.
+A self-contained ffmpeg binary is downloaded per-platform by CI and
+bundled as a Tauri externalBin under the name `ffmpeg-aftercalls`.
+For local dev, `pnpm tauri:dev` will fail at build time unless you
+stage a placeholder at `src-tauri/binaries/ffmpeg-aftercalls-<triple>`.
+The easiest stub is a symlink to your system `ffmpeg`:
 
-## License
+```bash
+ln -s "$(which ffmpeg)" \
+  src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
+```
 
-See [`LICENSE`](./LICENSE) and
-[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+The binary is gitignored (see `src-tauri/.gitignore`) so your
+personal stub never ends up in a commit. CI downloads the real
+LGPL-only build from John Van Sickle (Linux) or gyan.dev (Windows)
+before `tauri-action` runs — see the release workflow in the public
+mirror.
+
+## Licensing
+
+Proprietary — see the top-level `LICENSE`. ffmpeg and other bundled
+third-party components retain their own licenses; see
+`THIRD_PARTY_NOTICES.md` at the repo root.
