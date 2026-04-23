@@ -1,4 +1,11 @@
 {
+  "0.3.30": {
+    "headline": "Launch aftercalls with your computer; every speaker gets an avatar",
+    "changes": [
+      "Launch at sign-in. New toggle at the top of Settings → Behavior — flip it on and aftercalls starts automatically when you sign in to your computer (Linux and Windows). Off by default; your choice sticks across updates and auto-reflects the real OS state each time you open Settings.",
+      "Participant initials in the transcript and the rail footer. Every speaker row now leads with a small circular initial in the same order-based palette the transcript colours already use, so you can scan long calls without re-reading names. Your own chip in the bottom-left uses the brand accent."
+    ]
+  },
   "0.3.28": {
     "headline": "WYSIWYG notes editor, team-aware calls list, edit notes after the call, cleaner start cue",
     "changes": [

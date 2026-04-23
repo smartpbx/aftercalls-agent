@@ -55,6 +55,58 @@
   let manualNotesEnabled = $state(false);
   let prefsSavedAt = $state(0);
 
+  // ── Launch-at-sign-in (#4) ─────────────────────────────────────────
+  // OS-sourced (Linux: ~/.config/autostart/*.desktop, Windows:
+  // HKCU\...\Run). Deliberately NOT persisted in config.toml — we read
+  // fresh on every Settings mount so a hand-removed .desktop file shows
+  // up as OFF immediately. `autostartLoading` gates the switch into a
+  // disabled state until the first get_autostart resolves (typically
+  // sub-100ms). `autostartSavedAt` drives a row-local saved pip,
+  // separate from the card-head `prefsSavedAt` because autostart is
+  // out-of-band from `AppPrefs` and shouldn't imply the whole card
+  // saved. `autostartError` populates the row's .error-inline on
+  // failure and clears on the next successful toggle or mount.
+  let autostart = $state(false);
+  let autostartLoading = $state(true);
+  let autostartSavedAt = $state(0);
+  let autostartError = $state("");
+  let autostartSavedRecently = $derived(
+    autostartSavedAt > 0 && Date.now() - autostartSavedAt < 2000,
+  );
+
+  async function loadAutostart() {
+    autostartLoading = true;
+    autostartError = "";
+    try {
+      autostart = await invoke<boolean>("get_autostart");
+    } catch (e) {
+      // A read failure is rare and usually means the plugin couldn't
+      // talk to the OS (permission, missing ~/.config on a fresh
+      // account). Show the error inline; the switch stays at its
+      // default (off) so the user can still try to flip it on.
+      autostartError = "Couldn't update launch setting. Try again.";
+      console.warn("get_autostart failed", e);
+    } finally {
+      autostartLoading = false;
+    }
+  }
+
+  async function toggleAutostart(next: boolean) {
+    // Optimistic flip. Roll back on error so the UI never shows a
+    // state that diverges from disk.
+    const prev = autostart;
+    autostart = next;
+    autostartError = "";
+    try {
+      await invoke("set_autostart", { enabled: next });
+      autostartSavedAt = Date.now();
+    } catch (e) {
+      autostart = prev;
+      autostartError = "Couldn't update launch setting. Try again.";
+      console.warn("set_autostart failed", e);
+    }
+  }
+
   async function loadAppPrefs() {
     try {
       const p = await invoke<{
@@ -138,6 +190,7 @@
     }
 
     await loadAppPrefs();
+    await loadAutostart();
   });
 
   async function pickVaultDir() {
@@ -269,6 +322,43 @@
       </div>
       {#if prefsSavedRecently}<span class="saved">Saved</span>{/if}
     </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Launch at sign-in</span>
+        <span class="pref-hint" id="autostart-hint">
+          {autostart
+            ? "Starts aftercalls automatically when you sign in to your computer, so it's ready in the tray without a manual launch."
+            : "aftercalls won't start automatically — you'll launch it yourself after signing in."}
+        </span>
+      </div>
+      <div class="autostart-control">
+        <label
+          class="switch"
+          aria-busy={autostartLoading ? "true" : undefined}
+        >
+          <input
+            type="checkbox"
+            checked={autostart}
+            disabled={autostartLoading}
+            aria-describedby="autostart-hint"
+            onchange={(e) => {
+              toggleAutostart((e.currentTarget as HTMLInputElement).checked);
+            }}
+          />
+          <span class="track" aria-hidden="true">
+            <span class="knob"></span>
+          </span>
+          <span class="switch-label">
+            {autostartLoading ? "…" : autostart ? "On" : "Off"}
+          </span>
+        </label>
+        {#if autostartSavedRecently}<span class="saved autostart-saved">Saved</span>{/if}
+      </div>
+    </div>
+    {#if autostartError}
+      <p class="error-inline autostart-error" role="alert">{autostartError}</p>
+    {/if}
 
     <div class="pref-row">
       <div class="pref-label">
@@ -730,6 +820,25 @@
   .error-inline {
     color: var(--live);
     font-size: 0.82rem;
+  }
+
+  /* Autostart row: inline saved-pip next to the switch (row-local, not
+     card-head — see .claude/plans/issue-4/decisions.md Q1). Error
+     slides under the row on a new line so the row layout itself stays
+     stable when it appears. */
+  .autostart-control {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    flex-shrink: 0;
+  }
+  .autostart-saved {
+    /* Keeps the pip out of the switch's fixed-width label slot so the
+       knob doesn't shift when "Saved" appears. */
+    white-space: nowrap;
+  }
+  .autostart-error {
+    margin: 0.25rem 0 0.5rem;
   }
 
   .sub {

@@ -412,3 +412,34 @@ select {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+/* ── Avatar (initials, #5) ─────────────────────────────────────────
+ * CSS-only identity glyph. Used in the rail-foot (size 28,
+ * var(--accent) fill) and transcript speaker rows (size 20, fill
+ * passed in via speakerColor()). The component is markup-only and
+ * reads --avatar-c / --avatar-s from inline style.
+ *
+ * Color seeding rule: accept a color prop; don't hash names. See
+ * commit 68ef616 for the collision the order-based palette retired.
+ * design.md §Pattern library "Avatar (initials)".
+ */
+.avatar {
+  --avatar-c: var(--accent);
+  --avatar-s: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--avatar-s);
+  height: var(--avatar-s);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--avatar-c) 22%, transparent);
+  color: var(--avatar-c);
+  border: 1px solid color-mix(in srgb, var(--avatar-c) 40%, transparent);
+  font-size: calc(var(--avatar-s) * 0.42);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  flex-shrink: 0;
+  user-select: none;
+  font-family: var(--font-sans);
+}

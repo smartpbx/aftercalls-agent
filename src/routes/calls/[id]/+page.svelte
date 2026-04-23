@@ -6,6 +6,7 @@
   import { onMount, onDestroy } from "svelte";
   import Waveform from "$lib/Waveform.svelte";
   import NotesPanel from "$lib/NotesPanel.svelte";
+  import Avatar from "$lib/Avatar.svelte";
 
   type Utterance = {
     idx: number;
@@ -1723,7 +1724,7 @@
                   startEdit(u);
                 }}
               >
-                <span class="utt-speaker-dot"></span>
+                <Avatar name={u.speaker} color={speakerColor(u.speaker)} size={20} />
                 {u.speaker}
               </button>
               <span class="utt-text">{u.text}</span>
@@ -2591,14 +2592,6 @@
 
   .utt-speaker:hover {
     background: var(--ink-2);
-  }
-
-  .utt-speaker-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--c);
-    flex-shrink: 0;
   }
 
   .utt-text {

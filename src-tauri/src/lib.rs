@@ -19,6 +19,7 @@ use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // Holds references to tray menu items we need to mutate (toggle label) so we
@@ -707,6 +708,31 @@ fn set_app_prefs(
     cfg.save().map_err(|e| e.to_string())
 }
 
+// ── Launch-at-sign-in (#4) ───────────────────────────────────────────
+//
+// Thin wrappers over tauri-plugin-autostart so the Svelte layer can stay
+// on the same `invoke()` bus it already uses for every other pref. The
+// OS is the source of truth (Linux: ~/.config/autostart/*.desktop,
+// Windows: HKCU\...\Run) — we deliberately do NOT persist this in
+// config.toml. Settings reads it fresh on every mount.
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())
+    } else {
+        mgr.disable().map_err(|e| e.to_string())
+    }
+}
+
 /// Stream an audio URL to a user-chosen file path. Exists because
 /// `fetch()` from the Tauri webview (`tauri://localhost`) to Spaces
 /// is blocked by CORS — Spaces doesn't ack the origin. Native
@@ -1029,6 +1055,14 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
+        // Launch-at-sign-in (#4). MacosLauncher::LaunchAgent is inert on
+        // Linux/Windows so it's safe to include now; when we ship macOS
+        // it's the variant we want. Passing None for args: the plugin
+        // defaults to the current exe with no extra flags, which lands
+        // us straight in the tray via the existing single-instance +
+        // close-to-tray behavior — no silent-start flag needed.
+        .plugin(tauri_plugin_autostart::Builder::new()
+            .build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -1039,6 +1073,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(Recorder::new())
         .invoke_handler(tauri::generate_handler![
+            get_autostart,
+            set_autostart,
             start_recording,
             stop_recording,
             is_recording,

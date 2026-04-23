@@ -11,6 +11,7 @@
   import { onDestroy, onMount } from "svelte";
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
+  import Avatar from "$lib/Avatar.svelte";
   import "../app.css";
 
   let { children } = $props();
@@ -874,6 +875,9 @@
           aria-expanded={userMenuOpen}
           onclick={toggleUserMenu}
         >
+          <span class="who-avatar">
+            <Avatar name={me.display_name} size={28} />
+          </span>
           <span class="who-name">{me.display_name}</span>
           <span class="who-org">{me.org_display_name}</span>
           <span class="who-chevron" aria-hidden="true">
@@ -1361,10 +1365,10 @@
 
   .who-btn {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: auto 1fr auto;
     grid-template-rows: auto auto;
     align-items: center;
-    gap: 0.1rem 0.4rem;
+    gap: 0.1rem 0.55rem;
     padding: 0.4rem 0.55rem;
     background: transparent;
     border: 1px solid transparent;
@@ -1380,30 +1384,42 @@
     background: var(--ink-2);
     border-color: var(--hairline);
   }
+  .who-btn .who-avatar {
+    grid-row: 1 / span 2;
+    grid-column: 1;
+    align-self: center;
+    display: inline-flex;
+  }
   .who-btn .who-chevron {
     grid-row: 1 / span 2;
-    grid-column: 2;
+    grid-column: 3;
     align-self: center;
     color: var(--bone-4);
     font-size: 0.72rem;
   }
 
   .who-name {
+    grid-column: 2;
+    grid-row: 1;
     font-size: 0.82rem;
     color: var(--bone-1);
     font-weight: 500;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
   }
 
   .who-org {
+    grid-column: 2;
+    grid-row: 2;
     font-size: 0.7rem;
     color: var(--bone-3);
     letter-spacing: 0.02em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
   }
 
   /* ── User menu dropdown ──────────────────────────────────────────
