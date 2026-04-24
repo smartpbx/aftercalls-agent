@@ -1,4 +1,12 @@
 {
+  "0.4.3": {
+    "headline": "Action items filter fixed, waveform loads reliably mid-processing, better screen-reader support",
+    "changes": [
+      "The Open / Done / All filter on the Action items page now actually switches — the active pill updates and the counts next to each filter stay accurate across toggles.",
+      "The waveform on a call opened mid-processing now loads automatically as soon as the audio is ready. Previously you had to exit and reopen the call to see it.",
+      "Screen readers now announce when you start editing an action item and when it saves."
+    ]
+  },
   "0.4.2": {
     "headline": "Click-to-edit action items — tap to edit, tap the owner chip to reassign; Windows drag fix",
     "changes": [

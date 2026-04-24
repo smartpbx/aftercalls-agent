@@ -46,6 +46,8 @@
     items: MeActionItem[];
     next_cursor: string | null;
     total_open: number;
+    total_done: number;
+    total_all: number;
   };
 
   // Per-filter row counts used to label the segmented control.
@@ -406,6 +408,7 @@
           users={orgMembers}
           callId={item.call_id}
           index={i}
+          totalInList={items.length}
           variant="actions-page"
           callContext={{
             id: item.call_id,

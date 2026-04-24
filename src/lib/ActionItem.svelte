@@ -134,6 +134,12 @@
     users?: ActionItemUser[];
     callId: string;
     index: number;
+    // #113: total rows in the list this row belongs to. Used by the
+    // row-scoped aria-live announcer ("Editing action item 3 of 7").
+    // Optional; defaults to 0 and the announcer falls back to a
+    // plain "Editing action item 3" phrasing if the parent hasn't
+    // wired it yet.
+    totalInList?: number;
     variant?: "call-detail" | "actions-page";
     callContext?: ActionItemCallContext;
     colorFor?: (name: string) => string;
@@ -171,18 +177,6 @@
     deleting?: boolean;
     deleteError?: string;
 
-    // Legacy intent-trigger events (kept for callers that haven't
-    // migrated; #126 routes description/owner edits through the new
-    // granular events below). onsave / oncancel are unused now but
-    // kept in the type to avoid breaking older call-sites during
-    // bisect windows.
-    onedit?: (payload: {
-      item: ActionItem;
-      intent?: "description" | "owner";
-    }) => void;
-    onsave?: (payload: ActionItemEditSave) => void;
-    oncancel?: () => void;
-
     // #126 (v0.4.2): granular save / cancel / request callbacks.
     // The component fires these; the parent owns PATCH / POST and
     // updates `editingDescription` / `editingOwner` / `pending` in
@@ -217,6 +211,7 @@
     users = [],
     callId: _callId,
     index,
+    totalInList = 0,
     variant = "call-detail",
     callContext,
     colorFor,
@@ -229,9 +224,6 @@
     confirmingDelete = false,
     deleting = false,
     deleteError = "",
-    onedit: _legacyOnEdit,
-    onsave: _legacyOnSave,
-    oncancel: _legacyOnCancel,
     onDescriptionEditRequest,
     onOwnerEditRequest,
     onDescriptionSave,
@@ -295,6 +287,41 @@
     const nextStatus: "open" | "done" = el.checked ? "done" : "open";
     ontoggle({ item, nextStatus });
   }
+
+  // #113 — aria-live announcement for screen-reader users. The row
+  // enters edit mode via click-to-edit (no pencil button, no visible
+  // heading change) so a scoped live region narrates the transition
+  // into and out of edit mode. Silent on mount (first-render `""`);
+  // silent on Escape-cancel (first effect clears so a re-enter re-
+  // announces). The second effect watches `saving` for a true→false
+  // transition and, when the error channel is clean, announces "…
+  // updated". Cancels don't flip `saving`, so they fall through to
+  // the silent-clear path.
+  let announceText = $state("");
+  let wasSaving = $state(false);
+
+  $effect(() => {
+    if (editingDescription || editingOwner) {
+      const n = Math.max(index + 1, 1);
+      announceText =
+        totalInList > 0
+          ? `Editing action item ${n} of ${totalInList}`
+          : `Editing action item ${n}`;
+    } else if (!wasSaving) {
+      announceText = "";
+    }
+  });
+
+  $effect(() => {
+    if (saving) {
+      wasSaving = true;
+    } else if (wasSaving) {
+      wasSaving = false;
+      if (!editError) {
+        announceText = `Action item ${index + 1} updated`;
+      }
+    }
+  });
 
   // Resolve the assignee FK against the loaded roster. If the FK is
   // set but the user isn't in `users` (stale roster, cross-org leak
@@ -641,6 +668,13 @@
   class:ai-saving={saving}
   class:ai-actions-page={variant === "actions-page"}
 >
+  <!-- #113: scoped aria-live announcer. Narrates click-to-edit
+       transitions (silent on mount + on Escape-cancel). CSS is
+       component-scoped — `.ai-sr-announce` does not exist in
+       app.css (mirror-pair invariant). -->
+  <div class="ai-sr-announce" aria-live="polite" aria-atomic="true">
+    {announceText}
+  </div>
   <input
     type="checkbox"
     class="ai-check"
@@ -957,6 +991,22 @@
 </li>
 
 <style>
+  /* #113 — visually-hidden aria-live region. Clip-pattern mirrors
+     ActionsList.svelte's `.actions-sr-count` so the two announcers
+     use the same SR posture. Scoped to this component; app.css is
+     intentionally untouched (mirror-pair invariant). */
+  .ai-sr-announce {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   /* Row shape. Grid for columns (checkbox / idx / body / actions).
      Body is a flex row so the optional assignee chip can sit inline
      on wide viewports and wrap beneath on narrow ones without a

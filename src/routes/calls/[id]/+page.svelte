@@ -222,15 +222,12 @@
     return true;
   });
 
-  // Phase 2 (#19): summary-body + action-item editing gate. Same
-  // ownership model as the portal — owner / admin edits. Derived
-  // separately so a future admin-share feature doesn't have to
-  // rewrite the gate in two places.
-  let canEditSummary = $derived.by(() => {
-    if (!me) return false;
-    if (me.role === "admin" || me.role === "superadmin") return true;
-    return true;
-  });
+  // Phase 2 (#19): summary-body + action-item editing gate. #114 —
+  // the backend is the authority (cross-org 403 + permission gates
+  // on every PATCH); the frontend gate is cosmetic. Kept as a named
+  // binding so a future admin-share feature can re-introduce
+  // per-role branching without touching every callsite.
+  const canEditSummary = true;
 
   // ── Phase 2 (#19): regenerate + edit-in-place state ─────────────
   let regenConfirmOpen = $state(false);
@@ -896,6 +893,12 @@
   // instead of silently pretending the call has no audio.
   let audioUrlsError = $state(false);
   let peaks = $state<Float32Array | null>(null);
+  // Guards the auto-retry $effect below that watches peaks_available.
+  // Without this a burst of audioUrls updates (e.g. poll ticks after
+  // terminal) could fire concurrent get_peaks calls. Cleared in a
+  // finally so subsequent peaks_available transitions can still retry
+  // if the first fetch failed.
+  let peaksFetchInFlight = $state(false);
   let playing = $state(false);
   let rate = $state(1);
   // Playback volume slider. Persisted in localStorage so a user who
@@ -927,6 +930,39 @@
   // or src swap picks up the stored preference immediately.
   $effect(() => {
     if (audioEl) audioEl.volume = volume;
+  });
+
+  // Auto-retry peaks fetch when peaks_available flips false → true.
+  // The onMount fetch is one-shot and gated on audioUrls.peaks_available;
+  // if a user opens the call detail before processing finishes the flag
+  // is false and the fetch is skipped. Polling later refreshes audioUrls
+  // once the call reaches a terminal state, and this effect picks that
+  // up and pulls peaks without requiring the user to bounce the page.
+  // Gated on !peaks and !peaksFetchInFlight so unrelated audioUrls
+  // updates don't retrigger the fetch. Fixes #136.
+  $effect(() => {
+    if (!audioUrls?.peaks_available) return;
+    if (peaks && peaks.length > 0) return;
+    if (peaksFetchInFlight) return;
+
+    peaksFetchInFlight = true;
+    void (async () => {
+      try {
+        const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+          id: page.params.id,
+        });
+        if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
+          peaks = new Float32Array(doc.peaks);
+        }
+        trace("get_peaks ok (auto-retry on peaks_available transition)", {
+          bytes: doc.peaks?.length ?? 0,
+        });
+      } catch (e) {
+        trace("get_peaks FAILED (auto-retry)", e);
+      } finally {
+        peaksFetchInFlight = false;
+      }
+    })();
   });
   let deleting = $state(false);
   let copiedLabel = $state("");
@@ -1135,6 +1171,22 @@
         if (TERMINAL_STATES.has(fresh.status)) {
           clearInterval(pollTimer);
           pollTimer = undefined;
+          // Peaks are generated as part of processing, so peaks_available
+          // flips true around the same time status goes terminal. Refresh
+          // the audio-urls doc here — the $effect below watches
+          // audioUrls.peaks_available and will auto-fetch peaks the moment
+          // this assignment lands. Fixes #136 (waveform stays empty when
+          // the call detail was opened pre-processing).
+          try {
+            const fresh_urls = await invoke<typeof audioUrls>(
+              "get_audio_urls",
+              { id: page.params.id },
+            );
+            audioUrls = fresh_urls;
+            trace("get_audio_urls ok (post-terminal refresh)", audioUrls);
+          } catch (e) {
+            trace("get_audio_urls FAILED (post-terminal refresh)", e);
+          }
         }
       } catch (e) {
         // Swallow — we'll try again next tick. Terminal errors
@@ -2498,6 +2550,7 @@
                 users={memberRoster}
                 callId={call.id}
                 index={i}
+                totalInList={call.action_items.length}
                 colorFor={speakerColor}
                 canEdit={canEditSummary}
                 editingDescription={activeRowEdit.kind === "description" &&
@@ -2589,6 +2642,7 @@
                 users={memberRoster}
                 callId={call.id}
                 index={i}
+                totalInList={call.action_items.length}
                 colorFor={speakerColor}
                 canEdit={canEditSummary}
                 editingDescription={activeRowEdit.kind === "description" &&

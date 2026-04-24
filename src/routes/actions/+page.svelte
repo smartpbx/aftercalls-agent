@@ -20,6 +20,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { page } from "$app/state";
+  import { replaceState } from "$app/navigation";
   import ActionsList, {
     type MeActionItem,
     type ActionsStatusFilter,
@@ -45,7 +46,12 @@
   let status = $state<ActionsStatusFilter>("open");
   let items = $state<MeActionItem[]>([]);
   let nextCursor = $state<string | null>(null);
+  // #130b — three filter-stable counts sourced from the backend
+  // envelope on every `loadFirst`. `loadMore` keeps them as-is
+  // (paging doesn't change the unfiltered totals).
   let totalOpen = $state(0);
+  let totalDone = $state(0);
+  let totalAll = $state(0);
   let loading = $state(true);
   let loadingMore = $state(false);
   let error = $state<string | null>(null);
@@ -70,7 +76,11 @@
     } else {
       u.searchParams.set("status", next);
     }
-    window.history.replaceState(window.history.state, "", u.toString());
+    // #130a — use SvelteKit's `replaceState` so `page.url` reacts
+    // and the `$effect` below re-evaluates the class:active binding.
+    // A raw `window.history.replaceState` leaves SvelteKit's URL
+    // store stale, which is why the active pill used to stick.
+    replaceState(u.pathname + u.search, page.state);
   }
 
   async function loadFirst() {
@@ -85,6 +95,8 @@
       items = resp.items;
       nextCursor = resp.next_cursor;
       totalOpen = resp.total_open;
+      totalDone = resp.total_done;
+      totalAll = resp.total_all;
     } catch (e: any) {
       error = String(e?.message ?? e);
     } finally {
@@ -166,6 +178,12 @@
     togglingIds = new Set([...togglingIds, ev.itemId]);
 
     const prevItems = items;
+    // #130b — snapshot the two counts that move on a status flip so
+    // rollback can restore them together with `items`. `totalAll`
+    // stays stable on a status flip (no row is added or removed from
+    // the backlog).
+    const prevTotalOpen = totalOpen;
+    const prevTotalDone = totalDone;
     const patchedAt = new Date().toISOString();
     const nextItems = prevItems.map((it) => {
       if (it.id !== ev.itemId) return it;
@@ -180,6 +198,15 @@
         ? nextItems
         : nextItems.filter((it) => it.status === status);
     items = filteredItems;
+    // Optimistic badge update. Paired with the rollback below so a
+    // failed invoke snaps the pills back to their pre-click values.
+    if (ev.nextStatus === "done") {
+      totalOpen = Math.max(0, totalOpen - 1);
+      totalDone = totalDone + 1;
+    } else {
+      totalOpen = totalOpen + 1;
+      totalDone = Math.max(0, totalDone - 1);
+    }
 
     try {
       await invoke("patch_action_item", {
@@ -187,13 +214,10 @@
         itemId: ev.itemId,
         body: { status: ev.nextStatus },
       });
-      if (ev.nextStatus === "done") {
-        totalOpen = Math.max(0, totalOpen - 1);
-      } else {
-        totalOpen = totalOpen + 1;
-      }
     } catch (e: any) {
       items = prevItems;
+      totalOpen = prevTotalOpen;
+      totalDone = prevTotalDone;
       setTransient("Couldn't save. Try again.");
     } finally {
       togglingIds = new Set(
@@ -202,28 +226,14 @@
     }
   }
 
-  const totals = $derived.by(() => {
-    if (status === "open") {
-      return {
-        open: totalOpen,
-        done: items.filter((it) => it.status === "done").length,
-        all: totalOpen,
-      };
-    }
-    if (status === "done") {
-      return {
-        open: totalOpen,
-        done: items.length,
-        all: totalOpen + items.length,
-      };
-    }
-    const openCount = items.filter((it) => it.status === "open").length;
-    const doneCount = items.filter((it) => it.status === "done").length;
-    return {
-      open: totalOpen || openCount,
-      done: doneCount,
-      all: items.length,
-    };
+  // #130b — segmented-control counts. All three come straight from
+  // the backend envelope (one FILTER-aggregate scan), so the pills
+  // show distinct stable values on every filter and the counts
+  // don't drift with the visible page slice.
+  const totals = $derived({
+    open: totalOpen,
+    done: totalDone,
+    all: totalAll,
   });
 
   $effect(() => {
