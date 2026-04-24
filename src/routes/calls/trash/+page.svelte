@@ -3,6 +3,7 @@
   import { onMount } from "svelte";
   import { replaceState, afterNavigate } from "$app/navigation";
   import { page } from "$app/state";
+  import DateInput from "$lib/DateInput.svelte";
 
   // Mirrors the portal's trash view. Deleted calls live here for
   // 30 days before the backend's nightly purge drops them for good.
@@ -169,26 +170,36 @@
     <a class="back" href="/calls">← Back to Calls</a>
   </header>
 
-  <!-- #163 · Date range. Mirror of /calls on the agent. -->
+  <!-- #163 · Date range. Mirror of /calls on the agent. #189 swapped
+       the native <input type="date"> for DateInput because webkit2gtk
+       paints today as the placeholder AND doesn't dismiss on outside-
+       click. DateInput emits the same YYYY-MM-DD shape so URL sync +
+       debounce are unchanged. -->
   <div class="date-bar">
     <label class="date-label">
       <span class="date-label-text">From</span>
-      <input
-        class="date-input"
-        type="date"
-        bind:value={fromDate}
-        onchange={onDateChange}
-        aria-describedby="date-hint"
+      <DateInput
+        value={fromDate}
+        onchange={(v) => {
+          fromDate = v;
+          onDateChange();
+        }}
+        max={toDate}
+        ariaLabel="From"
+        ariaDescribedby="date-hint"
       />
     </label>
     <label class="date-label">
       <span class="date-label-text">To</span>
-      <input
-        class="date-input"
-        type="date"
-        bind:value={toDate}
-        onchange={onDateChange}
-        aria-describedby="date-hint"
+      <DateInput
+        value={toDate}
+        onchange={(v) => {
+          toDate = v;
+          onDateChange();
+        }}
+        min={fromDate}
+        ariaLabel="To"
+        ariaDescribedby="date-hint"
       />
     </label>
     {#if fromDate || toDate}
@@ -416,20 +427,8 @@
   .date-label-text {
     letter-spacing: 0.02em;
   }
-  .date-input {
-    padding: 0.35rem 0.55rem;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
-    background: var(--ink-1);
-    color: var(--bone-0);
-    font-family: inherit;
-    font-size: 0.8rem;
-    color-scheme: dark;
-  }
-  .date-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
+  /* .date-input retired in #189 — DateInput component owns its own
+     trigger + popover styling. */
   .date-clear {
     appearance: none;
     background: transparent;

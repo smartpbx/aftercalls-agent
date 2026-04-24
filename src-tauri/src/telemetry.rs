@@ -144,6 +144,31 @@ pub async fn flush_now() -> anyhow::Result<()> {
     flush_once(app).await
 }
 
+/// Return the most recent unique `session_id` values currently held
+/// in the ring buffer. Used by the support-report submit (#183) to
+/// stamp the report's `metadata` blob with pivot points the staff
+/// page can use to fetch the matching `agent_logs` rows. Bounded by
+/// `cap` and dedupes while preserving recency.
+pub fn recent_session_ids(cap: usize) -> Vec<String> {
+    let Ok(buf) = buffer().lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(cap.min(buf.len()));
+    // Walk the buffer back-to-front so newer entries land first.
+    for entry in buf.iter().rev() {
+        let Some(sid) = entry.session_id.as_ref() else {
+            continue;
+        };
+        if !out.iter().any(|x| x == sid) {
+            out.push(sid.clone());
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
 async fn flush_once(app: &AppHandle) -> anyhow::Result<()> {
     // Drain what's in the buffer; if the POST fails, re-insert at the
     // front so we retry on the next tick.

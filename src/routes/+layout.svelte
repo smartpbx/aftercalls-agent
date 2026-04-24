@@ -12,6 +12,7 @@
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import Avatar from "$lib/Avatar.svelte";
+  import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import "../app.css";
 
   let { children } = $props();
@@ -919,6 +920,10 @@
   const ICON_TEAM = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="8" r="3"/><circle cx="14" cy="9" r="2.2"/><path d="M2.5 17c.8-2.6 2.7-4 4.5-4s3.7 1.4 4.5 4M12 17c.6-1.8 1.8-3 3-3s2.4 1.2 3 3"/></svg>`;
   const ICON_ORG = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="13" rx="1.5"/><path d="M7 4v13M13 4v13M3 8h14M3 12h14"/></svg>`;
   const ICON_VOCAB = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h9a3 3 0 0 1 3 3v10H6a2 2 0 0 1-2-2V4Z"/><path d="M4 15h12"/></svg>`;
+  // #186 CRM (Zoho) icon — share / external-link glyph evokes the
+  // outbound nature of the integration. Same 16×16 stroke shape as
+  // the other admin icons.
+  const ICON_CRM = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2"/><circle cx="14" cy="6" r="2"/><circle cx="10" cy="14" r="2"/><path d="M7.5 7.3l1 5.4M12.5 7.3l-1 5.4M8 6h4"/></svg>`;
   const ICON_TERMS = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h8l3 3v11H5z"/><path d="M13 3v3h3M7.5 10h5M7.5 13h5"/></svg>`;
   const ICON_LOGS = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h12v12H4z"/><path d="M7 8h6M7 11h6M7 14h4"/></svg>`;
 
@@ -963,6 +968,10 @@
           { href: "/admin/users", label: "Team", match: nope, icon: ICON_TEAM, external: true },
           { href: "/admin", label: "Org", match: nope, icon: ICON_ORG, external: true },
           { href: "/admin/vocab", label: "Vocab", match: nope, icon: ICON_VOCAB, external: true },
+          // #186: CRM (Zoho) connect page — admin opens it in the
+          // browser via openPortalLink. The agent has no local
+          // routes for admin surfaces.
+          { href: "/admin/zoho", label: "CRM", match: nope, icon: ICON_CRM, external: true },
         ],
       });
     }
@@ -982,11 +991,22 @@
 
   // ── User menu (rail foot) ────────────────────────────────────────
   let userMenuOpen = $state(false);
+  // #183 — Report-issue dialog state. Mounts lazily on first open and
+  // stays mounted thereafter (state survives across opens; cheaper
+  // than a fresh component every time).
+  let reportDialogOpen = $state(false);
   function toggleUserMenu() {
     userMenuOpen = !userMenuOpen;
   }
   function closeUserMenu() {
     userMenuOpen = false;
+  }
+  function openReportDialog() {
+    closeUserMenu();
+    reportDialogOpen = true;
+  }
+  function closeReportDialog() {
+    reportDialogOpen = false;
   }
   async function openSettings() {
     closeUserMenu();
@@ -1196,6 +1216,18 @@
             }}
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
+          </button>
+          <!-- #183 — Report an issue. Opens an in-agent modal; not
+               an external URL, so no `um-ext` arrow. Sits between
+               Help (also support-leaning) and the separator that
+               divides per-account actions from the maintenance row
+               below. -->
+          <button
+            class="um-item"
+            role="menuitem"
+            onclick={openReportDialog}
+          >
+            Report an issue
           </button>
           <!-- #86 — ADMIN + STAFF items moved from the user menu to
                the rail's ADMIN / STAFF sections so the same identity
@@ -1650,6 +1682,14 @@
       </div>
     </div>
   </div>
+{/if}
+
+<!-- #183 — Report-issue dialog. Mounted at the layout root (not
+     inside `.shell`) so it correctly overlays everything including
+     the rail. Only mounts when open; teardown happens via the
+     dialog's onClose. -->
+{#if reportDialogOpen}
+  <ReportIssueDialog onClose={closeReportDialog} />
 {/if}
 
 <style>

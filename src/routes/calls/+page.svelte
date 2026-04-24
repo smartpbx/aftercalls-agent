@@ -4,6 +4,7 @@
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
   import { replaceState, afterNavigate } from "$app/navigation";
+  import DateInput from "$lib/DateInput.svelte";
 
   // #57 Tag-aware filter bar.
   //
@@ -769,31 +770,36 @@
   </div>
 
   <!-- #146 · Date range. Sits in its own row so the filter-bar above
-       stays legible at narrow agent widths. Both inputs are native
-       `<input type="date">` so the OS datepicker covers mobile + desk
-       without a custom widget. 250ms debounce on change keeps
-       keystroke-per-digit browsers from firing three loads. -->
+       stays legible at narrow agent widths. #189 swapped the native
+       `<input type="date">` for the custom DateInput mirror-pair
+       because webkit2gtk paints today as the placeholder AND doesn't
+       dismiss on outside-click. DateInput emits the same YYYY-MM-DD
+       strings so the 250ms debounce + URL-sync below is unchanged. -->
   <div class="date-bar">
     <label class="date-label">
       <span class="date-label-text">From</span>
-      <input
-        class="date-input"
-        class:date-input-empty={!fromDate}
-        type="date"
-        bind:value={fromDate}
-        onchange={onDateChange}
-        aria-describedby="date-hint"
+      <DateInput
+        value={fromDate}
+        onchange={(v) => {
+          fromDate = v;
+          onDateChange();
+        }}
+        max={toDate}
+        ariaLabel="From"
+        ariaDescribedby="date-hint"
       />
     </label>
     <label class="date-label">
       <span class="date-label-text">To</span>
-      <input
-        class="date-input"
-        class:date-input-empty={!toDate}
-        type="date"
-        bind:value={toDate}
-        onchange={onDateChange}
-        aria-describedby="date-hint"
+      <DateInput
+        value={toDate}
+        onchange={(v) => {
+          toDate = v;
+          onDateChange();
+        }}
+        min={fromDate}
+        ariaLabel="To"
+        ariaDescribedby="date-hint"
       />
     </label>
     {#if fromDate || toDate}
@@ -1400,29 +1406,11 @@
   .date-label-text {
     letter-spacing: 0.02em;
   }
-  .date-input {
-    padding: 0.35rem 0.55rem;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
-    background: var(--ink-1);
-    color: var(--bone-0);
-    font-family: inherit;
-    font-size: 0.8rem;
-    /* Tell the native datepicker chrome to match our dark palette. */
-    color-scheme: dark;
-  }
-  .date-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  /* webkit2gtk paints today's date as the placeholder label when the
-     value is empty — makes users think a filter is already active.
-     Hide the auto-filled edit until the user actually picks a date.
-     The class drops off as soon as fromDate/toDate is set and the
-     native rendering returns. */
-  .date-input-empty::-webkit-datetime-edit {
-    color: transparent;
-  }
+  /* .date-input + .date-input-empty retired in #189 — DateInput
+     component owns its own trigger + popover styling. The old
+     `.date-input-empty::-webkit-datetime-edit { color: transparent }`
+     workaround from #166 is superseded because the native webkit2gtk
+     widget is gone. */
   .date-clear {
     appearance: none;
     background: transparent;

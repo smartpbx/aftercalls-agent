@@ -36,12 +36,16 @@
     rosterLoaded?: boolean;
     rosterError?: boolean;
     // #150 · v0.4.6 — swap the two-item menu into its "external"
-    // shape: "Link to teammate" / "Leave as text". Unlink doesn't
-    // apply when the chip wasn't linked in the first place, so
-    // "Leave as text" just dismisses the popover without emitting
-    // onselect. Picker behaviour is unchanged — picking a teammate
-    // still fires `onselect("rename", pick)`, which the parent's
-    // rewrite helper handles identically to a linked rename.
+    // shape: "Link to teammate" / "Leave as text". The external
+    // branch is for italic name chips that never matched the org
+    // roster (often clients or counterparties the LLM wrapped
+    // anyway). #178 · v0.6.x — "Leave as text" now emits
+    // `onselect("unlink")` instead of dismissing silently, so the
+    // parent's rewrite path strips the `<name>` wrapper from the
+    // stored text; otherwise the italic chip reappears on reload.
+    // Picker behaviour is unchanged — picking a teammate still
+    // fires `onselect("rename", pick)`, which the parent's rewrite
+    // helper handles identically to a linked rename.
     isExternal?: boolean;
     onselect: (action: ChipMenuAction, pick?: SpeakerPick) => void;
     onclose: () => void;
@@ -145,10 +149,14 @@
       e.preventDefault();
       if (focusIdx === 0) {
         mode = "picker";
-      } else if (isExternal) {
-        // #150 — "Leave as text" is dismiss-only; no mutation.
-        onclose();
       } else {
+        // #178 — both modes now persist the unlink. In external
+        // mode ("Leave as text") this was previously dismiss-only,
+        // so the italic chip reappeared on reload because the
+        // `<name>` wrapper stayed in the stored text. Routing
+        // through `onselect("unlink")` reuses the page-level
+        // rewrite-and-persist path for both linked and external
+        // chips.
         onselect("unlink");
       }
     }
@@ -168,10 +176,14 @@
     onselect("unlink");
   }
 
-  // #150 — external mode's item-1 action. Dismiss without emitting
-  // a mutation — the mention keeps its italic rendering.
+  // #178 — external mode's item-2 action. Persist the unlink by
+  // stripping the `<name>` wrapper via the parent's rewrite path,
+  // so the italic chip doesn't reappear on reload. Previously this
+  // was `onclose()` (dismiss-only) per #150, but dismissing without
+  // mutating left the wrapper in `summary_text` / action-item
+  // `description`, defeating the user's intent.
   function doLeaveAsText() {
-    onclose();
+    onselect("unlink");
   }
 
   function onPickerPick(pick: SpeakerPick) {
@@ -224,8 +236,10 @@
       {isExternal ? "Link to teammate" : "Rename teammate"}
     </button>
     {#if isExternal}
-      <!-- #150 — external mode: item 1 is dismiss-only. No Unlink
-           glyph (the chip was never linked); no hint text. -->
+      <!-- #150 / #178 — external mode's item 2. No Unlink glyph
+           (the chip was never linked to a teammate) and no hint
+           text, but the action still strips the `<name>` wrapper
+           so the chip stays plain text on subsequent reloads. -->
       <button
         type="button"
         role="menuitem"

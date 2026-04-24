@@ -9,6 +9,7 @@
   import Avatar from "$lib/Avatar.svelte";
   import SpeakerRenamePicker, {
     type SpeakerPick,
+    type SpeakerSubsetPick,
   } from "$lib/SpeakerRenamePicker.svelte";
   import SummaryText, {
     firstLastInitial,
@@ -16,6 +17,12 @@
   } from "$lib/SummaryText.svelte";
   import ActionItem from "$lib/ActionItem.svelte";
   import ChipMenu from "$lib/ChipMenu.svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import SendToZohoModal, {
+    type SzmPriorPush,
+    type SzmSearchResult,
+    type SzmPushResponse,
+  } from "$lib/SendToZohoModal.svelte";
 
   type Utterance = {
     idx: number;
@@ -229,6 +236,94 @@
   let tagSuggestions = $state<TagSuggestion[]>([]);
   let tagSuggestDebounce: number | undefined;
   let tagInputEl: HTMLInputElement | undefined = $state();
+
+  // ── Send to CRM (Zoho) (#186) ────────────────────────────────────
+  // Mirror of the portal call-detail integration. Surface-specific
+  // bits: `zoho_status` / `zoho_search_records` / `zoho_push_call`
+  // ride through Tauri commands rather than fetch; `zohoUrlHandler`
+  // delegates to plugin-opener's openUrl.
+  let zohoConnected = $state(false);
+  let zohoModalOpen = $state(false);
+  let zohoFallbackOwnerName = $state<string | null>(null);
+  let zohoPushed = $derived(
+    !!call?.tags?.some(
+      (t) => t.kind === "custom" && t.value === "zoho:pushed",
+    ),
+  );
+
+  function openSendToZoho() {
+    zohoModalOpen = true;
+  }
+
+  function closeSendToZoho() {
+    zohoModalOpen = false;
+  }
+
+  // Bridge to backend via Tauri commands. Same shape as the portal's
+  // api.zoho.* helpers — that's what keeps the SendToZohoModal mirror
+  // pair byte-identical between portal and agent.
+  const zohoApi = {
+    searchRecords: async (
+      module: string,
+      q: string,
+    ): Promise<SzmSearchResult[]> => {
+      const out = (await invoke("zoho_search_records", {
+        module,
+        q,
+      })) as { results: SzmSearchResult[] };
+      return out.results ?? [];
+    },
+    pushCall: async (
+      callId: string,
+      body: {
+        module: string;
+        record_id: string;
+        record_name: string;
+        extra_tags?: string[];
+      },
+    ): Promise<SzmPushResponse> => {
+      try {
+        return (await invoke("zoho_push_call", {
+          callId,
+          body,
+        })) as SzmPushResponse;
+      } catch (e: any) {
+        // Tauri command errors come back as plain strings; reshape
+        // into a fetch-style error for the modal's error-classifier.
+        const msg = String(e ?? "");
+        const status = parseStatusFromInvokeError(msg);
+        const err = new Error(msg) as Error & { status?: number };
+        if (status) err.status = status;
+        throw err;
+      }
+    },
+  };
+
+  function parseStatusFromInvokeError(msg: string): number | undefined {
+    // portal helper formats backend non-success as `backend <CODE>: <body>`.
+    const m = msg.match(/backend (\d{3})/);
+    return m ? Number(m[1]) : undefined;
+  }
+
+  function openZohoUrl(url: string) {
+    void openUrl(url).catch((e) => console.warn("openUrl failed", e));
+  }
+
+  function onZohoPushed(resp: SzmPushResponse) {
+    if (!call) return;
+    const existing = call.tags ?? [];
+    const merged = [...existing];
+    for (const t of resp.tags_added) {
+      if (
+        !merged.some((e) => e.kind === t.kind && e.value === t.value)
+      ) {
+        merged.push({ kind: t.kind as TagKind, value: t.value });
+      }
+    }
+    call = { ...call, tags: merged };
+  }
+
+  const zohoPriorPush: SzmPriorPush | null = null;
 
   // Member viewing an admin-shared call: read-only. In the agent the
   // user is almost always the owner (local-session path) but we still
@@ -984,10 +1079,42 @@
   });
   let deleting = $state(false);
   let copiedLabel = $state("");
+  // ── Transcript speaker editing (single-line; #187 removed the
+  //    legacy apply-to-all checkbox — the in-picker `.srp-bulk-row`
+  //    shipped in #171 is now the canonical "apply to every" path) ──
   let editingIdx = $state<number | null>(null);
   let editValue = $state("");
-  let applyToAll = $state(false);
   let savingEdit = $state(false);
+
+  // ── #188 · Transcript multi-row subset selection ─────────────────
+  // `selectedIdxs`: idxs of utterances currently ticked via the row
+  // checkbox. Empty → normal transcript mode. Size >= 2 surfaces the
+  // sticky `.utt-select-bar` (single-row selection is NOT a subset
+  // surface per user decision 2026-04-24 — single-row renames still
+  // use the in-row speaker-click gesture).
+  // `selectionAnchorIdx`: the most recently checked idx, used as the
+  // range anchor for Shift+click.
+  let selectedIdxs = $state<Set<number>>(new Set());
+  let selectionAnchorIdx = $state<number | null>(null);
+  let subsetEditorOpen = $state(false);
+  let subsetEditValue = $state("");
+  let subsetEditingUserId = $state<string | null>(null);
+  let savingSubset = $state(false);
+  let selectionCount = $derived(selectedIdxs.size);
+  let showSelectBar = $derived(selectionCount >= 2);
+  let selectionFromLabel = $derived.by<string>(() => {
+    if (!call || selectionCount === 0) return "";
+    const speakers = new Set<string>();
+    for (const u of call.utterances ?? []) {
+      if (selectedIdxs.has(u.idx)) speakers.add(u.speaker);
+      if (speakers.size > 1) break;
+    }
+    if (speakers.size === 1) {
+      const [only] = speakers;
+      return only;
+    }
+    return "mixed speakers";
+  });
 
   let editingSpeaker = $state<string | null>(null);
   let speakerEditValue = $state("");
@@ -1160,6 +1287,19 @@
     } finally {
       loading = false;
       trace("onMount end loading=false");
+    }
+    // #186: probe the org's Zoho connection so the call-detail page
+    // can show/hide the "Send to CRM" button. Failure (env-disabled,
+    // network down) just leaves the button hidden.
+    try {
+      const status = (await invoke("zoho_status")) as {
+        connected: boolean;
+        connected_by?: { display_name: string };
+      };
+      zohoConnected = !!status.connected;
+      zohoFallbackOwnerName = status.connected_by?.display_name ?? null;
+    } catch {
+      zohoConnected = false;
     }
     // Live-refresh while the call is still being processed. Users
     // land here as soon as the transcript is in; summary + action
@@ -1554,9 +1694,15 @@
   }
 
   function startEdit(u: Utterance) {
+    // #187 · single-line edit is exclusive with subset selection.
+    // Opening the in-row picker from a NOT-selected row clears any
+    // stale selection; opening from a selected row keeps it so the
+    // user can edit one line while still holding a larger subset.
+    if (!selectedIdxs.has(u.idx) && selectedIdxs.size > 0) {
+      clearSelection();
+    }
     editingIdx = u.idx;
     editValue = u.speaker;
-    applyToAll = false;
     editingSpeakerUserId = u.speaker_user_id ?? null;
     editingSpeakerUserName = null;
     refreshRecentRows();
@@ -1566,15 +1712,13 @@
   function cancelEdit() {
     editingIdx = null;
     editValue = "";
-    applyToAll = false;
     editingSpeakerUserId = null;
     editingSpeakerUserName = null;
   }
 
   function onUtteranceEditorPick(pick: SpeakerPick) {
-    // Lift the picker's selection into parent state so the
-    // Apply-to-all label / Save button can see it; saveEdit does the
-    // actual network write.
+    // Lift the picker's selection into parent state; saveEdit does
+    // the actual network write.
     if (pick.user) {
       editValue = pick.user.display_name;
       editingSpeakerUserId = pick.user.id;
@@ -1605,31 +1749,21 @@
     }
     savingEdit = true;
     try {
-      if (applyToAll) {
-        const from = current.speaker;
-        await invoke<number>("rename_speaker", {
-          id: call.id,
-          from,
-          to,
-          toUserId: userId,
-        });
-        pushRecent(to);
-        // Refetch — rename also rewrites summary + action items.
-        call = await invoke<Call>("get_call", { id: call.id });
-      } else {
-        await invoke("update_utterance_speaker", {
-          id: call.id,
-          idx: editingIdx,
-          speaker: to,
-          speakerUserId: userId,
-        });
-        pushRecent(to);
-        call.utterances = call.utterances.map((u) =>
-          u.idx === editingIdx
-            ? { ...u, speaker: to, speaker_user_id: userId }
-            : u,
-        );
-      }
+      // #187 · single-line save always PATCHes one row. "Apply to
+      // every X" is now reachable exclusively via the picker's
+      // `.srp-bulk-row`, which fires onbulkpick / onBulkPick below.
+      await invoke("update_utterance_speaker", {
+        id: call.id,
+        idx: editingIdx,
+        speaker: to,
+        speakerUserId: userId,
+      });
+      pushRecent(to);
+      call.utterances = call.utterances.map((u) =>
+        u.idx === editingIdx
+          ? { ...u, speaker: to, speaker_user_id: userId }
+          : u,
+      );
       cancelEdit();
     } catch (e) {
       error = String(e);
@@ -1759,6 +1893,152 @@
     if (bulkDismissTimer) {
       clearTimeout(bulkDismissTimer);
       bulkDismissTimer = null;
+    }
+  }
+
+  // ── #188 · Subset-rename handlers ─────────────────────────────────
+  //
+  // Same contract as portal: row checkboxes + sticky
+  // `.utt-select-bar` + section-level `.utt-select-editor`. Agent
+  // side routes through the `rename_speaker` Tauri command with an
+  // explicit `utteranceIds: number[]` argument; the command forwards
+  // to the extended backend handler.
+  function clearSelection() {
+    selectedIdxs = new Set();
+    selectionAnchorIdx = null;
+    subsetEditorOpen = false;
+    subsetEditValue = "";
+    subsetEditingUserId = null;
+  }
+
+  function toggleRowSelection(idx: number, shiftKey: boolean) {
+    if (editingIdx !== null) cancelEdit();
+    if (shiftKey && selectionAnchorIdx !== null && call) {
+      const allIdxs = (call.utterances ?? []).map((u) => u.idx);
+      const a = allIdxs.indexOf(selectionAnchorIdx);
+      const b = allIdxs.indexOf(idx);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a <= b ? [a, b] : [b, a];
+        const next = new Set(selectedIdxs);
+        for (let i = lo; i <= hi; i++) next.add(allIdxs[i]);
+        selectedIdxs = next;
+        return;
+      }
+    }
+    const next = new Set(selectedIdxs);
+    if (next.has(idx)) next.delete(idx);
+    else next.add(idx);
+    selectedIdxs = next;
+    selectionAnchorIdx = idx;
+  }
+
+  function openSubsetEditor() {
+    if (selectionCount < 2) return;
+    if (editingIdx !== null) cancelEdit();
+    subsetEditValue = "";
+    subsetEditingUserId = null;
+    subsetEditorOpen = true;
+    refreshRecentRows();
+    void ensureMemberRoster();
+  }
+  function closeSubsetEditor() {
+    subsetEditorOpen = false;
+    subsetEditValue = "";
+    subsetEditingUserId = null;
+  }
+
+  type SubsetStatus =
+    | { kind: "success"; from: string; to: string; count: number }
+    | { kind: "error"; to: string; toUserId: string | null;
+        from: string; utteranceIds: number[] }
+    | null;
+  let subsetStatus = $state<SubsetStatus>(null);
+  let subsetDismissTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleSubsetDismiss() {
+    if (subsetDismissTimer) clearTimeout(subsetDismissTimer);
+    subsetDismissTimer = setTimeout(() => {
+      subsetStatus = null;
+      subsetDismissTimer = null;
+    }, 5000);
+  }
+  function dismissSubsetStatus() {
+    subsetStatus = null;
+    if (subsetDismissTimer) {
+      clearTimeout(subsetDismissTimer);
+      subsetDismissTimer = null;
+    }
+  }
+
+  async function runSubsetRename(
+    from: string,
+    to: string,
+    toUserId: string | null,
+    utteranceIds: number[],
+  ) {
+    if (!call || utteranceIds.length === 0) return;
+    const idxsForRetry = [...utteranceIds];
+    savingSubset = true;
+    try {
+      await invoke<number>("rename_speaker", {
+        id: call.id,
+        from,
+        to,
+        toUserId,
+        utteranceIds,
+      });
+      pushRecent(to);
+      call = await invoke<Call>("get_call", { id: call.id });
+      subsetStatus = {
+        kind: "success",
+        from,
+        to,
+        count: idxsForRetry.length,
+      };
+      scheduleSubsetDismiss();
+    } catch (e) {
+      subsetStatus = {
+        kind: "error",
+        from,
+        to,
+        toUserId,
+        utteranceIds: idxsForRetry,
+      };
+    } finally {
+      // Top risk per plan: clear on BOTH success AND error.
+      clearSelection();
+      savingSubset = false;
+    }
+  }
+
+  function onSubsetPick(pick: SpeakerSubsetPick) {
+    if (!call) return;
+    const to = pick.user
+      ? pick.user.display_name
+      : (pick.freeText ?? "").trim();
+    if (!to) return;
+    const toUserId = pick.user ? pick.user.id : null;
+    const from = selectionFromLabel;
+    const ids = [...selectedIdxs];
+    void runSubsetRename(from, to, toUserId, ids);
+  }
+
+  async function retrySubsetRename() {
+    if (!subsetStatus || subsetStatus.kind !== "error") return;
+    const { from, to, toUserId, utteranceIds } = subsetStatus;
+    subsetStatus = null;
+    await runSubsetRename(from, to, toUserId, utteranceIds);
+  }
+
+  function onTranscriptKeydown(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    if (subsetEditorOpen) {
+      e.preventDefault();
+      closeSubsetEditor();
+      return;
+    }
+    if (selectedIdxs.size > 0) {
+      e.preventDefault();
+      clearSelection();
     }
   }
 
@@ -2793,6 +3073,22 @@
                   </svg>
                 </button>
               {/if}
+              <!-- #186 Send to CRM. Hidden when org isn't connected
+                   (zohoConnected resolved on mount via Tauri command). -->
+              {#if zohoConnected && call.status === "complete"}
+                <button
+                  type="button"
+                  class="copy-btn send-crm"
+                  onclick={openSendToZoho}
+                  disabled={regenInFlight}
+                >
+                  Send to CRM
+                </button>
+                {#if zohoPushed}
+                  <span class="pip done crm-pip" aria-hidden="true"></span>
+                  <span class="visually-hidden">Already pushed</span>
+                {/if}
+              {/if}
             </div>
           {/if}
         </div>
@@ -3169,7 +3465,112 @@
           </div>
         {/if}
       {/if}
-      <div class="transcript">
+      <!-- #188 · subset-rename status toast. Mutually exclusive with
+           `bulk-toast` (#171 global rewrite). No Undo on success —
+           out of scope for the initial ship. -->
+      {#if subsetStatus}
+        {#if subsetStatus.kind === "success"}
+          <div class="bulk-toast bulk-toast-success" role="status" aria-live="polite">
+            <span class="bulk-toast-glyph" aria-hidden="true">✓</span>
+            <span class="bulk-toast-body">
+              Renamed {subsetStatus.count}
+              {subsetStatus.count === 1 ? "line" : "lines"}
+              of "{subsetStatus.from}" to "{subsetStatus.to}".
+            </span>
+            <button
+              type="button"
+              class="bulk-toast-dismiss"
+              aria-label="Dismiss"
+              onclick={dismissSubsetStatus}
+            >
+              ✕
+            </button>
+          </div>
+        {:else}
+          <div class="bulk-toast bulk-toast-error" role="alert">
+            <span class="bulk-toast-glyph" aria-hidden="true">⚠</span>
+            <span class="bulk-toast-body">
+              Couldn't rename the selected lines.
+            </span>
+            <button
+              type="button"
+              class="bulk-toast-action"
+              onclick={retrySubsetRename}
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              class="bulk-toast-dismiss"
+              aria-label="Dismiss"
+              onclick={dismissSubsetStatus}
+            >
+              ✕
+            </button>
+          </div>
+        {/if}
+      {/if}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="transcript"
+        class:selection-mode={selectedIdxs.size > 0}
+        role="region"
+        aria-label="Transcript"
+        onkeydown={onTranscriptKeydown}
+      >
+        {#if showSelectBar}
+          <!-- #188 · sticky subset-rename toolbar (≥2 rows). -->
+          <div class="utt-select-bar" role="status" aria-live="polite">
+            <span class="utt-select-count">
+              {selectionCount}
+              {selectionCount === 1 ? "line" : "lines"} selected
+            </span>
+            {#if !subsetEditorOpen}
+              <button
+                type="button"
+                class="utt-select-rename-btn"
+                onclick={openSubsetEditor}
+                disabled={savingSubset}
+              >
+                Rename selected ({selectionCount})
+              </button>
+            {/if}
+            <button
+              type="button"
+              class="utt-select-cancel"
+              onclick={clearSelection}
+              disabled={savingSubset}
+              aria-label="Clear selection"
+            >
+              ✕ Clear
+            </button>
+          </div>
+        {/if}
+        {#if subsetEditorOpen && showSelectBar}
+          <div class="utt-select-editor">
+            <div class="utt-select-head">
+              Renaming {selectionCount} selected
+              {selectionCount === 1 ? "line" : "lines"}
+              · <span class="utt-select-from">{selectionFromLabel}</span>
+            </div>
+            <SpeakerRenamePicker
+              bind:value={subsetEditValue}
+              roster={memberRoster}
+              rosterLoaded={memberRosterLoaded}
+              rosterError={memberRosterError}
+              recents={recentRows}
+              externals={externalSpeakers}
+              saving={savingSubset}
+              variant="stack"
+              selectionCount={selectionCount}
+              onpick={() => {
+                /* unreachable — subset mode emits via onsubsetpick */
+              }}
+              onsubsetpick={onSubsetPick}
+              oncancel={closeSubsetEditor}
+            />
+          </div>
+        {/if}
         {#each (call.utterances ?? []) as u (u.idx)}
           {#if editingIdx === u.idx}
             <div class="utt-editor">
@@ -3188,14 +3589,6 @@
                 onbulkpick={onBulkPick}
                 oncancel={cancelEdit}
               />
-              <label class="apply-all">
-                <input type="checkbox" bind:checked={applyToAll} />
-                {#if editingSpeakerUserName}
-                  Apply to every "{u.speaker}" — and link them to {editingSpeakerUserName}
-                {:else}
-                  Apply to every "{u.speaker}"
-                {/if}
-              </label>
               <div class="editor-buttons">
                 <button class="ed-save" disabled={savingEdit} onclick={saveEdit}>
                   {savingEdit ? "Saving…" : "Save"}
@@ -3207,6 +3600,7 @@
             <div
               class="utt"
               class:active={u.idx === activeIdx}
+              class:utt-selected={selectedIdxs.has(u.idx)}
               role="button"
               tabindex="0"
               onclick={() => seekTo(u.start_ms)}
@@ -3217,6 +3611,26 @@
                 }
               }}
             >
+              <!-- svelte-ignore a11y_label_has_associated_control -->
+              <label
+                class="utt-check"
+                onclick={(e) => {
+                  e.stopPropagation();
+                }}
+                onkeydown={(e) => {
+                  e.stopPropagation();
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedIdxs.has(u.idx)}
+                  aria-label={`Select line ${u.idx + 1}: ${u.speaker} — ${u.text.slice(0, 40)}`}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    toggleRowSelection(u.idx, e.shiftKey);
+                  }}
+                />
+              </label>
               <span class="utt-ts">{fmtTime(u.start_ms)}</span>
               <button
                 type="button"
@@ -3322,6 +3736,24 @@
       </div>
     </div>
   </div>
+{/if}
+
+{#if zohoModalOpen && call}
+  <!-- #186 Send-to-CRM modal. Mirror pair: agent supplies the api
+       transport via Tauri commands (zoho_search_records /
+       zoho_push_call), portal supplies it via window.fetch. The
+       modal stays byte-identical between surfaces. -->
+  <SendToZohoModal
+    callId={call.id}
+    existingTags={call.tags ?? []}
+    priorPush={zohoPriorPush}
+    matchedZohoDisplayName={null}
+    fallbackOwnerDisplayName={zohoFallbackOwnerName}
+    api={zohoApi}
+    zohoUrlHandler={openZohoUrl}
+    onClose={closeSendToZoho}
+    onPushed={onZohoPushed}
+  />
 {/if}
 
 {#if confirmingDelete && call}
@@ -3981,6 +4413,34 @@
     opacity: 0.5;
     cursor: default;
   }
+  /* #186 Send-to-CRM button — same .copy-btn shape but slightly
+     stronger text (the action is outbound, not a quick utility). */
+  .send-crm {
+    color: var(--bone-1);
+  }
+  .send-crm:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .crm-pip {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--olive);
+    display: inline-block;
+    margin-left: 0.1rem;
+  }
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
 
   /* ── Phase 2 (#19): Regenerate + edit-in-place ────────────────── */
 
@@ -4334,7 +4794,10 @@
 
   .utt {
     display: grid;
-    grid-template-columns: 56px 120px 1fr;
+    /* #188 · 24px leading column reserved for the row-selection
+       checkbox; hidden on hover, always shown in `.selection-mode`.
+       Column stays reserved so hover doesn't reflow the layout. */
+    grid-template-columns: 24px 56px 120px 1fr;
     align-items: baseline;
     gap: 0.9rem;
     padding: 0.7rem 0.4rem;
@@ -4355,6 +4818,139 @@
     );
     border-left: 2px solid var(--accent);
     padding-left: 0.7rem;
+  }
+  /* #188 · selected row. Flat accent-soft fill + accent left border. */
+  .utt.utt-selected {
+    background: var(--accent-soft);
+    border-left: 2px solid var(--accent);
+    padding-left: 0.7rem;
+  }
+  .utt.utt-selected.active {
+    background: linear-gradient(
+      90deg,
+      var(--accent-soft) 0%,
+      transparent 80%
+    );
+  }
+
+  /* #188 · row checkbox gutter. */
+  .utt-check {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 100ms ease-out;
+    cursor: pointer;
+    line-height: 0;
+  }
+  .utt:hover .utt-check,
+  .transcript.selection-mode .utt-check {
+    visibility: visible;
+    opacity: 1;
+  }
+  .utt-check input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+  .utt-check input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .utt-check {
+      transition: none;
+    }
+  }
+
+  /* #188 · sticky selection toolbar. */
+  .utt-select-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.6rem;
+    background: color-mix(in srgb, var(--ink-0) 88%, transparent);
+    backdrop-filter: saturate(140%) blur(8px);
+    -webkit-backdrop-filter: saturate(140%) blur(8px);
+    border-bottom: 1px solid var(--hairline);
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+  .utt-select-count {
+    font-size: 0.82rem;
+    color: var(--bone-2);
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .utt-select-rename-btn {
+    padding: 0.35rem 0.85rem;
+    font-size: 0.82rem;
+    border-radius: 6px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-weight: 600;
+    cursor: pointer;
+    font: inherit;
+    flex: 0 0 auto;
+  }
+  .utt-select-rename-btn:hover {
+    background: var(--accent-hi);
+  }
+  .utt-select-rename-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .utt-select-cancel {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.78rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-3);
+    cursor: pointer;
+    font: inherit;
+    flex: 0 0 auto;
+  }
+  .utt-select-cancel:hover {
+    color: var(--bone-0);
+  }
+  .utt-select-cancel:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* #188 · subset-rename editor surface. */
+  .utt-select-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding: 0.85rem 1rem;
+    margin: 0.3rem 0;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--accent-soft);
+  }
+  .utt-select-head {
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-2);
+    padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .utt-select-from {
+    color: var(--bone-1);
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
   }
 
   .utt-ts {
@@ -4419,13 +5015,9 @@
     background: var(--accent-soft);
   }
 
-  .apply-all {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.82rem;
-    color: var(--bone-1);
-  }
+  /* #187 · `.apply-all` checkbox removed. The in-picker
+     `.srp-bulk-row` ("Replace every X with…") is the sole
+     "apply to every" affordance now. */
 
   .editor-buttons {
     display: flex;

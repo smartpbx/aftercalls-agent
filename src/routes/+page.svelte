@@ -104,6 +104,7 @@
   let hotkeyNoteAppPrefs = $state<{
     close_to_tray: boolean;
     auto_detect: boolean;
+    auto_detect_popup: boolean;
     telemetry_enabled: boolean;
     sounds_enabled: boolean;
     max_recording_minutes: number;
@@ -148,6 +149,7 @@
       await invoke("set_app_prefs", {
         closeToTray: prefs.close_to_tray,
         autoDetect: prefs.auto_detect,
+        autoDetectPopup: prefs.auto_detect_popup,
         telemetryEnabled: prefs.telemetry_enabled,
         soundsEnabled: prefs.sounds_enabled,
         maxRecordingMinutes: prefs.max_recording_minutes,
@@ -323,6 +325,7 @@
       const prefs = await invoke<{
         close_to_tray: boolean;
         auto_detect: boolean;
+        auto_detect_popup: boolean;
         telemetry_enabled: boolean;
         sounds_enabled: boolean;
         max_recording_minutes: number;
@@ -356,6 +359,7 @@
       const status = await invoke<{
         recording: boolean;
         started_at_ms: number | null;
+        session_dir: string | null;
       }>("is_recording");
       if (status.recording && !recording) {
         recording = true;
@@ -366,6 +370,16 @@
             () => (elapsedMs = Date.now() - startAt),
             250,
           );
+        }
+        // #185: sessionDir is component-local $state that dies on
+        // route-nav unmount. Without it, currentSessionId stays empty
+        // and the manual-notes render gate fails on re-entry. The
+        // backend now carries the active session_dir on
+        // RecordingStatus so we can reseed here — mirroring the
+        // recording-state event handler's behaviour for the
+        // start-transition path.
+        if (status.session_dir) {
+          sessionDir = status.session_dir;
         }
       }
     } catch {}

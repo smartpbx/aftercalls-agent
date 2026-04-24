@@ -66,6 +66,15 @@ pub struct Recorder {
     // actually emitted. Mutex (not atomic) because the value isn't
     // Copy.
     pending_fallback: Mutex<Option<MicFallback>>,
+    // Mirror of the active session's directory, populated on a
+    // successful `start()` and cleared on `stop()`. Lets the
+    // `is_recording` command expose the current session_dir to the
+    // webview so a route-nav remount mid-recording can rehydrate
+    // the manual-notes panel's session id (#185). Authoritative
+    // ownership of the path still lives on the worker thread's
+    // `Active` struct; this is a read-only snapshot kept in sync
+    // with `started_at_ms`.
+    active_session_dir: Mutex<Option<PathBuf>>,
 }
 
 struct Inner {
@@ -137,6 +146,7 @@ impl Recorder {
             session_seq: AtomicI64::new(0),
             fallback_seen: Mutex::new(HashSet::new()),
             pending_fallback: Mutex::new(None),
+            active_session_dir: Mutex::new(None),
         }
     }
 
@@ -157,6 +167,13 @@ impl Recorder {
             0 => None,
             ts => Some(ts),
         }
+    }
+
+    /// Current active session directory, or None when idle. Mirrors the
+    /// `started_at_ms()` accessor so the `is_recording` command can
+    /// expose both fields together for remount rehydration (#185).
+    pub fn session_dir(&self) -> Option<PathBuf> {
+        self.active_session_dir.lock().unwrap().clone()
     }
 
     pub fn start(
@@ -193,6 +210,10 @@ impl Recorder {
                 // there, not here, so `start()` stays a pure
                 // "this-session-fell-back" signal.
                 *self.pending_fallback.lock().unwrap() = fallback;
+                // Snapshot the session_dir so `is_recording` can hand
+                // it back to a route-nav remount (#185). Cleared in
+                // `stop()`; paired with `started_at_ms`.
+                *self.active_session_dir.lock().unwrap() = Some(path.clone());
                 Ok(path)
             }
             Err(e) => Err(e),
@@ -226,6 +247,10 @@ impl Recorder {
         if result.is_ok() {
             self.active.store(false, Ordering::Relaxed);
             self.started_at_ms.store(0, Ordering::Relaxed);
+            // Drop the session_dir snapshot so a post-stop
+            // `is_recording` read doesn't hand the webview a stale
+            // path. Paired with the set in `start()`.
+            *self.active_session_dir.lock().unwrap() = None;
             // Bump on stop too so the currently-running watchdog's
             // captured seq goes stale and its next tick is a no-op.
             self.session_seq.fetch_add(1, Ordering::Relaxed);

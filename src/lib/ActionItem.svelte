@@ -414,14 +414,12 @@
     return "var(--accent)";
   });
 
-  // Phase 3 (#104): show the "Unassigned" chip only when the FK is
-  // null AND the description has no `<name>` markers.
-  let hasNameMarker = $derived(
-    /<name>[^<]+<\/name>/.test(item.description ?? ""),
-  );
-  let showUnassigned = $derived(
-    item.assignee_user_id === null && !hasNameMarker,
-  );
+  // Every FK-null action item gets the "Unassigned" affordance so the
+  // user can always invoke the owner-edit picker. Suppressing this on
+  // rows with `<name>` markers (#104 Phase 3) silently dropped the
+  // assign affordance when the AI couldn't auto-resolve the mention —
+  // see #172 and `backend/src/routes/pipeline.rs` ≈L561 contract.
+  let showUnassigned = $derived(item.assignee_user_id === null);
 
   // ── Description-edit local state ───────────────────────────────
   //

@@ -403,14 +403,29 @@ pub async fn rename_speaker(
     from: &str,
     to: &str,
     to_user_id: Option<&str>,
+    // #188: when present + non-empty, backend rewrites ONLY those idxs
+    // (subset rename) and skips summary/participants/action-item
+    // prose. `None` or empty slice → global rename (pre-existing).
+    utterance_ids: Option<&[i32]>,
 ) -> Result<u64> {
-    // Only include `to_user_id` in the payload when we have one.
-    // Omitting it on the wire leaves existing FKs on matching rows
-    // untouched (backend `Option<Uuid>` with `#[serde(default)]`) —
-    // important for text-only renames of already-linked speakers.
+    // Only include `to_user_id` / `utterance_ids` in the payload when
+    // we have them. Omitting `to_user_id` leaves existing FKs on
+    // matching rows untouched (backend `Option<Uuid>` with
+    // `#[serde(default)]`). Omitting `utterance_ids` selects the
+    // backend's global-rename branch; an older backend that doesn't
+    // recognise the field ignores it under `#[serde(default)]`.
     let mut payload = serde_json::json!({ "from": from, "to": to });
     if let Some(uid) = to_user_id {
         payload["to_user_id"] = serde_json::Value::String(uid.to_string());
+    }
+    if let Some(ids) = utterance_ids {
+        if !ids.is_empty() {
+            payload["utterance_ids"] = serde_json::Value::Array(
+                ids.iter()
+                    .map(|&i| serde_json::Value::Number(i.into()))
+                    .collect(),
+            );
+        }
     }
     let body: Value = post_json(
         backend,
@@ -725,6 +740,43 @@ pub async fn tag_suggestions(
         push("q", v);
     }
     get_json(backend, &path).await
+}
+
+/// GET /v1/org/zoho/status — used on call-detail mount to gate the
+/// "Send to CRM" button. Returns the same shape as the portal's
+/// `api.zoho.status()`. (#186)
+pub async fn zoho_status(backend: &Backend) -> Result<Value> {
+    get_json(backend, "/v1/org/zoho/status").await
+}
+
+/// GET /v1/zoho/records?module=…&q=… — Step 2 of SendToZohoModal. (#186)
+pub async fn zoho_search_records(
+    backend: &Backend,
+    module: &str,
+    q: &str,
+) -> Result<Value> {
+    let path = format!(
+        "/v1/zoho/records?module={}&q={}",
+        urlencoding_minimal(module),
+        urlencoding_minimal(q),
+    );
+    get_json(backend, &path).await
+}
+
+/// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
+/// `body` is forwarded verbatim; frontend pre-shapes
+/// `{module, record_id, record_name, extra_tags?}`. (#186)
+pub async fn zoho_push_call(
+    backend: &Backend,
+    call_id: &str,
+    body: &Value,
+) -> Result<Value> {
+    post_json(
+        backend,
+        &format!("/v1/calls/{call_id}/zoho/push"),
+        body.clone(),
+    )
+    .await
 }
 
 /// Tiny URL-encoder for the handful of characters we need to escape

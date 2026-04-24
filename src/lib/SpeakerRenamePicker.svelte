@@ -29,6 +29,18 @@
     user: OrgMemberLite | null;
     freeText: string | null;
   };
+
+  // #188 subset-pick payload. Picker emits this when `selectionCount
+  // >= 2`; parent calls renameSpeaker(id, from, to, toUserId,
+  // utteranceIds) with the selected idxs it was already tracking.
+  // `from` is purely advisory — the subset path doesn't filter on it
+  // (mixed-speaker selections are allowed) but the value helps parent
+  // toasts read naturally. Exactly one of `user` / `freeText` is
+  // non-null, matching SpeakerPick.
+  export type SpeakerSubsetPick = {
+    user: OrgMemberLite | null;
+    freeText: string | null;
+  };
 </script>
 
 <script lang="ts">
@@ -96,6 +108,24 @@
     // applyToAll via the checkbox; onbulkpick = direct rename-all
     // from the picker without the utterance-editor ceremony).
     onbulkpick?: (pick: SpeakerBulkPick) => void;
+    // #188 · count of utterance rows currently selected by the
+    // parent's row-checkbox state. When `>= 2` the picker is in
+    // "subset" mode:
+    //   • the per-transcript "Replace every X with…" bulk row is
+    //     suppressed — during a subset rename the user has already
+    //     chosen specific lines and the global-rewrite affordance
+    //     would be misleading.
+    //   • commits fire `onsubsetpick` instead of `onpick`; the parent
+    //     already tracks the selected idxs and plugs them into
+    //     `renameSpeaker(..., utteranceIds)`.
+    //   • header caps-label swaps to "RENAME SELECTED — {N} lines".
+    // Threshold is a hard ≥2 per user decision 2026-04-24 — single-
+    // row selection uses the existing in-row speaker-click gesture
+    // so there's no overlap with the subset surface.
+    selectionCount?: number;
+    // #188 · emitted when subset mode commits. Parent handles the
+    // save using the selected idxs it already tracks.
+    onsubsetpick?: (pick: SpeakerSubsetPick) => void;
   };
 
   let {
@@ -116,7 +146,14 @@
     contextSpeaker = "",
     contextCount = 0,
     onbulkpick,
+    selectionCount = 0,
+    onsubsetpick,
   }: Props = $props();
+
+  // #188 · sticky "is this a subset-rename picker" flag. Derived once
+  // from props so row picks / commit / keyboard paths all branch on
+  // the same truth. Threshold ≥2 per the plan + user decision.
+  let subsetMode = $derived(selectionCount >= 2 && !!onsubsetpick);
 
   // #169 · snapshot the opener so Escape / outside-click / commit
   // paths all return focus to the element that opened the picker
@@ -224,12 +261,17 @@
     // recursion). Rendered as second-to-last row (just before the
     // "+ Add a new external speaker" CTA if that CTA paints;
     // otherwise at the tail).
+    // #188 · additionally suppressed in subset mode — during a
+    // subset rename the user has explicitly chosen specific lines;
+    // offering "replace every X with…" would be a contradictory
+    // affordance.
     const showBulk =
       mode === "primary" &&
       variant === "stack" &&
       contextCount > 1 &&
       contextSpeaker.trim().length > 0 &&
-      !!onbulkpick;
+      !!onbulkpick &&
+      !subsetMode;
 
     // CTA row — shown when input has non-empty text that doesn't
     // match any row above (case-insensitive). In secondary mode the
@@ -353,6 +395,20 @@
     // Parent unmounts on success; no dropdownOpen toggle here.
   }
 
+  // #188 · route a SpeakerPick payload through `onsubsetpick` when
+  // the picker is mounted in subset mode; otherwise through the
+  // normal `onpick`. Parent handles the save (+ clears selection on
+  // success AND error).
+  function emitPrimary(user: OrgMemberLite | null, freeText: string | null) {
+    if (subsetMode && onsubsetpick) {
+      onsubsetpick({ user, freeText } as SpeakerSubsetPick);
+    } else if (user) {
+      onpick({ user, freeText: null });
+    } else {
+      onpick({ user: null, freeText: freeText ?? "" });
+    }
+  }
+
   function pickRow(row: Row) {
     if (row.kind === "bulk") {
       enterSecondary();
@@ -374,23 +430,23 @@
     }
     // primary mode
     if (row.kind === "member") {
-      onpick({ user: row.member, freeText: null });
+      emitPrimary(row.member, null);
     } else if (row.kind === "external") {
-      onpick({ user: null, freeText: row.name });
+      emitPrimary(null, row.name);
     } else if (row.kind === "recent") {
       // Recents row — resolve back to a roster member by name. If it
       // doesn't resolve (teammate deactivated between reads), fall
       // through as free-form so the Save isn't lost.
       const m = resolveMemberByName(row.name);
       if (m) {
-        onpick({ user: m, freeText: null });
+        emitPrimary(m, null);
       } else {
-        onpick({ user: null, freeText: row.name });
+        emitPrimary(null, row.name);
       }
     } else if (row.kind === "cta") {
-      onpick({ user: null, freeText: row.typed });
+      emitPrimary(null, row.typed);
     }
-    // v0.4.1 (#122 C.2): collapse after firing `onpick`. Setting
+    // v0.4.1 (#122 C.2): collapse after firing the pick. Setting
     // this last so a parent that re-seeds `value` in response to
     // the pick can't inadvertently re-open the list via a
     // dependent effect.
@@ -418,7 +474,7 @@
       return;
     }
     if (member) {
-      onpick({ user: member, freeText: null });
+      emitPrimary(member, null);
       dropdownOpen = false;
       return;
     }
@@ -426,7 +482,7 @@
       oncancel();
       return;
     }
-    onpick({ user: null, freeText: trimmed });
+    emitPrimary(null, trimmed);
     dropdownOpen = false;
   }
 
@@ -486,16 +542,20 @@
     return "";
   }
 
-  // Input placeholder / aria-label swap in secondary mode.
+  // Input placeholder / aria-label swap in secondary + subset mode.
   let currentPlaceholder = $derived(
     mode === "secondary"
       ? `Pick who "${contextSpeaker}" should be…`
-      : placeholder,
+      : subsetMode
+        ? "Pick a teammate or type a name…"
+        : placeholder,
   );
   let currentAriaLabel = $derived(
     mode === "secondary"
       ? `Pick who "${contextSpeaker}" should be`
-      : "Rename speaker — start typing or choose a teammate",
+      : subsetMode
+        ? `Rename ${selectionCount} selected lines — start typing or choose a teammate`
+        : "Rename speaker — start typing or choose a teammate",
   );
   let saveLabel = $derived(
     mode === "secondary" ? (saving ? "…" : "Go") : saving ? "…" : savingLabel,
@@ -562,6 +622,16 @@
           {#if mode === "secondary"}
             <div class="srp-bulk-head">
               Replace every "{contextSpeaker}" with:
+            </div>
+          {:else if subsetMode}
+            <!-- #188 · subset header: always reads "RENAME SELECTED
+                 — {N} lines" regardless of whether the selection
+                 spans one or many speakers (mixed-speaker subsets
+                 are allowed per user decision 2026-04-24). -->
+            <div class="srp-bulk-head">
+              Rename {selectionCount} selected {selectionCount === 1
+                ? "line"
+                : "lines"} to:
             </div>
           {/if}
           {#if !rosterLoaded}

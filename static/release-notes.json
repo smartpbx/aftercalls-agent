@@ -1,4 +1,16 @@
 {
+  "0.7.0": {
+    "headline": "Zoho CRM, guided onboarding, and in-app issue reporting",
+    "changes": [
+      "Send calls to Zoho CRM. An admin connects the org once; anyone can then push a call as a Call activity linked to a Contact, Deal, Account, Lead, or Quote, with tags reflecting the choice.",
+      "New-user onboarding. A short guided tour greets first-time sign-ins with the key things to know plus the desktop-app download.",
+      "Report an issue from inside the app. Attach screenshots; we include a diagnostic bundle so we can help faster.",
+      "Multi-select rename on transcripts. Pick two or more lines and rename only those — the missing granularity between single-line and every-occurrence.",
+      "Consistent date picker in Calls. Same behavior on every platform — no more stuck dropdowns or unexpected defaults.",
+      "Quieter auto-detect on Linux. Keep call detection running without the app stealing focus mid-task.",
+      "Stronger support workflow. When our team acts on your behalf to investigate an issue, you'll see a clear banner and every action gets logged to a tamper-resistant audit trail."
+    ]
+  },
   "0.6.0": {
     "headline": "Bulk transcript renaming, external speakers in the picker, cleaner sidebar",
     "changes": [

@@ -103,6 +103,14 @@
   // ── App preferences (per-machine) ───────────────────────────────────
   let closeToTray = $state(true);
   let autoDetect = $state(true);
+  // #180 (v0.6.x) — sub-toggle of autoDetect. When autoDetect is on
+  // but this is off, the in-app slide-out still renders on detection
+  // (the Rust side keeps emitting the `auto-detect` event) but the
+  // window-show / focus-steal path is skipped. Tiling-WM users
+  // (Hyprland, Sway) want detection to keep running without losing
+  // focus mid-task. Default true preserves historical behavior for
+  // every existing install.
+  let autoDetectPopup = $state(true);
   let telemetryEnabled = $state(true);
   let soundsEnabled = $state(true);
   // Hard recording-length ceiling (#75). Default 120 min; Rust clamps
@@ -276,6 +284,7 @@
       const p = await invoke<{
         close_to_tray: boolean;
         auto_detect: boolean;
+        auto_detect_popup: boolean;
         telemetry_enabled: boolean;
         sounds_enabled: boolean;
         max_recording_minutes: number;
@@ -288,6 +297,7 @@
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
+      autoDetectPopup = p.auto_detect_popup ?? true;
       telemetryEnabled = p.telemetry_enabled;
       soundsEnabled = p.sounds_enabled;
       maxRecordingMinutes = p.max_recording_minutes ?? 120;
@@ -318,6 +328,7 @@
       await invoke("set_app_prefs", {
         closeToTray,
         autoDetect,
+        autoDetectPopup,
         telemetryEnabled,
         soundsEnabled,
         maxRecordingMinutes: mins,
@@ -798,6 +809,42 @@
         </span>
         <span class="switch-label">
           {autoDetect ? "On" : "Off"}
+        </span>
+      </label>
+    </div>
+
+    <!-- #180 — sub-toggle of auto-detect. Detection runs in both
+         positions; this only controls whether the agent also raises
+         + focuses the window. Disabled when the master toggle is off
+         (nothing to gate). aria-describedby ties hint to the input
+         per the accessibility pattern used elsewhere on this page. -->
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Show window when a call is detected</span>
+        <span class="pref-hint" id="auto-detect-popup-hint">
+          {autoDetect
+            ? autoDetectPopup
+              ? "When a call starts, aftercalls raises and focuses the window so the prompt is unmissable."
+              : "Detection still updates the in-app prompt, but the window won't take focus. Helpful on tiling window managers (Hyprland, Sway) where focus-steal disrupts what you're doing."
+            : "Available when auto-detect is on."}
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={autoDetectPopup}
+          disabled={!autoDetect}
+          aria-describedby="auto-detect-popup-hint"
+          onchange={(e) => {
+            autoDetectPopup = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {autoDetectPopup ? "On" : "Off"}
         </span>
       </label>
     </div>

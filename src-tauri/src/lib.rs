@@ -6,6 +6,7 @@ mod portal;
 mod recorder;
 mod recovery;
 mod summary;
+mod support;
 mod telemetry;
 mod transcription;
 mod upload;
@@ -315,6 +316,14 @@ struct RecordingStatus {
     // the running timer after a webview remount (tray hide+show,
     // route nav) rather than restarting from 00:00.
     started_at_ms: Option<i64>,
+    // Active session directory path as a string; None when idle. Lets
+    // the Record page rehydrate `sessionDir` (and the `currentSessionId`
+    // derived from it) on a route-nav remount so the manual-notes
+    // panel's render gate re-passes without waiting for a new
+    // transition event (#185). String (not struct-wrapped PathBuf) so
+    // the webview's existing string-split parse of the session id
+    // continues to work unchanged.
+    session_dir: Option<String>,
 }
 
 // Point-in-time query used by the Record page on mount. The
@@ -325,6 +334,9 @@ fn is_recording(state: State<Recorder>) -> RecordingStatus {
     RecordingStatus {
         recording: state.is_active(),
         started_at_ms: state.started_at_ms(),
+        session_dir: state
+            .session_dir()
+            .map(|p| p.to_string_lossy().into_owned()),
     }
 }
 
@@ -863,6 +875,11 @@ async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
 struct AppPrefs {
     close_to_tray: bool,
     auto_detect: bool,
+    /// #180 — sub-toggle of auto_detect. When auto_detect is on but
+    /// this is off, detection still fires the in-app slide-out
+    /// (event emit) without raising / focusing the window. Settings
+    /// UI hides this row when auto_detect is off.
+    auto_detect_popup: bool,
     telemetry_enabled: bool,
     sounds_enabled: bool,
     max_recording_minutes: u32,
@@ -892,6 +909,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
     Ok(AppPrefs {
         close_to_tray: cfg.close_to_tray,
         auto_detect: cfg.auto_detect,
+        auto_detect_popup: cfg.auto_detect_popup,
         telemetry_enabled: cfg.telemetry_enabled,
         sounds_enabled: cfg.sounds_enabled,
         max_recording_minutes: cfg.max_recording_minutes,
@@ -909,6 +927,7 @@ fn set_app_prefs(
     app: AppHandle,
     close_to_tray: bool,
     auto_detect: bool,
+    auto_detect_popup: bool,
     telemetry_enabled: bool,
     sounds_enabled: bool,
     max_recording_minutes: u32,
@@ -963,6 +982,7 @@ fn set_app_prefs(
     let prev_record_toggle_shortcut = cfg.record_toggle_shortcut.clone();
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
+    cfg.auto_detect_popup = auto_detect_popup;
     cfg.telemetry_enabled = telemetry_enabled;
     cfg.sounds_enabled = sounds_enabled;
     cfg.max_recording_minutes = max_recording_minutes;
@@ -1139,15 +1159,26 @@ async fn rename_speaker(
     from: String,
     to: String,
     to_user_id: Option<String>,
+    // #188: optional subset of utterance idxs. `None` or empty vec →
+    // existing global rename; non-empty → subset-only rewrite on
+    // backend.
+    utterance_ids: Option<Vec<i32>>,
 ) -> Result<u64, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
-    portal::rename_speaker(backend, &id, &from, &to, to_user_id.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    portal::rename_speaker(
+        backend,
+        &id,
+        &from,
+        &to,
+        to_user_id.as_deref(),
+        utterance_ids.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // Slim org roster for the speaker-rename autocomplete (#65). Any
@@ -1291,6 +1322,59 @@ async fn delete_action_item(
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
     portal::delete_action_item(backend, &call_id, &item_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// GET /v1/org/zoho/status — Zoho connection probe (#186). Used by
+/// the call-detail page on mount to gate the "Send to CRM" button.
+/// Failure (env-disabled, network down) is the caller's concern;
+/// the frontend treats it as "not connected" and just hides the
+/// button.
+#[tauri::command]
+async fn zoho_status() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::zoho_status(backend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// GET /v1/zoho/records?module=…&q=… — Zoho record search (#186).
+/// Step 2 of SendToZohoModal. Returns up to 20 hits per
+/// (module, query) tuple.
+#[tauri::command]
+async fn zoho_search_records(
+    module: String,
+    q: String,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::zoho_search_records(backend, &module, &q)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
+/// activity linked to the picked record (#186). Body is forwarded
+/// verbatim from the SendToZohoModal Step-3 review state.
+#[tauri::command]
+async fn zoho_push_call(
+    call_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::zoho_push_call(backend, &call_id, &body)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1918,9 +2002,18 @@ pub fn run() {
             list_orphan_sessions,
             resume_orphan_session,
             discard_orphan_session,
+            // #186 Zoho CRM: status probe + search + push.
+            // Connect/disconnect happens on the portal admin page; the
+            // agent links out via openUrl, so no connect command here.
+            zoho_status,
+            zoho_search_records,
+            zoho_push_call,
             notes::save_notes,
             notes::load_notes,
             notes::update_call_notes,
+            // #183 — in-agent support reports.
+            support::inspect_support_attachment,
+            support::submit_support_report,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent

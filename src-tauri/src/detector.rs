@@ -99,9 +99,15 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
     // having to restart the app. When off, we clear any in-flight
     // prompt and return to Idle so the user isn't stuck on an
     // already-fired banner.
-    let auto_detect_on = crate::config::Config::load()
-        .map(|c| c.auto_detect)
-        .unwrap_or(true);
+    //
+    // #180 — the popup flag is read on the same tick so flipping
+    // "show system popup" in Settings takes effect before the next
+    // detection without a restart. Defaults to true on read failure
+    // to preserve historical "always-focus" behavior when the
+    // config can't be loaded.
+    let cfg = crate::config::Config::load().ok();
+    let auto_detect_on = cfg.as_ref().map(|c| c.auto_detect).unwrap_or(true);
+    let popup_on = cfg.as_ref().map(|c| c.auto_detect_popup).unwrap_or(true);
     if !auto_detect_on {
         if !matches!(phase, Phase::Idle) {
             emit(app, AutoDetectEvent::Cleared);
@@ -120,7 +126,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             if let Some(consumer) = consumers.iter().next() {
                 eprintln!("aftercalls: '{consumer}' is using the mic — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: consumer.clone() });
-                show_window(app);
+                maybe_show_window(app, popup_on);
                 Phase::AwaitingStartConfirm { consumer: consumer.clone() }
             } else {
                 Phase::Idle
@@ -142,7 +148,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                 if since.elapsed() >= CONSUMER_GONE_BEFORE_END_PROMPT {
                     eprintln!("aftercalls: '{consumer}' stopped using mic — prompting to end");
                     emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
-                    show_window(app);
+                    maybe_show_window(app, popup_on);
                     Phase::AwaitingEndConfirm { consumer, gone_since: since }
                 } else {
                     Phase::Recording { consumer, gone_since: Some(since) }
@@ -181,7 +187,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             if let Some(other) = consumers.iter().find(|c| **c != consumer) {
                 eprintln!("aftercalls: new mic consumer '{other}' — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: other.clone() });
-                show_window(app);
+                maybe_show_window(app, popup_on);
                 Phase::AwaitingStartConfirm { consumer: other.clone() }
             } else if still_suppressing {
                 Phase::Suppressed { consumer }
@@ -519,5 +525,16 @@ fn show_window(app: &AppHandle) {
         }
         let _ = win.unminimize();
         let _ = win.set_focus();
+    }
+}
+
+/// #180 — gate the window-show / focus-steal behind the
+/// `auto_detect_popup` pref. When the user has it off, the in-app
+/// `auto-detect` event still fires (the slide-out renders) but we
+/// don't pull the user's cursor / focus away from whatever they're
+/// doing. Tiling-WM / Hyprland use case in the issue.
+fn maybe_show_window(app: &AppHandle, popup_on: bool) {
+    if popup_on {
+        show_window(app);
     }
 }

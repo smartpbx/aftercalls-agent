@@ -30,6 +30,17 @@ pub struct Config {
     /// — no CPU wasted if the user never wants auto-detection.
     #[serde(default = "default_true")]
     pub auto_detect: bool,
+    /// #180 (v0.6.x) — when true (default), an auto-detected call
+    /// also raises and focuses the main window so the in-app prompt
+    /// is unmissable. Off keeps the in-app prompt firing (the
+    /// detector still emits its event so the slide-out renders) but
+    /// suppresses the window-show / focus path. Tiling-WM users
+    /// (Hyprland, Sway, etc.) flip this off so a detected call
+    /// doesn't yank focus mid-task. Serde default keeps existing
+    /// config.toml files loading cleanly with the historical
+    /// always-focus behavior.
+    #[serde(default = "default_true")]
+    pub auto_detect_popup: bool,
     /// When true (default during dev), the agent ships a ring buffer
     /// of log entries + pipeline events + panics to
     /// `/v1/agent/logs/batch` every 30s. Off disables the flush task
@@ -162,6 +173,7 @@ impl Config {
                 }),
                 close_to_tray: true,
                 auto_detect: true,
+                auto_detect_popup: true,
                 telemetry_enabled: true,
                 sounds_enabled: true,
                 max_recording_minutes: default_max_recording_minutes(),
