@@ -34,11 +34,80 @@
 
   let recording = $state(false);
   let pipelineStage = $state("");
+  // #142 · v0.4.5 — track which mode the in-flight recording is in
+  // so the note-to-self overlay can surface only during a self-note
+  // session. `"call"` defaults in a fallback where the backend's
+  // event shape lacks the mode field.
+  let recordingMode = $state<"call" | "self_note" | null>(null);
+  // Live-elapsed label for the overlay. Populated on mount via
+  // is_recording (so a reopened webview picks up an in-flight
+  // session) and ticked every 500ms while the overlay is visible.
+  let noteElapsedLabel = $state("0:00");
+  let noteStartedAtMs = $state<number | null>(null);
+  let noteTimerHandle: ReturnType<typeof setInterval> | null = null;
+  let stoppingNote = $state(false);
+  let noteError = $state<string | null>(null);
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
   let unlistenAutoDetect: UnlistenFn | null = null;
+
+  // #142 · v0.4.5 — note-to-self overlay helpers. Kept close to the
+  // overlay state declaration so additions/removals stay localised.
+  function fmtElapsed(ms: number): string {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+  function startNoteTimer() {
+    stopNoteTimer();
+    noteTimerHandle = setInterval(() => {
+      if (!noteStartedAtMs) return;
+      noteElapsedLabel = fmtElapsed(Date.now() - noteStartedAtMs);
+    }, 500);
+  }
+  function stopNoteTimer() {
+    if (noteTimerHandle) {
+      clearInterval(noteTimerHandle);
+      noteTimerHandle = null;
+    }
+  }
+  async function primeNoteOverlay() {
+    try {
+      const status = await invoke<{
+        recording: boolean;
+        started_at_ms: number | null;
+      }>("is_recording");
+      if (status?.started_at_ms) {
+        noteStartedAtMs = status.started_at_ms;
+        noteElapsedLabel = fmtElapsed(Date.now() - noteStartedAtMs);
+      } else {
+        noteStartedAtMs = Date.now();
+        noteElapsedLabel = "0:00";
+      }
+    } catch {
+      noteStartedAtMs = Date.now();
+      noteElapsedLabel = "0:00";
+    }
+    startNoteTimer();
+  }
+  async function stopNoteToSelf() {
+    if (stoppingNote) return;
+    stoppingNote = true;
+    noteError = null;
+    try {
+      await invoke<string>("stop_recording");
+    } catch (e) {
+      noteError = typeof e === "string" ? e : String(e);
+      stoppingNote = false;
+    }
+  }
+  function dismissNoteError() {
+    noteError = null;
+  }
+  let noteOverlayLive = $derived(recording && recordingMode === "self_note");
 
   // Auto-detect slide-out state (#59). Only the `prompt_start` kind
   // surfaces here; `prompt_end` (mid-recording idle-mic prompt) stays
@@ -345,10 +414,26 @@
       // the same ones that'll drive the status pill post-login.
     }
 
-    unlistenState = await listen<{ recording: boolean }>(
+    unlistenState = await listen<{
+      recording: boolean;
+      mode?: "call" | "self_note" | null;
+    }>(
       "recording-state",
       (evt) => {
         recording = evt.payload.recording;
+        // #142 · v0.4.5 — mode rides on the event so the overlay
+        // only surfaces for self-notes. Missing field (fallback
+        // from an old backend) → treat as "call".
+        const mode = evt.payload.mode ?? "call";
+        recordingMode = recording ? mode : null;
+        if (recording && mode === "self_note") {
+          void primeNoteOverlay();
+        } else {
+          stopNoteTimer();
+          noteStartedAtMs = null;
+          noteElapsedLabel = "0:00";
+          stoppingNote = false;
+        }
         // #79: a very short recording may stop before the pipeline
         // ever engages (auto-detect false start, cancelled session).
         // If we deferred a poll and no pipeline event comes along to
@@ -697,6 +782,7 @@
     unlistenTray?.();
     unlistenUpdatePoll?.();
     unlistenAutoDetect?.();
+    stopNoteTimer();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
   });
 
@@ -1273,6 +1359,63 @@
     </div>
   </div>
 </div>
+{/if}
+
+<!-- #142 · v0.4.5 — note-to-self overlay. Modeless bottom-right
+     (bottom-centre on narrow viewports). Reshapes to an error
+     surface when `noteError` is set. Only renders during an
+     active self-note session. -->
+{#if noteOverlayLive && !noteError}
+  <div
+    class="note-overlay"
+    role="dialog"
+    aria-live="polite"
+    aria-label="Recording note to self"
+  >
+    <div class="note-overlay-head">
+      <span class="note-pip" aria-hidden="true"></span>
+      <span class="note-title">Recording note</span>
+      <span class="note-elapsed" aria-hidden="true">{noteElapsedLabel}</span>
+    </div>
+    <div class="note-overlay-actions">
+      <button
+        type="button"
+        class="note-stop"
+        onclick={stopNoteToSelf}
+        disabled={stoppingNote}
+      >
+        {stoppingNote ? "Stopping…" : "Stop"}
+      </button>
+    </div>
+  </div>
+{/if}
+{#if noteError}
+  <div class="note-overlay note-overlay-error" role="alert">
+    <div class="note-overlay-head">
+      <span class="note-pip note-pip-failed" aria-hidden="true"></span>
+      <span class="note-title">Note not recorded</span>
+    </div>
+    <p class="note-error-body">{noteError}</p>
+    <div class="note-overlay-actions">
+      <button
+        type="button"
+        class="note-retry"
+        onclick={async () => {
+          noteError = null;
+          try {
+            await invoke<string>("start_self_note");
+          } catch (e) {
+            noteError = typeof e === "string" ? e : String(e);
+          }
+        }}
+      >
+        Try again
+      </button>
+      <button type="button" class="note-dismiss" onclick={dismissNoteError}>
+        Dismiss
+      </button>
+    </div>
+  </div>
 {/if}
 
 {#if releaseNotes}
@@ -2290,5 +2433,163 @@
       bottom: 1rem;
       width: auto;
     }
+  }
+
+  /* ── Note-to-self overlay (#142 / v0.4.5) ────────────────────────
+     Modeless live-capture widget on the agent. Fixed bottom-right
+     (bottom-centre on narrow viewports), `--ink-1` surface, same
+     shadow vocabulary as the user menu + update pill. z-index 50 —
+     above the chip-menu popover (30) but the overlay doesn't trap
+     focus so it doesn't compete semantically. */
+  .note-overlay {
+    position: fixed;
+    right: 1.5rem;
+    bottom: 1.5rem;
+    z-index: 50;
+    min-width: 240px;
+    max-width: 320px;
+    padding: 0.75rem 0.9rem;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    box-shadow:
+      0 18px 36px -12px rgba(0, 0, 0, 0.55),
+      0 2px 6px -2px rgba(0, 0, 0, 0.35);
+    font-size: 0.85rem;
+    color: var(--bone-1);
+    animation: note-overlay-in 180ms ease-out both;
+  }
+  @media (max-width: 520px) {
+    .note-overlay {
+      left: 50%;
+      right: auto;
+      bottom: 1rem;
+      transform: translateX(-50%);
+      max-width: calc(100vw - 2rem);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .note-overlay {
+      animation: none;
+    }
+  }
+  @keyframes note-overlay-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .note-overlay-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.45rem;
+  }
+  .note-pip {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--live);
+    animation: note-pip-pulse 1.2s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .note-pip {
+      animation: none;
+    }
+  }
+  @keyframes note-pip-pulse {
+    0%, 100% {
+      opacity: 1;
+      box-shadow: 0 0 0 0 var(--live-soft);
+    }
+    50% {
+      opacity: 0.85;
+      box-shadow: 0 0 0 4px transparent;
+    }
+  }
+  .note-pip-failed {
+    animation: none;
+  }
+  .note-title {
+    font-weight: 600;
+    color: var(--bone-0);
+    letter-spacing: -0.01em;
+    flex: 1 1 auto;
+  }
+  .note-elapsed {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--bone-1);
+    font-variant-numeric: tabular-nums;
+  }
+  .note-overlay-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
+  .note-stop {
+    padding: 0.38rem 0.9rem;
+    border: 1px solid var(--live);
+    background: var(--live-soft);
+    color: var(--live);
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 120ms linear, color 120ms linear;
+  }
+  .note-stop:hover:not(:disabled) {
+    background: var(--live);
+    color: var(--ink-0);
+  }
+  .note-stop:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+  }
+  .note-stop:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .note-overlay-error {
+    border-color: var(--live-soft);
+  }
+  .note-error-body {
+    margin: 0 0 0.6rem;
+    font-size: 0.82rem;
+    color: var(--bone-1);
+  }
+  .note-retry {
+    padding: 0.38rem 0.9rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .note-retry:hover {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .note-dismiss {
+    padding: 0.38rem 0.9rem;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--bone-2);
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .note-dismiss:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
   }
 </style>

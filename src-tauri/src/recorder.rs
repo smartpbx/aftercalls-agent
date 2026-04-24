@@ -85,6 +85,12 @@ enum Command_ {
     Start {
         base_dir: PathBuf,
         saved_device: Option<String>,
+        // #142 · v0.4.5 — note-to-self mode. When true `begin()`
+        // skips `start_system_loopback` entirely so even a
+        // compositor / WASAPI monitor that would otherwise succeed
+        // stays closed. The self-note session_dir contains only
+        // mic.wav (+ source.json written by `lib.rs`).
+        mic_only: bool,
         reply: Sender<Result<StartOk, String>>,
     },
     Stop {
@@ -157,6 +163,7 @@ impl Recorder {
         &self,
         base_dir: PathBuf,
         saved_device: Option<String>,
+        mic_only: bool,
     ) -> Result<PathBuf, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.inner
@@ -166,6 +173,7 @@ impl Recorder {
             .send(Command_::Start {
                 base_dir,
                 saved_device,
+                mic_only,
                 reply: reply_tx,
             })
             .map_err(|e| e.to_string())?;
@@ -233,13 +241,14 @@ fn worker_loop(rx: Receiver<Command_>) {
             Command_::Start {
                 base_dir,
                 saved_device,
+                mic_only,
                 reply,
             } => {
                 if active.is_some() {
                     let _ = reply.send(Err("recording already in progress".into()));
                     continue;
                 }
-                match begin(&base_dir, saved_device.as_deref()) {
+                match begin(&base_dir, saved_device.as_deref(), mic_only) {
                     Ok(rec) => {
                         let path = rec.session_dir.clone();
                         let fallback = rec.fallback.clone();
@@ -264,7 +273,7 @@ fn worker_loop(rx: Receiver<Command_>) {
     }
 }
 
-fn begin(base_dir: &Path, saved_device: Option<&str>) -> Result<Active> {
+fn begin(base_dir: &Path, saved_device: Option<&str>, mic_only: bool) -> Result<Active> {
     let session_dir = base_dir.join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
     fs::create_dir_all(&session_dir).context("create session dir")?;
 
@@ -277,14 +286,25 @@ fn begin(base_dir: &Path, saved_device: Option<&str>) -> Result<Active> {
         mic_device.name().unwrap_or_default()
     );
 
-    let system = match start_system_loopback(&session_dir.join("system.wav")) {
-        Ok((cap, target)) => {
-            eprintln!("aftercalls: recording system audio from {target}");
-            Some(cap)
-        }
-        Err(e) => {
-            eprintln!("aftercalls: skipping system loopback: {e:#}");
-            None
+    // #142 · v0.4.5 — note-to-self sessions skip system loopback
+    // entirely so a silently-succeeding compositor monitor can't
+    // capture "the other side" of a conversation we deliberately
+    // declared mic-only. Privacy + storage are both positively
+    // affected; the pipeline already handles a missing system.wav
+    // cleanly.
+    let system = if mic_only {
+        eprintln!("aftercalls: mic-only session — skipping system loopback");
+        None
+    } else {
+        match start_system_loopback(&session_dir.join("system.wav")) {
+            Ok((cap, target)) => {
+                eprintln!("aftercalls: recording system audio from {target}");
+                Some(cap)
+            }
+            Err(e) => {
+                eprintln!("aftercalls: skipping system loopback: {e:#}");
+                None
+            }
         }
     };
 

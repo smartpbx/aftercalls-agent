@@ -109,6 +109,11 @@
   // to [5, 1440] on save. Kept as a plain number so the <input> binds
   // cleanly; we coerce to integer inside saveAppPrefs before sending.
   let maxRecordingMinutes = $state(120);
+  // #142 · v0.4.5 — note-to-self cap. Default 5 min, Rust clamps to
+  // [1, 60]. Shorter range than the regular cap because dictations
+  // should be short by design; the tighter ceiling protects against
+  // a user walking away from the mic mid-note.
+  let maxSelfNoteMinutes = $state(5);
   // Manual notes panel (#73). When on, the record screen shows a
   // CodeMirror editor during active recording; notes ride into
   // create_call and optionally feed into the summary. Off by default
@@ -255,6 +260,7 @@
         telemetry_enabled: boolean;
         sounds_enabled: boolean;
         max_recording_minutes: number;
+        max_self_note_minutes: number;
         manual_notes_enabled: boolean;
         wayland_hotkey_notice_dismissed: boolean;
         input_device: string | null;
@@ -264,6 +270,7 @@
       telemetryEnabled = p.telemetry_enabled;
       soundsEnabled = p.sounds_enabled;
       maxRecordingMinutes = p.max_recording_minutes ?? 120;
+      maxSelfNoteMinutes = p.max_self_note_minutes ?? 5;
       manualNotesEnabled = p.manual_notes_enabled ?? false;
       waylandHotkeyNoticeDismissed = p.wayland_hotkey_notice_dismissed ?? false;
       inputDevice = p.input_device ?? null;
@@ -281,12 +288,17 @@
         1440,
         Math.max(5, Math.round(Number(maxRecordingMinutes) || 120)),
       );
+      const noteMins = Math.min(
+        60,
+        Math.max(1, Math.round(Number(maxSelfNoteMinutes) || 5)),
+      );
       await invoke("set_app_prefs", {
         closeToTray,
         autoDetect,
         telemetryEnabled,
         soundsEnabled,
         maxRecordingMinutes: mins,
+        maxSelfNoteMinutes: noteMins,
         manualNotesEnabled,
         waylandHotkeyNoticeDismissed,
         inputDevice,
@@ -722,6 +734,27 @@
         max="1440"
         step="5"
         bind:value={maxRecordingMinutes}
+        onchange={saveAppPrefs}
+      />
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Maximum note-to-self length (minutes)</span>
+        <span class="pref-hint">
+          Recording stops automatically at this length. Tighter cap
+          than regular recordings because a dictation is usually
+          short. Minimum 1, maximum 60. Default 5. Keyboard shortcut:
+          Super+Shift+N (Super = Win/Meta).
+        </span>
+      </div>
+      <input
+        class="input num-input"
+        type="number"
+        min="1"
+        max="60"
+        step="1"
+        bind:value={maxSelfNoteMinutes}
         onchange={saveAppPrefs}
       />
     </div>

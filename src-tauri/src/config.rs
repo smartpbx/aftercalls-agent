@@ -51,6 +51,14 @@ pub struct Config {
     /// validated in the UI to [5, 1440].
     #[serde(default = "default_max_recording_minutes")]
     pub max_recording_minutes: u32,
+    /// #142 · v0.4.5 — Hard upper bound on a single note-to-self
+    /// recording. Half the regular cap by default because a
+    /// dictation is typically 10–120s; the 5-minute ceiling is a
+    /// safety rail against a user walking away from the mic. UI
+    /// clamps to [1, 60]; serde default covers existing config.toml
+    /// files.
+    #[serde(default = "default_max_self_note_minutes")]
+    pub max_self_note_minutes: u32,
     /// When true, the record screen exposes a manual notes panel during
     /// an active recording. Notes persist to the session_dir and ride
     /// into create_call; the backend optionally feeds them into the
@@ -87,6 +95,10 @@ fn default_true() -> bool {
 
 fn default_max_recording_minutes() -> u32 {
     120
+}
+
+fn default_max_self_note_minutes() -> u32 {
+    5
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -127,6 +139,7 @@ impl Config {
                 telemetry_enabled: true,
                 sounds_enabled: true,
                 max_recording_minutes: default_max_recording_minutes(),
+                max_self_note_minutes: default_max_self_note_minutes(),
                 manual_notes_enabled: false,
                 wayland_hotkey_notice_dismissed: false,
                 input_device: None,

@@ -53,6 +53,63 @@
     if (!initial) return first;
     return `${first} ${initial.toLocaleUpperCase()}.`;
   }
+
+  // #140 · v0.4.5 — indexed chip-occurrence rewrite helper.
+  //
+  // Rewrite the `occurrenceIndex`-th `<name>...</name>` match in
+  // `source`. `action === "rename"` swaps the inner text for
+  // `replacement` (keeps the wrapper tags); `action === "unlink"`
+  // strips the wrapper and leaves the bare inner text in place.
+  //
+  // Every other `<name>...</name>` in `source` — including ones
+  // with the same inner string — stays untouched. The regex here
+  // mirrors the `tokenize` pattern above so the index counter
+  // stays in lockstep between render-order and rewrite-order.
+  //
+  // Caller is responsible for canonicalising `replacement` to the
+  // `First L.` form via `firstLastInitial(member)` so the rewritten
+  // token matches the tokenizer / resolver on the next render.
+  export function rewriteChipOccurrence(
+    source: string,
+    occurrenceIndex: number,
+    action: "rename" | "unlink",
+    replacement?: string,
+  ): string {
+    if (!source) return source;
+    const re = /<name>([^<]+)<\/name>/g;
+    let idx = 0;
+    let result = "";
+    let lastEnd = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(source)) !== null) {
+      result += source.slice(lastEnd, m.index);
+      if (idx === occurrenceIndex) {
+        if (action === "rename" && replacement !== undefined) {
+          result += `<name>${replacement}</name>`;
+        } else {
+          // Unlink (or rename with no replacement supplied): strip
+          // the wrapper, keep the inner text verbatim.
+          result += m[1];
+        }
+      } else {
+        result += m[0];
+      }
+      lastEnd = m.index + m[0].length;
+      idx += 1;
+    }
+    result += source.slice(lastEnd);
+    return result;
+  }
+
+  // Detail payload fired by the interactive chip surface (#140).
+  // Parent mounts `<ChipMenu>` anchored to `anchor` and — on menu
+  // action — uses `occurrenceIndex` with `rewriteChipOccurrence`
+  // to target the exact `<name>` token that was clicked.
+  export type ChipActionDetail = {
+    inner: string;
+    occurrenceIndex: number;
+    anchor: HTMLElement;
+  };
 </script>
 
 <script lang="ts">
@@ -87,6 +144,17 @@
   // Legacy summaries (stored before the marker prompt shipped) have
   // zero `<name>` tags; the tokenizer returns one text segment and
   // the output is plain text — no errors, no warnings.
+  //
+  // Interactive chip (#140 / v0.4.5). When `onchipaction` is
+  // provided, unique-match chips render as `<button>` elements with
+  // `aria-label="Edit mention: {name}"` and emit
+  // `onchipaction({ inner, occurrenceIndex, anchor })` on activate.
+  // The occurrence index counts only `<name>` segments in document
+  // order so the parent can target the exact token via
+  // `rewriteChipOccurrence(...)`. Without the prop chips render as
+  // non-interactive spans (read-only call-sites keep their v0.4.0
+  // behaviour). Ambiguous + external branches stay non-interactive
+  // in either mode.
 
   import Avatar from "./Avatar.svelte";
 
@@ -94,9 +162,24 @@
     text: string | null | undefined;
     users?: SummaryMember[];
     colorFor?: (name: string) => string;
+    // #140 · v0.4.5 — chip-action callback. Set by the parent on
+    // surfaces where clicking a chip should open the edit-menu.
+    // Undefined keeps chips non-interactive (read-only surfaces).
+    onchipaction?: (detail: ChipActionDetail) => void;
+    // #140 · v0.4.5 — occurrence index of the chip whose popover is
+    // currently open. When set, the matching chip renders with the
+    // `.name-chip-active` outline cue so multi-occurrence edits
+    // stay unambiguous. `null` / undefined → no active chip.
+    activeOccurrenceIndex?: number | null;
   };
 
-  let { text, users = [], colorFor }: Props = $props();
+  let {
+    text,
+    users = [],
+    colorFor,
+    onchipaction,
+    activeOccurrenceIndex = null,
+  }: Props = $props();
 
   let segments = $derived(tokenize(text ?? ""));
 
@@ -125,6 +208,36 @@
     const names = matches.map((m) => m.display_name || firstLastInitial(m));
     return `${inner.trim()} — multiple matches (${names.join(", ")})`;
   }
+
+  // Map each segment index → its occurrence index (count of
+  // `<name>` segments before and including this one, minus one).
+  // Text segments carry `-1`. Derived so it reruns whenever
+  // `segments` updates.
+  let occurrenceBySegmentIdx = $derived.by(() => {
+    const out: number[] = [];
+    let n = 0;
+    for (const seg of segments) {
+      if (seg.kind === "name") {
+        out.push(n);
+        n += 1;
+      } else {
+        out.push(-1);
+      }
+    }
+    return out;
+  });
+
+  function onChipClick(
+    e: MouseEvent,
+    inner: string,
+    occurrenceIndex: number,
+  ) {
+    if (!onchipaction) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const anchor = e.currentTarget as HTMLElement;
+    onchipaction({ inner, occurrenceIndex, anchor });
+  }
 </script>
 
 <span class="summary-text">
@@ -133,17 +246,35 @@
       <span>{seg.value}</span>
     {:else}
       {@const matches = matchFor(seg.inner)}
+      {@const occ = occurrenceBySegmentIdx[i]}
       {#if matches.length === 1}
         {@const m = matches[0]}
         {@const c = colorFor ? colorFor(m.display_name) : "var(--accent)"}
-        <span
-          class="name-chip name-linked"
-          style="--name-c: {c}"
-          title="{m.display_name} — linked teammate"
-        >
-          <Avatar name={m.display_name} color={c} size={18} />
-          <span class="name-chip-label">{seg.inner}</span>
-        </span>
+        {#if onchipaction}
+          <button
+            type="button"
+            class="name-chip name-linked name-chip-btn"
+            class:name-chip-active={activeOccurrenceIndex === occ}
+            style="--name-c: {c}"
+            title="{m.display_name} — click to edit"
+            aria-label="Edit mention: {m.display_name}"
+            aria-haspopup="menu"
+            aria-expanded={activeOccurrenceIndex === occ ? "true" : "false"}
+            onclick={(e) => onChipClick(e, seg.inner, occ)}
+          >
+            <Avatar name={m.display_name} color={c} size={18} />
+            <span class="name-chip-label">{seg.inner}</span>
+          </button>
+        {:else}
+          <span
+            class="name-chip name-linked"
+            style="--name-c: {c}"
+            title="{m.display_name} — linked teammate"
+          >
+            <Avatar name={m.display_name} color={c} size={18} />
+            <span class="name-chip-label">{seg.inner}</span>
+          </span>
+        {/if}
       {:else if matches.length > 1}
         <span
           class="name-chip name-ambiguous"
@@ -190,6 +321,32 @@
   }
   .name-linked:hover {
     background: color-mix(in srgb, var(--name-c, var(--accent)) 14%, transparent);
+  }
+
+  /* #140 · v0.4.5 — chip-as-button surface. Reset the native button
+     chrome so the inline paint stays identical to the span variant,
+     but keep the focusable / interactive affordances. */
+  .name-chip-btn {
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    padding: 0 0.25rem 0 0.15rem;
+    cursor: pointer;
+    text-align: inherit;
+  }
+  .name-chip-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* Active-occurrence cue — outlined teammate colour stays, so the
+     accent-hi ring reads as "this one" without overriding the
+     chip's existing paint. Instant; the popover animation covers
+     the transition. */
+  .name-chip-active {
+    outline: 1.5px solid var(--accent-hi);
+    outline-offset: 2px;
   }
 
   .name-chip-label {

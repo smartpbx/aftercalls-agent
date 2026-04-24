@@ -10,8 +10,12 @@
   import SpeakerRenamePicker, {
     type SpeakerPick,
   } from "$lib/SpeakerRenamePicker.svelte";
-  import SummaryText from "$lib/SummaryText.svelte";
+  import SummaryText, {
+    firstLastInitial,
+    rewriteChipOccurrence,
+  } from "$lib/SummaryText.svelte";
   import ActionItem from "$lib/ActionItem.svelte";
+  import ChipMenu from "$lib/ChipMenu.svelte";
 
   type Utterance = {
     idx: number;
@@ -117,6 +121,8 @@
         return "Imported file";
       case "manual":
         return "Manual";
+      case "self_note":
+        return "Note to self";
       default:
         return "";
     }
@@ -175,18 +181,30 @@
       notesError = `Notes exceed ${NOTES_MAX.toLocaleString()} chars.`;
       return;
     }
+    // #84: snapshot the value being PATCHed. If the user keeps typing
+    // during the Tauri round-trip, notesBuffer will have moved on and
+    // the "Saved" indicator would lie about persistence. Mirrors the
+    // portal's fix in portal/src/routes/calls/[id]/+page.svelte.
+    const sent = notesBuffer;
     try {
       await invoke("update_call_notes", {
         callId: call.id,
-        notes: notesBuffer,
+        notes: sent,
       });
-      call = { ...call, notes: notesBuffer };
-      notesStatus = "saved";
-      notesError = "";
-      if (notesSavedFadeTimer !== undefined) clearTimeout(notesSavedFadeTimer);
-      notesSavedFadeTimer = window.setTimeout(() => {
-        if (notesStatus === "saved") notesStatus = "idle";
-      }, 2000);
+      if (sent === notesBuffer) {
+        call = { ...call, notes: sent };
+        notesStatus = "saved";
+        notesError = "";
+        if (notesSavedFadeTimer !== undefined) clearTimeout(notesSavedFadeTimer);
+        notesSavedFadeTimer = window.setTimeout(() => {
+          if (notesStatus === "saved") notesStatus = "idle";
+        }, 2000);
+      } else if (call) {
+        // Server has `sent`; local buffer is newer and a follow-up
+        // debounce will push it. Reflect what the server has so poll
+        // refreshes don't re-clobber later.
+        call = { ...call, notes: sent };
+      }
     } catch (e: any) {
       notesStatus = "error";
       notesError = String(e?.message ?? e);
@@ -1397,6 +1415,19 @@
       clearInterval(pollTimer);
       pollTimer = undefined;
     }
+    // #84: flush any pending-debounce notes save before we unmount.
+    // Tauri commands survive webview route teardown (they run on the
+    // Rust side), so the invoke() here will complete even if the
+    // user navigates away within the 1s debounce window.
+    if (notesSaveTimer !== undefined) {
+      clearTimeout(notesSaveTimer);
+      notesSaveTimer = undefined;
+      void saveNotesNow();
+    }
+    if (notesSavedFadeTimer !== undefined) {
+      clearTimeout(notesSavedFadeTimer);
+      notesSavedFadeTimer = undefined;
+    }
     stopCooldownTicker();
   });
 
@@ -1881,6 +1912,189 @@
       kind.replace(/_/g, " ")
     );
   }
+
+  // ── Mentioned subsection (#140 Ask 1) ────────────────────────────
+  // Same derivation as the portal — scans `<name>` tokens in the
+  // summary + action-item descriptions, resolves each to a single
+  // roster member (ambiguous + external drop out), subtracts anyone
+  // already rendered in Participants, dedupes. Hidden when empty.
+  let mentionedMembers = $derived.by<OrgMember[]>(() => {
+    if (!call) return [];
+    const diarized = new Set<string>();
+    for (const sp of speakers) {
+      const trimmed = (sp.speaker ?? "").trim();
+      if (trimmed) diarized.add(trimmed.toLocaleLowerCase());
+    }
+    const inners = new Set<string>();
+    const tokenRe = /<name>([^<]+)<\/name>/g;
+    const sources: string[] = [];
+    if (call.summary_text) sources.push(call.summary_text);
+    if (call.action_items) {
+      for (const ai of call.action_items) {
+        if (ai.description) sources.push(ai.description);
+      }
+    }
+    for (const s of sources) {
+      for (const m of s.matchAll(tokenRe)) {
+        const inner = m[1].trim();
+        if (inner) inners.add(inner);
+      }
+    }
+    const rosterByKey = new Map<string, OrgMember[]>();
+    for (const member of memberRoster) {
+      const k = firstLastInitial(member).toLocaleLowerCase();
+      if (!k) continue;
+      const existing = rosterByKey.get(k);
+      if (existing) existing.push(member);
+      else rosterByKey.set(k, [member]);
+    }
+    const out: OrgMember[] = [];
+    const seen = new Set<string>();
+    for (const inner of inners) {
+      const key = inner.toLocaleLowerCase();
+      const matches = rosterByKey.get(key) ?? [];
+      if (matches.length !== 1) continue;
+      const member = matches[0];
+      if (seen.has(member.id)) continue;
+      const dn = (member.display_name ?? "").trim().toLocaleLowerCase();
+      const fli = firstLastInitial(member).toLocaleLowerCase();
+      if (dn && diarized.has(dn)) continue;
+      if (fli && diarized.has(fli)) continue;
+      seen.add(member.id);
+      out.push(member);
+    }
+    return out;
+  });
+
+  // ── Chip-menu state (#140 Ask 2/3) ───────────────────────────────
+  type ActiveChip =
+    | {
+        source: "summary";
+        anchor: HTMLElement;
+        inner: string;
+        occurrenceIndex: number;
+      }
+    | {
+        source: "action_item";
+        itemId: string;
+        anchor: HTMLElement;
+        inner: string;
+        occurrenceIndex: number;
+      };
+  let activeChip = $state<ActiveChip | null>(null);
+
+  function openSummaryChip(detail: {
+    inner: string;
+    occurrenceIndex: number;
+    anchor: HTMLElement;
+  }) {
+    activeChip = {
+      source: "summary",
+      anchor: detail.anchor,
+      inner: detail.inner,
+      occurrenceIndex: detail.occurrenceIndex,
+    };
+  }
+  function openActionItemChip(detail: {
+    inner: string;
+    occurrenceIndex: number;
+    anchor: HTMLElement;
+    itemId: string;
+  }) {
+    activeChip = {
+      source: "action_item",
+      itemId: detail.itemId,
+      anchor: detail.anchor,
+      inner: detail.inner,
+      occurrenceIndex: detail.occurrenceIndex,
+    };
+  }
+  function closeChipMenu() {
+    activeChip = null;
+  }
+
+  async function onChipMenuSelect(
+    action: "rename" | "unlink",
+    pick?: SpeakerPick,
+  ) {
+    if (!activeChip || !call) return;
+    const ac = activeChip;
+    let replacement: string | undefined;
+    if (action === "rename") {
+      const user = pick?.user;
+      if (!user) {
+        action = "unlink";
+      } else {
+        const full = memberRoster.find((m) => m.id === user.id);
+        replacement = full
+          ? firstLastInitial({
+              id: full.id,
+              first_name: full.first_name,
+              last_name: full.last_name,
+              display_name: full.display_name,
+            })
+          : "";
+        if (!replacement) {
+          const parts = (user.display_name ?? "").trim().split(/\s+/);
+          const first = parts[0] ?? "";
+          const lastInitial = parts[1] ? parts[1][0] : "";
+          replacement = lastInitial
+            ? `${first} ${lastInitial.toUpperCase()}.`
+            : first;
+        }
+      }
+    }
+    try {
+      if (ac.source === "summary") {
+        const current = call.summary_text ?? "";
+        const rewritten = rewriteChipOccurrence(
+          current,
+          ac.occurrenceIndex,
+          action,
+          replacement,
+        );
+        if (rewritten === current) {
+          closeChipMenu();
+          return;
+        }
+        const fresh = (await invoke("patch_call", {
+          id: call.id,
+          body: { summary_text: rewritten },
+        })) as Call;
+        fresh.notes = notesBuffer;
+        call = fresh;
+      } else {
+        const item = call.action_items?.find((x) => x.id === ac.itemId);
+        if (!item) return;
+        const current = item.description ?? "";
+        const rewritten = rewriteChipOccurrence(
+          current,
+          ac.occurrenceIndex,
+          action,
+          replacement,
+        );
+        if (rewritten === current) {
+          closeChipMenu();
+          return;
+        }
+        const updated = (await invoke("patch_action_item", {
+          callId: call.id,
+          itemId: ac.itemId,
+          body: { description: rewritten },
+        })) as ActionItemRow;
+        if (call?.action_items) {
+          const idx = call.action_items.findIndex((x) => x.id === ac.itemId);
+          if (idx !== -1) {
+            call.action_items[idx] = updated;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("chip action failed", e);
+    } finally {
+      closeChipMenu();
+    }
+  }
 </script>
 
 <!-- reveal class stripped on this route while we isolate the blank-on-click
@@ -1906,6 +2120,8 @@
               {call.title}
             {:else if call.status !== "complete" && call.status !== "failed"}
               <span class="generating">Generating title<span class="gen-dots"></span></span>
+            {:else if call.source_kind === "self_note"}
+              Note to self — {fmtDateTitle(call.recorded_at)}
             {:else}
               (untitled)
             {/if}
@@ -2255,7 +2471,7 @@
       {/if}
     </section>
 
-    {#if speakers.length > 0}
+    {#if speakers.length > 0 || mentionedMembers.length > 0}
       <section class="block" style="--i: 2">
         <div class="block-head">
           <h2>Participants</h2>
@@ -2300,6 +2516,25 @@
             {/if}
           {/each}
         </div>
+        {#if mentionedMembers.length > 0}
+          <div class="mentioned-sub">
+            <h3 class="mentioned-sub-h">Mentioned</h3>
+            <div class="chips mentioned-chips">
+              {#each mentionedMembers as m (m.id)}
+                <span
+                  class="chip speaker-chip mentioned-chip"
+                  style="--c: {speakerColor(m.display_name)}"
+                  title="Mentioned in the summary. Edit the mention from the summary text."
+                >
+                  <span class="chip-dot"></span>
+                  <span class="chip-body">
+                    <span class="chip-name">{m.display_name}</span>
+                  </span>
+                </span>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </section>
     {/if}
 
@@ -2449,6 +2684,10 @@
               text={call.summary_text}
               users={memberRoster}
               colorFor={speakerColor}
+              onchipaction={canEditSummary ? openSummaryChip : undefined}
+              activeOccurrenceIndex={activeChip?.source === "summary"
+                ? activeChip.occurrenceIndex
+                : null}
             />
           </p>
         {/if}
@@ -2576,6 +2815,11 @@
                 ondeleteconfirm={onActionItemDeleteConfirm}
                 ondeletecancel={onActionItemDeleteCancel}
                 ontoggle={canEditSummary ? onActionItemToggle : undefined}
+                onchipaction={canEditSummary ? openActionItemChip : undefined}
+                activeChipOccurrenceIndex={activeChip?.source ===
+                  "action_item" && activeChip.itemId === item.id
+                  ? activeChip.occurrenceIndex
+                  : null}
               />
             {/if}
           {/each}
@@ -2668,6 +2912,11 @@
                 ondeleteconfirm={onActionItemDeleteConfirm}
                 ondeletecancel={onActionItemDeleteCancel}
                 ontoggle={canEditSummary ? onActionItemToggle : undefined}
+                onchipaction={canEditSummary ? openActionItemChip : undefined}
+                activeChipOccurrenceIndex={activeChip?.source ===
+                  "action_item" && activeChip.itemId === item.id
+                  ? activeChip.occurrenceIndex
+                  : null}
               />
             {/each}
           </ul>
@@ -2769,6 +3018,18 @@
     </section>
   {/if}
 </main>
+
+{#if activeChip}
+  <ChipMenu
+    anchor={activeChip.anchor}
+    name={activeChip.inner}
+    users={memberRoster}
+    rosterLoaded={memberRosterLoaded}
+    rosterError={memberRosterError}
+    onselect={onChipMenuSelect}
+    onclose={closeChipMenu}
+  />
+{/if}
 
 {#if regenConfirmOpen && call}
   <!-- Regenerate confirm dialog. Reuses the shared .rn-* shell from
@@ -3069,6 +3330,32 @@
   .speaker-chip.speaker-unlinked .chip-dot {
     opacity: 0.75;
     border-color: var(--hairline-hi);
+  }
+
+  /* ── Mentioned subsection (#140 / v0.4.5) ─────────────────────────
+     Sub-block below Participants listing teammates named in summary
+     or action items but NOT in the diarized participants row.
+     Dashed-hairline separator, dimmed chips, non-interactive. Edit
+     via the chip popover on the summary prose itself. */
+  .mentioned-sub {
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
+    border-top: 1px dashed var(--hairline);
+  }
+  .mentioned-sub-h {
+    margin: 0 0 0.4rem;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--bone-2);
+    letter-spacing: 0.01em;
+  }
+  .mentioned-chip {
+    opacity: 0.88;
+    cursor: default;
+  }
+  .mentioned-chip:hover {
+    border-color: var(--hairline);
+    background: transparent;
   }
   .utt-speaker.speaker-unlinked :global(.avatar) {
     opacity: 0.75;

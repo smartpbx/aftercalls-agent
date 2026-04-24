@@ -1,6 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount, onDestroy } from "svelte";
+  import { page } from "$app/state";
+  import { replaceState, afterNavigate } from "$app/navigation";
 
   // #57 Tag-aware filter bar.
   //
@@ -96,6 +99,8 @@
         return "Imported";
       case "manual":
         return "Manual";
+      case "self_note":
+        return "Note to self";
       default:
         return "";
     }
@@ -175,8 +180,14 @@
     const u = new URL(window.location.href);
     u.searchParams.delete("tag");
     for (const t of tagFilters) u.searchParams.append("tag", t);
-    // replaceState so toggling filters doesn't flood the back button.
-    window.history.replaceState(window.history.state, "", u.toString());
+    // #135 — use SvelteKit's `replaceState` so the browser history
+    // stays in sync with the filter pill without a push-navigation.
+    // `replaceState` from `$app/navigation` updates `history` +
+    // `page.state` but does NOT update `page.url` — so there is
+    // intentionally no URL-observing `$effect` here; filter-click
+    // writes `tagFilters` + URL synchronously, and browser
+    // back/forward is handled by `afterNavigate` below.
+    replaceState(u.pathname + u.search, page.state);
   }
 
   async function load() {
@@ -296,13 +307,63 @@
     }, 120);
   });
 
+  // #142 · v0.4.5 — note-to-self button state. `recordingActive`
+  // tracks whether ANY recording (regular or self-note) is in flight;
+  // used to disable the ghost button with a title explaining why.
+  // Seeded on mount via is_recording + kept current via the
+  // `recording-state` event the backend emits on every transition.
+  let recordingActive = $state(false);
+  let noteStartError = $state("");
+  let noteErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function startNoteToSelf() {
+    if (recordingActive) return;
+    noteStartError = "";
+    try {
+      await invoke<string>("start_self_note");
+    } catch (e) {
+      noteStartError = typeof e === "string" ? e : String(e);
+      if (noteErrorTimer) clearTimeout(noteErrorTimer);
+      noteErrorTimer = setTimeout(() => (noteStartError = ""), 4000);
+    }
+  }
+
+  let stopStateListen: (() => void) | null = null;
   onMount(async () => {
     try {
       me = await invoke<Me | null>("current_user");
     } catch {}
     tagFilters = readTagsFromUrl();
     if (scope === "all" && canSeeAll) void ensureMemberRoster();
+    try {
+      const status = await invoke<{ recording: boolean }>("is_recording");
+      recordingActive = !!status?.recording;
+    } catch {}
+    try {
+      stopStateListen = await listen<{ recording: boolean }>(
+        "recording-state",
+        (ev) => {
+          recordingActive = !!ev.payload?.recording;
+        },
+      );
+    } catch {}
     await load();
+  });
+
+  onDestroy(() => {
+    if (stopStateListen) stopStateListen();
+    if (noteErrorTimer) clearTimeout(noteErrorTimer);
+  });
+
+  // Back/forward navigation: `replaceState` (used for filter-pill
+  // clicks) does NOT update `page.url`, so a `$effect` on
+  // `page.url.searchParams` never re-evaluates. Real navigation
+  // (popstate) DOES update `page.url`, so `afterNavigate` with a
+  // `type === "popstate"` guard re-seeds filters and reloads.
+  afterNavigate(({ type }) => {
+    if (type !== "popstate") return;
+    tagFilters = readTagsFromUrl();
+    void load();
   });
 
   let filtered = $derived.by(() => {
@@ -406,8 +467,55 @@
           </button>
         </div>
       {/if}
+      <button
+        type="button"
+        class="note-self-btn"
+        onclick={startNoteToSelf}
+        disabled={recordingActive}
+        title={recordingActive
+          ? "Recording already in progress"
+          : "Record a short dictation that goes through the regular pipeline (Super+Shift+N)"}
+        aria-label="Note to self"
+      >
+        <svg
+          class="note-self-glyph"
+          viewBox="0 0 16 16"
+          width="13"
+          height="13"
+          aria-hidden="true"
+        >
+          <rect
+            x="6"
+            y="2"
+            width="4"
+            height="7"
+            rx="2"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+          />
+          <path
+            d="M4 8.5a4 4 0 0 0 8 0"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+          <path
+            d="M8 12.5v1.5M6.2 14h3.6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+        </svg>
+        <span>Note to self</span>
+      </button>
       <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
     </div>
+    {#if noteStartError}
+      <p class="note-start-err" role="alert">{noteStartError}</p>
+    {/if}
   </header>
 
   <div class="filter-bar" style="--i: 1">
@@ -639,7 +747,45 @@
                   <span class="entry-time">{fmtTime(call.recorded_at)}</span>
                   <div class="entry-body">
                     <h3 class="entry-title">
-                      {call.title ?? "(untitled)"}
+                      {#if call.source_kind === "self_note"}
+                        <span
+                          class="entry-title-glyph"
+                          title="Note to self"
+                          aria-hidden="true"
+                        >
+                          <svg viewBox="0 0 16 16" width="12" height="12">
+                            <rect
+                              x="6"
+                              y="2"
+                              width="4"
+                              height="7"
+                              rx="2"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.4"
+                            />
+                            <path
+                              d="M4 8.5a4 4 0 0 0 8 0"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.4"
+                              stroke-linecap="round"
+                            />
+                            <path
+                              d="M8 12.5v1.5M6.2 14h3.6"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.4"
+                              stroke-linecap="round"
+                            />
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if !call.title && call.source_kind === "self_note"}
+                        Note to self — {fmtTime(call.recorded_at)}
+                      {:else}
+                        {call.title ?? "(untitled)"}
+                      {/if}
                     </h3>
                     <div class="entry-meta">
                       {#if scope === "all" && call.user_display_name}
@@ -763,6 +909,73 @@
   .trash-link:hover {
     color: var(--bone-0);
     border-color: var(--hairline-hi);
+  }
+
+  /* #142 · v0.4.5 — note-to-self entry point. Ghost button; disabled
+     while any recording is in flight. Sits in the head-actions cluster
+     just before the Trash link so the record + archive surface share
+     the same row. */
+  .note-self-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.42rem 0.75rem;
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    color: var(--bone-1);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 500;
+    border-radius: 8px;
+    cursor: pointer;
+    transition:
+      background 150ms linear,
+      border-color 150ms linear,
+      color 150ms linear;
+    align-self: center;
+  }
+  .note-self-btn:hover {
+    border-color: var(--hairline-hi);
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .note-self-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .note-self-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .note-self-glyph {
+    color: var(--bone-2);
+  }
+  .note-self-btn:hover:not(:disabled) .note-self-glyph {
+    color: var(--accent);
+  }
+
+  .note-start-err {
+    margin: 0.5rem 0 0;
+    padding: 0.45rem 0.7rem;
+    border: 1px solid var(--live);
+    background: var(--live-soft);
+    color: var(--live);
+    border-radius: 6px;
+    font-size: 0.82rem;
+  }
+
+  /* #142 · v0.4.5 — mic glyph prefix on self-note rows. Decorative
+     only (aria-hidden on the span); the title text "Note to self —
+     …" already carries the semantic. Sits flush-left of the title
+     to give sighted users a quick scan cue. */
+  .entry-title-glyph {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 0.35rem;
+    color: var(--bone-3);
+  }
+  .entry:hover .entry-title-glyph {
+    color: var(--bone-1);
   }
 
   .head h1 {

@@ -1,4 +1,13 @@
 {
+  "0.4.5": {
+    "headline": "Note to self quick dictation + clickable name chips to edit or unlink + notes save reliably",
+    "changes": [
+      "Note to self — quick dictation. Click the new button on the calls page, use the tray menu entry, or hit Super+Shift+N from anywhere. The recording runs through the same transcribe + summarize pipeline as a regular call. Stop anytime — auto-caps at 5 minutes by default (configurable in Settings).",
+      "Click a teammate name chip in a summary to edit or unlink it. If the AI tagged someone incorrectly (the call said 'Mike' but it meant a different Mike), you can rename the chip to the right teammate or unlink it entirely to leave it as plain text. Works on action-item descriptions too.",
+      "New Mentioned section under Participants. Shows teammates the AI named in the summary or action items but who weren't speakers on the call — so you can see who was talked about versus who was there.",
+      "Notes on a call now save reliably across tab closes and fast typing. Previously, the Saved indicator could lie about what actually persisted if you closed the page mid-save or kept typing during one; the indicator now reflects real state and a pending save is committed on tab close."
+    ]
+  },
   "0.4.4": {
     "headline": "Action items filter fixed + row polish + new System requirements page",
     "changes": [

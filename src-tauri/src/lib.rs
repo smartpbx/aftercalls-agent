@@ -78,6 +78,14 @@ fn apply_tray_state(app: &AppHandle, state: TrayState) {
 #[derive(Serialize, Clone)]
 struct RecordingStateEvent {
     recording: bool,
+    /// #142 · v0.4.5 — which mode the in-flight recording is in.
+    /// `"call"` for a regular capture (full pipeline incl. system
+    /// loopback), `"self_note"` for a mic-only dictation. Absent /
+    /// null when `recording = false` OR when the frontend is behind
+    /// a backend build that doesn't emit the field — pages default
+    /// to "call" shape in that fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
 }
 
 /// Writes a small metadata file into a newly-created session_dir capturing
@@ -102,8 +110,11 @@ pub(crate) fn write_session_source(
     }
 }
 
-fn emit_state(app: &AppHandle, recording: bool) {
-    let _ = app.emit("recording-state", RecordingStateEvent { recording });
+fn emit_state(app: &AppHandle, recording: bool, mode: Option<&'static str>) {
+    let _ = app.emit(
+        "recording-state",
+        RecordingStateEvent { recording, mode },
+    );
     apply_tray_state(
         app,
         if recording {
@@ -114,6 +125,50 @@ fn emit_state(app: &AppHandle, recording: bool) {
             TrayState::Idle
         },
     );
+}
+
+/// Spawns the hard-ceiling watchdog for an in-flight recording. Used
+/// by both the regular recorder path (`do_start`) and the note-to-
+/// self path (`do_start_self_note`). Captures the current session_seq
+/// so a manual stop-then-start can't let a stale watchdog nuke the
+/// new session. `minutes` is the cap the caller picks (per-user
+/// `max_recording_minutes` for regular calls, `max_self_note_minutes`
+/// for self-notes).
+fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, label: &'static str) {
+    let app_for_watchdog = app.clone();
+    let minutes_owned = minutes;
+    tauri::async_runtime::spawn(async move {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(minutes_owned as u64 * 60);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let rec = app_for_watchdog.state::<Recorder>();
+            // Session changed out from under us — manual stop (and
+            // possibly a new start). Stale watchdog; bail.
+            if rec.session_seq() != captured_seq {
+                return;
+            }
+            if !rec.is_active() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "aftercalls: {label} hit max={minutes_owned}m; auto-stopping"
+                );
+                telemetry::log(
+                    "info",
+                    "recorder::max_length_auto_stop",
+                    format!("auto-stopped {label} after {minutes_owned} minutes"),
+                    None,
+                    None,
+                );
+                if let Err(e) = do_stop(&rec, &app_for_watchdog) {
+                    eprintln!("aftercalls: watchdog auto-stop failed: {e}");
+                }
+                return;
+            }
+        }
+    });
 }
 
 pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
@@ -129,8 +184,8 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
     let saved_device = config::Config::load()
         .ok()
         .and_then(|c| c.input_device);
-    let path = state.start(base, saved_device)?;
-    emit_state(app, true);
+    let path = state.start(base, saved_device, false)?;
+    emit_state(app, true, Some("call"));
     // If the saved-name preference didn't resolve, surface a one-time
     // toast on the Record page. Dedupe lives inside the Recorder
     // (HashSet<String>), so repeat Start/Stop in the same session with
@@ -139,54 +194,47 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
         let _ = app.emit("mic-fallback", &fallback);
     }
     // Hard ceiling watchdog (#75). Reads the per-user cap from config
-    // once at spawn (runtime changes take effect on the next session),
-    // polls every 30s, and fires do_stop via the same code path the
-    // UI / tray / hotkey use. Guarded by session_seq so a manual
-    // stop-then-start sequence can't let a stale watchdog kill the
-    // new session.
+    // once at spawn (runtime changes take effect on the next session).
     let max_minutes = config::Config::load()
         .map(|c| c.max_recording_minutes)
         .unwrap_or(120);
     let captured_seq = app.state::<Recorder>().session_seq();
-    let app_for_watchdog = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(max_minutes as u64 * 60);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let rec = app_for_watchdog.state::<Recorder>();
-            // Session changed out from under us — manual stop (and
-            // possibly a new start). Stale watchdog; bail.
-            if rec.session_seq() != captured_seq {
-                return;
-            }
-            if !rec.is_active() {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                eprintln!(
-                    "aftercalls: recording hit max_recording_minutes={max_minutes}; auto-stopping"
-                );
-                telemetry::log(
-                    "info",
-                    "recorder::max_length_auto_stop",
-                    format!("auto-stopped after {max_minutes} minutes"),
-                    None,
-                    None,
-                );
-                if let Err(e) = do_stop(&rec, &app_for_watchdog) {
-                    eprintln!("aftercalls: watchdog auto-stop failed: {e}");
-                }
-                return;
-            }
-        }
-    });
+    spawn_max_length_watchdog(app, captured_seq, max_minutes, "recording");
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// #142 · v0.4.5 — Start a note-to-self (mic-only) recording. Same
+/// recorder state machine as `do_start`, but passes `mic_only=true`
+/// so the worker skips `start_system_loopback`, and spawns the
+/// watchdog at the per-user `max_self_note_minutes` ceiling (default
+/// 5m) instead of `max_recording_minutes`. Caller is responsible for
+/// writing `source.json` with `kind = "self_note"` (see
+/// `start_self_note`).
+pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<String, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("recordings");
+    let saved_device = config::Config::load()
+        .ok()
+        .and_then(|c| c.input_device);
+    let path = state.start(base, saved_device, true)?;
+    emit_state(app, true, Some("self_note"));
+    if let Some(fallback) = state.take_last_fallback() {
+        let _ = app.emit("mic-fallback", &fallback);
+    }
+    let max_minutes = config::Config::load()
+        .map(|c| c.max_self_note_minutes)
+        .unwrap_or(5);
+    let captured_seq = app.state::<Recorder>().session_seq();
+    spawn_max_length_watchdog(app, captured_seq, max_minutes, "note-to-self");
     Ok(path.to_string_lossy().into_owned())
 }
 
 pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
-    emit_state(app, false);
+    emit_state(app, false, None);
     let session_dir = path.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -199,6 +247,19 @@ pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, Strin
 fn start_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
     let path = do_start(&state, &app)?;
     write_session_source(std::path::Path::new(&path), "manual", None);
+    Ok(path)
+}
+
+/// #142 · v0.4.5 — Start a note-to-self dictation. Mic-only capture;
+/// writes `source.json.kind = "self_note"` so the pipeline + backend
+/// list views can surface the distinct "Note to self" treatment on
+/// the call row. Auto-stops at `config.max_self_note_minutes`
+/// (default 5m). Rejects when a regular recording is already active
+/// — the caller surfaces the inline notice.
+#[tauri::command]
+fn start_self_note(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
+    let path = do_start_self_note(&state, &app)?;
+    write_session_source(std::path::Path::new(&path), "self_note", None);
     Ok(path)
 }
 
@@ -733,6 +794,10 @@ struct AppPrefs {
     telemetry_enabled: bool,
     sounds_enabled: bool,
     max_recording_minutes: u32,
+    /// #142 · v0.4.5 — user-configurable note-to-self cap. 5 default,
+    /// [1, 60] range. Reads fresh from config on each new self-note
+    /// session, so a runtime edit takes effect on the next note.
+    max_self_note_minutes: u32,
     manual_notes_enabled: bool,
     wayland_hotkey_notice_dismissed: bool,
     // Saved cpal name of the preferred input microphone (#3). None
@@ -750,6 +815,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         telemetry_enabled: cfg.telemetry_enabled,
         sounds_enabled: cfg.sounds_enabled,
         max_recording_minutes: cfg.max_recording_minutes,
+        max_self_note_minutes: cfg.max_self_note_minutes,
         manual_notes_enabled: cfg.manual_notes_enabled,
         wayland_hotkey_notice_dismissed: cfg.wayland_hotkey_notice_dismissed,
         input_device: cfg.input_device,
@@ -763,6 +829,7 @@ fn set_app_prefs(
     telemetry_enabled: bool,
     sounds_enabled: bool,
     max_recording_minutes: u32,
+    max_self_note_minutes: u32,
     manual_notes_enabled: bool,
     wayland_hotkey_notice_dismissed: bool,
     input_device: Option<String>,
@@ -772,6 +839,10 @@ fn set_app_prefs(
     // absurd value (0 would auto-stop immediately; u32::MAX would
     // overflow the Duration arithmetic in the watchdog).
     let max_recording_minutes = max_recording_minutes.clamp(5, 1440);
+    // #142 — clamp self-note cap to [1, 60]. Looser floor than the
+    // regular cap because a 60-second dictation is a plausible
+    // intentional length.
+    let max_self_note_minutes = max_self_note_minutes.clamp(1, 60);
     // Treat an empty/whitespace-only string the same as None so the UI
     // can send a cleared select as either null or "" without a
     // separate "reset" command. `skip_serializing_if` on the config
@@ -786,6 +857,7 @@ fn set_app_prefs(
     cfg.telemetry_enabled = telemetry_enabled;
     cfg.sounds_enabled = sounds_enabled;
     cfg.max_recording_minutes = max_recording_minutes;
+    cfg.max_self_note_minutes = max_self_note_minutes;
     cfg.manual_notes_enabled = manual_notes_enabled;
     cfg.wayland_hotkey_notice_dismissed = wayland_hotkey_notice_dismissed;
     cfg.input_device = input_device;
@@ -1140,6 +1212,10 @@ enum CliAction {
     ToggleRecording,
     Start,
     Stop,
+    // #142 · v0.4.5 — note-to-self flag. Starts a mic-only capture
+    // with the self-note auto-cap. Guarded against "already
+    // recording" — no-op in that case (matches `--start`'s shape).
+    NoteToSelf,
 }
 
 fn parse_cli_action(argv: &[String]) -> Option<CliAction> {
@@ -1151,6 +1227,7 @@ fn parse_cli_action(argv: &[String]) -> Option<CliAction> {
             "--toggle-recording" => return Some(CliAction::ToggleRecording),
             "--start" => return Some(CliAction::Start),
             "--stop" => return Some(CliAction::Stop),
+            "--note-to-self" => return Some(CliAction::NoteToSelf),
             _ => {}
         }
     }
@@ -1184,6 +1261,29 @@ fn run_cli_action(app: &AppHandle, action: CliAction) {
                 eprintln!("aftercalls: cli stop error: {e}");
             }
         }
+        CliAction::NoteToSelf => {
+            start_note_to_self(app);
+        }
+    }
+}
+
+/// Shared entry point for the tray "Note to self" menu item, the
+/// global Super+Shift+N hotkey, and the `--note-to-self` CLI flag.
+/// No-ops (with a log) when a regular recording is active — a
+/// self-note is additive, not interruptive. Writes
+/// `source.json.kind = "self_note"` on success so the pipeline +
+/// backend list view render the distinct title + glyph.
+fn start_note_to_self(app: &AppHandle) {
+    let state = app.state::<Recorder>();
+    if state.is_active() {
+        eprintln!("aftercalls: cannot start note — a recording is already in progress");
+        return;
+    }
+    match do_start_self_note(&state, app) {
+        Ok(path) => {
+            write_session_source(std::path::Path::new(&path), "self_note", None);
+        }
+        Err(e) => eprintln!("aftercalls: start note-to-self error: {e}"),
     }
 }
 
@@ -1274,6 +1374,12 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    // #142 · v0.4.5 — "Note to self" sits above "Start recording" so
+    // the two recording entry points cluster visually and the user
+    // sees the lighter (self-note) option first. Tray label matches
+    // the in-app button copy verbatim.
+    let note_self =
+        MenuItem::with_id(app, "note_to_self", "Note to self", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Start recording", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Open aftercalls", true, None::<&str>)?;
     let settings =
@@ -1283,7 +1389,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&toggle, &sep1, &show, &settings, &sep2, &quit],
+        &[&note_self, &toggle, &sep1, &show, &settings, &sep2, &quit],
     )?;
 
     let idle_icon = tauri::include_image!("icons/tray-idle.png");
@@ -1299,6 +1405,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle" => toggle_recording(app),
+            "note_to_self" => start_note_to_self(app),
             "show" => show_main_window(app),
             "settings" => {
                 show_main_window(app);
@@ -1334,6 +1441,22 @@ fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
         }
     }) {
         eprintln!("aftercalls: global shortcut unavailable ({e}); use the UI or tray");
+    }
+    // #142 · v0.4.5 — Super+Shift+N (note). Doesn't clash with
+    // Super+Shift+R (primary toggle) or Ctrl+Shift+N (browser
+    // incognito window). Wayland users who can't grab a global
+    // shortcut get the `--note-to-self` CLI flag via a compositor
+    // keybind.
+    let note_shortcut =
+        Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyN);
+    if let Err(e) = app.global_shortcut().on_shortcut(note_shortcut, |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            start_note_to_self(app);
+        }
+    }) {
+        eprintln!(
+            "aftercalls: note-to-self shortcut unavailable ({e}); use the UI, tray, or --note-to-self CLI"
+        );
     }
     Ok(())
 }
@@ -1386,6 +1509,7 @@ pub fn run() {
             get_autostart,
             set_autostart,
             start_recording,
+            start_self_note,
             stop_recording,
             is_recording,
             is_processing,

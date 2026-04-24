@@ -204,6 +204,23 @@
       item: ActionItem;
       nextStatus: "open" | "done";
     }) => void;
+
+    // #140 · v0.4.5 — chip-edit plumbing. The embedded SummaryText
+    // inside the read-only description wrapper emits `onchipaction`
+    // when a linked chip is clicked; the row forwards it up to the
+    // page so a single <ChipMenu> can be mounted at the page level.
+    // Page-level state picks `itemId` out of the callback to route
+    // the PATCH to the right action-item row.
+    onchipaction?: (detail: {
+      inner: string;
+      occurrenceIndex: number;
+      anchor: HTMLElement;
+      itemId: string;
+    }) => void;
+    // Occurrence index of the chip whose popover is currently open,
+    // scoped to this action-item's description. Matching segment
+    // renders with the `.name-chip-active` outline cue.
+    activeChipOccurrenceIndex?: number | null;
   };
 
   let {
@@ -237,7 +254,20 @@
     ondeleteconfirm,
     ondeletecancel,
     ontoggle,
+    onchipaction,
+    activeChipOccurrenceIndex = null,
   }: Props = $props();
+
+  // #140 — surface-bound wrapper around the page's chipaction
+  // handler. Pins the `itemId` so the page router can tell a
+  // summary chip apart from an action-item chip.
+  function onChipActionForward(detail: {
+    inner: string;
+    occurrenceIndex: number;
+    anchor: HTMLElement;
+  }) {
+    onchipaction?.({ ...detail, itemId: item.id });
+  }
 
   // Convenience derivation — used in the template to gate trash /
   // checkbox / hover affordances. "Anything editing" treats
@@ -745,9 +775,14 @@
            tabindex gives keyboard + AT parity with the pointer
            affordance. The nested SummaryText contains its own
            chip children (name-linked / name-ambiguous / name-
-           external) — none are interactive, so wrapping the
-           whole span in role=button is safe per WAI-ARIA 1.2 §4.3
-           (button permits non-interactive descendants). -->
+           external). In v0.4.5 (#140) the unique-match chips are
+           interactive buttons when `onchipaction` is wired — the
+           wrapper's onclick still fires for clicks on plain text,
+           and the chip buttons stopPropagation on their own click
+           so the two surfaces don't fight. role=button on the
+           wrapper stays valid since interactive nested buttons
+           are allowed under the WAI-ARIA 1.2 relaxed rules used
+           elsewhere in the app. -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <span
         class="ai-desc"
@@ -761,6 +796,8 @@
           text={item.description}
           {users}
           {colorFor}
+          onchipaction={onchipaction ? onChipActionForward : undefined}
+          activeOccurrenceIndex={activeChipOccurrenceIndex}
         />
       </span>
     {:else}
@@ -768,6 +805,8 @@
         text={item.description}
         {users}
         {colorFor}
+        onchipaction={onchipaction ? onChipActionForward : undefined}
+        activeOccurrenceIndex={activeChipOccurrenceIndex}
       />
     {/if}
     {#if callContext && variant === "actions-page" && !editingDescription}
