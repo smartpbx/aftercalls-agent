@@ -156,14 +156,14 @@ jobs:
             ${{ github.event.inputs.tag || github.ref_name }}.
 
             ### Install
-            - **Linux**: `.AppImage` is the default — slim, links against
-              system `libwebkit2gtk-4.1` + `libgtk-3`. Also available:
-              `.deb` (Debian / Ubuntu / Pop), `.rpm` (Fedora / RHEL).
-            - **Windows**: `.msi` or `.exe` (NSIS).
 
-            All three desktop platforms auto-update from a running
-            instance (Linux updates via AppImage-in-place swap).
-          releaseDraft: true
+            - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
+            - **Windows**: .msi or .exe.
+
+            All platforms auto-update from a running instance.
+
+            See [aftercalls.io/releases](https://aftercalls.io/releases/) for the full changelog.
+          releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
           # Skip tauri-bundler's AppImage on Linux — it invokes
