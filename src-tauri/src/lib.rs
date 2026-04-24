@@ -380,6 +380,12 @@ async fn list_calls(
     scope: Option<String>,
     user: Option<String>,
     tags: Option<Vec<String>>,
+    // #146 — optional date-range bounds. The Svelte layer passes
+    // `YYYY-MM-DDTHH:MM:SSZ` strings (client-side expansion of the
+    // `<input type="date">` values); we forward them straight to the
+    // backend, which parses with `chrono::DateTime<Utc>`.
+    from_date: Option<String>,
+    to_date: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
@@ -387,9 +393,16 @@ async fn list_calls(
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
     let tags = tags.unwrap_or_default();
-    portal::list_calls(backend, scope.as_deref(), user.as_deref(), &tags)
-        .await
-        .map_err(|e| e.to_string())
+    portal::list_calls(
+        backend,
+        scope.as_deref(),
+        user.as_deref(),
+        &tags,
+        from_date.as_deref(),
+        to_date.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -804,6 +817,10 @@ struct AppPrefs {
     // means "use system default". Surfaced to the Settings dropdown
     // so a mounted form reflects what's actually on disk.
     input_device: Option<String>,
+    /// #149 (v0.4.7) — user-configurable self-note hotkey. Shipped
+    /// default "Super+Shift+N"; `None` disables the global hotkey
+    /// entirely (tray + button + CLI keep working).
+    self_note_shortcut: Option<String>,
 }
 
 #[tauri::command]
@@ -819,11 +836,13 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         manual_notes_enabled: cfg.manual_notes_enabled,
         wayland_hotkey_notice_dismissed: cfg.wayland_hotkey_notice_dismissed,
         input_device: cfg.input_device,
+        self_note_shortcut: cfg.self_note_shortcut,
     })
 }
 
 #[tauri::command]
 fn set_app_prefs(
+    app: AppHandle,
     close_to_tray: bool,
     auto_detect: bool,
     telemetry_enabled: bool,
@@ -833,6 +852,7 @@ fn set_app_prefs(
     manual_notes_enabled: bool,
     wayland_hotkey_notice_dismissed: bool,
     input_device: Option<String>,
+    self_note_shortcut: Option<String>,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
@@ -851,7 +871,20 @@ fn set_app_prefs(
     let input_device = input_device
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // #149 — same empty-as-None treatment for the self-note shortcut.
+    // An empty string clears the binding; a non-empty value has to
+    // parse (`parse_shortcut_str`) or we reject the save rather than
+    // persist a dead binding.
+    let self_note_shortcut = self_note_shortcut
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref s) = self_note_shortcut {
+        if parse_shortcut_str(s).is_none() {
+            return Err(format!("unrecognized shortcut: {s}"));
+        }
+    }
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let prev_self_note_shortcut = cfg.self_note_shortcut.clone();
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
     cfg.telemetry_enabled = telemetry_enabled;
@@ -861,7 +894,20 @@ fn set_app_prefs(
     cfg.manual_notes_enabled = manual_notes_enabled;
     cfg.wayland_hotkey_notice_dismissed = wayland_hotkey_notice_dismissed;
     cfg.input_device = input_device;
-    cfg.save().map_err(|e| e.to_string())
+    cfg.self_note_shortcut = self_note_shortcut.clone();
+    cfg.save().map_err(|e| e.to_string())?;
+    // #149 — re-register the self-note hotkey in place if it changed.
+    // Best-effort: a failure to bind (portal denied, combo in use)
+    // is logged, not surfaced, because tray + button + CLI keep
+    // triggering note-to-self regardless.
+    if prev_self_note_shortcut != self_note_shortcut {
+        reapply_self_note_hotkey(
+            &app,
+            prev_self_note_shortcut.as_deref(),
+            self_note_shortcut.as_deref(),
+        );
+    }
+    Ok(())
 }
 
 /// Enumerate input microphones for the Settings dropdown (#3). Returns
@@ -1429,6 +1475,155 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// #149 (v0.4.7) — parse the user-facing shortcut string written by
+/// the Settings capture widget + persisted to config.toml.
+///
+/// Accepts `+`-separated segments in any order, case-insensitive.
+/// Modifier synonyms: `Super|Meta|Cmd|Command|Win` → SUPER,
+/// `Ctrl|Control` → CONTROL, `Alt|Option|Opt` → ALT, `Shift` → SHIFT.
+/// Key token accepts either a single letter/digit (`N`, `1`) or the
+/// raw `Code` variant name (`KeyN`, `Digit1`, `F7`). Returns `None`
+/// when no non-modifier key is supplied or any segment is unknown —
+/// the caller either logs + ignores (setup path) or rejects the save
+/// (set_app_prefs).
+fn parse_shortcut_str(s: &str) -> Option<Shortcut> {
+    let mut mods = Modifiers::empty();
+    let mut code: Option<Code> = None;
+    for raw in s.split('+') {
+        let seg = raw.trim();
+        if seg.is_empty() {
+            return None;
+        }
+        let lower = seg.to_ascii_lowercase();
+        match lower.as_str() {
+            "super" | "meta" | "cmd" | "command" | "win" => {
+                mods |= Modifiers::SUPER;
+            }
+            "ctrl" | "control" => {
+                mods |= Modifiers::CONTROL;
+            }
+            "alt" | "option" | "opt" => {
+                mods |= Modifiers::ALT;
+            }
+            "shift" => {
+                mods |= Modifiers::SHIFT;
+            }
+            _ => {
+                if code.is_some() {
+                    // Two non-modifier tokens in the same string is
+                    // malformed; reject rather than silently dropping.
+                    return None;
+                }
+                code = parse_key_code(seg);
+                code?;
+            }
+        }
+    }
+    let code = code?;
+    let mods = if mods.is_empty() { None } else { Some(mods) };
+    Some(Shortcut::new(mods, code))
+}
+
+/// Map a single capture-string segment onto a Tauri `Code`. Accepts
+/// either the raw `Code` variant name (`KeyN`, `Digit1`, `F7`) or a
+/// user-friendly short form (`N`, `1`). The short form keeps the
+/// settings input readable; the long form matches what the Svelte
+/// side will canonicalise.
+fn parse_key_code(raw: &str) -> Option<Code> {
+    let upper = raw.to_ascii_uppercase();
+    if upper.len() == 1 {
+        let c = upper.chars().next().unwrap();
+        if c.is_ascii_alphabetic() {
+            return match c {
+                'A' => Some(Code::KeyA), 'B' => Some(Code::KeyB),
+                'C' => Some(Code::KeyC), 'D' => Some(Code::KeyD),
+                'E' => Some(Code::KeyE), 'F' => Some(Code::KeyF),
+                'G' => Some(Code::KeyG), 'H' => Some(Code::KeyH),
+                'I' => Some(Code::KeyI), 'J' => Some(Code::KeyJ),
+                'K' => Some(Code::KeyK), 'L' => Some(Code::KeyL),
+                'M' => Some(Code::KeyM), 'N' => Some(Code::KeyN),
+                'O' => Some(Code::KeyO), 'P' => Some(Code::KeyP),
+                'Q' => Some(Code::KeyQ), 'R' => Some(Code::KeyR),
+                'S' => Some(Code::KeyS), 'T' => Some(Code::KeyT),
+                'U' => Some(Code::KeyU), 'V' => Some(Code::KeyV),
+                'W' => Some(Code::KeyW), 'X' => Some(Code::KeyX),
+                'Y' => Some(Code::KeyY), 'Z' => Some(Code::KeyZ),
+                _ => None,
+            };
+        }
+        if c.is_ascii_digit() {
+            return match c {
+                '0' => Some(Code::Digit0), '1' => Some(Code::Digit1),
+                '2' => Some(Code::Digit2), '3' => Some(Code::Digit3),
+                '4' => Some(Code::Digit4), '5' => Some(Code::Digit5),
+                '6' => Some(Code::Digit6), '7' => Some(Code::Digit7),
+                '8' => Some(Code::Digit8), '9' => Some(Code::Digit9),
+                _ => None,
+            };
+        }
+    }
+    if let Some(letter) = upper.strip_prefix("KEY") {
+        return parse_key_code(letter);
+    }
+    if let Some(digit) = upper.strip_prefix("DIGIT") {
+        return parse_key_code(digit);
+    }
+    if let Some(rest) = upper.strip_prefix('F') {
+        if let Ok(n) = rest.parse::<u8>() {
+            return match n {
+                1 => Some(Code::F1), 2 => Some(Code::F2), 3 => Some(Code::F3),
+                4 => Some(Code::F4), 5 => Some(Code::F5), 6 => Some(Code::F6),
+                7 => Some(Code::F7), 8 => Some(Code::F8), 9 => Some(Code::F9),
+                10 => Some(Code::F10), 11 => Some(Code::F11), 12 => Some(Code::F12),
+                13 => Some(Code::F13), 14 => Some(Code::F14), 15 => Some(Code::F15),
+                16 => Some(Code::F16), 17 => Some(Code::F17), 18 => Some(Code::F18),
+                19 => Some(Code::F19), 20 => Some(Code::F20), 21 => Some(Code::F21),
+                22 => Some(Code::F22), 23 => Some(Code::F23), 24 => Some(Code::F24),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// #149 (v0.4.7) — rebind the self-note hotkey at runtime. Called
+/// from `set_app_prefs` when `self_note_shortcut` changes; unregisters
+/// the previous combo (if any) and re-registers the new one. Pure
+/// side-effect wrapper so the settings save stays transactional.
+fn reapply_self_note_hotkey(
+    app: &AppHandle,
+    prev: Option<&str>,
+    next: Option<&str>,
+) {
+    if let Some(prev_str) = prev {
+        if let Some(prev_sc) = parse_shortcut_str(prev_str) {
+            if let Err(e) = app.global_shortcut().unregister(prev_sc) {
+                eprintln!(
+                    "aftercalls: unregister prev self-note shortcut failed ({e})"
+                );
+            }
+        }
+    }
+    if let Some(next_str) = next {
+        let Some(next_sc) = parse_shortcut_str(next_str) else {
+            eprintln!("aftercalls: parse self-note shortcut failed: {next_str}");
+            return;
+        };
+        if let Err(e) = app
+            .global_shortcut()
+            .on_shortcut(next_sc, |app, _sc, event| {
+                if event.state() == ShortcutState::Pressed {
+                    start_note_to_self(app);
+                }
+            })
+        {
+            eprintln!(
+                "aftercalls: note-to-self shortcut unavailable ({e}); use the UI, tray, or --note-to-self CLI"
+            );
+        }
+    }
+}
+
 fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
     // Super+Shift+R: rare conflict vs. Ctrl+Shift+R (browser hard-reload).
     // On Wayland/Hyprland this still depends on xdg-desktop-portal-hyprland
@@ -1442,21 +1637,35 @@ fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
     }) {
         eprintln!("aftercalls: global shortcut unavailable ({e}); use the UI or tray");
     }
-    // #142 · v0.4.5 — Super+Shift+N (note). Doesn't clash with
-    // Super+Shift+R (primary toggle) or Ctrl+Shift+N (browser
-    // incognito window). Wayland users who can't grab a global
-    // shortcut get the `--note-to-self` CLI flag via a compositor
-    // keybind.
-    let note_shortcut =
-        Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyN);
-    if let Err(e) = app.global_shortcut().on_shortcut(note_shortcut, |app, _sc, event| {
-        if event.state() == ShortcutState::Pressed {
-            start_note_to_self(app);
+    // #142 · v0.4.5 + #149 · v0.4.7 — self-note hotkey, now user-
+    // configurable. Fresh installs get "Super+Shift+N" via the serde
+    // default in config.rs. Parse failures log + fall through to the
+    // tray / button / --note-to-self CLI.
+    let configured = config::Config::load()
+        .ok()
+        .and_then(|c| c.self_note_shortcut);
+    if let Some(ref raw) = configured {
+        match parse_shortcut_str(raw) {
+            Some(note_shortcut) => {
+                if let Err(e) = app
+                    .global_shortcut()
+                    .on_shortcut(note_shortcut, |app, _sc, event| {
+                        if event.state() == ShortcutState::Pressed {
+                            start_note_to_self(app);
+                        }
+                    })
+                {
+                    eprintln!(
+                        "aftercalls: note-to-self shortcut unavailable ({e}); use the UI, tray, or --note-to-self CLI"
+                    );
+                }
+            }
+            None => {
+                eprintln!(
+                    "aftercalls: could not parse self-note shortcut {raw:?}; falling back to tray + CLI"
+                );
+            }
         }
-    }) {
-        eprintln!(
-            "aftercalls: note-to-self shortcut unavailable ({e}); use the UI, tray, or --note-to-self CLI"
-        );
     }
     Ok(())
 }

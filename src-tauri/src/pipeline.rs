@@ -107,6 +107,31 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
                     call_id,
                 },
             );
+            // #77 (v0.4.7) — once the pipeline has succeeded the
+            // backend is the single source of truth for the call
+            // audio (streamed from Spaces). Clear the local
+            // session_dir unconditionally so the user's disk
+            // doesn't carry redundant raw audio + compressed
+            // uploads indefinitely. Failure path (run_inner
+            // returned Err) leaves the session on disk — the 7-day
+            // orphan sweeper at launch picks it up for retry.
+            // Best-effort: a filesystem hiccup gets logged to
+            // telemetry, not surfaced, because the backend already
+            // has the full call and the orphan sweeper catches
+            // stragglers next session.
+            if let Err(e) = crate::recovery::discard(&session_dir).await {
+                eprintln!(
+                    "aftercalls: post-pipeline cleanup failed for {}: {e}",
+                    session_dir.display()
+                );
+                crate::telemetry::log(
+                    "warn",
+                    "pipeline::cleanup_failed",
+                    e,
+                    None,
+                    Some(session_str.clone()),
+                );
+            }
         }
         Err(e) => {
             let err_str = format!("{e:#}");

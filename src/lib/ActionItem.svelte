@@ -216,6 +216,10 @@
       occurrenceIndex: number;
       anchor: HTMLElement;
       itemId: string;
+      // #150 · v0.4.6 — true when the clicked `<name>` span was a
+      // roster-miss (external mention). Page-level ChipMenu uses
+      // this to flip into Link/Leave-text mode.
+      isExternal: boolean;
     }) => void;
     // Occurrence index of the chip whose popover is currently open,
     // scoped to this action-item's description. Matching segment
@@ -260,11 +264,14 @@
 
   // #140 — surface-bound wrapper around the page's chipaction
   // handler. Pins the `itemId` so the page router can tell a
-  // summary chip apart from an action-item chip.
+  // summary chip apart from an action-item chip. #150 — forwards
+  // the `isExternal` flag unchanged so the page-level ChipMenu
+  // flips into Link/Leave-text mode for roster-miss mentions.
   function onChipActionForward(detail: {
     inner: string;
     occurrenceIndex: number;
     anchor: HTMLElement;
+    isExternal: boolean;
   }) {
     onchipaction?.({ ...detail, itemId: item.id });
   }

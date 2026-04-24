@@ -215,10 +215,16 @@ pub async fn list_calls(
     scope: Option<&str>,
     user_id: Option<&str>,
     tags: &[String],
+    // #146 — optional RFC3339 bounds (`YYYY-MM-DDTHH:MM:SSZ`). Empty
+    // or `None` leaves the param off the wire, which matches the
+    // backend's `serde(default) = None` default.
+    from_date: Option<&str>,
+    to_date: Option<&str>,
 ) -> Result<Value> {
     // Tag filters are passed as repeated ?tag= params; missing = no
     // filter. scope=all restricts to admin/superadmin; user= narrows
-    // scope=all to one member's calls.
+    // scope=all to one member's calls. `from_date` / `to_date` add
+    // an open-ended date filter — either may be absent.
     let mut path = String::from("/v1/calls");
     let mut params: Vec<(String, String)> = Vec::new();
     if let Some(s) = scope {
@@ -233,6 +239,16 @@ pub async fn list_calls(
     }
     for t in tags {
         params.push(("tag".into(), t.clone()));
+    }
+    if let Some(f) = from_date {
+        if !f.is_empty() {
+            params.push(("from_date".into(), f.into()));
+        }
+    }
+    if let Some(t) = to_date {
+        if !t.is_empty() {
+            params.push(("to_date".into(), t.into()));
+        }
     }
     if !params.is_empty() {
         path.push('?');

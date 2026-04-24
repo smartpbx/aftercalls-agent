@@ -1,4 +1,15 @@
 {
+  "0.5.0": {
+    "headline": "Date filter on Calls, external-name chip linking, configurable self-note shortcut, /actions chip editing",
+    "changes": [
+      "Optional date filter on the Calls page — pick From / To and the list narrows live. URL keeps the filter so back/forward restores state. Clear link resets to all dates.",
+      "Click an italic name in a summary (or action item) to link it to a teammate. Previously only teammate-resolved chips could be edited or unlinked; now the reverse direction works too — tag a name the AI missed.",
+      "Self-note dictation shortcut is now configurable in Settings. Default stays Super+Shift+N; rebind to anything that doesn't collide with your other shortcuts.",
+      "Clickable name chips now work on the Action items page too. Same Rename / Unlink / Link menu as the call detail page.",
+      "Filter popover on the Calls page now sits above the top strip. Was hidden underneath in some layouts.",
+      "Admins publishing Terms of Service or Privacy Policy now have editable drafts — save a draft with a future effective date, come back later to edit or delete before it goes live. Every publish, edit, and delete writes an audit log row."
+    ]
+  },
   "0.4.5": {
     "headline": "Note to self quick dictation + clickable name chips to edit or unlink + notes save reliably",
     "changes": [

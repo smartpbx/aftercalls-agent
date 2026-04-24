@@ -170,6 +170,24 @@
     onEditErrorClear?: (payload: {
       item: { id: string; call_id: string };
     }) => void;
+
+    // #147 (v0.4.7) — chip-edit forwarding onto the /actions page.
+    // Mirrors the call-detail page's ChipMenu wiring: the nested
+    // SummaryText inside each read-only action-item description
+    // emits chip clicks via ActionItem; ActionsList forwards them
+    // up to the page wrapper, which mounts a single <ChipMenu> and
+    // keeps all PATCH bookkeeping in one place. Optional — when
+    // unset, chips stay non-interactive (read-only surfaces).
+    onactionitemchipaction?: (detail: {
+      inner: string;
+      occurrenceIndex: number;
+      anchor: HTMLElement;
+      itemId: string;
+    }) => void;
+    // Page-level active-chip indicator so the matching
+    // `.name-chip-active` outline lands on the right row.
+    activeChipItemId?: string | null;
+    activeChipOccurrenceIndex?: number | null;
   };
 
   let {
@@ -200,6 +218,9 @@
     onDescriptionCancel,
     onOwnerCancel,
     onEditErrorClear,
+    onactionitemchipaction,
+    activeChipItemId = null,
+    activeChipOccurrenceIndex = null,
   }: Props = $props();
 
   // Adapters: ActionItem fires with {itemId, description} /
@@ -446,6 +467,10 @@
           onEditErrorClear={(p) => onEditErrorClear?.({ item: p.item })}
           ontoggle={(payload) =>
             !togglingIds.has(item.id) && handleRowToggle(payload)}
+          onchipaction={onactionitemchipaction}
+          activeChipOccurrenceIndex={activeChipItemId === item.id
+            ? activeChipOccurrenceIndex
+            : null}
         />
       {/each}
     </ul>

@@ -87,6 +87,15 @@ pub struct Config {
     /// #3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_device: Option<String>,
+    /// #149 (v0.4.7) — user-configurable global shortcut for
+    /// "note to self" capture. `Some("Super+Shift+N")` is the default
+    /// so fresh installs behave exactly like v0.4.6 did; the user can
+    /// rebind from Settings (`reapply_self_note_hotkey` re-binds the
+    /// OS hotkey on save). Serialized as a single string so the TOML
+    /// stays human-readable. `None` disables the hotkey entirely;
+    /// tray + button + CLI keep working.
+    #[serde(default = "default_self_note_shortcut")]
+    pub self_note_shortcut: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -99,6 +108,10 @@ fn default_max_recording_minutes() -> u32 {
 
 fn default_max_self_note_minutes() -> u32 {
     5
+}
+
+fn default_self_note_shortcut() -> Option<String> {
+    Some("Super+Shift+N".to_string())
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -143,6 +156,7 @@ impl Config {
                 manual_notes_enabled: false,
                 wayland_hotkey_notice_dismissed: false,
                 input_device: None,
+                self_note_shortcut: default_self_note_shortcut(),
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

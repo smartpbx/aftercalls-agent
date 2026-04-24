@@ -114,6 +114,18 @@
   // should be short by design; the tighter ceiling protects against
   // a user walking away from the mic mid-note.
   let maxSelfNoteMinutes = $state(5);
+  // #149 (v0.4.7) — user-configurable self-note hotkey. `null` means
+  // the global hotkey is disabled; tray + button + CLI keep working.
+  // The capture widget below writes either a canonical "Super+Shift+N"
+  // style string or null. Shipped default (fresh install) is
+  // "Super+Shift+N", matching v0.4.5 behaviour.
+  let selfNoteShortcut = $state<string | null>("Super+Shift+N");
+  // Live capture state: when `capturingShortcut === true`, the hidden
+  // input on the row has focus and the next keydown event is recorded
+  // as the new combo. Separate from `selfNoteShortcut` so the
+  // persisted value only changes once the user confirms the capture.
+  let capturingShortcut = $state(false);
+  let shortcutError = $state<string | null>(null);
   // Manual notes panel (#73). When on, the record screen shows a
   // CodeMirror editor during active recording; notes ride into
   // create_call and optionally feed into the summary. Off by default
@@ -264,6 +276,7 @@
         manual_notes_enabled: boolean;
         wayland_hotkey_notice_dismissed: boolean;
         input_device: string | null;
+        self_note_shortcut: string | null;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -274,6 +287,7 @@
       manualNotesEnabled = p.manual_notes_enabled ?? false;
       waylandHotkeyNoticeDismissed = p.wayland_hotkey_notice_dismissed ?? false;
       inputDevice = p.input_device ?? null;
+      selfNoteShortcut = p.self_note_shortcut ?? null;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -302,11 +316,91 @@
         manualNotesEnabled,
         waylandHotkeyNoticeDismissed,
         inputDevice,
+        selfNoteShortcut,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
       error = String(e);
     }
+  }
+
+  // #149 (v0.4.7) — capture-widget handlers. The row renders a
+  // read-only text box showing the current combo; clicking "Change"
+  // flips `capturingShortcut = true`, which unhides a transparent
+  // input that grabs focus + swallows the next keydown. Esc cancels.
+  // Validates against the hardcoded record-toggle "Super+Shift+R" to
+  // avoid collisions (follow-up #TBD makes THAT one configurable too).
+  const RECORD_TOGGLE_SHORTCUT = "Super+Shift+R";
+
+  function normalizeShortcut(mods: string[], key: string): string {
+    // Canonical ordering: Ctrl → Alt → Shift → Super → Key. Keeps
+    // the display stable across keyboard layouts (Linux emits Super
+    // first, macOS emits Cmd differently) so two users with the
+    // "same" combo get the same persisted string.
+    const order = ["Ctrl", "Alt", "Shift", "Super"];
+    const seen = new Set(mods);
+    const ordered = order.filter((m) => seen.has(m));
+    return [...ordered, key].join("+");
+  }
+
+  function onShortcutKeyDown(e: KeyboardEvent) {
+    if (!capturingShortcut) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") {
+      capturingShortcut = false;
+      shortcutError = null;
+      return;
+    }
+    // Ignore bare modifier presses; keep listening until the user
+    // presses a real key alongside them.
+    if (["Shift", "Control", "Alt", "Meta", "Super"].includes(e.key)) {
+      return;
+    }
+    const mods: string[] = [];
+    if (e.ctrlKey) mods.push("Ctrl");
+    if (e.altKey) mods.push("Alt");
+    if (e.shiftKey) mods.push("Shift");
+    if (e.metaKey) mods.push("Super");
+    // Promote the keycode to a canonical token the Rust parser
+    // understands: letters A..Z, digits 0..9, function keys F1..F24.
+    let key = "";
+    if (e.code.startsWith("Key") && e.code.length === 4) {
+      key = e.code.slice(3).toUpperCase();
+    } else if (e.code.startsWith("Digit") && e.code.length === 6) {
+      key = e.code.slice(5);
+    } else if (/^F\d{1,2}$/.test(e.code)) {
+      key = e.code;
+    } else {
+      // Unsupported key; surface an inline error + stay in capture
+      // mode so the user can try again without clicking Change again.
+      shortcutError = "Use a letter, digit, or F-key with at least one modifier.";
+      return;
+    }
+    if (mods.length === 0) {
+      shortcutError = "Add at least one modifier (Ctrl / Alt / Shift / Super).";
+      return;
+    }
+    const candidate = normalizeShortcut(mods, key);
+    if (candidate === RECORD_TOGGLE_SHORTCUT) {
+      shortcutError = `${candidate} is already bound to start/stop recording.`;
+      return;
+    }
+    selfNoteShortcut = candidate;
+    capturingShortcut = false;
+    shortcutError = null;
+    void saveAppPrefs();
+  }
+
+  function beginCaptureShortcut() {
+    capturingShortcut = true;
+    shortcutError = null;
+  }
+  function clearShortcut() {
+    selfNoteShortcut = null;
+    capturingShortcut = false;
+    shortcutError = null;
+    void saveAppPrefs();
   }
 
   let prefsSavedRecently = $derived(
@@ -744,8 +838,7 @@
         <span class="pref-hint">
           Recording stops automatically at this length. Tighter cap
           than regular recordings because a dictation is usually
-          short. Minimum 1, maximum 60. Default 5. Keyboard shortcut:
-          Super+Shift+N (Super = Win/Meta).
+          short. Minimum 1, maximum 60. Default 5.
         </span>
       </div>
       <input
@@ -757,6 +850,59 @@
         bind:value={maxSelfNoteMinutes}
         onchange={saveAppPrefs}
       />
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Note-to-self shortcut</span>
+        <span class="pref-hint">
+          Global keyboard shortcut that starts a note-to-self
+          recording, even when aftercalls isn't focused. Defaults to
+          Super+Shift+N (Super = Win/Meta). Click Change and press
+          your combo. Clear to disable — the tray, button, and
+          command-line still work.
+        </span>
+        {#if shortcutError}
+          <span class="error-inline" role="alert">{shortcutError}</span>
+        {/if}
+      </div>
+      <div class="shortcut-controls">
+        {#if capturingShortcut}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="input shortcut-input shortcut-capturing"
+            type="text"
+            readonly
+            autofocus
+            value="Press a key combination…"
+            onkeydown={onShortcutKeyDown}
+            onblur={() => (capturingShortcut = false)}
+          />
+        {:else}
+          <input
+            class="input shortcut-input"
+            type="text"
+            readonly
+            value={selfNoteShortcut ?? "Disabled"}
+          />
+        {/if}
+        <button
+          type="button"
+          class="add"
+          onclick={beginCaptureShortcut}
+          disabled={capturingShortcut}
+        >
+          Change
+        </button>
+        <button
+          type="button"
+          class="add"
+          onclick={clearShortcut}
+          disabled={selfNoteShortcut === null}
+        >
+          Clear
+        </button>
+      </div>
     </div>
 
     <div class="pref-row">
@@ -1148,6 +1294,27 @@
   .num-input {
     flex: 0 0 7rem;
     text-align: right;
+  }
+  /* #149 — self-note shortcut capture widget. Read-only input + two
+     Change/Clear pills so the shape matches the adjacent number +
+     toggle rows without introducing new primitives. */
+  .shortcut-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .shortcut-input {
+    flex: 0 0 12rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.82rem;
+    text-align: left;
+  }
+  .shortcut-capturing {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
   /* Mic-device dropdown (#3). Wider than .num-input because device
      names are long; truncates rather than pushes the row layout

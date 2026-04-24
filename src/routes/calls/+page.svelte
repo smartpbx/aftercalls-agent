@@ -120,6 +120,14 @@
   // Active tag filters, each as "kind:value". Kept in sync with the URL.
   let tagFilters = $state<string[]>([]);
 
+  // #146 — optional date range. Empty string = unset; mirrors the
+  // value shape that `<input type="date">` emits so there's no extra
+  // conversion on every change. Both ends live on the URL as
+  // `?from=YYYY-MM-DD&to=YYYY-MM-DD` for share-links + back/forward.
+  let fromDate = $state("");
+  let toDate = $state("");
+  let dateTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Admin-only: filter the All-team list to a single member.
   let userFilter = $state<{ id: string; name: string } | null>(null);
   let memberRoster = $state<OrgMember[]>([]);
@@ -175,11 +183,26 @@
     return params.getAll("tag").filter((t) => !!parseTagParam(t));
   }
 
+  // #146 — read + validate `?from=` / `?to=` from the URL. Strict
+  // `YYYY-MM-DD` shape; anything else is silently dropped so a
+  // pasted malformed URL can't wedge the input.
+  function readDateFromUrl(key: string): string {
+    if (typeof window === "undefined") return "";
+    const raw = new URL(window.location.href).searchParams.get(key) ?? "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : "";
+  }
+
   function syncUrl() {
     if (typeof window === "undefined") return;
     const u = new URL(window.location.href);
     u.searchParams.delete("tag");
     for (const t of tagFilters) u.searchParams.append("tag", t);
+    // #146 — date range on the URL. Delete + set (instead of mutate)
+    // so clearing an input drops the param cleanly.
+    u.searchParams.delete("from");
+    u.searchParams.delete("to");
+    if (fromDate) u.searchParams.set("from", fromDate);
+    if (toDate) u.searchParams.set("to", toDate);
     // #135 — use SvelteKit's `replaceState` so the browser history
     // stays in sync with the filter pill without a push-navigation.
     // `replaceState` from `$app/navigation` updates `history` +
@@ -198,12 +221,39 @@
         scope,
         user: scope === "all" ? (userFilter?.id ?? null) : null,
         tags: tagFilters,
+        // #146 — pack `YYYY-MM-DD` into full RFC3339 on this side so
+        // the Tauri command + backend only ever see parsed timestamps.
+        fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
+        toDate: toDate ? `${toDate}T23:59:59Z` : null,
       });
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
     }
+  }
+
+  // #146 — live-on-change with 250ms debounce. Typing a date picks one
+  // digit at a time in some browsers (`on:input` fires per keystroke),
+  // so we don't want to refetch on every tick. Clear is immediate via
+  // `clearDates()`.
+  function onDateChange() {
+    if (dateTimer) clearTimeout(dateTimer);
+    dateTimer = setTimeout(() => {
+      syncUrl();
+      void load();
+    }, 250);
+  }
+
+  async function clearDates() {
+    if (dateTimer) {
+      clearTimeout(dateTimer);
+      dateTimer = null;
+    }
+    fromDate = "";
+    toDate = "";
+    syncUrl();
+    await load();
   }
 
   async function setScope(next: "mine" | "all") {
@@ -248,6 +298,12 @@
     tagFilters = [];
     query = "";
     userFilter = null;
+    fromDate = "";
+    toDate = "";
+    if (dateTimer) {
+      clearTimeout(dateTimer);
+      dateTimer = null;
+    }
     syncUrl();
     await load();
   }
@@ -334,6 +390,8 @@
       me = await invoke<Me | null>("current_user");
     } catch {}
     tagFilters = readTagsFromUrl();
+    fromDate = readDateFromUrl("from");
+    toDate = readDateFromUrl("to");
     if (scope === "all" && canSeeAll) void ensureMemberRoster();
     try {
       const status = await invoke<{ recording: boolean }>("is_recording");
@@ -363,6 +421,8 @@
   afterNavigate(({ type }) => {
     if (type !== "popstate") return;
     tagFilters = readTagsFromUrl();
+    fromDate = readDateFromUrl("from");
+    toDate = readDateFromUrl("to");
     void load();
   });
 
@@ -708,11 +768,47 @@
     </div>
   </div>
 
+  <!-- #146 · Date range. Sits in its own row so the filter-bar above
+       stays legible at narrow agent widths. Both inputs are native
+       `<input type="date">` so the OS datepicker covers mobile + desk
+       without a custom widget. 250ms debounce on change keeps
+       keystroke-per-digit browsers from firing three loads. -->
+  <div class="date-bar">
+    <label class="date-label">
+      <span class="date-label-text">From</span>
+      <input
+        class="date-input"
+        type="date"
+        bind:value={fromDate}
+        onchange={onDateChange}
+        aria-describedby="date-hint"
+      />
+    </label>
+    <label class="date-label">
+      <span class="date-label-text">To</span>
+      <input
+        class="date-input"
+        type="date"
+        bind:value={toDate}
+        onchange={onDateChange}
+        aria-describedby="date-hint"
+      />
+    </label>
+    {#if fromDate || toDate}
+      <button type="button" class="date-clear" onclick={clearDates}>
+        All dates
+      </button>
+    {/if}
+    <span id="date-hint" class="sr-only">
+      Dates narrow the visible calls to the selected range.
+    </span>
+  </div>
+
   {#if loading}
     <p class="state" style="--i: 2">Loading…</p>
   {:else if error}
     <p class="state err" style="--i: 2">{error}</p>
-  {:else if calls.length === 0 && tagFilters.length === 0 && !query.trim()}
+  {:else if calls.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate}
     <div class="empty" style="--i: 2">
       <p class="empty-title">No calls yet</p>
       <p class="empty-sub">
@@ -722,7 +818,13 @@
     </div>
   {:else if filtered.length === 0}
     <div class="empty" style="--i: 2">
-      <p class="empty-title">No calls match these filters</p>
+      <p class="empty-title">
+        {#if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
+          No calls in the selected range
+        {:else}
+          No calls match these filters
+        {/if}
+      </p>
       <p class="empty-sub">
         <button type="button" class="empty-clear" onclick={clearFilters}>
           Clear filters
@@ -859,7 +961,12 @@
     margin: 0 auto;
     padding: 2.2rem 2rem 4rem;
     position: relative;
-    z-index: 2;
+    /* #145 — no `z-index` here. Setting one would form a stacking
+       context pinned at the page level, and the filter popover
+       (`.pop` at z-index 11) would end up painting UNDER the layout
+       topstrip (z-index 5 in app.css) because the popover's local
+       stack tops out inside the `.page` context. Keep this bare so
+       the popover's own z-index competes at the global level. */
   }
 
   .head {
@@ -1271,6 +1378,65 @@
     padding: 0.4rem;
     text-align: center;
     list-style: none;
+  }
+
+  /* ── #146 · Date range bar ───────────────────────────────────────── */
+  .date-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.8rem;
+    margin-bottom: 1.4rem;
+  }
+  .date-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--bone-3);
+    font-size: 0.78rem;
+  }
+  .date-label-text {
+    letter-spacing: 0.02em;
+  }
+  .date-input {
+    padding: 0.35rem 0.55rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ink-1);
+    color: var(--bone-0);
+    font-family: inherit;
+    font-size: 0.8rem;
+    /* Tell the native datepicker chrome to match our dark palette. */
+    color-scheme: dark;
+  }
+  .date-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .date-clear {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .date-clear:hover {
+    color: var(--accent-hi);
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   /* ── States ──────────────────────────────────────────────────────── */

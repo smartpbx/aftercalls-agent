@@ -35,6 +35,14 @@
     users: OrgMemberLite[];
     rosterLoaded?: boolean;
     rosterError?: boolean;
+    // #150 · v0.4.6 — swap the two-item menu into its "external"
+    // shape: "Link to teammate" / "Leave as text". Unlink doesn't
+    // apply when the chip wasn't linked in the first place, so
+    // "Leave as text" just dismisses the popover without emitting
+    // onselect. Picker behaviour is unchanged — picking a teammate
+    // still fires `onselect("rename", pick)`, which the parent's
+    // rewrite helper handles identically to a linked rename.
+    isExternal?: boolean;
     onselect: (action: ChipMenuAction, pick?: SpeakerPick) => void;
     onclose: () => void;
   };
@@ -45,6 +53,7 @@
     users,
     rosterLoaded = true,
     rosterError = false,
+    isExternal = false,
     onselect,
     onclose,
   }: Props = $props();
@@ -136,6 +145,9 @@
       e.preventDefault();
       if (focusIdx === 0) {
         mode = "picker";
+      } else if (isExternal) {
+        // #150 — "Leave as text" is dismiss-only; no mutation.
+        onclose();
       } else {
         onselect("unlink");
       }
@@ -154,6 +166,12 @@
 
   function doUnlink() {
     onselect("unlink");
+  }
+
+  // #150 — external mode's item-1 action. Dismiss without emitting
+  // a mutation — the mention keeps its italic rendering.
+  function doLeaveAsText() {
+    onclose();
   }
 
   function onPickerPick(pick: SpeakerPick) {
@@ -203,35 +221,60 @@
           />
         </svg>
       </span>
-      Rename teammate
+      {isExternal ? "Link to teammate" : "Rename teammate"}
     </button>
-    <button
-      type="button"
-      role="menuitem"
-      class="chip-menu-item"
-      class:chip-menu-item-active={focusIdx === 1}
-      onmouseenter={() => (focusIdx = 1)}
-      onclick={doUnlink}
-    >
-      <span class="chip-menu-glyph" aria-hidden="true">
-        <svg viewBox="0 0 12 12" width="12" height="12">
-          <path
-            d="M4 8L2 10M8 4l2-2"
-            stroke="currentColor"
-            stroke-width="1.2"
-            stroke-linecap="round"
-          />
-          <path
-            d="M5 9a2 2 0 0 1-3-3l1-1M7 3a2 2 0 0 1 3 3l-1 1"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.2"
-            stroke-linecap="round"
-          />
-        </svg>
-      </span>
-      Unlink <span class="chip-menu-hint">(just show as text)</span>
-    </button>
+    {#if isExternal}
+      <!-- #150 — external mode: item 1 is dismiss-only. No Unlink
+           glyph (the chip was never linked); no hint text. -->
+      <button
+        type="button"
+        role="menuitem"
+        class="chip-menu-item"
+        class:chip-menu-item-active={focusIdx === 1}
+        onmouseenter={() => (focusIdx = 1)}
+        onclick={doLeaveAsText}
+      >
+        <span class="chip-menu-glyph" aria-hidden="true">
+          <svg viewBox="0 0 12 12" width="12" height="12">
+            <path
+              d="M3 9 L9 3 M3 3 L9 9"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linecap="round"
+            />
+          </svg>
+        </span>
+        Leave as text
+      </button>
+    {:else}
+      <button
+        type="button"
+        role="menuitem"
+        class="chip-menu-item"
+        class:chip-menu-item-active={focusIdx === 1}
+        onmouseenter={() => (focusIdx = 1)}
+        onclick={doUnlink}
+      >
+        <span class="chip-menu-glyph" aria-hidden="true">
+          <svg viewBox="0 0 12 12" width="12" height="12">
+            <path
+              d="M4 8L2 10M8 4l2-2"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linecap="round"
+            />
+            <path
+              d="M5 9a2 2 0 0 1-3-3l1-1M7 3a2 2 0 0 1 3 3l-1 1"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linecap="round"
+            />
+          </svg>
+        </span>
+        Unlink <span class="chip-menu-hint">(just show as text)</span>
+      </button>
+    {/if}
   {:else}
     <div class="chip-menu-picker">
       <SpeakerRenamePicker

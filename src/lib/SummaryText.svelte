@@ -1,114 +1,32 @@
 <script lang="ts" module>
-  // Minimal shape this component needs per roster entry. Parent maps
-  // its source-specific OrgMember row (portal api vs agent Tauri
-  // invoke) onto this triple before passing. Matches the shape of
-  // OrgMemberLite in SpeakerRenamePicker — callers can pass the same
-  // array to both components.
-  export type SummaryMember = {
-    id: string;
-    first_name: string;
-    last_name: string;
-    display_name: string;
-  };
-
-  // Tokenizer output. Either a plain text span (rendered via Svelte
-  // `{segment.value}` — never `{@html}`) or a name-span the parent
-  // renders as a resolved chip.
-  type Segment =
-    | { kind: "text"; value: string }
-    | { kind: "name"; inner: string };
-
-  // Split the LLM-emitted body on `<name>...</name>` markers. No
-  // nested tags are expected (prompt forbids them); a simple regex is
-  // sufficient. Any unmatched `<` / `>` stays in the text segment and
-  // renders as literal characters through Svelte interpolation.
-  export function tokenize(text: string): Segment[] {
-    if (!text) return [];
-    const out: Segment[] = [];
-    const re = /<name>([^<]+)<\/name>/g;
-    let lastIdx = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      if (m.index > lastIdx) {
-        out.push({ kind: "text", value: text.slice(lastIdx, m.index) });
-      }
-      out.push({ kind: "name", inner: m[1] });
-      lastIdx = m.index + m[0].length;
-    }
-    if (lastIdx < text.length) {
-      out.push({ kind: "text", value: text.slice(lastIdx) });
-    }
-    return out;
-  }
-
-  // Synthesize the `First L.` form the LLM is instructed to emit for
-  // each member. Trims input; falls back to the bare first name when
-  // there's no last initial (mononyms). Used to match a `<name>` span
-  // back to a roster row.
-  export function firstLastInitial(m: SummaryMember): string {
-    const first = (m.first_name ?? "").trim();
-    const last = (m.last_name ?? "").trim();
-    if (!first) return "";
-    const initial = [...last][0];
-    if (!initial) return first;
-    return `${first} ${initial.toLocaleUpperCase()}.`;
-  }
-
-  // #140 · v0.4.5 — indexed chip-occurrence rewrite helper.
-  //
-  // Rewrite the `occurrenceIndex`-th `<name>...</name>` match in
-  // `source`. `action === "rename"` swaps the inner text for
-  // `replacement` (keeps the wrapper tags); `action === "unlink"`
-  // strips the wrapper and leaves the bare inner text in place.
-  //
-  // Every other `<name>...</name>` in `source` — including ones
-  // with the same inner string — stays untouched. The regex here
-  // mirrors the `tokenize` pattern above so the index counter
-  // stays in lockstep between render-order and rewrite-order.
-  //
-  // Caller is responsible for canonicalising `replacement` to the
-  // `First L.` form via `firstLastInitial(member)` so the rewritten
-  // token matches the tokenizer / resolver on the next render.
-  export function rewriteChipOccurrence(
-    source: string,
-    occurrenceIndex: number,
-    action: "rename" | "unlink",
-    replacement?: string,
-  ): string {
-    if (!source) return source;
-    const re = /<name>([^<]+)<\/name>/g;
-    let idx = 0;
-    let result = "";
-    let lastEnd = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(source)) !== null) {
-      result += source.slice(lastEnd, m.index);
-      if (idx === occurrenceIndex) {
-        if (action === "rename" && replacement !== undefined) {
-          result += `<name>${replacement}</name>`;
-        } else {
-          // Unlink (or rename with no replacement supplied): strip
-          // the wrapper, keep the inner text verbatim.
-          result += m[1];
-        }
-      } else {
-        result += m[0];
-      }
-      lastEnd = m.index + m[0].length;
-      idx += 1;
-    }
-    result += source.slice(lastEnd);
-    return result;
-  }
+  // #148 (v0.4.7) — pure-TS helpers now live in
+  // `./SummaryText.helpers.ts` so vitest can exercise them without
+  // parsing a Svelte file. This module script re-exports them so
+  // existing `$lib/SummaryText.svelte` call-sites keep working with
+  // no churn. Byte-for-byte behaviour is unchanged.
+  export {
+    tokenize,
+    firstLastInitial,
+    rewriteChipOccurrence,
+    type SummaryMember,
+    type Segment,
+  } from "./SummaryText.helpers";
 
   // Detail payload fired by the interactive chip surface (#140).
   // Parent mounts `<ChipMenu>` anchored to `anchor` and — on menu
   // action — uses `occurrenceIndex` with `rewriteChipOccurrence`
   // to target the exact `<name>` token that was clicked.
+  //
+  // #150 · v0.4.6 — `isExternal` is `true` when the clicked `<name>`
+  // span didn't resolve against the roster (renders as an italic
+  // external mention). Parent routes these through ChipMenu in
+  // external mode ("Link to teammate" / "Leave as text") so a user
+  // can upgrade the mention to a proper teammate chip.
   export type ChipActionDetail = {
     inner: string;
     occurrenceIndex: number;
     anchor: HTMLElement;
+    isExternal: boolean;
   };
 </script>
 
@@ -157,6 +75,11 @@
   // in either mode.
 
   import Avatar from "./Avatar.svelte";
+  import {
+    tokenize,
+    firstLastInitial,
+    type SummaryMember,
+  } from "./SummaryText.helpers";
 
   type Props = {
     text: string | null | undefined;
@@ -231,12 +154,13 @@
     e: MouseEvent,
     inner: string,
     occurrenceIndex: number,
+    isExternal: boolean,
   ) {
     if (!onchipaction) return;
     e.preventDefault();
     e.stopPropagation();
     const anchor = e.currentTarget as HTMLElement;
-    onchipaction({ inner, occurrenceIndex, anchor });
+    onchipaction({ inner, occurrenceIndex, anchor, isExternal });
   }
 </script>
 
@@ -260,7 +184,7 @@
             aria-label="Edit mention: {m.display_name}"
             aria-haspopup="menu"
             aria-expanded={activeOccurrenceIndex === occ ? "true" : "false"}
-            onclick={(e) => onChipClick(e, seg.inner, occ)}
+            onclick={(e) => onChipClick(e, seg.inner, occ, false)}
           >
             <Avatar name={m.display_name} color={c} size={18} />
             <span class="name-chip-label">{seg.inner}</span>
@@ -282,6 +206,22 @@
         >
           <span class="name-chip-label">{seg.inner}</span>
         </span>
+      {:else if onchipaction}
+        <!-- #150 · v0.4.6 — external mention promoted to a button so
+             the user can Link-to-teammate a roster-miss. The inner
+             `<name>` span is still a tokenizer hit; it just didn't
+             resolve via `First L.` lookup. ChipMenu opens in external
+             mode (see isExternal below). -->
+        <button
+          type="button"
+          class="name-external name-external-btn"
+          class:name-chip-active={activeOccurrenceIndex === occ}
+          title="{seg.inner} — click to link to a teammate"
+          aria-label="Link mention: {seg.inner}"
+          aria-haspopup="menu"
+          aria-expanded={activeOccurrenceIndex === occ ? "true" : "false"}
+          onclick={(e) => onChipClick(e, seg.inner, occ, true)}
+        >{seg.inner}</button>
       {:else}
         <span class="name-external">{seg.inner}</span>
       {/if}
@@ -366,5 +306,31 @@
   .name-external {
     color: var(--bone-1);
     font-style: italic;
+  }
+
+  /* #150 · v0.4.6 — external mention rendered as a button when the
+     parent wires `onchipaction`. Reset the native chrome so the
+     inline paint stays identical to the span variant (italic, bone-1
+     text); add padding + hover + focus-visible so the affordance is
+     discoverable without pulling visual weight away from the prose. */
+  .name-external-btn {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: inherit;
+    font: inherit;
+    font-style: italic;
+    padding: 0 0.15rem;
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: inherit;
+    transition: background-color 120ms ease;
+  }
+  .name-external-btn:hover {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .name-external-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 </style>

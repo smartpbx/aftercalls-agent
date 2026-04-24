@@ -1967,12 +1967,17 @@
   });
 
   // ── Chip-menu state (#140 Ask 2/3) ───────────────────────────────
+  // #150 · v0.4.6 — `isExternal` flips ChipMenu into its Link/Leave
+  // shape for roster-miss mentions. The rewrite helper treats both
+  // external and linked renames identically, so the Save path below
+  // stays unchanged.
   type ActiveChip =
     | {
         source: "summary";
         anchor: HTMLElement;
         inner: string;
         occurrenceIndex: number;
+        isExternal: boolean;
       }
     | {
         source: "action_item";
@@ -1980,6 +1985,7 @@
         anchor: HTMLElement;
         inner: string;
         occurrenceIndex: number;
+        isExternal: boolean;
       };
   let activeChip = $state<ActiveChip | null>(null);
 
@@ -1987,12 +1993,14 @@
     inner: string;
     occurrenceIndex: number;
     anchor: HTMLElement;
+    isExternal: boolean;
   }) {
     activeChip = {
       source: "summary",
       anchor: detail.anchor,
       inner: detail.inner,
       occurrenceIndex: detail.occurrenceIndex,
+      isExternal: detail.isExternal,
     };
   }
   function openActionItemChip(detail: {
@@ -2000,6 +2008,7 @@
     occurrenceIndex: number;
     anchor: HTMLElement;
     itemId: string;
+    isExternal: boolean;
   }) {
     activeChip = {
       source: "action_item",
@@ -2007,6 +2016,7 @@
       anchor: detail.anchor,
       inner: detail.inner,
       occurrenceIndex: detail.occurrenceIndex,
+      isExternal: detail.isExternal,
     };
   }
   function closeChipMenu() {
@@ -3026,6 +3036,7 @@
     users={memberRoster}
     rosterLoaded={memberRosterLoaded}
     rosterError={memberRosterError}
+    isExternal={activeChip.isExternal}
     onselect={onChipMenuSelect}
     onclose={closeChipMenu}
   />

@@ -30,6 +30,12 @@
     type ActionsOwnerSave,
   } from "$lib/ActionsList.svelte";
   import type { ActionItemUser } from "$lib/ActionItem.svelte";
+  import {
+    rewriteChipOccurrence,
+    firstLastInitial,
+  } from "$lib/SummaryText.svelte";
+  import ChipMenu from "$lib/ChipMenu.svelte";
+  import type { SpeakerPick } from "$lib/SpeakerRenamePicker.svelte";
 
   // Roster shape the Tauri invoke returns. Superset of ActionItemUser
   // so we just map over the relevant fields.
@@ -389,6 +395,114 @@
       };
     }
   }
+
+  // ── Chip-edit wiring (#147 / v0.4.7) ─────────────────────────────
+  //
+  // Agent twin of the portal handler — see portal/src/routes/actions
+  // for the longer narrative. Divergence is confined to the PATCH
+  // path (invoke vs fetch); shape + occurrence bookkeeping is
+  // identical.
+  let activeChip = $state<{
+    itemId: string;
+    anchor: HTMLElement;
+    inner: string;
+    occurrenceIndex: number;
+  } | null>(null);
+  const memberRosterLoaded = $derived(orgMembers.length > 0);
+  const memberRosterError = $state(false);
+
+  function openActionItemChip(detail: {
+    inner: string;
+    occurrenceIndex: number;
+    anchor: HTMLElement;
+    itemId: string;
+  }) {
+    activeChip = {
+      itemId: detail.itemId,
+      anchor: detail.anchor,
+      inner: detail.inner,
+      occurrenceIndex: detail.occurrenceIndex,
+    };
+  }
+  function closeChipMenu() {
+    activeChip = null;
+  }
+
+  async function onChipMenuSelect(
+    action: "rename" | "unlink",
+    pick?: SpeakerPick,
+  ) {
+    if (!activeChip) return;
+    const ac = activeChip;
+    let replacement: string | undefined;
+    if (action === "rename") {
+      const user = pick?.user;
+      if (!user) {
+        action = "unlink";
+      } else {
+        const full = orgMembers.find((m) => m.id === user.id);
+        replacement = full
+          ? firstLastInitial({
+              id: full.id,
+              first_name: full.first_name,
+              last_name: full.last_name,
+              display_name: full.display_name,
+            })
+          : "";
+        if (!replacement) {
+          const parts = (user.display_name ?? "").trim().split(/\s+/);
+          const first = parts[0] ?? "";
+          const lastInitial = parts[1] ? parts[1][0] : "";
+          replacement = lastInitial
+            ? `${first} ${lastInitial.toUpperCase()}.`
+            : first;
+        }
+      }
+    }
+    try {
+      const item = items.find((it) => it.id === ac.itemId);
+      if (!item) {
+        closeChipMenu();
+        return;
+      }
+      const current = item.description ?? "";
+      const rewritten = rewriteChipOccurrence(
+        current,
+        ac.occurrenceIndex,
+        action,
+        replacement,
+      );
+      if (rewritten === current) {
+        closeChipMenu();
+        return;
+      }
+      const updated = (await invoke("patch_action_item", {
+        callId: item.call_id,
+        itemId: ac.itemId,
+        body: { description: rewritten },
+      })) as MeActionItem;
+      items = items.map((it) =>
+        it.id === ac.itemId
+          ? { ...it, description: updated.description }
+          : it,
+      );
+    } catch (e) {
+      console.warn("chip action failed", e);
+    } finally {
+      closeChipMenu();
+    }
+  }
+
+  // ChipMenu wants OrgMemberLite[] (id + display_name + email); the
+  // /actions roster already carries those fields via ActionItemUser,
+  // so we just narrow the view rather than re-mapping.
+  const chipRoster = $derived(
+    orgMembers.map((m) => ({
+      id: m.id,
+      display_name: m.display_name,
+      email: m.email,
+    })),
+  );
 </script>
 
 <svelte:head>
@@ -422,4 +536,19 @@
   onDescriptionCancel={onDescriptionCancel}
   onOwnerCancel={onOwnerCancel}
   onEditErrorClear={onEditErrorClear}
+  onactionitemchipaction={openActionItemChip}
+  activeChipItemId={activeChip?.itemId ?? null}
+  activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}
 />
+
+{#if activeChip}
+  <ChipMenu
+    anchor={activeChip.anchor}
+    name={activeChip.inner}
+    users={chipRoster}
+    rosterLoaded={memberRosterLoaded}
+    rosterError={memberRosterError}
+    onselect={onChipMenuSelect}
+    onclose={closeChipMenu}
+  />
+{/if}
