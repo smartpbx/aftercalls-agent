@@ -87,6 +87,14 @@
 
   let inputEl = $state<HTMLInputElement | null>(null);
   let activeIdx = $state(-1);
+  // v0.4.1 (#122 C.2): dropdown collapses after `pickRow` / `commit`
+  // and reopens on input focus/click/typing or arrow keys. Default
+  // `true` preserves the "open-on-mount" behaviour the transcript +
+  // participants-chip call-sites rely on (they unmount the picker
+  // immediately after pick so this state is moot there). For the
+  // action-item editor + add-composer call-sites, the picker stays
+  // mounted across picks — this flag is the actual UX knob.
+  let dropdownOpen = $state(true);
   // Stable per-instance listbox id so aria-controls matches the
   // rendered `role="listbox"` element. $props.id() would be nicer but
   // isn't available on Svelte 5 stable without a generator — a
@@ -148,17 +156,22 @@
   function pickRow(row: Row) {
     if (row.kind === "member") {
       onpick({ user: row.member, freeText: null });
-      return;
-    }
-    // Recents row — resolve back to a roster member by name. If it
-    // doesn't resolve (teammate deactivated between reads), fall
-    // through as free-form so the Save isn't lost.
-    const m = resolveMemberByName(row.name);
-    if (m) {
-      onpick({ user: m, freeText: null });
     } else {
-      onpick({ user: null, freeText: row.name });
+      // Recents row — resolve back to a roster member by name. If it
+      // doesn't resolve (teammate deactivated between reads), fall
+      // through as free-form so the Save isn't lost.
+      const m = resolveMemberByName(row.name);
+      if (m) {
+        onpick({ user: m, freeText: null });
+      } else {
+        onpick({ user: null, freeText: row.name });
+      }
     }
+    // v0.4.1 (#122 C.2): collapse after firing `onpick`. Setting
+    // this last so a parent that re-seeds `value` in response to
+    // the pick can't inadvertently re-open the list via a
+    // dependent effect.
+    dropdownOpen = false;
   }
 
   function commit() {
@@ -172,6 +185,7 @@
     const member = resolveMemberByName(value);
     if (member) {
       onpick({ user: member, freeText: null });
+      dropdownOpen = false;
       return;
     }
     const trimmed = value.trim();
@@ -180,6 +194,7 @@
       return;
     }
     onpick({ user: null, freeText: trimmed });
+    dropdownOpen = false;
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -189,12 +204,16 @@
     e.stopPropagation();
     if (e.key === "ArrowDown") {
       e.preventDefault();
+      // v0.4.1 (#122 C.2): arrow keys reopen the list — keyboard
+      // users expect arrows to surface choices after a pick.
+      dropdownOpen = true;
       if (rows.length === 0) return;
       activeIdx = activeIdx + 1 >= rows.length ? 0 : activeIdx + 1;
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
+      dropdownOpen = true;
       if (rows.length === 0) return;
       activeIdx = activeIdx <= 0 ? rows.length - 1 : activeIdx - 1;
       return;
@@ -221,11 +240,14 @@
       autocomplete="off"
       aria-label="Rename speaker — start typing or choose a teammate"
       role="combobox"
-      aria-expanded="true"
+      aria-expanded={dropdownOpen}
       aria-autocomplete="list"
       aria-controls={listboxId}
       bind:this={inputEl}
       bind:value
+      onfocus={() => (dropdownOpen = true)}
+      onclick={() => (dropdownOpen = true)}
+      oninput={() => (dropdownOpen = true)}
     />
     <button
       type="button"
@@ -239,53 +261,55 @@
       Cancel
     </button>
   </div>
-  <div class="srp-list" role="listbox" id={listboxId}>
-    {#if !rosterLoaded}
-      <div class="srp-hint">Loading teammates…</div>
-    {:else if rosterError}
-      <div class="srp-hint srp-hint-err">
-        Couldn't load teammates. Free-form save still works.
-      </div>
-    {:else if roster.length === 0}
-      <div class="srp-hint">No teammates in your org yet.</div>
-    {:else if rows.length === 0}
-      <div class="srp-hint">
-        {noMatchHint}
-      </div>
-    {:else}
-      {#each rows as row, i (row.kind === "member" ? "m:" + row.member.id : "r:" + row.name)}
-        {#if row.kind === "recent" && (i === 0 || rows[i - 1].kind !== "recent")}
-          <div class="srp-hdr">Recently used</div>
-        {/if}
-        {#if row.kind === "member" && (i === 0 || rows[i - 1].kind !== "member")}
-          <div class="srp-hdr">All members</div>
-        {/if}
-        <button
-          type="button"
-          class="srp-row-btn"
-          class:active={i === activeIdx}
-          role="option"
-          aria-selected={i === activeIdx}
-          {...{ "aria-description": "Linked teammate" }}
-          onmouseenter={() => (activeIdx = i)}
-          onclick={() => pickRow(row)}
-        >
-          {#if row.kind === "recent"}
-            <Avatar name={row.name} size={20} />
-            <span class="srp-stack">
-              <span class="srp-name">{row.name}</span>
-            </span>
-          {:else}
-            <Avatar name={row.member.display_name} size={20} />
-            <span class="srp-stack">
-              <span class="srp-name">{row.member.display_name}</span>
-              <span class="srp-email">{row.member.email}</span>
-            </span>
+  {#if dropdownOpen}
+    <div class="srp-list" role="listbox" id={listboxId}>
+      {#if !rosterLoaded}
+        <div class="srp-hint">Loading teammates…</div>
+      {:else if rosterError}
+        <div class="srp-hint srp-hint-err">
+          Couldn't load teammates. Free-form save still works.
+        </div>
+      {:else if roster.length === 0}
+        <div class="srp-hint">No teammates in your org yet.</div>
+      {:else if rows.length === 0}
+        <div class="srp-hint">
+          {noMatchHint}
+        </div>
+      {:else}
+        {#each rows as row, i (row.kind === "member" ? "m:" + row.member.id : "r:" + row.name)}
+          {#if row.kind === "recent" && (i === 0 || rows[i - 1].kind !== "recent")}
+            <div class="srp-hdr">Recently used</div>
           {/if}
-        </button>
-      {/each}
-    {/if}
-  </div>
+          {#if row.kind === "member" && (i === 0 || rows[i - 1].kind !== "member")}
+            <div class="srp-hdr">All members</div>
+          {/if}
+          <button
+            type="button"
+            class="srp-row-btn"
+            class:active={i === activeIdx}
+            role="option"
+            aria-selected={i === activeIdx}
+            {...{ "aria-description": "Linked teammate" }}
+            onmouseenter={() => (activeIdx = i)}
+            onclick={() => pickRow(row)}
+          >
+            {#if row.kind === "recent"}
+              <Avatar name={row.name} size={20} />
+              <span class="srp-stack">
+                <span class="srp-name">{row.name}</span>
+              </span>
+            {:else}
+              <Avatar name={row.member.display_name} size={20} />
+              <span class="srp-stack">
+                <span class="srp-name">{row.member.display_name}</span>
+                <span class="srp-email">{row.member.email}</span>
+              </span>
+            {/if}
+          </button>
+        {/each}
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>

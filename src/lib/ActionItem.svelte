@@ -300,6 +300,11 @@
   let descDraft = $state("");
   let assigneeDraft = $state<string | null>(null);
   let assigneeValue = $state("");
+  // v0.4.1 (#122 C.1): root element of the editor block. Bound via
+  // `bind:this` on `<div class="ai-editor">` so the outside-click
+  // listener can test `editorEl.contains(target)` without caring
+  // which descendant the user clicked on.
+  let editorEl: HTMLDivElement | undefined = $state();
   let pickerRoster = $derived.by<OrgMemberLite[]>(() =>
     users.map((u) => ({
       id: u.id,
@@ -344,6 +349,12 @@
     }
   }
 
+  // Reserved for a post-v0.4.1 `×` glyph that explicitly clears the
+  // picker's selected teammate from the editor. The v0.4.1 rewire
+  // routed the picker's `oncancel` to `handleCancel` (Escape closes the
+  // whole edit, not just the field), leaving this function unbound in
+  // the current surface — kept so the glyph work doesn't need to
+  // redefine it.
   function clearAssignee() {
     assigneeDraft = null;
     assigneeValue = "";
@@ -364,22 +375,62 @@
   }
 
   function onDescKeydown(e: KeyboardEvent) {
-    // Cmd/Ctrl+Enter saves; Escape cancels. Listener is on the
-    // textarea only — we never capture these at the page level
-    // (ui-phase-2 §G reminder: don't eat Ctrl+S / Cmd+Enter for the
-    // whole page).
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      handleCancel();
-      return;
-    }
+    // Cmd/Ctrl+Enter saves from the textarea only — don't escalate
+    // this to the editor root (ui-phase-2 §G reminder: don't eat
+    // Ctrl+S / Cmd+Enter for the whole page, and don't let
+    // Cmd+Enter inside the picker's combobox fire Save either).
+    // Escape is handled by `onEditorKeydown` on `.ai-editor` so it
+    // catches regardless of which descendant has focus.
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       handleSave();
       return;
     }
   }
+
+  function onEditorKeydown(e: KeyboardEvent) {
+    // v0.4.1 (#122 C.1): Escape on the editor root cancels the edit
+    // regardless of which descendant has focus (textarea, picker
+    // input, Save / Cancel buttons). `preventDefault` + stopPropagation
+    // keep the Escape from bubbling to the page-level transcript
+    // Space/Enter handlers.
+    //
+    // The picker's internal `handleKeydown` runs first on a combobox
+    // keystroke and calls `e.stopPropagation()` unconditionally — its
+    // own Escape branch fires `oncancel`, which we've rewired below
+    // to `handleCancel`. This listener catches Escape from the
+    // textarea / Save / Cancel surfaces, which don't go through the
+    // picker.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      handleCancel();
+    }
+  }
+
+  // v0.4.1 (#122 C.1): outside-click cancels the edit. Registered
+  // only while `editing === true`; `pointerdown` fires before focus
+  // transitions so we close deterministically even when the user
+  // clicks another interactive surface. Capture phase means a
+  // descendant's stopPropagation can't hide the click from us.
+  //
+  // Silent-discard policy: no dirty-state guard, matching Phase 2
+  // precedent on summaryEditing. The Cancel button is the explicit
+  // "I meant to save" undo path for anyone surprised.
+  $effect(() => {
+    if (!editing) return;
+    function onDocPointerDown(e: PointerEvent) {
+      if (saving) return;
+      if (!editorEl) return;
+      const target = e.target as Node | null;
+      if (target && editorEl.contains(target)) return;
+      handleCancel();
+    }
+    document.addEventListener("pointerdown", onDocPointerDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointerDown, true);
+    };
+  });
 
   // ── Phase 3 (#104): delete affordance + inline confirm ───────────
 
@@ -431,7 +482,12 @@
   {/if}
   <span class="ai-body">
     {#if editing}
-      <div class="ai-editor">
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="ai-editor"
+        bind:this={editorEl}
+        onkeydown={onEditorKeydown}
+      >
         <textarea
           class="ai-edit-desc"
           bind:value={descDraft}
@@ -450,9 +506,8 @@
             autofocus={false}
             placeholder="Assign to a teammate…"
             noMatchHint="No match — leave empty to keep this item unassigned."
-            savingLabel="Pick"
             onpick={handlePickerPick}
-            oncancel={clearAssignee}
+            oncancel={handleCancel}
           />
         </div>
         {#if editError}

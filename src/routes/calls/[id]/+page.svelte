@@ -236,6 +236,12 @@
   let regenConfirmOpen = $state(false);
   let regenInFlight = $state(false);
   let regenModalError = $state("");
+  // v0.4.1 (#122 F.2): modal closes on click (F.1), so any error
+  // landing after the await has no modal to render into — surface a
+  // persistent inline callout above the Summary block.
+  // `regenModalError` is kept for defence-in-depth (future modal-
+  // reopen scenario would use it).
+  let regenAsyncError = $state<string | null>(null);
   let regenCooldownSeconds = $state(0);
   let regenCooldownTimer: number | undefined;
   let regenCooldownMsg = $state("");
@@ -259,7 +265,13 @@
   }
   function openRegenConfirm() {
     if (regenCooldownSeconds > 0) return;
+    // v0.4.1 (#122 F.2): belt-and-suspenders — the button's
+    // `disabled` already blocks this path when regen is in-flight,
+    // but a focus-Enter race could slip through.
+    if (regenInFlight) return;
     regenModalError = "";
+    // Fresh attempt clears any lingering async-error callout.
+    regenAsyncError = null;
     regenConfirmOpen = true;
     queueMicrotask(() => {
       const primary =
@@ -268,6 +280,9 @@
     });
   }
   function dismissRegenConfirm() {
+    // With F.1 closing the modal on submit, regenInFlight is false
+    // by the time the user sees the modal again — but leaving the
+    // guard in for defence-in-depth is cheap.
     if (regenInFlight) return;
     regenConfirmOpen = false;
     regenModalError = "";
@@ -276,27 +291,40 @@
     if (!call || regenInFlight) return;
     regenInFlight = true;
     regenModalError = "";
+    // v0.4.1 (#122 F.1): close the modal BEFORE awaiting the POST.
+    // The request fires in the background while the user continues
+    // to work; existing `.gen-shimmer` + "Regenerating…" button
+    // label carry the in-flight UI.
+    regenConfirmOpen = false;
     try {
       const fresh = (await invoke("resummarize_call", { id: call.id })) as Call;
       // Preserve the local notes buffer — server copy might be stale
       // vs. what the user just typed.
       fresh.notes = notesBuffer;
       call = fresh;
-      regenConfirmOpen = false;
+      // Success also clears any prior async-error callout.
+      regenAsyncError = null;
       startCooldownTicker(30);
     } catch (e: any) {
       // Tauri errors round-trip as plain strings. Our resummarize
       // command shapes 429s as `cooldown:{N}` so we can parse the
-      // retry window out. Everything else surfaces as a modal error.
+      // retry window out. Server-side failures come through as
+      // whatever message the Rust side attached. We don't have an
+      // HTTP status at this layer — everything non-cooldown is
+      // treated as a server error (the Tauri updater marshals both
+      // 5xx and network errors into the same plain-string bucket).
       const msg = String(e?.message ?? e ?? "");
       const cooldownMatch = msg.match(/^cooldown:(\d+)$/);
       if (cooldownMatch) {
-        regenConfirmOpen = false;
         const retry = Number(cooldownMatch[1]);
         regenCooldownMsg = "cooldown";
         startCooldownTicker(retry > 0 ? retry : 30);
+      } else if (/network|connect|timeout|offline/i.test(msg)) {
+        regenAsyncError =
+          "Couldn't reach the server to regenerate. Check your connection and try again.";
       } else {
-        regenModalError = msg;
+        regenAsyncError =
+          "Couldn't regenerate the summary. Your existing summary and action items are unchanged. Try again in a moment.";
       }
     } finally {
       regenInFlight = false;
@@ -360,6 +388,16 @@
   let actionItemErrors = $state<Record<string, string>>({});
 
   function onActionItemEditStart(payload: { item: ActionItemRow }) {
+    // v0.4.1 (#122 D): mutual exclusion with the add composer.
+    // Pencil-click closes an open composer (unless mid-save —
+    // addSaving guards against stomping an in-flight POST).
+    if (addingItem && !addSaving) {
+      addingItem = false;
+      addError = "";
+      addDescDraft = "";
+      addAssigneeDraft = null;
+      addAssigneeValue = "";
+    }
     editingActionItemId = payload.item.id;
     actionItemErrors = {};
   }
@@ -425,6 +463,14 @@
 
   function openAddComposer() {
     if (!canAddActionItem) return;
+    // v0.4.1 (#122 D): mutual exclusion with the edit-in-place row.
+    // If a row is currently being edited, close it before opening
+    // the composer. `actionItemSaving` guards the in-flight PATCH —
+    // we don't stomp an active save, just wait for it to resolve.
+    if (editingActionItemId !== null && !actionItemSaving) {
+      editingActionItemId = null;
+      actionItemErrors = {};
+    }
     addingItem = true;
     addError = "";
     addDescDraft = "";
@@ -897,6 +943,13 @@
         id: call?.id,
         utterances: call?.utterances?.length,
       });
+      // v0.4.1 (#122 E-frontend): eager-load the member roster on
+      // mount. Previously lazy — only fired on speaker-rename /
+      // utterance-edit — so the first paint had no roster to resolve
+      // SummaryText `<name>` chips OR action-item assignee FKs,
+      // collapsing linked teammates to italic fallback + "unassigned"
+      // pills. Idempotent (`memberRosterLoaded` guard inside).
+      void ensureMemberRoster();
       // Seed the notes editor once — subsequent poll refreshes keep
       // the local buffer authoritative so mid-type saves aren't
       // clobbered by a stale server value.
@@ -1272,6 +1325,15 @@
       .replace(/"/g, "&quot;");
   }
 
+  // v0.4.1 (#122 A): strip `<name>...</name>` markers before writing
+  // to the clipboard. Summary + action-item copy handlers share
+  // this so pasted text never leaks raw template tags.
+  const stripNameTags = (s: string) =>
+    s.replace(/<name>([^<]+)<\/name>/g, "$1");
+  function copySummary() {
+    if (!call) return;
+    copy(stripNameTags(call.summary_text ?? ""), "summary");
+  }
   function copyActionItems() {
     if (!call) return;
     const items = call.action_items;
@@ -1280,9 +1342,7 @@
     // the assignee's display name when the FK resolves in-roster.
     // Matches the vault-note rendering on the Tauri side.
     const lines = items.map((a) => {
-      const bare = a.description
-        .replace(/<name>([^<]+)<\/name>/g, "$1")
-        .trim();
+      const bare = stripNameTags(a.description).trim();
       const assignee = a.assignee_user_id
         ? memberRoster.find((u) => u.id === a.assignee_user_id)
         : null;
@@ -2098,13 +2158,29 @@
             Just regenerated — try again in {regenCooldownSeconds} seconds.
           </p>
         {/if}
+        {#if regenAsyncError}
+          <!-- v0.4.1 (#122 F.2): async-error callout. Modal closes
+               on submit (F.1); any error that resolves after that
+               point lands here so the user sees it without a
+               re-open. Manual × dismiss. Sticky until the next
+               successful regen or until the user clears it. -->
+          <div class="regen-callout regen-callout-err" role="alert">
+            <span class="regen-callout-txt">{regenAsyncError}</span>
+            <button
+              type="button"
+              class="regen-callout-close"
+              aria-label="Dismiss"
+              onclick={() => (regenAsyncError = null)}
+            >×</button>
+          </div>
+        {/if}
         <div class="block-head">
           <h2>Summary</h2>
           {#if !summaryEditing}
             <div class="block-head-actions">
               <button
                 class="copy-btn"
-                onclick={() => copy(call!.summary_text ?? "", "summary")}
+                onclick={copySummary}
                 disabled={regenInFlight}
               >
                 {copiedLabel === "summary" ? "Copied" : "Copy"}
@@ -2369,7 +2445,6 @@
                 autofocus={false}
                 placeholder="Assign to a teammate…"
                 noMatchHint="No match — leave empty to keep this item unassigned."
-                savingLabel="Pick"
                 onpick={onAddPickerPick}
                 oncancel={clearAddAssignee}
               />
@@ -2476,7 +2551,6 @@
                 autofocus={false}
                 placeholder="Assign to a teammate…"
                 noMatchHint="No match — leave empty to keep this item unassigned."
-                savingLabel="Pick"
                 onpick={onAddPickerPick}
                 oncancel={clearAddAssignee}
               />
@@ -3368,6 +3442,38 @@
     color: var(--live);
     font-size: 0.85rem;
     font-variant-numeric: tabular-nums;
+  }
+  /* v0.4.1 (#122 F.2): async-error variant. Same pigment palette
+     (destructive red on soft red bg) as the 429 callout, laid out
+     as a flex row with the dismiss glyph right-aligned.
+     Component-scoped — `app.css` byte-identical invariant intact. */
+  .regen-callout-err {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+  }
+  .regen-callout-txt {
+    flex: 1 1 auto;
+    line-height: 1.45;
+  }
+  .regen-callout-close {
+    flex: 0 0 auto;
+    padding: 0 0.35rem;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 1rem;
+    line-height: 1.2;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .regen-callout-close:hover {
+    background: color-mix(in srgb, var(--live) 18%, transparent);
+  }
+  .regen-callout-close:focus-visible {
+    outline: 2px solid var(--live);
+    outline-offset: 1px;
   }
 
   .summary-editor-wrap {

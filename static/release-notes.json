@@ -1,4 +1,15 @@
 {
+  "0.4.1": {
+    "headline": "Action-items polish — name chips after rename, click-outside to cancel, regenerate runs in the background",
+    "changes": [
+      "Copying a summary or action item no longer leaves stray tags in the clipboard — text pastes clean.",
+      "After you rename a speaker to a teammate, their chips show up across the summary and every action item, not just where you renamed them.",
+      "Editing an action item closes with Escape or by clicking outside the row. Picking an assignee collapses the dropdown.",
+      "Clicking Add item while editing another row now closes the open edit first.",
+      "Fresh recordings load your team's roster on open so the assignee picker is populated and AI-detected assignees resolve correctly.",
+      "Regenerating summary + action items no longer blocks the UI — the confirmation closes as soon as you start and regeneration runs in the background while you keep working."
+    ]
+  },
   "0.4.0": {
     "headline": "Assign, edit, and complete action items — one page for every task across every call",
     "changes": [
