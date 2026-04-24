@@ -1733,7 +1733,10 @@
   .strip-right {
     display: flex;
     align-items: center;
-    gap: 0.9rem;
+    /* #108 — slightly wider inter-chip gap + more row-gap when the
+       strip wraps on narrow windows, so the wrapped pill clears the
+       one above it with air instead of butting its bottom edge. */
+    gap: 1rem;
     /* When both the orphan-recovery pill and the update pill fire
        at once, the combined width overflows the topstrip on narrow
        windows. flex-wrap lets the second pill drop to a new row so
@@ -1741,7 +1744,7 @@
        buttons on the right. */
     flex-wrap: wrap;
     justify-content: flex-end;
-    row-gap: 0.4rem;
+    row-gap: 0.55rem;
     /* Allow the strip to grow vertically when wrapping; the
        container is sticky-positioned so this just means the
        content underneath pushes down by one pill's height. */
@@ -1756,8 +1759,12 @@
   .update {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.22rem 0.6rem;
+    /* #108 — slightly more breathing room between the pip, the
+       label, and the install/dismiss buttons. Paired with the
+       .update .pip + .update-label negative-margin rule below
+       so the pip-to-label distance stays tight. */
+    gap: 0.55rem;
+    padding: 0.28rem 0.7rem;
     border: 1px solid var(--hairline);
     border-radius: 999px;
     background: var(--ink-1);
@@ -1769,6 +1776,12 @@
        instead of forcing the pill to max-content width (#88). */
     min-width: 0;
     max-width: 100%;
+  }
+  /* #108 — pull the update-pill label tight to its pip so the two
+     read as a paired chrome unit. Net distance between pip and
+     label comes out ~0.3rem (0.55rem gap − 0.25rem margin). */
+  .update .pip + .update-label {
+    margin-left: -0.25rem;
   }
 
   .update-label {
@@ -1878,11 +1891,31 @@
   .indicator {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    /* #108 — slightly wider gap between clusters (pip+label pairs
+       and the separator dot between them) so the two logical
+       groups ("Recording · Processing") read as distinct units.
+       The pip-to-label tight pair inside each cluster is handled
+       by the negative-margin rule below. */
+    gap: 0.65rem;
     font-family: var(--font-mono);
     font-size: 0.72rem;
     letter-spacing: 0.04em;
     color: var(--bone-2);
+  }
+  /* #108 — pair the pip with its immediate label tight (net
+     distance ~0.35rem). Without this, the uniform 0.65rem flex-gap
+     makes the pip look unattached from its label. */
+  .indicator .pip + .ind-label {
+    margin-left: -0.3rem;
+  }
+  /* #108 — give the "·" separator explicit styling so it reads as
+     a separator, not as part of the adjacent label. Dimmer than
+     the labels (bone-3 at 0.7 opacity) with minimal horizontal
+     breathing room. */
+  .indicator .ind-sep {
+    margin: 0 0.1rem;
+    color: var(--bone-3);
+    opacity: 0.7;
   }
 
   /* ── Windows custom titlebar controls ──────────────────────────── */

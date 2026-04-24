@@ -20,7 +20,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { page } from "$app/state";
-  import { replaceState } from "$app/navigation";
+  import { replaceState, afterNavigate } from "$app/navigation";
   import ActionsList, {
     type MeActionItem,
     type ActionsStatusFilter,
@@ -76,10 +76,13 @@
     } else {
       u.searchParams.set("status", next);
     }
-    // #130a — use SvelteKit's `replaceState` so `page.url` reacts
-    // and the `$effect` below re-evaluates the class:active binding.
-    // A raw `window.history.replaceState` leaves SvelteKit's URL
-    // store stale, which is why the active pill used to stick.
+    // #130a — use SvelteKit's `replaceState` so the browser history
+    // stays in sync with the filter pill without a push-navigation.
+    // NOTE (#139B): `replaceState` from `$app/navigation` updates
+    // `history` + `page.state` but does NOT update `page.url` — so
+    // there is intentionally no URL-observing `$effect` on this
+    // page; filter-click writes `status` + URL synchronously above,
+    // and browser back/forward is handled by `afterNavigate` below.
     replaceState(u.pathname + u.search, page.state);
   }
 
@@ -236,18 +239,27 @@
     all: totalAll,
   });
 
-  $effect(() => {
-    const urlStatus = (() => {
-      const raw = page.url.searchParams.get("status");
-      if (raw === "done" || raw === "all") return raw;
-      return "open";
-    })();
-    if (urlStatus !== status) {
-      status = urlStatus;
-      nextCursor = null;
-      items = [];
-      void loadFirst();
-    }
+  // Back/forward navigation: SvelteKit's actual navigation flow
+  // DOES update `page.url` (via `update_url` inside `_navigate`),
+  // so `afterNavigate` fires with the fresh URL and we can resync
+  // `status` on popstate. `replaceState` (used for filter-pill
+  // clicks) does NOT update `page.url` — so we deliberately do NOT
+  // watch `page.url` in a `$effect` there. The v0.4.3 `$effect`
+  // trapped on `status` as a tracked read, re-fired on every
+  // filter click, and clobbered `status` back with the stale URL
+  // value (#139B). Filter-click syncs synchronously via
+  // `onFilterChange`; no URL observer needed outside popstate.
+  afterNavigate(({ type }) => {
+    // `type: "enter"` fires once on initial hydration — no-op so
+    // onMount owns the first load. Only real back/forward
+    // navigation (popstate) should trigger a resync.
+    if (type !== "popstate") return;
+    const urlStatus = readStatusFromUrl();
+    if (urlStatus === status) return;
+    status = urlStatus;
+    nextCursor = null;
+    items = [];
+    void loadFirst();
   });
 
   function onRetry() {

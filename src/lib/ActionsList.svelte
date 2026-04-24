@@ -333,37 +333,50 @@
   });
 </script>
 
-<section class="actions-wrap">
+<!-- #131 — align to /calls shell: <main> landmark + horizontal
+     centering + reserved right-side actions lane in the header + a
+     filter-row wrapper so future filters can join the segmented
+     control without reshuffling the tree. Verified both portal and
+     agent layouts have no competing <main> (D4). -->
+<main class="actions-page">
   <header class="actions-head">
-    <h1>Action items</h1>
-    <p class="actions-subhead">{subhead}</p>
+    <div class="actions-head-main">
+      <h1>Action items</h1>
+      <p class="actions-subhead">{subhead}</p>
+    </div>
+    <!-- Reserved right-side lane (ui-spec D3). Empty in v0.4.4;
+         future filters / scope toggles mount here. `aria-hidden`
+         comes off when content lands. -->
+    <div class="actions-head-actions" aria-hidden="true"></div>
   </header>
 
-  <div
-    class="actions-filter"
-    role="radiogroup"
-    aria-label="Action item status"
-  >
-    {#each filterOptions as opt (opt.v)}
-      <label
-        class="actions-filter-opt"
-        class:active={status === opt.v}
-      >
-        <input
-          type="radio"
-          name="actions-status"
-          value={opt.v}
-          checked={status === opt.v}
-          onchange={() => setFilter(opt.v)}
-        />
-        <span class="actions-filter-label">{opt.label}</span>
-        {#if totals}
-          <span class="actions-filter-count" aria-hidden="true">
-            {totals[opt.v]}
-          </span>
-        {/if}
-      </label>
-    {/each}
+  <div class="actions-filter-row">
+    <div
+      class="actions-filter"
+      role="radiogroup"
+      aria-label="Action item status"
+    >
+      {#each filterOptions as opt (opt.v)}
+        <label
+          class="actions-filter-opt"
+          class:active={status === opt.v}
+        >
+          <input
+            type="radio"
+            name="actions-status"
+            value={opt.v}
+            checked={status === opt.v}
+            onchange={() => setFilter(opt.v)}
+          />
+          <span class="actions-filter-label">{opt.label}</span>
+          {#if totals}
+            <span class="actions-filter-count" aria-hidden="true">
+              {totals[opt.v]}
+            </span>
+          {/if}
+        </label>
+      {/each}
+    </div>
   </div>
 
   {#if transientError}
@@ -456,31 +469,66 @@
       </div>
     {/if}
   {/if}
-</section>
+</main>
 
 <style>
   /* All styles are component-scoped — Phase 4's acceptance bars
      `portal/src/app.css` and `agent/src/app.css` edits. Mirror-pair
      invariant kept intact. */
 
-  .actions-wrap {
-    max-width: 920px;
-    padding: 1.5rem 1.5rem 3rem;
+  /* #131 — match /calls .page shape: horizontally centred, 900px
+     max-width, 2rem padding. `.actions-page` namespace preserves
+     the mirror-pair invariant (app.css untouched) and avoids
+     accidentally coupling to any future app-wide `.page` rule. */
+  .actions-page {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+    position: relative;
+    z-index: 2;
   }
 
+  /* #131 — flex head: title + subhead left, reserved actions lane
+     right. Mirrors /calls .head verbatim so the three list pages
+     (/calls, /actions, /admin) share one visual rhythm. */
   .actions-head {
-    margin-bottom: 1.25rem;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-bottom: 1.2rem;
+  }
+  .actions-head-main {
+    min-width: 0;
   }
   .actions-head h1 {
-    margin: 0 0 0.35rem;
-    font-size: 1.35rem;
+    margin: 0 0 0.2rem;
     font-weight: 600;
     color: var(--bone-0);
   }
   .actions-subhead {
     margin: 0;
-    font-size: 0.92rem;
+    font-size: 0.82rem;
     color: var(--bone-3);
+  }
+  .actions-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    /* Empty in v0.4.4 — reserves layout so the header doesn't
+       reshape when future filters/toggles land. Remove
+       aria-hidden from the markup when content arrives. */
+  }
+
+  /* #131 — filter-row wrapper mirrors /calls .filter-bar rhythm.
+     One child in v0.4.4; future filters (e.g. pending review)
+     slot in here without restructuring. */
+  .actions-filter-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.7rem;
+    margin-bottom: 0;
   }
 
   /* Segmented filter — visual shape mirrors `admin/+page.svelte`'s
@@ -491,7 +539,7 @@
     flex-wrap: wrap;
     gap: 0.2rem;
     padding: 0.2rem;
-    margin-bottom: 0.9rem;
+    margin-bottom: 1.6rem;
     border: 1px solid var(--hairline);
     background: var(--ink-1);
     border-radius: 8px;
@@ -598,22 +646,22 @@
     color: var(--ink-0);
   }
 
-  /* Empty state — dashed-hairline centred block. Mirrors the
-     calls-page `.empty` rhythm (padding + color tokens) without
-     reaching into app.css. */
+  /* #131 — empty state matches /calls .empty exactly (hairline
+     token, radius-lg, title weight/color). Gives the three list
+     pages a single empty-state visual. */
   .actions-empty {
-    border: 1px dashed var(--hairline-hi);
-    border-radius: 10px;
+    border: 1px dashed var(--hairline);
+    border-radius: var(--radius-lg);
     padding: 3rem 2rem;
     text-align: center;
     background: var(--ink-1);
     margin-top: 0.5rem;
   }
   .actions-empty-title {
-    margin: 0 0 0.4rem;
-    font-size: 1rem;
-    font-weight: 500;
-    color: var(--bone-1);
+    margin: 0 0 0.35rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--bone-0);
   }
   .actions-empty-sub {
     margin: 0;
@@ -621,17 +669,19 @@
     color: var(--bone-3);
   }
 
+  /* #131 — drop the top-border: .ai-row already carries a
+     bottom-border, so a top-border here doubles up when the list
+     starts immediately after the filter row. */
   .actions-list {
     list-style: none;
     padding: 0;
     margin: 0;
-    border-top: 1px solid var(--hairline);
   }
 
   .actions-more {
     display: flex;
     justify-content: center;
-    margin-top: 1rem;
+    margin-top: 1.2rem;
   }
   .actions-more-btn {
     padding: 0.48rem 1.1rem;
@@ -675,8 +725,8 @@
      here for the wrap-point documentation (ui-phase-4 §Responsive
      520px). */
   @media (max-width: 520px) {
-    .actions-wrap {
-      padding: 1rem 1rem 2.5rem;
+    .actions-page {
+      padding: 1.25rem 1rem 2rem;
     }
   }
 </style>

@@ -910,6 +910,11 @@
 
   <footer class="legal-footer" style="--i: 5">
     <a
+      href="https://aftercalls.io/help/system-requirements"
+      onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/help/system-requirements"); }}
+    >System requirements</a>
+    <span class="sep" aria-hidden="true">·</span>
+    <a
       href="https://aftercalls.io/licenses"
       onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/licenses"); }}
     >Licenses</a>

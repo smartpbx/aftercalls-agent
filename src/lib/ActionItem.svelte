@@ -411,15 +411,21 @@
     el.style.height = "0px";
     el.style.height = `${el.scrollHeight}px`;
   }
-  // Run autoresize after the textarea mounts and whenever the draft
-  // changes. Svelte's $effect on the textarea binding covers mount;
-  // the `oninput` handler covers typing.
+  // Run autoresize on edit-mode entry + whenever the draft changes.
+  // #137: depending on `editingDescription` guarantees an on-entry
+  // resize for pre-existing multi-line content; otherwise the
+  // first-render race between Svelte's bind-materialization and the
+  // effect's first flush leaves the textarea stuck at its rows=2
+  // intrinsic height. The `queueMicrotask` indirection is the
+  // standard Svelte 5 idiom for "read a bind:this ref in the same
+  // effect that causes its element to mount" — by the time the
+  // microtask runs, the binding has settled.
   $effect(() => {
-    // Track descDraft so Svelte re-runs on every character. The
-    // textarea may not yet be mounted on the first run (Svelte binds
-    // in the DOM-update phase) — guard with a conditional.
+    if (!editingDescription) return;
     descDraft;
-    if (descTextareaEl) autoresize();
+    queueMicrotask(() => {
+      if (descTextareaEl) autoresize();
+    });
   });
 
   // ── Owner-edit local state ─────────────────────────────────────
@@ -706,7 +712,7 @@
           bind:this={descTextareaEl}
           bind:value={descDraft}
           disabled={saving}
-          rows="1"
+          rows="2"
           placeholder="Describe the task…"
           aria-label="Action item description"
           autofocus
@@ -1016,7 +1022,11 @@
     display: grid;
     grid-template-columns: 20px 28px 1fr auto;
     gap: 0.55rem;
-    align-items: start;
+    /* #132.1 — anchor the four columns to the same first-baseline
+       so checkbox + idx + body + assignee chip read as visually
+       on the same line. Replaces the hand-tuned per-cell margin /
+       padding offsets that compensated for `align-items: start`. */
+    align-items: first baseline;
     padding: 0.6rem 0;
     border-bottom: 1px solid var(--hairline);
     color: var(--bone-1);
@@ -1027,15 +1037,65 @@
     border-bottom: none;
   }
 
+  /* #132.2 — custom-draw the checkbox so the tick glyph is ours to
+     size and position. Drops the `accent-color` reliance, which
+     renders a different glyph per OS theme and clips on Linux
+     webkit2gtk. The 16x16 box stays — only the chrome changes.
+     Tick stroke is the cream hex %23f4efe3 hardcoded in the SVG
+     data-URI below (data: URIs cannot interpolate CSS vars); it
+     contrasts the olive accent in both light and dark themes. */
   .ai-check {
-    margin: 0.22rem 0 0 0;
+    appearance: none;
+    -webkit-appearance: none;
+    margin: 0;
     width: 16px;
     height: 16px;
+    box-sizing: border-box;
+    flex: 0 0 16px;
+    border: 1.5px solid var(--hairline-hi);
+    border-radius: 4px;
+    background: var(--ink-1);
     cursor: default;
-    accent-color: var(--olive);
+    position: relative;
+    transition: background 150ms linear, border-color 150ms linear;
+    /* Center on the first line-box so the box doesn't drift down on
+       multi-line rows. */
+    align-self: center;
   }
   .ai-check-live {
     cursor: pointer;
+  }
+  .ai-check:hover:not(:disabled) {
+    border-color: var(--olive);
+  }
+  .ai-check:checked {
+    background: var(--olive);
+    border-color: var(--olive);
+  }
+  /* Tick glyph. SVG path drawn in a 16x16 viewBox, painted at 14x14
+     centred — the path lives in the middle 10x10 sub-region with
+     ~3px padding on every side, so no clipping under any browser
+     anti-aliasing or sub-pixel rounding. Stroke colour is cream
+     (%23f4efe3) hardcoded inline because data: URIs can't read
+     CSS vars; the same hex reads with AA contrast on olive in
+     both themes. */
+  .ai-check:checked::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%23f4efe3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 14px 14px;
+  }
+  .ai-check:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-check {
+      transition: none;
+    }
   }
 
   .ai-idx {
@@ -1043,7 +1103,9 @@
     font-size: 0.72rem;
     color: var(--accent);
     letter-spacing: 0.04em;
-    padding-top: 0.22rem;
+    /* #132.1 — drop the hand-tuned padding-top: 0.22rem; baseline
+       grid handles vertical alignment now. */
+    align-self: baseline;
   }
   .ai-idx-spacer {
     width: 0;
@@ -1300,11 +1362,17 @@
     display: inline-flex;
     align-items: center;
     gap: 0.15rem;
+    /* #132.1 — center on the body's first line. The grid's
+       first-baseline alignment doesn't apply cleanly to a cell
+       containing only an icon button (no text baseline), so we
+       give it an explicit anchor. */
+    align-self: center;
   }
 
   .ai-del {
     padding: 0.22rem 0.35rem;
-    margin-top: 0.1rem;
+    /* #132.1 — drop the hand-tuned margin-top: 0.1rem; the
+       parent's align-self: center handles vertical alignment. */
     border: none;
     background: transparent;
     color: var(--bone-2);
@@ -1344,7 +1412,9 @@
     gap: 0.35rem;
     flex-wrap: wrap;
     justify-content: flex-end;
-    margin-top: 0.1rem;
+    /* #132.1 — drop margin-top: 0.1rem (compensated for the old
+       align-items: start). Centre on the first body line. */
+    align-self: center;
   }
 
   .ai-confirm-delete,

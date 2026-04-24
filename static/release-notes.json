@@ -1,4 +1,14 @@
 {
+  "0.4.4": {
+    "headline": "Action items filter fixed + row polish + new System requirements page",
+    "changes": [
+      "Action items filter works correctly end-to-end: the active pill (Open / Done / All) updates on click, counts show accurate totals, and the list refreshes every time.",
+      "Action item rows line up properly. Checkbox + number align with the description + owner chip, and the checkmark renders without clipping in both light and dark modes.",
+      "Editing a multi-line action item shows the full text on entry. Textarea autosizes as you type, up to 5 visible lines before scrolling.",
+      "Actions page layout now matches the rest of the list pages: cleaner spacing, consistent empty state.",
+      "New System requirements page at aftercalls.io/help/system-requirements/. Reachable from Settings → footer on both agent and portal."
+    ]
+  },
   "0.4.3": {
     "headline": "Action items filter fixed, waveform loads reliably mid-processing, better screen-reader support",
     "changes": [
