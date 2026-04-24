@@ -1,4 +1,10 @@
 {
+  "0.5.1": {
+    "headline": "Hotfix: v0.5.0 backend startup",
+    "changes": [
+      "Internal-only hotfix. v0.5.0 introduced a backend route-registration conflict that prevented the admin Terms of Service endpoints from starting. Routes consolidated; everything else in v0.5.0 unchanged."
+    ]
+  },
   "0.5.0": {
     "headline": "Date filter on Calls, external-name chip linking, configurable self-note shortcut, /actions chip editing",
     "changes": [
