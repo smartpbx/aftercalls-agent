@@ -32,6 +32,7 @@ struct TrayItems {
 enum TrayState {
     Idle,
     Recording,
+    SelfNote,
     Processing,
 }
 
@@ -57,6 +58,10 @@ fn apply_tray_state(app: &AppHandle, state: TrayState) {
             tauri::include_image!("icons/tray-recording.png"),
             "aftercalls — recording",
         ),
+        TrayState::SelfNote => (
+            tauri::include_image!("icons/tray-self-note.png"),
+            "aftercalls — recording note",
+        ),
         TrayState::Processing => (
             tauri::include_image!("icons/tray-processing.png"),
             "aftercalls — processing",
@@ -69,6 +74,7 @@ fn apply_tray_state(app: &AppHandle, state: TrayState) {
     if let Some(items) = app.try_state::<TrayItems>() {
         let label = match state {
             TrayState::Recording => "Stop recording",
+            TrayState::SelfNote => "Stop note",
             _ => "Start recording",
         };
         let _ = items.toggle.set_text(label);
@@ -86,6 +92,15 @@ struct RecordingStateEvent {
     /// to "call" shape in that fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
+    /// #164 · v0.5.2 — session directory for the in-flight recording.
+    /// Populated when `recording = true`. The manual `start_recording`
+    /// IPC return-value already carries this for /record's notes
+    /// panel, but the auto-detect `confirm_auto_start` path calls
+    /// `do_start` internally and never surfaces the path. Propagating
+    /// it here lets the frontend populate `sessionDir` regardless of
+    /// entry-point, so the notes panel mounts for both modes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_dir: Option<String>,
 }
 
 /// Writes a small metadata file into a newly-created session_dir capturing
@@ -110,15 +125,30 @@ pub(crate) fn write_session_source(
     }
 }
 
-fn emit_state(app: &AppHandle, recording: bool, mode: Option<&'static str>) {
+fn emit_state(
+    app: &AppHandle,
+    recording: bool,
+    mode: Option<&'static str>,
+    session_dir: Option<String>,
+) {
     let _ = app.emit(
         "recording-state",
-        RecordingStateEvent { recording, mode },
+        RecordingStateEvent {
+            recording,
+            mode,
+            session_dir,
+        },
     );
     apply_tray_state(
         app,
         if recording {
-            TrayState::Recording
+            // #151: distinct tray icon during self-note recording
+            // (amber-dot badge) so the user can see at-a-glance whether
+            // the tray is showing a regular call vs a mic-only note.
+            match mode {
+                Some("self_note") => TrayState::SelfNote,
+                _ => TrayState::Recording,
+            }
         } else {
             // Pipeline handler will bump us to Processing immediately after stop;
             // this covers the "start failed" / "no recording" case.
@@ -185,7 +215,12 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
         .ok()
         .and_then(|c| c.input_device);
     let path = state.start(base, saved_device, false)?;
-    emit_state(app, true, Some("call"));
+    emit_state(
+        app,
+        true,
+        Some("call"),
+        Some(path.to_string_lossy().into_owned()),
+    );
     // If the saved-name preference didn't resolve, surface a one-time
     // toast on the Record page. Dedupe lives inside the Recorder
     // (HashSet<String>), so repeat Start/Stop in the same session with
@@ -220,7 +255,12 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
         .ok()
         .and_then(|c| c.input_device);
     let path = state.start(base, saved_device, true)?;
-    emit_state(app, true, Some("self_note"));
+    emit_state(
+        app,
+        true,
+        Some("self_note"),
+        Some(path.to_string_lossy().into_owned()),
+    );
     if let Some(fallback) = state.take_last_fallback() {
         let _ = app.emit("mic-fallback", &fallback);
     }
@@ -234,7 +274,7 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
 
 pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
-    emit_state(app, false, None);
+    emit_state(app, false, None, None);
     let session_dir = path.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -421,13 +461,26 @@ async fn tag_suggestions(
 }
 
 #[tauri::command]
-async fn list_trashed() -> Result<serde_json::Value, String> {
+async fn list_trashed(
+    // #163 (v0.5.2) — optional date-range filter on the trash list.
+    // Agent UI passes `YYYY-MM-DDTHH:MM:SSZ` strings already expanded
+    // on the JS side; backend narrows by `recorded_at`.
+    from_date: Option<String>,
+    to_date: Option<String>,
+) -> Result<serde_json::Value, String> {
     let cfg = config::Config::load().map_err(|e| e.to_string())?;
     let backend = cfg
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
-    portal::list_trashed(backend).await.map_err(|e| e.to_string())
+    portal::list_trashed(
+        backend,
+        None,
+        from_date.as_deref(),
+        to_date.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -821,6 +874,10 @@ struct AppPrefs {
     /// default "Super+Shift+N"; `None` disables the global hotkey
     /// entirely (tray + button + CLI keep working).
     self_note_shortcut: Option<String>,
+    /// #161 (v0.5.2) — user-configurable record-toggle hotkey.
+    /// Shipped default "Super+Shift+R"; `None` disables the global
+    /// hotkey entirely (tray + UI Record button + CLI keep working).
+    record_toggle_shortcut: Option<String>,
 }
 
 #[tauri::command]
@@ -837,6 +894,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         wayland_hotkey_notice_dismissed: cfg.wayland_hotkey_notice_dismissed,
         input_device: cfg.input_device,
         self_note_shortcut: cfg.self_note_shortcut,
+        record_toggle_shortcut: cfg.record_toggle_shortcut,
     })
 }
 
@@ -853,6 +911,7 @@ fn set_app_prefs(
     wayland_hotkey_notice_dismissed: bool,
     input_device: Option<String>,
     self_note_shortcut: Option<String>,
+    record_toggle_shortcut: Option<String>,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
@@ -883,8 +942,19 @@ fn set_app_prefs(
             return Err(format!("unrecognized shortcut: {s}"));
         }
     }
+    // #161 — same empty-as-None treatment for the record-toggle
+    // shortcut. Mirrors the self-note path above.
+    let record_toggle_shortcut = record_toggle_shortcut
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref s) = record_toggle_shortcut {
+        if parse_shortcut_str(s).is_none() {
+            return Err(format!("unrecognized shortcut: {s}"));
+        }
+    }
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     let prev_self_note_shortcut = cfg.self_note_shortcut.clone();
+    let prev_record_toggle_shortcut = cfg.record_toggle_shortcut.clone();
     cfg.close_to_tray = close_to_tray;
     cfg.auto_detect = auto_detect;
     cfg.telemetry_enabled = telemetry_enabled;
@@ -895,6 +965,7 @@ fn set_app_prefs(
     cfg.wayland_hotkey_notice_dismissed = wayland_hotkey_notice_dismissed;
     cfg.input_device = input_device;
     cfg.self_note_shortcut = self_note_shortcut.clone();
+    cfg.record_toggle_shortcut = record_toggle_shortcut.clone();
     cfg.save().map_err(|e| e.to_string())?;
     // #149 — re-register the self-note hotkey in place if it changed.
     // Best-effort: a failure to bind (portal denied, combo in use)
@@ -905,6 +976,14 @@ fn set_app_prefs(
             &app,
             prev_self_note_shortcut.as_deref(),
             self_note_shortcut.as_deref(),
+        );
+    }
+    // #161 — same rebind-in-place for the record-toggle shortcut.
+    if prev_record_toggle_shortcut != record_toggle_shortcut {
+        reapply_record_toggle_hotkey(
+            &app,
+            prev_record_toggle_shortcut.as_deref(),
+            record_toggle_shortcut.as_deref(),
         );
     }
     Ok(())
@@ -1624,18 +1703,79 @@ fn reapply_self_note_hotkey(
     }
 }
 
-fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
-    // Super+Shift+R: rare conflict vs. Ctrl+Shift+R (browser hard-reload).
-    // On Wayland/Hyprland this still depends on xdg-desktop-portal-hyprland
-    // implementing the GlobalShortcuts portal; falling back to a Hyprland
-    // bind → CLI trigger is tracked as a follow-up.
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyR);
-    if let Err(e) = app.global_shortcut().on_shortcut(shortcut, |app, _sc, event| {
-        if event.state() == ShortcutState::Pressed {
-            toggle_recording(app);
+/// #161 (v0.5.2) — rebind the record-toggle hotkey at runtime. Mirror
+/// of `reapply_self_note_hotkey` above, but the handler calls
+/// `toggle_recording` instead of `start_note_to_self`. Called from
+/// `set_app_prefs` when `record_toggle_shortcut` changes.
+fn reapply_record_toggle_hotkey(
+    app: &AppHandle,
+    prev: Option<&str>,
+    next: Option<&str>,
+) {
+    if let Some(prev_str) = prev {
+        if let Some(prev_sc) = parse_shortcut_str(prev_str) {
+            if let Err(e) = app.global_shortcut().unregister(prev_sc) {
+                eprintln!(
+                    "aftercalls: unregister prev record-toggle shortcut failed ({e})"
+                );
+            }
         }
-    }) {
-        eprintln!("aftercalls: global shortcut unavailable ({e}); use the UI or tray");
+    }
+    if let Some(next_str) = next {
+        let Some(next_sc) = parse_shortcut_str(next_str) else {
+            eprintln!("aftercalls: parse record-toggle shortcut failed: {next_str}");
+            return;
+        };
+        if let Err(e) = app
+            .global_shortcut()
+            .on_shortcut(next_sc, |app, _sc, event| {
+                if event.state() == ShortcutState::Pressed {
+                    toggle_recording(app);
+                }
+            })
+        {
+            eprintln!(
+                "aftercalls: record-toggle shortcut unavailable ({e}); use the UI, tray, or --toggle-recording CLI"
+            );
+        }
+    }
+}
+
+fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
+    // #161 (v0.5.2) — record-toggle hotkey, now user-configurable.
+    // Fresh installs get "Super+Shift+R" via the serde default in
+    // config.rs. Parse failures log + fall through to the tray + UI
+    // Record button + --toggle-recording CLI. Super+Shift+R has a rare
+    // conflict vs. Ctrl+Shift+R (browser hard-reload).
+    // On Wayland/Hyprland this still depends on
+    // xdg-desktop-portal-hyprland implementing the GlobalShortcuts
+    // portal; falling back to a Hyprland bind → CLI trigger is tracked
+    // as a follow-up.
+    let record_toggle_configured = config::Config::load()
+        .ok()
+        .and_then(|c| c.record_toggle_shortcut);
+    if let Some(ref raw) = record_toggle_configured {
+        match parse_shortcut_str(raw) {
+            Some(rec_shortcut) => {
+                if let Err(e) = app
+                    .global_shortcut()
+                    .on_shortcut(rec_shortcut, |app, _sc, event| {
+                        if event.state() == ShortcutState::Pressed {
+                            toggle_recording(app);
+                        }
+                    })
+                {
+                    eprintln!(
+                        "aftercalls: record-toggle shortcut unavailable ({e}); use the UI, tray, or --toggle-recording CLI"
+                    );
+                }
+            }
+            None => {
+                eprintln!(
+                    "aftercalls: could not parse record-toggle shortcut {raw:?}; falling back to tray + UI + CLI"
+                );
+            }
+        }
     }
     // #142 · v0.4.5 + #149 · v0.4.7 — self-note hotkey, now user-
     // configurable. Fresh installs get "Super+Shift+N" via the serde

@@ -497,8 +497,8 @@
   }
 </script>
 
-<main class="page reveal">
-  <header class="head" style="--i: 0">
+<main class="page">
+  <header class="head">
     <div>
       <h1>Calls</h1>
       <p class="sub">
@@ -578,7 +578,7 @@
     {/if}
   </header>
 
-  <div class="filter-bar" style="--i: 1">
+  <div class="filter-bar">
     <div class="search">
       <span class="search-glyph" aria-hidden="true">
         <svg viewBox="0 0 16 16" width="13" height="13">
@@ -778,6 +778,7 @@
       <span class="date-label-text">From</span>
       <input
         class="date-input"
+        class:date-input-empty={!fromDate}
         type="date"
         bind:value={fromDate}
         onchange={onDateChange}
@@ -788,6 +789,7 @@
       <span class="date-label-text">To</span>
       <input
         class="date-input"
+        class:date-input-empty={!toDate}
         type="date"
         bind:value={toDate}
         onchange={onDateChange}
@@ -805,11 +807,11 @@
   </div>
 
   {#if loading}
-    <p class="state" style="--i: 2">Loading…</p>
+    <p class="state">Loading…</p>
   {:else if error}
-    <p class="state err" style="--i: 2">{error}</p>
+    <p class="state err">{error}</p>
   {:else if calls.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate}
-    <div class="empty" style="--i: 2">
+    <div class="empty">
       <p class="empty-title">No calls yet</p>
       <p class="empty-sub">
         Go to Record to capture your first call.
@@ -817,7 +819,7 @@
       <a href="/" class="empty-cta">Go to Record →</a>
     </div>
   {:else if filtered.length === 0}
-    <div class="empty" style="--i: 2">
+    <div class="empty">
       <p class="empty-title">
         {#if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
           No calls in the selected range
@@ -833,8 +835,8 @@
     </div>
   {:else}
     <div class="groups">
-      {#each groups as [day, items], idx (day)}
-        <section class="group" style="--i: {idx + 2}">
+      {#each groups as [day, items] (day)}
+        <section class="group">
           <div class="group-head">
             <span class="day">{fmtDay(day)}</span>
             <span class="day-count">
@@ -1412,6 +1414,14 @@
   .date-input:focus {
     outline: none;
     border-color: var(--accent);
+  }
+  /* webkit2gtk paints today's date as the placeholder label when the
+     value is empty — makes users think a filter is already active.
+     Hide the auto-filled edit until the user actually picks a date.
+     The class drops off as soon as fromDate/toDate is set and the
+     native rendering returns. */
+  .date-input-empty::-webkit-datetime-edit {
+    color: transparent;
   }
   .date-clear {
     appearance: none;

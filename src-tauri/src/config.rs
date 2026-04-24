@@ -96,6 +96,15 @@ pub struct Config {
     /// tray + button + CLI keep working.
     #[serde(default = "default_self_note_shortcut")]
     pub self_note_shortcut: Option<String>,
+    /// #161 (v0.5.2) — user-configurable global shortcut for
+    /// "start/stop recording". `Some("Super+Shift+R")` is the default
+    /// so fresh installs behave exactly like v0.5.1 did; the user can
+    /// rebind from Settings (`reapply_record_toggle_hotkey` re-binds
+    /// the OS hotkey on save). Mirror of `self_note_shortcut` above.
+    /// `None` disables the hotkey entirely; tray + UI Record button +
+    /// CLI keep working.
+    #[serde(default = "default_record_toggle_shortcut")]
+    pub record_toggle_shortcut: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -112,6 +121,10 @@ fn default_max_self_note_minutes() -> u32 {
 
 fn default_self_note_shortcut() -> Option<String> {
     Some("Super+Shift+N".to_string())
+}
+
+fn default_record_toggle_shortcut() -> Option<String> {
+    Some("Super+Shift+R".to_string())
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -157,6 +170,7 @@ impl Config {
                 wayland_hotkey_notice_dismissed: false,
                 input_device: None,
                 self_note_shortcut: default_self_note_shortcut(),
+                record_toggle_shortcut: default_record_toggle_shortcut(),
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

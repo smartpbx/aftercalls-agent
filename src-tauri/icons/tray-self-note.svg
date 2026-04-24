@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#161412"/>
+  <!-- Same wave as tray-recording.svg: the user IS recording. -->
+  <g fill="#ff5032">
+    <rect x="91" y="186" width="50" height="140" rx="25"/>
+    <rect x="161" y="146" width="50" height="220" rx="25"/>
+    <rect x="231" y="106" width="50" height="300" rx="25"/>
+    <rect x="301" y="146" width="50" height="220" rx="25"/>
+    <rect x="371" y="186" width="50" height="140" rx="25"/>
+  </g>
+  <!-- Self-note badge: same geometry as tray-recording's dot but
+       amber (the repo 'sig' accent). At tray size (16-32px) the
+       colour swap is the legible cue; shape detail below ~64px
+       blurs. Speech bubble / pen glyph renders were indistinguishable
+       from the recording dot at actual tray sizes; colour wins. -->
+  <circle cx="410" cy="110" r="58" fill="#c9a24a" stroke="#161412" stroke-width="18"/>
+</svg>

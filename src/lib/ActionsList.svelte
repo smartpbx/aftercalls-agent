@@ -183,6 +183,7 @@
       occurrenceIndex: number;
       anchor: HTMLElement;
       itemId: string;
+      isExternal: boolean;
     }) => void;
     // Page-level active-chip indicator so the matching
     // `.name-chip-active` outline lands on the right row.

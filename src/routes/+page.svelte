@@ -235,11 +235,22 @@
         notifyPipelineDone();
       }
     });
-    unlistenState = await listen<{ recording: boolean }>(
+    unlistenState = await listen<{
+      recording: boolean;
+      mode?: string;
+      session_dir?: string;
+    }>(
       "recording-state",
       (evt) => {
         const wasRecording = recording;
         recording = evt.payload.recording;
+        // #164: the manual toggle sets sessionDir from start_recording's
+        // return value, but auto-detect routes through confirm_auto_start
+        // (no return). Capture session_dir from the recording-state event
+        // so the notes panel mounts for both paths.
+        if (recording && evt.payload.session_dir) {
+          sessionDir = evt.payload.session_dir;
+        }
         // Start cue plays BEFORE start_recording (see
         // actuallyStartRecording / confirmAutoStart) so the system
         // loopback doesn't capture it. Stop cue still plays on the

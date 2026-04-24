@@ -47,10 +47,12 @@
   // those tags and promotes each one to an avatar-chip resolved
   // against the loaded member roster. Three match branches:
   //
-  //   1. Unique match → Avatar + colored name chip.
+  //   1. Unique match → coloured name chip (text-only; avatars live
+  //      in the Participants + Mentioned sub-sections, not inline in
+  //      prose — dropped in #167 to kill the baseline-alignment gap).
   //   2. Ambiguous match (≥2 members synthesize to the same
-  //      `First L.`) → neutral chip, no avatar, title enumerates.
-  //   3. No match (external person) → italic non-chip span.
+  //      `First L.`) → neutral chip, title enumerates.
+  //   3. No match (external person) → italic span, per-name colour.
   //
   // XSS discipline: `text` can contain adversarial content (pasted
   // quotes, LLM hallucination of `<script>`). The tokenizer extracts
@@ -74,7 +76,6 @@
   // behaviour). Ambiguous + external branches stay non-interactive
   // in either mode.
 
-  import Avatar from "./Avatar.svelte";
   import {
     tokenize,
     firstLastInitial,
@@ -186,7 +187,6 @@
             aria-expanded={activeOccurrenceIndex === occ ? "true" : "false"}
             onclick={(e) => onChipClick(e, seg.inner, occ, false)}
           >
-            <Avatar name={m.display_name} color={c} size={18} />
             <span class="name-chip-label">{seg.inner}</span>
           </button>
         {:else}
@@ -195,7 +195,6 @@
             style="--name-c: {c}"
             title="{m.display_name} — linked teammate"
           >
-            <Avatar name={m.display_name} color={c} size={18} />
             <span class="name-chip-label">{seg.inner}</span>
           </span>
         {/if}
@@ -216,6 +215,7 @@
           type="button"
           class="name-external name-external-btn"
           class:name-chip-active={activeOccurrenceIndex === occ}
+          style="--name-c: {colorFor ? colorFor(seg.inner) : 'var(--bone-1)'}"
           title="{seg.inner} — click to link to a teammate"
           aria-label="Link mention: {seg.inner}"
           aria-haspopup="menu"
@@ -223,7 +223,11 @@
           onclick={(e) => onChipClick(e, seg.inner, occ, true)}
         >{seg.inner}</button>
       {:else}
-        <span class="name-external">{seg.inner}</span>
+        <span
+          class="name-external"
+          style="--name-c: {colorFor ? colorFor(seg.inner) : 'var(--bone-1)'}"
+          >{seg.inner}</span
+        >
       {/if}
     {/if}
   {/each}
@@ -240,14 +244,13 @@
   }
 
   /* Shared chip hook. Three branches share the inline-flex shape so
-     surrounding prose breaks cleanly around them. `--name-c` is only
-     set by the linked branch; the ambiguous + external branches read
-     from the token palette directly. */
+     surrounding prose breaks cleanly around them. `--name-c` is set
+     by the linked + external branches for per-name colouring; the
+     ambiguous branch reads from the token palette directly. */
   .name-chip {
     display: inline-flex;
     align-items: center;
-    gap: 2px;
-    padding: 0 0.25rem 0 0.15rem;
+    padding: 0 0.25rem;
     border-radius: 999px;
     line-height: 1.4;
     vertical-align: baseline;
@@ -265,13 +268,15 @@
 
   /* #140 · v0.4.5 — chip-as-button surface. Reset the native button
      chrome so the inline paint stays identical to the span variant,
-     but keep the focusable / interactive affordances. */
+     but keep the focusable / interactive affordances. Deliberately
+     omits `color: inherit` so `.name-linked`'s `var(--name-c)` wins
+     the cascade (#167.1 — without this, the button variant lost the
+     teammate colour while the span variant kept it). */
   .name-chip-btn {
     border: none;
     background: transparent;
-    color: inherit;
     font: inherit;
-    padding: 0 0.25rem 0 0.15rem;
+    padding: 0 0.25rem;
     cursor: pointer;
     text-align: inherit;
   }
@@ -302,9 +307,12 @@
 
   /* External / unmatched — signals "named person, not a teammate"
      without suggesting clickability. No chip background, italic for
-     the "proper noun" feel. */
+     the "proper noun" feel. Per-name colour (#167.2) so the summary
+     body tracks the speaker-colour convention used elsewhere; italic
+     stays as the "external" cue. Falls back to bone-1 when the parent
+     doesn't wire `colorFor`. */
   .name-external {
-    color: var(--bone-1);
+    color: var(--name-c, var(--bone-1));
     font-style: italic;
   }
 
@@ -317,7 +325,6 @@
     appearance: none;
     background: transparent;
     border: none;
-    color: inherit;
     font: inherit;
     font-style: italic;
     padding: 0 0.15rem;
@@ -327,7 +334,7 @@
     transition: background-color 120ms ease;
   }
   .name-external-btn:hover {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    background: color-mix(in srgb, var(--name-c, var(--accent)) 14%, transparent);
   }
   .name-external-btn:focus-visible {
     outline: 2px solid var(--accent);

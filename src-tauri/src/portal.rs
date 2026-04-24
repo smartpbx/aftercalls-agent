@@ -266,8 +266,45 @@ pub async fn list_calls(
     get_json(backend, &path).await
 }
 
-pub async fn list_trashed(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/calls/trashed").await
+pub async fn list_trashed(
+    backend: &Backend,
+    scope: Option<&str>,
+    // #163 (v0.5.2) — optional date-range filter on the trash list,
+    // passed through to the backend which narrows by `recorded_at`.
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+) -> Result<Value> {
+    let mut path = String::from("/v1/calls/trashed");
+    let mut params: Vec<(String, String)> = Vec::new();
+    if let Some(s) = scope {
+        if !s.is_empty() {
+            params.push(("scope".into(), s.into()));
+        }
+    }
+    if let Some(f) = from_date {
+        if !f.is_empty() {
+            params.push(("from_date".into(), f.into()));
+        }
+    }
+    if let Some(t) = to_date {
+        if !t.is_empty() {
+            params.push(("to_date".into(), t.into()));
+        }
+    }
+    if !params.is_empty() {
+        path.push('?');
+        let mut first = true;
+        for (k, v) in &params {
+            if !first {
+                path.push('&');
+            }
+            first = false;
+            path.push_str(k);
+            path.push('=');
+            path.push_str(&urlencoding_minimal(v));
+        }
+    }
+    get_json(backend, &path).await
 }
 
 pub async fn restore_call(backend: &Backend, id: &str) -> Result<()> {

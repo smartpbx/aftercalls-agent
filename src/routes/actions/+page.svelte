@@ -407,6 +407,7 @@
     anchor: HTMLElement;
     inner: string;
     occurrenceIndex: number;
+    isExternal: boolean;
   } | null>(null);
   const memberRosterLoaded = $derived(orgMembers.length > 0);
   const memberRosterError = $state(false);
@@ -416,12 +417,14 @@
     occurrenceIndex: number;
     anchor: HTMLElement;
     itemId: string;
+    isExternal: boolean;
   }) {
     activeChip = {
       itemId: detail.itemId,
       anchor: detail.anchor,
       inner: detail.inner,
       occurrenceIndex: detail.occurrenceIndex,
+      isExternal: detail.isExternal,
     };
   }
   function closeChipMenu() {
@@ -548,6 +551,7 @@
     users={chipRoster}
     rosterLoaded={memberRosterLoaded}
     rosterError={memberRosterError}
+    isExternal={activeChip.isExternal}
     onselect={onChipMenuSelect}
     onclose={closeChipMenu}
   />

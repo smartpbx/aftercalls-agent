@@ -126,6 +126,13 @@
   // persisted value only changes once the user confirms the capture.
   let capturingShortcut = $state(false);
   let shortcutError = $state<string | null>(null);
+  // #161 (v0.5.2) — parallel state for the record-toggle shortcut.
+  // Same shape as the self-note wiring above. Shipped default
+  // "Super+Shift+R" matches v0.5.1 behaviour; user can rebind from
+  // Settings, clear to disable (tray + UI + CLI keep working).
+  let recordToggleShortcut = $state<string | null>("Super+Shift+R");
+  let capturingRecordToggleShortcut = $state(false);
+  let recordToggleError = $state<string | null>(null);
   // Manual notes panel (#73). When on, the record screen shows a
   // CodeMirror editor during active recording; notes ride into
   // create_call and optionally feed into the summary. Off by default
@@ -277,6 +284,7 @@
         wayland_hotkey_notice_dismissed: boolean;
         input_device: string | null;
         self_note_shortcut: string | null;
+        record_toggle_shortcut: string | null;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -288,6 +296,7 @@
       waylandHotkeyNoticeDismissed = p.wayland_hotkey_notice_dismissed ?? false;
       inputDevice = p.input_device ?? null;
       selfNoteShortcut = p.self_note_shortcut ?? null;
+      recordToggleShortcut = p.record_toggle_shortcut ?? null;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -317,6 +326,7 @@
         waylandHotkeyNoticeDismissed,
         inputDevice,
         selfNoteShortcut,
+        recordToggleShortcut,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
@@ -324,13 +334,13 @@
     }
   }
 
-  // #149 (v0.4.7) — capture-widget handlers. The row renders a
-  // read-only text box showing the current combo; clicking "Change"
-  // flips `capturingShortcut = true`, which unhides a transparent
-  // input that grabs focus + swallows the next keydown. Esc cancels.
-  // Validates against the hardcoded record-toggle "Super+Shift+R" to
-  // avoid collisions (follow-up #TBD makes THAT one configurable too).
-  const RECORD_TOGGLE_SHORTCUT = "Super+Shift+R";
+  // #149 (v0.4.7) + #161 (v0.5.2) — capture-widget handlers. The row
+  // renders a read-only text box showing the current combo; clicking
+  // "Change" flips the matching `capturing*` flag, which unhides a
+  // transparent input that grabs focus + swallows the next keydown.
+  // Esc cancels. Collision logic checks the candidate against the
+  // OTHER configurable shortcut (either direction) so the two can
+  // never bind to the same combo.
 
   function normalizeShortcut(mods: string[], key: string): string {
     // Canonical ordering: Ctrl → Alt → Shift → Super → Key. Keeps
@@ -382,7 +392,7 @@
       return;
     }
     const candidate = normalizeShortcut(mods, key);
-    if (candidate === RECORD_TOGGLE_SHORTCUT) {
+    if (candidate === recordToggleShortcut) {
       shortcutError = `${candidate} is already bound to start/stop recording.`;
       return;
     }
@@ -400,6 +410,63 @@
     selfNoteShortcut = null;
     capturingShortcut = false;
     shortcutError = null;
+    void saveAppPrefs();
+  }
+
+  // #161 (v0.5.2) — record-toggle twins of the handlers above.
+  // Identical shape modulo the target state + the collision target
+  // (blocks assigning the self-note combo to the record toggle).
+  function onRecordToggleShortcutKeyDown(e: KeyboardEvent) {
+    if (!capturingRecordToggleShortcut) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") {
+      capturingRecordToggleShortcut = false;
+      recordToggleError = null;
+      return;
+    }
+    if (["Shift", "Control", "Alt", "Meta", "Super"].includes(e.key)) {
+      return;
+    }
+    const mods: string[] = [];
+    if (e.ctrlKey) mods.push("Ctrl");
+    if (e.altKey) mods.push("Alt");
+    if (e.shiftKey) mods.push("Shift");
+    if (e.metaKey) mods.push("Super");
+    let key = "";
+    if (e.code.startsWith("Key") && e.code.length === 4) {
+      key = e.code.slice(3).toUpperCase();
+    } else if (e.code.startsWith("Digit") && e.code.length === 6) {
+      key = e.code.slice(5);
+    } else if (/^F\d{1,2}$/.test(e.code)) {
+      key = e.code;
+    } else {
+      recordToggleError = "Use a letter, digit, or F-key with at least one modifier.";
+      return;
+    }
+    if (mods.length === 0) {
+      recordToggleError = "Add at least one modifier (Ctrl / Alt / Shift / Super).";
+      return;
+    }
+    const candidate = normalizeShortcut(mods, key);
+    if (candidate === selfNoteShortcut) {
+      recordToggleError = `${candidate} is already bound to note-to-self.`;
+      return;
+    }
+    recordToggleShortcut = candidate;
+    capturingRecordToggleShortcut = false;
+    recordToggleError = null;
+    void saveAppPrefs();
+  }
+
+  function beginCaptureRecordToggleShortcut() {
+    capturingRecordToggleShortcut = true;
+    recordToggleError = null;
+  }
+  function clearRecordToggleShortcut() {
+    recordToggleShortcut = null;
+    capturingRecordToggleShortcut = false;
+    recordToggleError = null;
     void saveAppPrefs();
   }
 
@@ -899,6 +966,58 @@
           class="add"
           onclick={clearShortcut}
           disabled={selfNoteShortcut === null}
+        >
+          Clear
+        </button>
+      </div>
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Start/stop recording shortcut</span>
+        <span class="pref-hint">
+          Global keyboard shortcut that starts or stops recording,
+          even when aftercalls isn't focused. Defaults to
+          Super+Shift+R. Clear to disable — the tray and record
+          button still work.
+        </span>
+        {#if recordToggleError}
+          <span class="error-inline" role="alert">{recordToggleError}</span>
+        {/if}
+      </div>
+      <div class="shortcut-controls">
+        {#if capturingRecordToggleShortcut}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="input shortcut-input shortcut-capturing"
+            type="text"
+            readonly
+            autofocus
+            value="Press a key combination…"
+            onkeydown={onRecordToggleShortcutKeyDown}
+            onblur={() => (capturingRecordToggleShortcut = false)}
+          />
+        {:else}
+          <input
+            class="input shortcut-input"
+            type="text"
+            readonly
+            value={recordToggleShortcut ?? "Disabled"}
+          />
+        {/if}
+        <button
+          type="button"
+          class="add"
+          onclick={beginCaptureRecordToggleShortcut}
+          disabled={capturingRecordToggleShortcut}
+        >
+          Change
+        </button>
+        <button
+          type="button"
+          class="add"
+          onclick={clearRecordToggleShortcut}
+          disabled={recordToggleShortcut === null}
         >
           Clear
         </button>

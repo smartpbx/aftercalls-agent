@@ -1,4 +1,18 @@
 {
+  "0.5.2": {
+    "headline": "Scannable summaries, trash date filter, configurable recording shortcut, more /actions chip controls",
+    "changes": [
+      "Meeting summaries now render in scannable sections: a one-sentence gist on the first line, then Summary / Decisions / Next steps paragraphs. Easier to skim at a glance than one dense block of prose.",
+      "Note-to-self summaries use a tighter shape — one-sentence gist followed by bullets. No meeting scaffold for solo dictations.",
+      "Filter the Calls trash by date range — same From / To picker as the main Calls page. URL retains the filter for back/forward.",
+      "Start / Stop Recording shortcut is now configurable in Settings (default Super+Shift+R). Collision checks against the Note-to-self shortcut both directions.",
+      "Click an italic name in an action item on the /actions page to link it to a teammate — same chip menu as the call detail page. Previously only worked from within a summary.",
+      "External name chips in summaries now share the speaker-colour convention (italic stays as the 'external' tell; colour matches across all mentions of the same person). Inline avatars in summary prose are gone — avatars live in Participants and Mentioned only, cleaner inline flow.",
+      "Auto-detected recordings now mount the notes panel immediately — previously it stayed hidden until you opened the call detail page.",
+      "Distinct tray icon while a note-to-self is recording — separate visual cue from a regular call recording.",
+      "Unified brand waveform across the marketing site pages and portal rail — matches the desktop tray icon."
+    ]
+  },
   "0.5.1": {
     "headline": "Hotfix: v0.5.0 backend startup",
     "changes": [
