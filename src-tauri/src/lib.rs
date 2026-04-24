@@ -559,6 +559,9 @@ struct LoginResult {
     last_name: String,
     display_name: String,
     role: String,
+    /// #86 — aftercalls-staff capability, orthogonal to role. Surfaced
+    /// so the agent sidebar can gate the STAFF section.
+    is_platform_staff: bool,
     org_display_name: String,
     // Surfaced to the layout + Record page so the PIPEDA ack modal
     // (#44) knows not to prompt a user who's already acknowledged.
@@ -582,6 +585,7 @@ async fn login(email: String, password: String) -> Result<LoginResult, String> {
         last_name: auth.last_name,
         display_name: auth.display_name,
         role: auth.role,
+        is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
     })
@@ -607,6 +611,7 @@ fn current_user() -> Result<Option<LoginResult>, String> {
         last_name: a.last_name,
         display_name: a.display_name,
         role: a.role,
+        is_platform_staff: a.is_platform_staff,
         org_display_name: a.org_display_name,
         recording_acknowledged: a.recording_acknowledged,
     }))
@@ -636,6 +641,7 @@ async fn update_me(
         last_name: auth.last_name,
         display_name: auth.display_name,
         role: auth.role,
+        is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
     })

@@ -251,6 +251,11 @@ pub struct AuthFile {
     pub last_name: String,
     pub display_name: String,
     pub role: String,
+    /// #86 — aftercalls-staff capability flag, orthogonal to role.
+    /// Serde default keeps old auth.json files (written before this
+    /// field existed) readable; next login repopulates from backend.
+    #[serde(default)]
+    pub is_platform_staff: bool,
     pub org_id: String,
     pub org_slug: String,
     pub org_display_name: String,

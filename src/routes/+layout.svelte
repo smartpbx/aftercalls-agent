@@ -26,6 +26,10 @@
     last_name?: string;
     display_name: string;
     role: string;
+    /// #86 — aftercalls-staff capability flag, orthogonal to role.
+    /// Optional so older auth.json files deserialize cleanly; defaults
+    /// to false when absent.
+    is_platform_staff?: boolean;
     org_display_name: string;
   };
 
@@ -364,7 +368,7 @@
     // Using console.error (not warn) because some webkit builds filter warns
     // out of the devtools panel by default.
     // Forward frontend errors into the Rust-side telemetry buffer so
-    // they land in /admin/logs alongside panics + pipeline failures.
+    // they land in /staff/agent-logs alongside panics + pipeline failures.
     // Fire-and-forget invoke — telemetry is best-effort and
     // log_event is a no-op when the user has telemetry off.
     const sendToTelemetry = (
@@ -875,39 +879,106 @@
     } catch {}
   }
 
-  const items: {
+  type NavItem = {
     href: string;
     label: string;
     match: (p: string) => boolean;
     icon: string;
-  }[] = [
-    {
-      href: "/",
-      label: "Record",
-      match: (p) => p === "/",
-      // simple inline SVGs — microphone, list, gear
-      icon: `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M10 2a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" fill="currentColor"/><path d="M5 9v1a5 5 0 0 0 10 0V9M10 15v3M7 18h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>`,
-    },
-    {
-      href: "/calls",
-      label: "Calls",
-      match: (p) => p.startsWith("/calls"),
-      icon: `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
-    },
-    // v0.4.0 Phase 4 (#105): /actions portfolio view. Peer with
-    // Calls, not a submenu — ui-phase-4 §A flagged the decision.
-    // Checkmark-in-circle glyph matches the stroke-based 16px
-    // vocabulary of the other rail items.
-    {
-      href: "/actions",
-      label: "Action items",
-      match: (p) => p.startsWith("/actions"),
-      icon: `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="m7 10 2 2 4-4.5"/></svg>`,
-    },
-    // Settings moved out of the primary nav and into the user-menu
-    // dropdown in the rail foot — account-level knobs don't belong
-    // next to Record and Calls (the main workflow). See #33.
-  ];
+    /// When true, clicking opens the portal in the default browser
+    /// instead of navigating inside the agent webview. Agent has no
+    /// local /admin or /staff routes — those surfaces live on
+    /// app.aftercalls.io.
+    external?: boolean;
+  };
+  type NavSection = {
+    id: "workspace" | "admin" | "staff";
+    label: string;
+    items: NavItem[];
+  };
+
+  // #86 — three-section rail: WORKSPACE / ADMIN / STAFF. See ui.md.
+  // Back-compat branch on `superadmin` is dropped in the CHECK-
+  // constraint-flip commit (already flipped in the backend by step 1,
+  // but the claim can still say superadmin for ≤1h after deploy).
+  const isAdmin = $derived(
+    !!me &&
+      (me.role === "admin" ||
+        me.role === "owner" ||
+        (me.role as string) === "superadmin"),
+  );
+  const isStaff = $derived(
+    !!me &&
+      ((me.is_platform_staff === true) ||
+        (me.role as string) === "superadmin"),
+  );
+
+  // Icons — simple inline SVGs, 16px stroke vocabulary.
+  const ICON_RECORD = `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M10 2a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" fill="currentColor"/><path d="M5 9v1a5 5 0 0 0 10 0V9M10 15v3M7 18h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>`;
+  const ICON_CALLS = `<svg viewBox="0 0 20 20" width="16" height="16"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+  const ICON_ACTIONS = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="m7 10 2 2 4-4.5"/></svg>`;
+  const ICON_TEAM = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="8" r="3"/><circle cx="14" cy="9" r="2.2"/><path d="M2.5 17c.8-2.6 2.7-4 4.5-4s3.7 1.4 4.5 4M12 17c.6-1.8 1.8-3 3-3s2.4 1.2 3 3"/></svg>`;
+  const ICON_ORG = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="13" rx="1.5"/><path d="M7 4v13M13 4v13M3 8h14M3 12h14"/></svg>`;
+  const ICON_VOCAB = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h9a3 3 0 0 1 3 3v10H6a2 2 0 0 1-2-2V4Z"/><path d="M4 15h12"/></svg>`;
+  const ICON_TERMS = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h8l3 3v11H5z"/><path d="M13 3v3h3M7.5 10h5M7.5 13h5"/></svg>`;
+  const ICON_LOGS = `<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h12v12H4z"/><path d="M7 8h6M7 11h6M7 14h4"/></svg>`;
+
+  const navSections = $derived.by<NavSection[]>(() => {
+    if (!me) return [];
+    const sections: NavSection[] = [];
+    sections.push({
+      id: "workspace",
+      label: "Workspace",
+      items: [
+        {
+          href: "/",
+          label: "Record",
+          match: (p) => p === "/",
+          icon: ICON_RECORD,
+        },
+        {
+          href: "/calls",
+          label: "Calls",
+          match: (p) => p.startsWith("/calls"),
+          icon: ICON_CALLS,
+        },
+        // v0.4.0 Phase 4 (#105): /actions portfolio view.
+        {
+          href: "/actions",
+          label: "Action items",
+          match: (p) => p.startsWith("/actions"),
+          icon: ICON_ACTIONS,
+        },
+        // Settings stays in the user-menu dropdown — account-level
+        // knobs per #33.
+      ],
+    });
+    if (isAdmin) {
+      // ADMIN surfaces live on the portal; agent has no local routes.
+      // External=true routes clicks through openPortalLink().
+      const nope = (_p: string) => false;
+      sections.push({
+        id: "admin",
+        label: "Admin",
+        items: [
+          { href: "/admin/users", label: "Team", match: nope, icon: ICON_TEAM, external: true },
+          { href: "/admin", label: "Org", match: nope, icon: ICON_ORG, external: true },
+          { href: "/admin/vocab", label: "Vocab", match: nope, icon: ICON_VOCAB, external: true },
+        ],
+      });
+    }
+    if (isStaff) {
+      const nope = (_p: string) => false;
+      sections.push({
+        id: "staff",
+        label: "Staff",
+        items: [
+          { href: "/staff/tos", label: "Terms", match: nope, icon: ICON_TERMS, external: true },
+          { href: "/staff/agent-logs", label: "Agent logs", match: nope, icon: ICON_LOGS, external: true },
+        ],
+      });
+    }
+    return sections;
+  });
 
   // ── User menu (rail foot) ────────────────────────────────────────
   let userMenuOpen = $state(false);
@@ -981,20 +1052,40 @@
       <span class="wordmark">aftercalls</span>
     </a>
 
-    <nav>
-      {#each items as it (it.href)}
-        {@const active = it.match(page.url.pathname)}
-        <div class="nav-row" class:has-slideout={it.href === "/" && autoPrompt}>
-          <a
-            href={it.href}
-            class="nav-item"
-            class:active
-            aria-current={active ? "page" : undefined}
-          >
-            <span class="glyph">{@html it.icon}</span>
-            <span class="label">{it.label}</span>
-          </a>
-          {#if it.href === "/" && autoPrompt && !isRecordPage}
+    <div class="rail-scroll">
+      {#each navSections as sec (sec.id)}
+        <section class="rail-section" aria-labelledby={`nav-sec-${sec.id}`}>
+          {#if navSections.length > 1}
+            <h2 id={`nav-sec-${sec.id}`} class="rail-section-head">
+              {sec.label}
+            </h2>
+          {/if}
+          <nav aria-labelledby={`nav-sec-${sec.id}`}>
+            {#each sec.items as it (it.href)}
+              {@const active = it.match(page.url.pathname)}
+              <div class="nav-row" class:has-slideout={it.href === "/" && autoPrompt}>
+                {#if it.external}
+                  <button
+                    type="button"
+                    class="nav-item"
+                    onclick={() => openPortalLink(it.href)}
+                  >
+                    <span class="glyph">{@html it.icon}</span>
+                    <span class="label">{it.label}</span>
+                    <span class="ext" aria-hidden="true">↗</span>
+                  </button>
+                {:else}
+                  <a
+                    href={it.href}
+                    class="nav-item"
+                    class:active
+                    aria-current={active ? "page" : undefined}
+                  >
+                    <span class="glyph">{@html it.icon}</span>
+                    <span class="label">{it.label}</span>
+                  </a>
+                {/if}
+                {#if it.href === "/" && autoPrompt && !isRecordPage}
             <!-- Auto-detect slide-out (#59, #60, #74). Shown only when
                  the user is on a route OTHER than the Record page —
                  the Record page has its own inline DETECTED banner.
@@ -1031,9 +1122,12 @@
               </p>
             </div>
           {/if}
-        </div>
+              </div>
+            {/each}
+          </nav>
+        </section>
       {/each}
-    </nav>
+    </div>
 
     <!-- Rail foot: user name/org doubles as the trigger for a
          dropdown menu that carries every account-scoped action.
@@ -1103,32 +1197,10 @@
           >
             Help <span class="um-ext" aria-hidden="true">↗</span>
           </button>
-          {#if me && (me.role === "admin" || me.role === "superadmin")}
-            <div class="um-sep"></div>
-            <button
-              class="um-item"
-              role="menuitem"
-              onclick={() => openPortalLink("/admin/users")}
-            >
-              Team <span class="um-ext" aria-hidden="true">↗</span>
-            </button>
-            <button
-              class="um-item"
-              role="menuitem"
-              onclick={() => openPortalLink("/admin/vocab")}
-            >
-              Org vocab <span class="um-ext" aria-hidden="true">↗</span>
-            </button>
-            {#if me.role === "superadmin"}
-              <button
-                class="um-item"
-                role="menuitem"
-                onclick={() => openPortalLink("/admin/tos")}
-              >
-                Terms &amp; privacy <span class="um-ext" aria-hidden="true">↗</span>
-              </button>
-            {/if}
-          {/if}
+          <!-- #86 — ADMIN + STAFF items moved from the user menu to
+               the rail's ADMIN / STAFF sections so the same identity
+               sees the same rail on agent + portal. User menu shrinks
+               back to per-account actions. -->
           <div class="um-sep"></div>
           <button
             class="um-item"

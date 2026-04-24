@@ -1,4 +1,12 @@
 {
+  "0.6.0": {
+    "headline": "Bulk transcript renaming, external speakers in the picker, cleaner sidebar",
+    "changes": [
+      "Replace every instance of a name in a transcript in one action. Open the speaker picker on any line and use the new \"Replace every [name] in this transcript with…\" option — no more clicking each row individually.",
+      "External speakers you've added in a call now show up as picker options for later entries in the same call. Name someone once, reuse across the rest of the transcript.",
+      "Sidebar grouped by role: Workspace for everyday items, a separate Admin section for org management, and a new Staff section for platform-level tools. Cleaner separation between what's yours and what you manage."
+    ]
+  },
   "0.5.2": {
     "headline": "Scannable summaries, trash date filter, configurable recording shortcut, more /actions chip controls",
     "changes": [

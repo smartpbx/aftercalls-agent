@@ -114,7 +114,7 @@
   let scope = $state<"mine" | "all">("mine");
 
   let canSeeAll = $derived(
-    !!me && (me.role === "admin" || me.role === "superadmin"),
+    !!me && (me.role === "admin" || me.role === "owner"),
   );
 
   // Active tag filters, each as "kind:value". Kept in sync with the URL.

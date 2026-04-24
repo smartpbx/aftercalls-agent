@@ -38,6 +38,11 @@ struct MeResponse {
     last_name: String,
     display_name: String,
     role: String,
+    /// #86 — aftercalls-staff capability, orthogonal to role. Default
+    /// covers a backend ≤ step-2 that hasn't yet started emitting the
+    /// field.
+    #[serde(default)]
+    is_platform_staff: bool,
     org_id: String,
     org_slug: String,
     org_display_name: String,
@@ -114,6 +119,7 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         last_name: p.user.last_name,
         display_name: p.user.display_name,
         role: p.user.role,
+        is_platform_staff: p.user.is_platform_staff,
         org_id: p.user.org_id,
         org_slug: p.user.org_slug,
         org_display_name: p.user.org_display_name,
@@ -181,6 +187,7 @@ pub async fn update_me(
         last_name: me.last_name,
         display_name: me.display_name,
         role: me.role,
+        is_platform_staff: me.is_platform_staff,
         org_id: me.org_id,
         org_slug: me.org_slug,
         org_display_name: me.org_display_name,

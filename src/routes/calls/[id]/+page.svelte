@@ -236,7 +236,7 @@
   // future admin-share doesn't regress.
   let canEditTags = $derived.by(() => {
     if (!me) return false;
-    if (me.role === "admin" || me.role === "superadmin") return true;
+    if (me.role === "admin" || me.role === "owner") return true;
     return true;
   });
 
@@ -1638,6 +1638,130 @@
     }
   }
 
+  // #171 · bulk rename from the picker's secondary-chooser. `from` is
+  // the speaker label the user opened the editor on; `to` / `toUserId`
+  // come from the picker's chosen row. Reuses the existing
+  // `rename_speaker` Tauri command (already a transactional UPDATE
+  // across transcript + summary + action-items + participants) —
+  // no new API.
+  type BulkStatus =
+    | { kind: "success"; from: string; to: string; toUserId: string | null;
+        fromUserId: string | null; count: number }
+    | { kind: "error"; from: string; to: string; toUserId: string | null;
+        fromUserId: string | null }
+    | null;
+  let bulkStatus = $state<BulkStatus>(null);
+  let bulkDismissTimer: ReturnType<typeof setTimeout> | null = null;
+  let bulkUndoBusy = $state(false);
+
+  function scheduleBulkDismiss() {
+    if (bulkDismissTimer) clearTimeout(bulkDismissTimer);
+    bulkDismissTimer = setTimeout(() => {
+      bulkStatus = null;
+      bulkDismissTimer = null;
+    }, 5000);
+  }
+
+  async function runBulkRename(
+    from: string,
+    to: string,
+    toUserId: string | null,
+    _fromUserId: string | null,
+  ): Promise<number> {
+    if (!call) return 0;
+    const before = call.utterances.filter((u) => u.speaker === from).length;
+    await invoke<number>("rename_speaker", {
+      id: call.id,
+      from,
+      to,
+      toUserId,
+    });
+    pushRecent(to);
+    // Refetch — rename also rewrites summary + action items +
+    // participants in the same transaction.
+    call = await invoke<Call>("get_call", { id: call.id });
+    return before;
+  }
+
+  async function onBulkPick(pick: {
+    from: string;
+    user: { id: string; display_name: string; email: string } | null;
+    freeText: string | null;
+  }) {
+    if (!call) return;
+    const from = pick.from;
+    const to = pick.user ? pick.user.display_name : (pick.freeText ?? "").trim();
+    if (!to) return;
+    const toUserId = pick.user ? pick.user.id : null;
+    // Capture the FK that was on `from` before the rewrite (first
+    // non-null speaker_user_id seen for that name) so Undo can
+    // restore it. Matches the SpeakerStat.userId derivation.
+    const fromUserId =
+      speakers.find((s) => s.speaker === from)?.userId ?? null;
+    savingEdit = true;
+    try {
+      const count = await runBulkRename(from, to, toUserId, fromUserId);
+      cancelEdit();
+      bulkStatus = {
+        kind: "success",
+        from,
+        to,
+        toUserId,
+        fromUserId,
+        count,
+      };
+      scheduleBulkDismiss();
+    } catch (e) {
+      error = String(e);
+      bulkStatus = {
+        kind: "error",
+        from,
+        to,
+        toUserId,
+        fromUserId,
+      };
+    } finally {
+      savingEdit = false;
+    }
+  }
+
+  async function undoBulkRename() {
+    if (!bulkStatus || bulkStatus.kind !== "success" || !call) return;
+    const { from, to, toUserId, fromUserId } = bulkStatus;
+    bulkUndoBusy = true;
+    try {
+      // Swap direction: rename the new target back to the original
+      // label, restoring the original FK (may be null).
+      await invoke<number>("rename_speaker", {
+        id: call.id,
+        from: to,
+        to: from,
+        toUserId: fromUserId,
+      });
+      call = await invoke<Call>("get_call", { id: call.id });
+      bulkStatus = null;
+      if (bulkDismissTimer) {
+        clearTimeout(bulkDismissTimer);
+        bulkDismissTimer = null;
+      }
+    } catch (e) {
+      error = String(e);
+    } finally {
+      bulkUndoBusy = false;
+    }
+    // Silence unused-local warning — toUserId is captured for the
+    // forward flow, not for undo.
+    void toUserId;
+  }
+
+  function dismissBulkStatus() {
+    bulkStatus = null;
+    if (bulkDismissTimer) {
+      clearTimeout(bulkDismissTimer);
+      bulkDismissTimer = null;
+    }
+  }
+
   let confirmingDelete = $state(false);
 
   function askDeleteCall() {
@@ -1747,6 +1871,32 @@
       }
     }
     return order.map((s) => map.get(s)!);
+  });
+
+  // #170 · external speakers seen in THIS call — names attached to
+  // utterances with no linked teammate FK and not matching any
+  // roster display_name (case-insensitive). Feeds the picker's "In
+  // this call" group so free-form names used earlier in the same
+  // call are one-click reusable on subsequent utterances. Purely
+  // derived; no API call, no new column.
+  let externalSpeakers = $derived.by<string[]>(() => {
+    if (!speakers.length) return [];
+    const rosterNames = new Set(
+      memberRoster.map((m) => m.display_name.toLocaleLowerCase()),
+    );
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const s of speakers) {
+      if (s.userId) continue;
+      const name = (s.speaker ?? "").trim();
+      if (!name) continue;
+      const key = name.toLocaleLowerCase();
+      if (rosterNames.has(key)) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(name);
+    }
+    return out;
   });
 
   function fmtSpeakingTime(ms: number) {
@@ -2497,6 +2647,7 @@
                   rosterLoaded={memberRosterLoaded}
                   rosterError={memberRosterError}
                   recents={recentRows}
+                  externals={externalSpeakers}
                   saving={savingSpeaker}
                   variant="chip"
                   onpick={onParticipantPick}
@@ -2959,6 +3110,65 @@
           {copiedLabel === "transcript" ? "Copied" : "Copy"}
         </button>
       </div>
+      {#if bulkStatus}
+        {#if bulkStatus.kind === "success"}
+          <div class="bulk-toast bulk-toast-success" role="status" aria-live="polite">
+            <span class="bulk-toast-glyph" aria-hidden="true">✓</span>
+            <span class="bulk-toast-body">
+              Replaced {bulkStatus.count}
+              {bulkStatus.count === 1 ? "line" : "lines"}
+              of "{bulkStatus.from}" with "{bulkStatus.to}".
+            </span>
+            <button
+              type="button"
+              class="bulk-toast-action"
+              disabled={bulkUndoBusy}
+              onclick={undoBulkRename}
+            >
+              {bulkUndoBusy ? "Undoing…" : "Undo"}
+            </button>
+            <button
+              type="button"
+              class="bulk-toast-dismiss"
+              aria-label="Dismiss"
+              onclick={dismissBulkStatus}
+            >
+              ✕
+            </button>
+          </div>
+        {:else}
+          <div class="bulk-toast bulk-toast-error" role="alert">
+            <span class="bulk-toast-glyph" aria-hidden="true">⚠</span>
+            <span class="bulk-toast-body">
+              Couldn't replace "{bulkStatus.from}".
+            </span>
+            <button
+              type="button"
+              class="bulk-toast-action"
+              onclick={() =>
+                bulkStatus &&
+                bulkStatus.kind === "error" &&
+                onBulkPick({
+                  from: bulkStatus.from,
+                  user: bulkStatus.toUserId
+                    ? (memberRoster.find((m) => m.id === bulkStatus!.toUserId) ?? null)
+                    : null,
+                  freeText: bulkStatus.toUserId ? null : bulkStatus.to,
+                })}
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              class="bulk-toast-dismiss"
+              aria-label="Dismiss"
+              onclick={dismissBulkStatus}
+            >
+              ✕
+            </button>
+          </div>
+        {/if}
+      {/if}
       <div class="transcript">
         {#each (call.utterances ?? []) as u (u.idx)}
           {#if editingIdx === u.idx}
@@ -2969,9 +3179,13 @@
                 rosterLoaded={memberRosterLoaded}
                 rosterError={memberRosterError}
                 recents={recentRows}
+                externals={externalSpeakers}
                 saving={savingEdit}
                 variant="stack"
+                contextSpeaker={u.speaker}
+                contextCount={speakers.find((s) => s.speaker === u.speaker)?.count ?? 1}
                 onpick={onUtteranceEditorPick}
+                onbulkpick={onBulkPick}
                 oncancel={cancelEdit}
               />
               <label class="apply-all">
@@ -4550,5 +4764,95 @@
     margin: 0.6rem 0 0;
     color: var(--live);
     font-size: 0.82rem;
+  }
+
+  /* #171 · bulk-rename inline toast. Lives above the transcript,
+     reports the server-side rewrite count, offers a one-shot Undo
+     that runs the reverse rename. Olive (success) / live (error)
+     semantic pair — no new color. Auto-dismisses at 5s; Undo after
+     dismiss is intentionally out of scope. */
+  .bulk-toast {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin: 0.4rem 0 0.6rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    animation: bulk-toast-in 160ms ease-out;
+  }
+  @keyframes bulk-toast-in {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bulk-toast {
+      animation: none;
+    }
+  }
+  .bulk-toast-success {
+    background: var(--olive-soft);
+    border: 1px solid var(--olive);
+    color: var(--bone-0);
+  }
+  .bulk-toast-error {
+    background: var(--live-soft);
+    border: 1px solid var(--live);
+    color: var(--bone-0);
+  }
+  .bulk-toast-glyph {
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .bulk-toast-success .bulk-toast-glyph {
+    color: var(--olive);
+  }
+  .bulk-toast-error .bulk-toast-glyph {
+    color: var(--live);
+  }
+  .bulk-toast-body {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .bulk-toast-action {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    color: var(--bone-1);
+    padding: 0.25rem 0.6rem;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .bulk-toast-action:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .bulk-toast-action:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .bulk-toast-dismiss {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--bone-3);
+    padding: 0.2rem 0.4rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    font: inherit;
+  }
+  .bulk-toast-dismiss:hover {
+    color: var(--bone-0);
+  }
+
+  @media (max-width: 520px) {
+    .bulk-toast {
+      flex-wrap: wrap;
+    }
+    .bulk-toast-body {
+      flex-basis: 100%;
+    }
   }
 </style>
