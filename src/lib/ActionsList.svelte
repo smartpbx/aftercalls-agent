@@ -65,6 +65,28 @@
     callId: string;
     nextStatus: "open" | "done";
   };
+
+  // #126 (v0.4.2): the actions list also surfaces click-to-edit
+  // for description + owner, same UX as the call-detail page. The
+  // list component forwards ActionItem's granular callbacks; the
+  // page wrapper owns the PATCH. Mutual-exclusion state (`activeRowEdit`)
+  // lives in the page wrapper so row-across-page coordination is
+  // the wrapper's responsibility.
+  export type ActionsActiveRowEdit =
+    | { kind: "none" }
+    | { kind: "description"; itemId: string }
+    | { kind: "owner"; itemId: string };
+
+  export type ActionsDescriptionSave = {
+    itemId: string;
+    callId: string;
+    description: string;
+  };
+  export type ActionsOwnerSave = {
+    itemId: string;
+    callId: string;
+    assigneeUserId: string | null;
+  };
 </script>
 
 <script lang="ts">
@@ -119,6 +141,33 @@
     ontoggle?: (e: ActionsToggleEvent) => void;
     onloadmore?: () => void;
     onretry?: () => void;
+
+    // #126 (v0.4.2): click-to-edit machinery, parallel to what the
+    // call-detail page wires on each ActionItem. `canEdit` gates
+    // entry into edit mode; when unset/false, rows render read-only
+    // (preserves prior /actions-page behaviour for surfaces that
+    // don't want in-place edit).
+    canEdit?: boolean;
+    activeRowEdit?: ActionsActiveRowEdit;
+    patchingItemIds?: Set<string>;
+    actionItemErrors?: Record<string, string>;
+    onDescriptionEditRequest?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onOwnerEditRequest?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onDescriptionSave?: (payload: ActionsDescriptionSave) => void;
+    onOwnerSave?: (payload: ActionsOwnerSave) => void;
+    onDescriptionCancel?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onOwnerCancel?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onEditErrorClear?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
   };
 
   let {
@@ -138,7 +187,51 @@
     ontoggle,
     onloadmore,
     onretry,
+    canEdit = false,
+    activeRowEdit = { kind: "none" } as ActionsActiveRowEdit,
+    patchingItemIds = new Set<string>(),
+    actionItemErrors = {},
+    onDescriptionEditRequest,
+    onOwnerEditRequest,
+    onDescriptionSave: onDescSaveProp,
+    onOwnerSave: onOwnerSaveProp,
+    onDescriptionCancel,
+    onOwnerCancel,
+    onEditErrorClear,
   }: Props = $props();
+
+  // Adapters: ActionItem fires with {itemId, description} /
+  // {itemId, assigneeUserId}; the /actions page wants to know the
+  // call_id too. We look up the row by id in the currently-visible
+  // items list (it must be present — the fire came from one of the
+  // rendered rows) to recover call_id.
+  function findCallId(itemId: string): string | null {
+    return items.find((it) => it.id === itemId)?.call_id ?? null;
+  }
+  function onDescriptionSaveForward(payload: {
+    itemId: string;
+    description: string;
+  }) {
+    const callId = findCallId(payload.itemId);
+    if (!callId) return;
+    onDescSaveProp?.({
+      itemId: payload.itemId,
+      callId,
+      description: payload.description,
+    });
+  }
+  function onOwnerSaveForward(payload: {
+    itemId: string;
+    assigneeUserId: string | null;
+  }) {
+    const callId = findCallId(payload.itemId);
+    if (!callId) return;
+    onOwnerSaveProp?.({
+      itemId: payload.itemId,
+      callId,
+      assigneeUserId: payload.assigneeUserId,
+    });
+  }
 
   // Subhead copy mirrors ui-phase-4 §Copy verbatim. The three
   // branches reinforce the "across all calls" framing new users
@@ -320,7 +413,21 @@
             recordedAt: item.call_recorded_at,
           }}
           {colorFor}
-          canEdit={false}
+          {canEdit}
+          editingDescription={activeRowEdit.kind === "description" &&
+            activeRowEdit.itemId === item.id}
+          editingOwner={activeRowEdit.kind === "owner" &&
+            activeRowEdit.itemId === item.id}
+          saving={patchingItemIds.has(item.id)}
+          editError={actionItemErrors[item.id] ?? ""}
+          onDescriptionEditRequest={(p) =>
+            onDescriptionEditRequest?.({ item: p.item })}
+          onOwnerEditRequest={(p) => onOwnerEditRequest?.({ item: p.item })}
+          onDescriptionSave={onDescriptionSaveForward}
+          onOwnerSave={onOwnerSaveForward}
+          onDescriptionCancel={(p) => onDescriptionCancel?.({ item: p.item })}
+          onOwnerCancel={(p) => onOwnerCancel?.({ item: p.item })}
+          onEditErrorClear={(p) => onEditErrorClear?.({ item: p.item })}
           ontoggle={(payload) =>
             !togglingIds.has(item.id) && handleRowToggle(payload)}
         />

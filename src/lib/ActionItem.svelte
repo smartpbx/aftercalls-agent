@@ -32,15 +32,34 @@
     order_index: number;
   };
 
-  // Save payload the parent receives when the editor commits.
-  // `assignee_user_id` is tri-state from the parent's POV:
-  //   `string` → set to this uuid
-  //   `null`   → explicit clear
-  //   the parent decides whether to include the field in the PATCH
-  //   based on whether the user changed it — the component surfaces
-  //   the picked value verbatim.
+  // Legacy (v0.4.1) combined-save payload. Retained for
+  // compatibility with any call-site that still wants the single
+  // description+assignee blob; #126 splits into granular callbacks.
   export type ActionItemEditSave = {
     itemId: string;
+    description: string;
+    assigneeUserId: string | null;
+  };
+
+  // #126 (v0.4.2): granular event payloads emitted by the row.
+  //
+  // Description-only save — fires on blur / Enter / Tab when the
+  // draft is non-empty. Parent PATCHes `{ description }`.
+  export type ActionItemDescriptionSave = {
+    itemId: string;
+    description: string;
+  };
+  // Owner-only save — fires on picker `onpick`, or on blur with an
+  // empty input (explicit clear). Parent PATCHes
+  // `{ assignee_user_id }`.
+  export type ActionItemOwnerSave = {
+    itemId: string;
+    assigneeUserId: string | null;
+  };
+  // Phantom-row (optimistic add) commit — fires on first commit of
+  // a `pending` row. Parent POSTs `/action-items/manual` with both
+  // description + the phantom's carried assignee.
+  export type ActionItemPendingSave = {
     description: string;
     assigneeUserId: string | null;
   };
@@ -57,38 +76,38 @@
   // live in app.css. The `diff portal/src/app.css agent/src/app.css`
   // invariant stays intact.
   //
-  // Phase 2 of v0.4.0 bundle (closes #19): adds click-to-edit
-  // affordance. Pencil appears in a row-actions slot, hover-revealed
-  // on desktop (opacity 0.4 → 1) and always-visible on touch.
-  // Clicking the pencil flips the row into an inline editor: textarea
-  // for the description (raw `<name>...</name>` markers preserved) +
-  // compact SpeakerRenamePicker for the assignee + Save / Cancel.
-  // The PARENT owns the mutation — this component emits `onedit`
-  // when the pencil is clicked (so the parent can dirty-cancel any
-  // other row), `onsave` with the edited payload, `oncancel` on
-  // dismiss.
+  // #126 / v0.4.2 — click-to-edit iteration.
+  //   • The pencil button retires. Clicking the rendered description
+  //     enters description-edit mode. Clicking the owner chip enters
+  //     owner-edit mode. Both commit on blur / Enter / Tab; Escape
+  //     cancels. No Save / Cancel buttons in the row anymore.
+  //   • The add flow no longer opens a separate composer — the Add
+  //     item button appends a phantom row (local only, prefixed
+  //     `__pending__`) directly in description-edit mode. Phantom
+  //     POSTs on first non-empty commit; blur-empty or Escape drops.
+  //   • Per-row editing state is controlled by the parent:
+  //       editingDescription — textarea swap for this row
+  //       editingOwner       — picker swap for this row
+  //       pending            — this row is a pre-POST phantom
+  //       saving             — PATCH / POST in flight for this row
+  //     Mutual exclusion is the parent's responsibility (at most one
+  //     row is in any edit mode across the page); the parent emits
+  //     the auto-commit transitions documented in the ui-spec §3 /
+  //     architect's §5.4.
   //
-  // Phase 3 of v0.4.0 bundle (closes #104): adds
-  //   - Trash (.ai-del) next to the pencil, hover-revealed with the
-  //     same opacity + reduced-motion rules as .ai-edit.
-  //   - Inline delete confirm: clicking trash swaps the row-actions
-  //     slot from [pencil|trash] to [Delete|Cancel]. Zero-ms
-  //     transition (ui-phase-3 §Motion). Escape / Cancel restore the
-  //     pencil+trash; Enter on Delete fires ondelete.
-  //   - Unassigned chip: `.ai-assignee-empty` renders when the FK is
-  //     null AND the description has no `<name>` markers. Dashed 20px
-  //     circle + "Unassigned" label in --bone-3 (ui-phase-3 §D).
+  // State matrix (updated for #126):
+  //   default                — read-only row
+  //   editingDescription     — inline textarea swap for the description
+  //   editingOwner           — inline picker swap for the owner chip
+  //   pending                — phantom row, `pending: true`, id prefixed
+  //   saving                 — PATCH / POST in flight; .ai-body dims
+  //   error                  — inline error line below the editing
+  //                            surface; draft preserved; commit
+  //                            triggers block until the user retypes
+  //   confirmingDelete       — unchanged from Phase 3
+  //   deleting / deleteError — unchanged from Phase 3
   //
-  // State matrix (extended from Phase 1's):
-  //   default           — read-only row
-  //   editing           — textarea + picker + Save/Cancel; driven by `editing` prop
-  //   saving            — Save label flips to "Saving…", disabled
-  //   error             — inline callout above the buttons; draft preserved
-  //   confirmingDelete  — trash/pencil swap to Delete/Cancel inline buttons
-  //   deleting          — Delete label flips to "Deleting…", disabled
-  //   deleteError       — inline error line replacing the confirm buttons
-  //
-  // Phase 4 still reserves `ontoggle` — status check-off lands there.
+  // Phase 4 still owns `ontoggle` for check-off — wiring unchanged.
 
   import Avatar from "./Avatar.svelte";
   import SummaryText from "./SummaryText.svelte";
@@ -118,48 +137,72 @@
     variant?: "call-detail" | "actions-page";
     callContext?: ActionItemCallContext;
     colorFor?: (name: string) => string;
-    // Phase 2 (#19): inline-edit machinery. The PARENT owns mutation
-    // + "only one row edits at a time" state; this component just
-    // renders the read-only / edit affordances and emits events.
-    //
-    //   editing  — true when this row is the one in edit mode; false
-    //              otherwise. Parent typically stores an
-    //              `editingItemId` and passes `editing={id === editingItemId}`.
-    //   saving   — flips the Save button label to "Saving…" and
-    //              disables both buttons. Controlled so the parent
-    //              can reset it when its PATCH resolves or fails.
-    //   editError — inline error line above Save/Cancel. Component
-    //              never drops the user's draft on error; parent
-    //              controls the message.
-    //   canEdit  — permission gate. False (member viewing a call
-    //              they can't edit) hides the pencil entirely.
-    editing?: boolean;
+    // #126 (v0.4.2): per-row edit state, now split by intent.
+    //   editingDescription — textarea swap for this row. Mutually
+    //                        exclusive with editingOwner on the
+    //                        same row (parent enforces).
+    //   editingOwner       — picker swap for this row.
+    //   pending            — row is a pre-POST phantom. Parent
+    //                        appends it to its local list with an
+    //                        id prefixed `__pending__`; on commit
+    //                        the parent POSTs and replaces with the
+    //                        server row. Phantoms render like
+    //                        normal rows except trash + checkbox
+    //                        are suppressed.
+    //   saving             — PATCH or POST in flight. Dims .ai-body
+    //                        and disables commit-triggering
+    //                        handlers so the user can't fire a
+    //                        second blur-commit over an in-flight
+    //                        save.
+    //   editError          — inline error line below whichever
+    //                        editor is active (textarea / picker).
+    //                        Parent clears when the user edits the
+    //                        draft again (retry-by-typing).
+    //   canEdit            — permission gate. False → all click-to-
+    //                        edit affordances (cursor / role /
+    //                        tabindex) are suppressed.
+    editingDescription?: boolean;
+    editingOwner?: boolean;
+    pending?: boolean;
     saving?: boolean;
     editError?: string;
     canEdit?: boolean;
-    // Phase 3 (#104): inline delete confirm. Parent owns state so
-    // only one row confirms at a time (same rule as `editing`). When
-    // `confirmingDelete` flips true, the row-actions slot swaps from
-    // [pencil|trash] to [Delete|Cancel]. `deleting` flips the Delete
-    // label to "Deleting…" and disables both buttons during the
-    // in-flight DELETE. `deleteError` replaces the buttons with an
-    // inline error line until the parent clears it (e.g. after a
-    // retry click).
     confirmingDelete?: boolean;
     deleting?: boolean;
     deleteError?: string;
-    // Phase 4 reserves `ontoggle` for the status check-off; P3 treats
-    // it as a no-op.
-    onedit?: (payload: { item: ActionItem }) => void;
+
+    // Legacy intent-trigger events (kept for callers that haven't
+    // migrated; #126 routes description/owner edits through the new
+    // granular events below). onsave / oncancel are unused now but
+    // kept in the type to avoid breaking older call-sites during
+    // bisect windows.
+    onedit?: (payload: {
+      item: ActionItem;
+      intent?: "description" | "owner";
+    }) => void;
     onsave?: (payload: ActionItemEditSave) => void;
     oncancel?: () => void;
-    // Phase 3 (#104): three stages. `ondeleterequest` fires when the
-    // trash is clicked (parent flips confirmingDelete for this row,
-    // clearing any other row's confirm). `ondeleteconfirm` fires on
-    // Delete — parent runs the DELETE + removes the row on success
-    // / sets deleteError on failure. `ondeletecancel` fires on the
-    // inline Cancel or Escape inside the slot; parent clears
-    // confirmingDelete without touching the row.
+
+    // #126 (v0.4.2): granular save / cancel / request callbacks.
+    // The component fires these; the parent owns PATCH / POST and
+    // updates `editingDescription` / `editingOwner` / `pending` in
+    // response.
+    onDescriptionEditRequest?: (payload: { item: ActionItem }) => void;
+    onOwnerEditRequest?: (payload: { item: ActionItem }) => void;
+    onDescriptionSave?: (payload: ActionItemDescriptionSave) => void;
+    onOwnerSave?: (payload: ActionItemOwnerSave) => void;
+    onDescriptionCancel?: (payload: { item: ActionItem }) => void;
+    onOwnerCancel?: (payload: { item: ActionItem }) => void;
+    onPendingSave?: (payload: ActionItemPendingSave) => void;
+    onPendingDiscard?: () => void;
+    // Fired on every keystroke while an error is visible — the
+    // parent uses this to clear `actionItemErrors[item.id]` so the
+    // next blur / Enter can attempt a fresh commit (retry-by-typing
+    // per architect §5.3). Emitted at most once per edit-session
+    // (parent manages the state lifecycle).
+    onEditErrorClear?: (payload: { item: ActionItem }) => void;
+
+    // Phase 3 (#104): delete flow. Unchanged.
     ondeleterequest?: (payload: { item: ActionItem }) => void;
     ondeleteconfirm?: (payload: { item: ActionItem }) => void;
     ondeletecancel?: (payload: { item: ActionItem }) => void;
@@ -177,36 +220,53 @@
     variant = "call-detail",
     callContext,
     colorFor,
-    editing = false,
+    editingDescription = false,
+    editingOwner = false,
+    pending = false,
     saving = false,
     editError = "",
     canEdit = false,
     confirmingDelete = false,
     deleting = false,
     deleteError = "",
-    onedit,
-    onsave,
-    oncancel,
+    onedit: _legacyOnEdit,
+    onsave: _legacyOnSave,
+    oncancel: _legacyOnCancel,
+    onDescriptionEditRequest,
+    onOwnerEditRequest,
+    onDescriptionSave,
+    onOwnerSave,
+    onDescriptionCancel,
+    onOwnerCancel,
+    onPendingSave,
+    onPendingDiscard,
+    onEditErrorClear,
     ondeleterequest,
     ondeleteconfirm,
     ondeletecancel,
     ontoggle,
   }: Props = $props();
 
-  // Phase 4 (#105): row check-off wiring. The checkbox is interactive
-  // when the parent wires `ontoggle` AND the row is not currently in
-  // the edit / delete / save flight paths (mid-edit toggling would
-  // race against the PATCH in-flight from Save). Call-detail rows
-  // with only `canEdit=false` (member viewing a teammate's call, or
-  // no ontoggle wired yet) stay disabled — same posture Phase 1-3
-  // shipped.
+  // Convenience derivation — used in the template to gate trash /
+  // checkbox / hover affordances. "Anything editing" treats
+  // description-edit, owner-edit, and phantom pending-edit the same
+  // way for most surface rules.
+  let anyEditing = $derived(editingDescription || editingOwner);
+
+  // Phase 4 (#105): row check-off wiring. Disabled while editing,
+  // saving, deleting, or when the row is a phantom (no backend id
+  // yet to PATCH).
   let canToggle = $derived(
-    ontoggle !== undefined && !editing && !saving && !deleting,
+    ontoggle !== undefined &&
+      !anyEditing &&
+      !saving &&
+      !deleting &&
+      !pending,
   );
 
   // Secondary line on /actions rows — `{call-title} · {relative-time}`
   // linking to /calls/{id}. Suppressed on call-detail (no callContext)
-  // and during edit mode (the editor owns the body slot).
+  // and during any edit mode (the editor owns the body slot).
   let callContextTitle = $derived(callContext?.title ?? "(untitled)");
   let callContextRelative = $derived.by(() => {
     if (!callContext?.recordedAt) return "";
@@ -253,11 +313,10 @@
   );
 
   // Screen-reader label for the checkbox. Strip <name>...</name>
-  // markers so the announced text reads naturally (no "less-than name
-  // greater-than Clayton M." spoken aloud). Truncated to avoid a
-  // paragraph being announced on tab. On the /actions variant the
-  // leading "Action item {n}:" prefix is dropped — positional numbering
-  // is meaningless across calls (ui-phase-4 §Copy).
+  // markers so the announced text reads naturally. Truncated to avoid
+  // a paragraph being announced on tab. On the /actions variant the
+  // leading "Action item {n}:" prefix is dropped — positional
+  // numbering is meaningless across calls (ui-phase-4 §Copy).
   let srLabel = $derived.by(() => {
     const bare = trimmedDesc.replace(/<name>([^<]+)<\/name>/g, "$1");
     const truncated = bare.length > 80 ? bare.slice(0, 77) + "…" : bare;
@@ -268,6 +327,23 @@
     return `Action item ${index + 1}: ${truncated || "(no description)"}${suffix}`;
   });
 
+  // #126: aria-label for the .ai-desc role=button wrapper — announces
+  // the truncated description so SR users get the click-to-edit
+  // intent. Falls back to a generic label on empty rows.
+  let descEditLabel = $derived.by(() => {
+    const bare = trimmedDesc.replace(/<name>([^<]+)<\/name>/g, "$1");
+    const truncated = bare.length > 80 ? bare.slice(0, 77) + "…" : bare;
+    return truncated
+      ? `Edit description: ${truncated}`
+      : "Edit description";
+  });
+  let ownerEditLabel = $derived.by(() => {
+    if (resolvedAssignee) {
+      return `Change owner: ${resolvedAssignee.display_name}`;
+    }
+    return "Assign owner";
+  });
+
   let assigneeColor = $derived.by(() => {
     if (!resolvedAssignee) return "var(--accent)";
     if (colorFor) return colorFor(resolvedAssignee.display_name);
@@ -275,12 +351,7 @@
   });
 
   // Phase 3 (#104): show the "Unassigned" chip only when the FK is
-  // null AND the description has no `<name>` markers. If the prose
-  // already surfaces a name via SummaryText's chip render, double-
-  // labelling would be noise (ui-phase-3 §D case-#4 suppression).
-  // The regex matches the same shape SummaryText tokenizes on —
-  // intentionally narrow (`[^<]+` refuses nested tags), identical to
-  // the learnings #97+#102 safe-render contract.
+  // null AND the description has no `<name>` markers.
   let hasNameMarker = $derived(
     /<name>[^<]+<\/name>/.test(item.description ?? ""),
   );
@@ -288,23 +359,49 @@
     item.assignee_user_id === null && !hasNameMarker,
   );
 
-  // ── Editor local state ─────────────────────────────────────────
+  // ── Description-edit local state ───────────────────────────────
   //
-  // Description draft is a plain local string seeded from the row's
-  // `description` when edit mode opens. We preserve raw
-  // `<name>...</name>` markers verbatim — the user is editing the
-  // wire format and the read surface re-parses them into chips on
-  // save. Assignee draft tracks the picker's current selection.
-  // Both reset on entering edit mode (below) rather than on every
-  // prop change, so Save-side re-renders don't clobber the draft.
+  // Textarea draft reseeds on entry into description-edit so a
+  // revert-then-reopen lands the user back at the stored description,
+  // not at a half-typed draft from earlier. Autoresize uses a single
+  // effect — seed `height=0` then set `scrollHeight` on every input.
   let descDraft = $state("");
+  let descTextareaEl: HTMLTextAreaElement | undefined = $state();
+  // Re-seeds the draft on entry into description-edit. `pending` rows
+  // skip the seed — the parent appended the row with description=""
+  // and the textarea starts empty by design.
+  $effect(() => {
+    if (editingDescription) {
+      descDraft = item.description ?? "";
+    }
+  });
+  // Autoresize: grow up to ~5 rows then scroll. Zero out the height
+  // first so `scrollHeight` reports content-only size; set back to
+  // that value capped by CSS max-height.
+  function autoresize() {
+    const el = descTextareaEl;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${el.scrollHeight}px`;
+  }
+  // Run autoresize after the textarea mounts and whenever the draft
+  // changes. Svelte's $effect on the textarea binding covers mount;
+  // the `oninput` handler covers typing.
+  $effect(() => {
+    // Track descDraft so Svelte re-runs on every character. The
+    // textarea may not yet be mounted on the first run (Svelte binds
+    // in the DOM-update phase) — guard with a conditional.
+    descDraft;
+    if (descTextareaEl) autoresize();
+  });
+
+  // ── Owner-edit local state ─────────────────────────────────────
   let assigneeDraft = $state<string | null>(null);
   let assigneeValue = $state("");
-  // v0.4.1 (#122 C.1): root element of the editor block. Bound via
-  // `bind:this` on `<div class="ai-editor">` so the outside-click
-  // listener can test `editorEl.contains(target)` without caring
-  // which descendant the user clicked on.
-  let editorEl: HTMLDivElement | undefined = $state();
+  // The outer editor wrapper — bound so the outside-click listener
+  // can ignore clicks inside the picker's absolute-positioned
+  // listbox.
+  let ownerEditorEl: HTMLDivElement | undefined = $state();
   let pickerRoster = $derived.by<OrgMemberLite[]>(() =>
     users.map((u) => ({
       id: u.id,
@@ -312,14 +409,8 @@
       email: u.email,
     })),
   );
-
-  // Seed the drafts when the row flips into edit mode. `editing` is
-  // a parent-controlled boolean; entering edit mode without dirtying
-  // drafts means Cancel reverts to whatever the row held at entry,
-  // not whatever state a half-written draft left behind.
   $effect(() => {
-    if (editing) {
-      descDraft = item.description ?? "";
+    if (editingOwner) {
       assigneeDraft = item.assignee_user_id ?? null;
       const current = item.assignee_user_id
         ? users.find((u) => u.id === item.assignee_user_id)
@@ -328,103 +419,189 @@
     }
   });
 
-  function handleEditClick() {
+  // ── Request handlers (click-to-edit entry points) ──────────────
+
+  function requestDescriptionEdit() {
     if (!canEdit) return;
-    onedit?.({ item });
+    if (saving || deleting) return;
+    onDescriptionEditRequest?.({ item });
+  }
+  function requestOwnerEdit() {
+    if (!canEdit) return;
+    if (saving || deleting) return;
+    onOwnerEditRequest?.({ item });
+  }
+  function onDescWrapperKeydown(e: KeyboardEvent) {
+    // Keyboard entry into description-edit from the focused `.ai-desc`
+    // wrapper. Enter / Space both open the editor. `preventDefault`
+    // keeps Space from scrolling the page.
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      requestDescriptionEdit();
+    }
+  }
+  function onOwnerBtnKeydown(e: KeyboardEvent) {
+    // Native <button> handles Enter / Space already; this handler
+    // exists only to keep the A11Y parity comment visible with the
+    // description wrapper. No-op unless a future keystroke maps in.
+    void e;
   }
 
-  function handlePickerPick(pick: SpeakerPick) {
+  // ── Description commit / cancel ────────────────────────────────
+  //
+  // Commit fires on blur / Enter / Tab (blur path). Routing:
+  //   • phantom (`pending`) + non-empty     → onPendingSave
+  //   • phantom (`pending`) + empty         → onPendingDiscard
+  //   • existing row + non-empty            → onDescriptionSave
+  //   • existing row + empty                → silent revert
+  // The parent decides whether to PATCH and whether to close edit
+  // mode — this component just emits.
+  function commitDescription() {
+    const next = descDraft.trim();
+    if (pending) {
+      if (next.length === 0) {
+        onPendingDiscard?.();
+      } else {
+        onPendingSave?.({
+          description: next,
+          assigneeUserId: assigneeDraft ?? item.assignee_user_id ?? null,
+        });
+      }
+      return;
+    }
+    if (next.length === 0) {
+      // Silent revert for existing rows — the user cleared the text
+      // then blurred; dropping the change is safer than a backend
+      // round-trip. They can delete via trash if that was intent.
+      onDescriptionCancel?.({ item });
+      return;
+    }
+    onDescriptionSave?.({ itemId: item.id, description: next });
+  }
+  function cancelDescription() {
+    // Escape path — always discards (no PATCH / POST). For phantoms
+    // this unmounts the row entirely.
+    if (pending) {
+      onPendingDiscard?.();
+      return;
+    }
+    onDescriptionCancel?.({ item });
+  }
+
+  function onDescKeydown(e: KeyboardEvent) {
+    // Enter (with or without Cmd/Ctrl) commits; Shift+Enter inserts
+    // a newline; Escape cancels. Tab doesn't get a handler here; the
+    // textarea's native blur fires `onblur` which commits.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelDescription();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      commitDescription();
+      return;
+    }
+  }
+  function onDescInput() {
+    // Typing clears the inline error so the next commit trigger
+    // isn't pre-blocked — retry-by-editing per architect §5.3.
+    if (editError) {
+      onEditErrorClear?.({ item });
+    }
+  }
+  function onDescBlur(e: FocusEvent) {
+    // Blur-commit. Skip if focus moved onto the inline error retry
+    // path (there's no retry button in #126 but this guard is cheap).
+    // Also skip if the row is mid-save — avoids firing a second
+    // blur-commit while the first is still in flight.
+    if (saving) return;
+    // If an error is showing we block blur-commit until the user
+    // types (clearing the error) — architect §5.3.
+    if (editError) {
+      // Return focus so the error stays actionable. Using
+      // requestAnimationFrame so the blur event completes first.
+      const el = e.currentTarget as HTMLTextAreaElement;
+      requestAnimationFrame(() => el?.focus());
+      return;
+    }
+    commitDescription();
+  }
+
+  // ── Owner commit / cancel ──────────────────────────────────────
+  //
+  // Owner picker fires `onpick` when a roster row is clicked or
+  // Enter commits the active row. Free-form text is NOT a valid
+  // assignee (FK-only backend). Blur-with-empty clears assignee;
+  // blur-with-unmatched-text is treated as cancel (per D5).
+  function onPickerPick(pick: SpeakerPick) {
     if (pick.user) {
+      // Update local state first (covers the phantom case where
+      // there's no row to PATCH), then emit to parent. For phantoms
+      // the parent updates its `pendingRow` local state via
+      // onOwnerSave (no PATCH); the description commit (later) will
+      // POST both fields. For existing rows this triggers the PATCH.
       assigneeDraft = pick.user.id;
       assigneeValue = pick.user.display_name;
+      onOwnerSave?.({ itemId: item.id, assigneeUserId: pick.user.id });
     } else {
-      // Free-form text is IGNORED in the action-item context
-      // (assignee_user_id is FK-only; see ui-phase-2 §D). We leave
-      // the picker input showing the typed text but keep
-      // `assigneeDraft` at null so Save writes `assignee_user_id =
-      // null`. Clearing the input (freeText === "") is the
-      // "unassign" path.
+      // Free-form text — keep the input showing what they typed but
+      // don't save anything yet. Blur will decide: empty input →
+      // explicit clear; non-empty unmatched → cancel.
       assigneeDraft = null;
       assigneeValue = pick.freeText;
     }
   }
-
-  // Reserved for a post-v0.4.1 `×` glyph that explicitly clears the
-  // picker's selected teammate from the editor. The v0.4.1 rewire
-  // routed the picker's `oncancel` to `handleCancel` (Escape closes the
-  // whole edit, not just the field), leaving this function unbound in
-  // the current surface — kept so the glyph work doesn't need to
-  // redefine it.
+  function onPickerCancel() {
+    // Escape inside the picker → revert to chip without PATCH.
+    onOwnerCancel?.({ item });
+  }
+  // The × glyph clears the assignee directly. Fires immediate clear
+  // PATCH on existing rows; on phantoms, just mutates local state.
   function clearAssignee() {
+    if (!canEdit) return;
+    if (saving || deleting) return;
     assigneeDraft = null;
     assigneeValue = "";
+    // Phantoms: parent mutates local state only. Existing rows:
+    // parent fires the clear PATCH. Same callback, same payload.
+    onOwnerSave?.({ itemId: item.id, assigneeUserId: null });
   }
 
-  function handleSave() {
-    const next = descDraft.trim();
-    if (!next) return; // backend rejects empty; don't bother round-tripping
-    onsave?.({
-      itemId: item.id,
-      description: next,
-      assigneeUserId: assigneeDraft,
-    });
-  }
-
-  function handleCancel() {
-    oncancel?.();
-  }
-
-  function onDescKeydown(e: KeyboardEvent) {
-    // Cmd/Ctrl+Enter saves from the textarea only — don't escalate
-    // this to the editor root (ui-phase-2 §G reminder: don't eat
-    // Ctrl+S / Cmd+Enter for the whole page, and don't let
-    // Cmd+Enter inside the picker's combobox fire Save either).
-    // Escape is handled by `onEditorKeydown` on `.ai-editor` so it
-    // catches regardless of which descendant has focus.
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      handleSave();
-      return;
-    }
-  }
-
-  function onEditorKeydown(e: KeyboardEvent) {
-    // v0.4.1 (#122 C.1): Escape on the editor root cancels the edit
-    // regardless of which descendant has focus (textarea, picker
-    // input, Save / Cancel buttons). `preventDefault` + stopPropagation
-    // keep the Escape from bubbling to the page-level transcript
-    // Space/Enter handlers.
-    //
-    // The picker's internal `handleKeydown` runs first on a combobox
-    // keystroke and calls `e.stopPropagation()` unconditionally — its
-    // own Escape branch fires `oncancel`, which we've rewired below
-    // to `handleCancel`. This listener catches Escape from the
-    // textarea / Save / Cancel surfaces, which don't go through the
-    // picker.
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      handleCancel();
-    }
-  }
-
-  // v0.4.1 (#122 C.1): outside-click cancels the edit. Registered
-  // only while `editing === true`; `pointerdown` fires before focus
-  // transitions so we close deterministically even when the user
-  // clicks another interactive surface. Capture phase means a
-  // descendant's stopPropagation can't hide the click from us.
-  //
-  // Silent-discard policy: no dirty-state guard, matching Phase 2
-  // precedent on summaryEditing. The Cancel button is the explicit
-  // "I meant to save" undo path for anyone surprised.
+  // Owner outside-click: commit-on-unmatched-text rule from ui-spec
+  // §1.b.6. Empty → PATCH null; unmatched text → treat as cancel.
   $effect(() => {
-    if (!editing) return;
+    if (!editingOwner) return;
     function onDocPointerDown(e: PointerEvent) {
       if (saving) return;
-      if (!editorEl) return;
+      if (!ownerEditorEl) return;
       const target = e.target as Node | null;
-      if (target && editorEl.contains(target)) return;
-      handleCancel();
+      if (target && ownerEditorEl.contains(target)) return;
+      const trimmed = assigneeValue.trim();
+      if (trimmed.length === 0) {
+        // Explicit clear.
+        if (pending) {
+          assigneeDraft = null;
+          onOwnerSave?.({ itemId: item.id, assigneeUserId: null });
+          return;
+        }
+        onOwnerSave?.({ itemId: item.id, assigneeUserId: null });
+        return;
+      }
+      // Unmatched text OR a roster name the user typed manually.
+      // Roster-match-by-name: treat as pick.
+      const match = pickerRoster.find(
+        (m) => m.display_name.toLowerCase() === trimmed.toLowerCase(),
+      );
+      if (match) {
+        assigneeDraft = match.id;
+        assigneeValue = match.display_name;
+        onOwnerSave?.({ itemId: item.id, assigneeUserId: match.id });
+        return;
+      }
+      // Unmatched free-form text → cancel (ui-spec D5).
+      onOwnerCancel?.({ item });
     }
     document.addEventListener("pointerdown", onDocPointerDown, true);
     return () => {
@@ -432,26 +609,21 @@
     };
   });
 
-  // ── Phase 3 (#104): delete affordance + inline confirm ───────────
+  // ── Phase 3 (#104): delete affordance + inline confirm ─────────
 
   function handleDeleteRequest() {
     if (!canEdit || deleting) return;
     ondeleterequest?.({ item });
   }
-
   function handleDeleteConfirm() {
     if (deleting) return;
     ondeleteconfirm?.({ item });
   }
-
   function handleDeleteCancel() {
     if (deleting) return;
     ondeletecancel?.({ item });
   }
-
   function onConfirmKeydown(e: KeyboardEvent) {
-    // Escape inside the inline-confirm slot behaves like Cancel.
-    // Scoped to the confirm wrapper — page-level keydown isn't eaten.
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -463,7 +635,10 @@
 <li
   class="ai-row"
   class:ai-done={isDone}
-  class:ai-editing={editing}
+  class:ai-editing={editingDescription}
+  class:ai-owner-editing={editingOwner}
+  class:ai-pending={pending}
+  class:ai-saving={saving}
   class:ai-actions-page={variant === "actions-page"}
 >
   <input
@@ -481,59 +656,73 @@
     <span class="ai-idx ai-idx-spacer" aria-hidden="true"></span>
   {/if}
   <span class="ai-body">
-    {#if editing}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="ai-editor"
-        bind:this={editorEl}
-        onkeydown={onEditorKeydown}
-      >
+    {#if editingDescription}
+      <!-- #126: inline description textarea. Autoresize via
+           `autoresize()` on input; max-height caps at ~5 visible rows
+           via CSS. Commit on blur / Enter (non-shift); Escape
+           cancels. -->
+      <div class="ai-desc-editor">
+        <!-- svelte-ignore a11y_autofocus — click-to-edit UX
+             deliberately lands caret in the textarea on mount.
+             Parent only sets editingDescription=true when the user
+             explicitly clicked or pressed Enter on the row, so
+             focus-capture is user-driven. -->
         <textarea
           class="ai-edit-desc"
+          bind:this={descTextareaEl}
           bind:value={descDraft}
           disabled={saving}
-          rows="3"
+          rows="1"
+          placeholder="Describe the task…"
           aria-label="Action item description"
+          autofocus
           onkeydown={onDescKeydown}
+          oninput={onDescInput}
+          onblur={onDescBlur}
         ></textarea>
-        <div class="ai-edit-picker">
-          <SpeakerRenamePicker
-            bind:value={assigneeValue}
-            roster={pickerRoster}
-            rosterLoaded={true}
-            saving={false}
-            variant="stack"
-            autofocus={false}
-            placeholder="Assign to a teammate…"
-            noMatchHint="No match — leave empty to keep this item unassigned."
-            onpick={handlePickerPick}
-            oncancel={handleCancel}
-          />
-        </div>
         {#if editError}
           <p class="ai-edit-err" role="alert">{editError}</p>
         {/if}
-        <div class="ai-edit-actions">
-          <button
-            type="button"
-            class="ai-save"
-            disabled={saving || descDraft.trim().length === 0}
-            onclick={handleSave}
-          >
-            {saving ? "Saving…" : "Save"}
-          </button>
-          <button
-            type="button"
-            class="ai-cancel"
-            disabled={saving}
-            onclick={handleCancel}
-          >
-            Cancel
-          </button>
-        </div>
       </div>
     {:else if isEmpty}
-      <em class="ai-empty">—</em>
+      {#if canEdit}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <span
+          class="ai-desc ai-desc-empty"
+          role="button"
+          tabindex="0"
+          aria-label={descEditLabel}
+          onclick={requestDescriptionEdit}
+          onkeydown={onDescWrapperKeydown}
+        >
+          <em class="ai-empty">—</em>
+        </span>
+      {:else}
+        <em class="ai-empty">—</em>
+      {/if}
+    {:else if canEdit}
+      <!-- #126: clickable description wrapper. role="button" +
+           tabindex gives keyboard + AT parity with the pointer
+           affordance. The nested SummaryText contains its own
+           chip children (name-linked / name-ambiguous / name-
+           external) — none are interactive, so wrapping the
+           whole span in role=button is safe per WAI-ARIA 1.2 §4.3
+           (button permits non-interactive descendants). -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <span
+        class="ai-desc"
+        role="button"
+        tabindex="0"
+        aria-label={descEditLabel}
+        onclick={requestDescriptionEdit}
+        onkeydown={onDescWrapperKeydown}
+      >
+        <SummaryText
+          text={item.description}
+          {users}
+          {colorFor}
+        />
+      </span>
     {:else}
       <SummaryText
         text={item.description}
@@ -541,14 +730,8 @@
         {colorFor}
       />
     {/if}
-    {#if callContext && variant === "actions-page" && !editing}
-      <!-- Phase 4 (#105): /actions row context. `flex-basis: 100%`
-           drops this below the description + assignee chip, so the
-           row's top line stays dense (checkbox + description +
-           chip) and this line acts as a footer link. Whole line is
-           an anchor per ui-phase-4 §I (larger hit target; title +
-           time resolve to the same destination so there's no
-           ambiguity at the separator). -->
+    {#if callContext && variant === "actions-page" && !editingDescription}
+      <!-- Phase 4 (#105): /actions row context. -->
       <a
         class="actx-context"
         href="/calls/{callContext.id}"
@@ -563,49 +746,143 @@
         {/if}
       </a>
     {/if}
-    {#if !editing && resolvedAssignee}
-      <span
-        class="ai-assignee"
-        title="Assigned to {resolvedAssignee.display_name}"
+    <!-- Owner column. Three branches:
+         • owner-edit mode → inline SpeakerRenamePicker in a reserved
+           right-side lane. Chip unmounts; picker mounts in place.
+         • read-only + resolved assignee → button wraps the chip so
+           click + keyboard entry is symmetric; × glyph (v0.4.1
+           clearAssignee, reactivated here) appears on hover.
+         • read-only + unassigned → button wraps the dashed-ring
+           chip with the same semantics. -->
+    {#if editingOwner}
+      <div
+        class="ai-owner-editor"
+        bind:this={ownerEditorEl}
       >
-        <Avatar
-          name={resolvedAssignee.display_name}
-          color={assigneeColor}
-          size={20}
+        <SpeakerRenamePicker
+          bind:value={assigneeValue}
+          roster={pickerRoster}
+          rosterLoaded={true}
+          saving={false}
+          variant="stack"
+          autofocus={true}
+          placeholder="Assign to a teammate…"
+          noMatchHint="No match — leave empty to keep this item unassigned."
+          onpick={onPickerPick}
+          oncancel={onPickerCancel}
         />
-        <span class="ai-assignee-name" style="--name-c: {assigneeColor}">
-          {resolvedAssignee.display_name}
+        {#if editError}
+          <p class="ai-edit-err" role="alert">{editError}</p>
+        {/if}
+      </div>
+    {:else if resolvedAssignee}
+      {#if canEdit}
+        <span class="ai-assignee-wrap">
+          <button
+            type="button"
+            class="ai-assignee-btn"
+            aria-label={ownerEditLabel}
+            onclick={requestOwnerEdit}
+            onkeydown={onOwnerBtnKeydown}
+          >
+            <span
+              class="ai-assignee"
+              title="Assigned to {resolvedAssignee.display_name} — click to change"
+            >
+              <Avatar
+                name={resolvedAssignee.display_name}
+                color={assigneeColor}
+                size={20}
+              />
+              <span
+                class="ai-assignee-name"
+                style="--name-c: {assigneeColor}"
+              >
+                {resolvedAssignee.display_name}
+              </span>
+            </span>
+          </button>
+          <!-- #126 (A1): × clear-assignee glyph. Hover-revealed like
+               `.ai-del`; always visible on touch via @media hover:none.
+               Clicking fires an immediate PATCH to clear. -->
+          <button
+            type="button"
+            class="ai-assignee-clear"
+            aria-label="Clear assignee"
+            disabled={saving || deleting}
+            onclick={clearAssignee}
+          >
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+              aria-hidden="true"
+            >
+              <path d="M4 4l8 8" />
+              <path d="M12 4l-8 8" />
+            </svg>
+          </button>
         </span>
-      </span>
-    {:else if !editing && showUnassigned}
-      <!-- Phase 3 (#104): dashed-border placeholder chip when there's
-           no FK and no inline <name> marker in the description. Acts
-           as a subdued "deliberately unassigned" signal so the row
-           doesn't read as missing data. `role="img"` + aria-label
-           so screen readers announce it alongside the visible label
-           for sighted users. -->
-      <span
-        class="ai-assignee-empty"
-        title="No assignee"
-      >
+      {:else}
         <span
-          class="ai-assignee-empty-dot"
-          role="img"
-          aria-label="Unassigned"
-        ></span>
-        <span class="ai-assignee-empty-label">Unassigned</span>
-      </span>
+          class="ai-assignee"
+          title="Assigned to {resolvedAssignee.display_name}"
+        >
+          <Avatar
+            name={resolvedAssignee.display_name}
+            color={assigneeColor}
+            size={20}
+          />
+          <span
+            class="ai-assignee-name"
+            style="--name-c: {assigneeColor}"
+          >
+            {resolvedAssignee.display_name}
+          </span>
+        </span>
+      {/if}
+    {:else if showUnassigned}
+      {#if canEdit}
+        <button
+          type="button"
+          class="ai-assignee-btn ai-assignee-btn-empty"
+          aria-label={ownerEditLabel}
+          onclick={requestOwnerEdit}
+          onkeydown={onOwnerBtnKeydown}
+        >
+          <span
+            class="ai-assignee-empty"
+            title="No assignee — click to assign"
+          >
+            <span
+              class="ai-assignee-empty-dot"
+              role="img"
+              aria-label="Unassigned"
+            ></span>
+            <span class="ai-assignee-empty-label">Unassigned</span>
+          </span>
+        </button>
+      {:else}
+        <span class="ai-assignee-empty" title="No assignee">
+          <span
+            class="ai-assignee-empty-dot"
+            role="img"
+            aria-label="Unassigned"
+          ></span>
+          <span class="ai-assignee-empty-label">Unassigned</span>
+        </span>
+      {/if}
     {/if}
   </span>
-  {#if canEdit && !editing}
+  {#if canEdit && !editingDescription && !pending}
     {#if confirmingDelete}
-      <!-- Phase 3 inline confirm. Swaps the row-actions slot (pencil
-           + trash) to [Delete | Cancel]. Zero-ms transition (no
-           reflow: the buttons occupy the same grid column). Escape
-           inside the slot maps to Cancel. Keydown listener is on the
-           wrapper so Escape works regardless of which inner button
-           has focus — both children are interactive buttons, so the
-           a11y intent holds. -->
+      <!-- Phase 3 inline confirm. Unchanged from v0.4.1 except for
+           the outer guard — pending (phantom) rows don't render trash
+           at all, so confirm is unreachable there. -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <span
         class="ai-confirm"
@@ -654,37 +931,10 @@
       <span class="ai-actions">
         <button
           type="button"
-          class="ai-edit"
-          aria-label="Edit action item {index + 1}"
-          onclick={handleEditClick}
-        >
-          <!-- 12px pencil glyph. `currentColor` so hover-opacity +
-               focus rings work against any ink background without a
-               new token. -->
-          <svg
-            width="12"
-            height="12"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" />
-          </svg>
-        </button>
-        <button
-          type="button"
           class="ai-del"
           aria-label="Delete action item {index + 1}"
           onclick={handleDeleteRequest}
         >
-          <!-- 12px trash glyph. Stroke-only, `currentColor` so the
-               hover-opacity + reduced-motion rules in `.ai-del`
-               match `.ai-edit`. Destroy-forever semantic per
-               ui-phase-3 §"Trash glyph vs. xmark". -->
           <svg
             width="12"
             height="12"
@@ -710,8 +960,8 @@
   /* Row shape. Grid for columns (checkbox / idx / body / actions).
      Body is a flex row so the optional assignee chip can sit inline
      on wide viewports and wrap beneath on narrow ones without a
-     media query. The fourth column (`ai-edit`) carries `auto` width
-     so rows without the pencil collapse it. */
+     media query. The fourth column carries `auto` width so rows
+     without the trash collapse it. */
   .ai-row {
     display: grid;
     grid-template-columns: 20px 28px 1fr auto;
@@ -723,30 +973,17 @@
     font-size: 0.9rem;
     line-height: 1.5;
   }
-  /* Last row in the parent <ul> sheds the separator so the block
-     bottom doesn't look like it's hanging a line. Parent is
-     expected to be a <ul> with no extra padding. */
   :global(.ai-row:last-child) {
     border-bottom: none;
   }
 
   .ai-check {
-    /* Keep the checkbox on the text baseline — Grid's
-       `align-items: start` + a small top pad reads as visually
-       aligned with the idx pill and first line of the body. */
     margin: 0.22rem 0 0 0;
     width: 16px;
     height: 16px;
-    /* `cursor: default` when the parent hasn't wired an `ontoggle`
-       (call-detail surfaces without Phase 4 plumbing); flips to
-       pointer via `.ai-check-live` below when the toggle is wired. */
     cursor: default;
     accent-color: var(--olive);
   }
-  /* Phase 4 (#105): wired-up toggle state. `.ai-check-live` is added
-     alongside `.ai-check` whenever `ontoggle` is passed and the row
-     isn't currently mid-edit / mid-save. Cursor flips to pointer so
-     the interactive affordance is discoverable. */
   .ai-check-live {
     cursor: pointer;
   }
@@ -758,8 +995,6 @@
     letter-spacing: 0.04em;
     padding-top: 0.22rem;
   }
-  /* Spacer keeps the grid columns stable on the /actions page where
-     the per-call idx pill is replaced by the call-row context. */
   .ai-idx-spacer {
     width: 0;
   }
@@ -769,13 +1004,10 @@
     flex-wrap: wrap;
     align-items: baseline;
     gap: 0.4rem 0.75rem;
+    min-width: 0;
   }
 
-  /* Done state: strikethrough the prose and the assignee chip label,
-     soften the body color, dim the avatar. Strike-through on the
-     idx pill itself reads poorly on a 2-digit mono number, so the
-     pill stays colored as a stable anchor (design.md §Semantic
-     colors rule-of-thumb). */
+  /* Done state: strikethrough + dim. */
   .ai-done {
     color: var(--bone-3);
   }
@@ -794,17 +1026,31 @@
     opacity: 0.6;
   }
 
+  /* #126: read-mode description wrapper. Click-to-edit affordance
+     lives here — cursor: text hints at the editable prose; focus
+     ring covers keyboard / AT users. Nested SummaryText renders
+     its own chips; none are interactive so role=button on the
+     outer span is ARIA-compliant. */
+  .ai-desc {
+    display: inline;
+    cursor: text;
+    border-radius: 4px;
+  }
+  .ai-desc:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .ai-desc-empty {
+    display: inline-block;
+  }
+
   .ai-assignee {
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
-    margin-left: auto;
     padding: 0 0.3rem 0 0.15rem;
     border-radius: 999px;
     line-height: 1.4;
-    /* Nudge the chip onto the text baseline; Avatar renders as a
-       block-level round, so this keeps it centered on the line of
-       prose to its left. */
     align-self: baseline;
     white-space: nowrap;
   }
@@ -815,88 +1061,44 @@
     color: var(--name-c, var(--accent));
   }
 
-  /* Empty-description backstop. Shouldn't happen from valid data —
-     an LLM item always has a description and the manual-add UI
-     (Phase 3) validates non-empty. Keeps the row structurally
-     present if somehow it does. */
+  /* Empty-description backstop. */
   .ai-empty {
     color: var(--bone-4);
     font-style: normal;
     letter-spacing: 0.08em;
   }
 
-  /* Focus ring — inherits the app-level 2px accent outline on the
-     checkbox itself. `:focus-visible` so mouse clicks don't paint
-     one. */
   .ai-check:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
 
-  /* ── Phase 2 edit affordance (#19) ───────────────────────────── */
-
-  .ai-edit {
-    padding: 0.22rem 0.35rem;
-    margin-top: 0.1rem;
-    border: none;
-    background: transparent;
-    color: var(--bone-2);
-    cursor: pointer;
-    border-radius: 4px;
-    line-height: 0;
-    /* Hover-reveal on desktop. Touch / no-hover viewports get 0.7
-       always so the affordance is discoverable without pointer
-       hover. `:focus-visible` pops to 1 so keyboard users can find
-       it after tabbing in. */
-    opacity: 0.4;
-    transition: opacity 150ms linear;
-  }
-  .ai-row:hover .ai-edit,
-  .ai-edit:focus-visible {
-    opacity: 1;
-  }
-  .ai-edit:hover {
-    color: var(--accent);
-    background: var(--ink-2);
-  }
-  @media (hover: none) {
-    .ai-edit {
-      opacity: 0.7;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .ai-edit {
-      transition: none;
-    }
-  }
-  .ai-edit:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-
-  /* Editor block. Occupies the full body column when the row flips
-     into edit mode. `max-width: 100%` + `min-width: 0` keep flex
-     overflow in check on narrow viewports. */
-  .ai-editor {
+  /* #126: description-edit inline surface. No borders or Save
+     bar — the textarea IS the editor. Autoresize via JS; CSS
+     caps max-height at ~5 rows before scrolling. */
+  .ai-desc-editor {
     display: flex;
     flex-direction: column;
-    gap: 0.55rem;
+    gap: 0.35rem;
     width: 100%;
     min-width: 0;
   }
-
   .ai-edit-desc {
     width: 100%;
-    min-height: 5.5rem;
-    padding: 0.55rem 0.7rem;
-    border: 1px solid var(--hairline-hi);
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--hairline);
     border-radius: 10px;
     background: var(--ink-1);
     color: var(--bone-0);
     font: inherit;
     font-size: 0.9rem;
     line-height: 1.5;
-    resize: vertical;
+    /* Autoresize cap: 5 visible rows before the textarea scrolls.
+       JS autoresize in $effect owns the height on every keystroke,
+       so no CSS `resize` rule — it would only fight the JS on drag. */
+    max-height: calc(5 * 1.5em + 0.9rem);
+    overflow-y: auto;
+    transition: opacity 150ms linear;
   }
   .ai-edit-desc:focus {
     outline: none;
@@ -905,14 +1107,6 @@
   .ai-edit-desc:disabled {
     opacity: 0.6;
     cursor: not-allowed;
-  }
-
-  /* Give the picker a reserved vertical lane — its combobox dropdown
-     is absolute-positioned inside its own `.srp` root, but we still
-     want some breathing room so the rendered roster rows don't
-     bump into the Save / Cancel row immediately below. */
-  .ai-edit-picker {
-    position: relative;
   }
 
   .ai-edit-err {
@@ -924,62 +1118,140 @@
     font-size: 0.82rem;
   }
 
-  .ai-edit-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.4rem;
-    flex-wrap: wrap;
+  /* #126: owner-edit inline surface. Replaces the chip's DOM at the
+     right-side lane. Reserves the picker's width so the row doesn't
+     shift wildly when swapping chip → picker. */
+  .ai-owner-editor {
+    margin-left: auto;
+    align-self: baseline;
+    min-width: 11rem;
+    max-width: min(22rem, 70%);
+    flex: 0 1 auto;
   }
 
-  .ai-save,
-  .ai-cancel {
-    padding: 0.38rem 0.9rem;
-    border-radius: 6px;
-    font-size: 0.82rem;
-    font: inherit;
-    font-weight: 500;
+  /* #126: owner chip as a clickable button. Wraps the chip's visual
+     in a transparent button so click + focus-ring land naturally.
+     Hover gets a 150ms bg tint — understated, matches Linear-style
+     chips. */
+  .ai-assignee-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.1rem;
+    margin-left: auto;
+    align-self: baseline;
+  }
+  .ai-assignee-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 0;
+    border: none;
+    background: transparent;
     cursor: pointer;
-    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    font: inherit;
+    color: inherit;
+    transition: background 150ms linear;
+  }
+  .ai-assignee-btn-empty {
+    margin-left: auto;
+  }
+  .ai-assignee-btn:hover {
     background: var(--ink-2);
-    color: var(--bone-1);
   }
-  .ai-save {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: var(--ink-0);
+  .ai-assignee-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
-  .ai-save:disabled,
-  .ai-cancel:disabled {
-    opacity: 0.6;
+  @media (prefers-reduced-motion: reduce) {
+    .ai-assignee-btn {
+      transition: none;
+    }
+  }
+
+  /* #126 (A1): × clear-assignee glyph. Hover-revealed like .ai-del
+     (Phase 3 precedent) — opacity 0.4 at rest, 1 on row-hover or
+     focus-visible. Touch viewports get 0.7 always so the affordance
+     is still discoverable without pointer hover. */
+  .ai-assignee-clear {
+    padding: 0.15rem 0.2rem;
+    margin-left: -0.1rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-3);
+    cursor: pointer;
+    border-radius: 4px;
+    line-height: 0;
+    opacity: 0;
+    transition: opacity 150ms linear, color 150ms linear,
+      background 150ms linear;
+  }
+  .ai-row:hover .ai-assignee-clear,
+  .ai-assignee-clear:focus-visible {
+    opacity: 1;
+  }
+  .ai-assignee-clear:hover {
+    color: var(--live);
+    background: var(--ink-2);
+  }
+  @media (hover: none) {
+    .ai-assignee-clear {
+      opacity: 0.7;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-assignee-clear {
+      transition: none;
+    }
+  }
+  .ai-assignee-clear:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .ai-assignee-clear:disabled {
+    opacity: 0.4;
     cursor: not-allowed;
   }
 
-  /* Editing row: hide the trailing assignee chip (the picker is
-     editing it) so the layout doesn't double-up. The checkbox + idx
-     pill stay on the left as spatial anchors so the user knows
-     which row they're editing, per ui-phase-2 §D. */
+  /* During description-edit: hide the trailing assignee chip + trash
+     so the editor owns the row's horizontal space. Owner-edit does
+     NOT hide trash (ui-spec D7). */
   .ai-editing .ai-assignee,
-  .ai-editing .ai-assignee-empty {
+  .ai-editing .ai-assignee-empty,
+  .ai-editing .ai-assignee-wrap,
+  .ai-editing .ai-assignee-btn {
+    display: none;
+  }
+  .ai-editing .ai-actions {
     display: none;
   }
 
+  /* Saving dim — covers description, owner, and phantom POST
+     saves. Applied to .ai-body so interactive surfaces stay
+     readable but the user sees "something is in flight". */
+  .ai-saving .ai-body {
+    opacity: 0.65;
+    transition: opacity 150ms linear;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-saving .ai-body {
+      transition: none;
+    }
+  }
+
+  /* Pending (phantom) row — shares the .ai-editing visuals (row
+     already carries .ai-editing because the parent opens it in
+     description-edit mode on mount). The class is reserved for
+     future visual distinction if testers flag the "which is saved
+     which is phantom" question. */
+
   /* ── Phase 3 (#104): delete affordance + inline confirm ──────── */
 
-  /* Wraps pencil + trash in the row-actions slot so they share the
-     fourth grid column as a single flex cluster. The slot is
-     single-use — either [pencil + trash] OR the inline confirm
-     cluster, never both (see `{#if confirmingDelete}` branch in the
-     template). */
   .ai-actions {
     display: inline-flex;
     align-items: center;
     gap: 0.15rem;
   }
 
-  /* Trash button mirrors `.ai-edit` opacity rules. The only deltas
-     are the hover color (warm red signalling destructive) and the
-     margin-left (butt up against the pencil without the gap the
-     `.ai-actions` flex container supplies). */
   .ai-del {
     padding: 0.22rem 0.35rem;
     margin-top: 0.1rem;
@@ -1016,11 +1288,6 @@
     outline-offset: 1px;
   }
 
-  /* Inline-confirm cluster. Sits in the same grid column the
-     `.ai-actions` wrapper occupies when the row is at rest — the
-     zero-motion swap in ui-phase-3 §Motion relies on this being a
-     drop-in replacement. `flex-wrap: wrap` so narrow rows stack
-     Delete above Cancel without reaching into a new media query. */
   .ai-confirm {
     display: inline-flex;
     align-items: center;
@@ -1045,9 +1312,6 @@
   }
   .ai-confirm-delete,
   .ai-confirm-retry {
-    /* Warm red for the destructive primary — same `--live`/`--live-soft`
-       pairing used by `.ai-edit-err` so the two destructive surfaces
-       read consistently. */
     border-color: var(--live);
     background: var(--live-soft);
     color: var(--live);
@@ -1078,20 +1342,10 @@
   }
 
   /* ── Phase 3 (#104): Unassigned chip ─────────────────────────── */
-  /*
-     Renders when the FK is null AND the description has no inline
-     <name> marker. Shape mirrors `.ai-assignee` (same margin-left,
-     same baseline-alignment) so long-wrap behaviour stays
-     consistent — the chip snaps inline at the tail of `.ai-body` on
-     wide viewports and wraps beneath on narrow. The dashed-ring dot
-     carries `role="img"` + aria-label="Unassigned" in markup so AT
-     announces it; visible label is there for sighted users.
-  */
   .ai-assignee-empty {
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
-    margin-left: auto;
     padding: 0 0.3rem 0 0.15rem;
     border-radius: 999px;
     line-height: 1.4;
@@ -1112,24 +1366,11 @@
     font-size: 0.85rem;
     color: var(--bone-3);
   }
-  /* Done rows strike through the unassigned chip's label via the
-     cascade in `.ai-done .ai-body`, same as `.ai-assignee-name`. */
   .ai-done .ai-assignee-empty-label {
     text-decoration: line-through;
   }
 
   /* ── Phase 4 (#105): /actions call-context secondary line ───────── */
-  /*
-     Drops below the description + assignee chip via `flex-basis: 100%`
-     on the `.ai-body` flex container — no media query needed, the
-     existing flex-wrap rhythm handles narrow viewports (ui-phase-4
-     §Responsive). Whole line is an anchor so the hit target matches
-     the visual span; title + time resolve to the same destination.
-
-     Done-row strike-through in `.ai-done .ai-body` cascades through
-     the nested `<a>`; we override `.actx-context` color so the
-     strike reads cleanly over the muted text (ui-phase-4 §C).
-  */
   .actx-context {
     flex-basis: 100%;
     display: inline-flex;

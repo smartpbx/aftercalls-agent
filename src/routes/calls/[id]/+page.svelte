@@ -382,41 +382,232 @@
     }
   }
 
-  // Inline action-item edit ─────────────────────────────────────────
-  let editingActionItemId = $state<string | null>(null);
-  let actionItemSaving = $state(false);
+  // ── Action-item edit state machine (#126 / v0.4.2) ────────────────
+  //
+  // Row-scoped discriminated-union replaces the Phase 2
+  // `editingActionItemId` singleton + Phase 3 separate-composer
+  // state. See the portal mirror for the full architect commentary;
+  // this agent-surface version routes PATCH / POST through `invoke`
+  // instead of fetch but keeps the same state semantics. Mutual
+  // exclusion is parent-enforced; per-row PATCH in-flight tracked
+  // via `patchingItemIds: Set<string>`.
+  type ActiveRowEdit =
+    | { kind: "none" }
+    | { kind: "description"; itemId: string }
+    | { kind: "owner"; itemId: string };
+
+  let activeRowEdit = $state<ActiveRowEdit>({ kind: "none" });
+  let patchingItemIds = $state<Set<string>>(new Set());
   let actionItemErrors = $state<Record<string, string>>({});
 
-  function onActionItemEditStart(payload: { item: ActionItemRow }) {
-    // v0.4.1 (#122 D): mutual exclusion with the add composer.
-    // Pencil-click closes an open composer (unless mid-save —
-    // addSaving guards against stomping an in-flight POST).
-    if (addingItem && !addSaving) {
-      addingItem = false;
-      addError = "";
-      addDescDraft = "";
-      addAssigneeDraft = null;
-      addAssigneeValue = "";
+  let canAddActionItem = $derived.by(() => {
+    if (!canEditSummary) return false;
+    if (!call) return false;
+    return call.status === "complete" || call.status === "failed";
+  });
+
+  // Disable Add item while a phantom row is already open AND empty.
+  let hasEmptyPhantom = $derived.by(() => {
+    if (!call) return false;
+    const active = activeRowEdit;
+    if (active.kind !== "description") return false;
+    if (!active.itemId.startsWith("__pending__")) return false;
+    const row = call.action_items.find((ai) => ai.id === active.itemId);
+    if (!row) return false;
+    return (row.description ?? "").trim().length === 0;
+  });
+
+  function markPatching(itemId: string, on: boolean) {
+    if (on) {
+      patchingItemIds = new Set([...patchingItemIds, itemId]);
+    } else {
+      patchingItemIds = new Set(
+        [...patchingItemIds].filter((id) => id !== itemId),
+      );
     }
-    editingActionItemId = payload.item.id;
-    actionItemErrors = {};
   }
-  function onActionItemCancel() {
-    editingActionItemId = null;
-    actionItemErrors = {};
+
+  async function onDescriptionEditRequest(payload: { item: ActionItemRow }) {
+    if (!canEditSummary) return;
+    activeRowEdit = { kind: "description", itemId: payload.item.id };
   }
-  async function onActionItemSave(payload: {
+  async function onOwnerEditRequest(payload: { item: ActionItemRow }) {
+    if (!canEditSummary) return;
+    activeRowEdit = { kind: "owner", itemId: payload.item.id };
+  }
+
+  async function onDescriptionSave(payload: {
     itemId: string;
     description: string;
-    assigneeUserId: string | null;
   }) {
-    if (!call || actionItemSaving) return;
-    actionItemSaving = true;
+    if (!call) return;
+    if (payload.itemId.startsWith("__pending__")) return;
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
     actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const updated = (await invoke("patch_action_item", {
         callId: call.id,
         itemId: payload.itemId,
+        body: { description: payload.description },
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === updated.id ? updated : ai,
+        ),
+      };
+      if (
+        activeRowEdit.kind === "description" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "none" };
+      }
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg = /workspace|team|member/i.test(raw)
+        ? "That teammate isn't in your workspace. Pick someone from your team."
+        : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      console.warn("action item description save failed", e);
+    } finally {
+      markPatching(payload.itemId, false);
+    }
+  }
+
+  function onDescriptionCancel(payload: { item: ActionItemRow }) {
+    if (
+      activeRowEdit.kind === "description" &&
+      activeRowEdit.itemId === payload.item.id
+    ) {
+      activeRowEdit = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+
+  function onEditErrorClear(payload: { item: ActionItemRow }) {
+    if (actionItemErrors[payload.item.id]) {
+      actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+    }
+  }
+
+  async function onOwnerSave(payload: {
+    itemId: string;
+    assigneeUserId: string | null;
+  }) {
+    if (!call) return;
+    if (payload.itemId.startsWith("__pending__")) {
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === payload.itemId
+            ? { ...ai, assignee_user_id: payload.assigneeUserId }
+            : ai,
+        ),
+      };
+      if (
+        activeRowEdit.kind === "owner" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "description", itemId: payload.itemId };
+      }
+      return;
+    }
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const updated = (await invoke("patch_action_item", {
+        callId: call.id,
+        itemId: payload.itemId,
+        body: { assignee_user_id: payload.assigneeUserId },
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === updated.id ? updated : ai,
+        ),
+      };
+      if (
+        activeRowEdit.kind === "owner" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "none" };
+      }
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg = /workspace|team|member/i.test(raw)
+        ? "That teammate isn't in your workspace. Pick someone from your team."
+        : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      console.warn("action item owner save failed", e);
+    } finally {
+      markPatching(payload.itemId, false);
+    }
+  }
+
+  function onOwnerCancel(payload: { item: ActionItemRow }) {
+    if (
+      activeRowEdit.kind === "owner" &&
+      activeRowEdit.itemId === payload.item.id
+    ) {
+      activeRowEdit = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+
+  function openAddRow() {
+    if (!call) return;
+    if (!canAddActionItem) return;
+    if (hasEmptyPhantom) return;
+    const phantomId = `__pending__${crypto.randomUUID()}`;
+    const orderIndex =
+      call.action_items.length > 0
+        ? Math.max(...call.action_items.map((ai) => ai.order_index)) + 1
+        : 0;
+    const phantom: ActionItemRow = {
+      id: phantomId,
+      call_id: call.id,
+      description: "",
+      assignee_user_id: me?.user_id ?? null,
+      status: "open",
+      completed_at: null,
+      completed_by_user_id: null,
+      source: "manual",
+      created_at: new Date().toISOString(),
+      order_index: orderIndex,
+    };
+    call = {
+      ...call,
+      action_items: [...call.action_items, phantom],
+    };
+    activeRowEdit = { kind: "description", itemId: phantomId };
+    queueMicrotask(() => {
+      const el = document.querySelector<HTMLTextAreaElement>(
+        ".ai-row.ai-editing .ai-edit-desc",
+      );
+      el?.focus();
+    });
+  }
+
+  async function onPendingSave(payload: {
+    description: string;
+    assigneeUserId: string | null;
+  }) {
+    if (!call) return;
+    if (
+      activeRowEdit.kind !== "description" ||
+      !activeRowEdit.itemId.startsWith("__pending__")
+    ) {
+      return;
+    }
+    const phantomId = activeRowEdit.itemId;
+    if (patchingItemIds.has(phantomId)) return;
+    markPatching(phantomId, true);
+    actionItemErrors = { ...actionItemErrors, [phantomId]: "" };
+    try {
+      const created = (await invoke("add_action_item", {
+        callId: call.id,
         body: {
           description: payload.description,
           assignee_user_id: payload.assigneeUserId,
@@ -425,131 +616,40 @@
       call = {
         ...call,
         action_items: call.action_items.map((ai) =>
-          ai.id === updated.id ? updated : ai,
+          ai.id === phantomId ? created : ai,
         ),
       };
-      editingActionItemId = null;
+      activeRowEdit = { kind: "none" };
     } catch (e: any) {
       const raw = String(e?.message ?? e ?? "");
-      const msg =
-        /workspace|team|member/i.test(raw)
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
-      console.warn("action item save failed", e);
+      const msg = /workspace|team|member/i.test(raw)
+        ? "That teammate isn't in your workspace. Pick someone from your team."
+        : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [phantomId]: msg };
+      console.warn("action item phantom save failed", e);
     } finally {
-      actionItemSaving = false;
+      markPatching(phantomId, false);
     }
   }
 
-  // ── Phase 3 (#104): manual add composer ──────────────────────────
-  //
-  // Ghost "Add item" button in the Action items `.block-head-actions`
-  // toggles a composer appended at the bottom of the list
-  // (ui-phase-3 §A). Mirrors the portal implementation; Tauri invoke
-  // takes the place of fetch, every other behaviour identical.
-  let addingItem = $state(false);
-  let addSaving = $state(false);
-  let addError = $state("");
-  let addDescDraft = $state("");
-  let addAssigneeDraft = $state<string | null>(null);
-  let addAssigneeValue = $state("");
-
-  let canAddActionItem = $derived.by(() => {
-    if (!canEditSummary) return false;
-    if (!call) return false;
-    return call.status === "complete" || call.status === "failed";
-  });
-
-  function openAddComposer() {
-    if (!canAddActionItem) return;
-    // v0.4.1 (#122 D): mutual exclusion with the edit-in-place row.
-    // If a row is currently being edited, close it before opening
-    // the composer. `actionItemSaving` guards the in-flight PATCH —
-    // we don't stomp an active save, just wait for it to resolve.
-    if (editingActionItemId !== null && !actionItemSaving) {
-      editingActionItemId = null;
-      actionItemErrors = {};
-    }
-    addingItem = true;
-    addError = "";
-    addDescDraft = "";
-    addAssigneeDraft = null;
-    addAssigneeValue = "";
-    queueMicrotask(() => {
-      const ta = document.querySelector<HTMLTextAreaElement>(
-        ".ai-composer-desc",
-      );
-      ta?.focus();
-    });
-  }
-  function cancelAddComposer() {
-    if (addSaving) return;
-    addingItem = false;
-    addError = "";
-    addDescDraft = "";
-    addAssigneeDraft = null;
-    addAssigneeValue = "";
-  }
-  function onAddPickerPick(pick: SpeakerPick) {
-    if (pick.user) {
-      addAssigneeDraft = pick.user.id;
-      addAssigneeValue = pick.user.display_name;
-    } else {
-      addAssigneeDraft = null;
-      addAssigneeValue = pick.freeText;
-    }
-  }
-  function clearAddAssignee() {
-    addAssigneeDraft = null;
-    addAssigneeValue = "";
-  }
-  async function saveAddComposer() {
-    if (!call || addSaving) return;
-    const trimmed = addDescDraft.trim();
-    if (!trimmed) return;
-    addSaving = true;
-    addError = "";
-    try {
-      const created = (await invoke("add_action_item", {
-        callId: call.id,
-        body: {
-          description: trimmed,
-          assignee_user_id: addAssigneeDraft,
-        },
-      })) as ActionItemRow;
-      call = {
-        ...call,
-        action_items: [...call.action_items, created],
-      };
-      addingItem = false;
-      addDescDraft = "";
-      addAssigneeDraft = null;
-      addAssigneeValue = "";
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg =
-        /workspace|team|member/i.test(raw)
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      addError = msg;
-      console.warn("action item add failed", e);
-    } finally {
-      addSaving = false;
-    }
-  }
-  function onAddComposerKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      cancelAddComposer();
+  function onPendingDiscard() {
+    if (!call) return;
+    if (
+      activeRowEdit.kind !== "description" ||
+      !activeRowEdit.itemId.startsWith("__pending__")
+    ) {
       return;
     }
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      void saveAddComposer();
-      return;
-    }
+    const phantomId = activeRowEdit.itemId;
+    if (patchingItemIds.has(phantomId)) return;
+    call = {
+      ...call,
+      action_items: call.action_items.filter((ai) => ai.id !== phantomId),
+    };
+    activeRowEdit = { kind: "none" };
+    const nextErr = { ...actionItemErrors };
+    delete nextErr[phantomId];
+    actionItemErrors = nextErr;
   }
 
   // ── Phase 3 (#104): row-level delete with inline confirm ─────────
@@ -2362,8 +2462,8 @@
               <button
                 type="button"
                 class="add-item-btn"
-                onclick={openAddComposer}
-                disabled={addingItem || !canAddActionItem || regenInFlight}
+                onclick={openAddRow}
+                disabled={hasEmptyPhantom || !canAddActionItem || regenInFlight}
                 aria-label="Add action item"
               >
                 <svg
@@ -2400,15 +2500,25 @@
                 index={i}
                 colorFor={speakerColor}
                 canEdit={canEditSummary}
-                editing={editingActionItemId === item.id}
-                saving={actionItemSaving && editingActionItemId === item.id}
+                editingDescription={activeRowEdit.kind === "description" &&
+                  activeRowEdit.itemId === item.id}
+                editingOwner={activeRowEdit.kind === "owner" &&
+                  activeRowEdit.itemId === item.id}
+                pending={item.id.startsWith("__pending__")}
+                saving={patchingItemIds.has(item.id)}
                 editError={actionItemErrors[item.id] ?? ""}
                 confirmingDelete={confirmingDeleteId === item.id}
                 deleting={deletingId === item.id}
                 deleteError={deleteErrors[item.id] ?? ""}
-                onedit={onActionItemEditStart}
-                onsave={onActionItemSave}
-                oncancel={onActionItemCancel}
+                onDescriptionEditRequest={onDescriptionEditRequest}
+                onOwnerEditRequest={onOwnerEditRequest}
+                onDescriptionSave={onDescriptionSave}
+                onOwnerSave={onOwnerSave}
+                onDescriptionCancel={onDescriptionCancel}
+                onOwnerCancel={onOwnerCancel}
+                onPendingSave={onPendingSave}
+                onPendingDiscard={onPendingDiscard}
+                onEditErrorClear={onEditErrorClear}
                 ondeleterequest={onActionItemDeleteRequest}
                 ondeleteconfirm={onActionItemDeleteConfirm}
                 ondeletecancel={onActionItemDeleteCancel}
@@ -2417,61 +2527,6 @@
             {/if}
           {/each}
         </ul>
-        {#if addingItem}
-          <!-- Phase 3 (#104): inline add composer. Same shape as the
-               portal's — textarea + picker + Save/Cancel. -->
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <form
-            class="ai-composer"
-            onkeydown={onAddComposerKeydown}
-            onsubmit={(e) => e.preventDefault()}
-            aria-label="Add action item"
-          >
-            <textarea
-              class="ai-composer-desc"
-              bind:value={addDescDraft}
-              disabled={addSaving}
-              rows="3"
-              placeholder="Describe the task…"
-              aria-label="New action item description"
-            ></textarea>
-            <div class="ai-composer-picker">
-              <SpeakerRenamePicker
-                bind:value={addAssigneeValue}
-                roster={memberRoster}
-                rosterLoaded={memberRosterLoaded}
-                saving={false}
-                variant="stack"
-                autofocus={false}
-                placeholder="Assign to a teammate…"
-                noMatchHint="No match — leave empty to keep this item unassigned."
-                onpick={onAddPickerPick}
-                oncancel={clearAddAssignee}
-              />
-            </div>
-            {#if addError}
-              <p class="ai-composer-err" role="alert">{addError}</p>
-            {/if}
-            <div class="ai-composer-actions">
-              <button
-                type="button"
-                class="ai-composer-save"
-                disabled={addSaving || addDescDraft.trim().length === 0}
-                onclick={saveAddComposer}
-              >
-                {addSaving ? "Saving…" : "Save"}
-              </button>
-              <button
-                type="button"
-                class="ai-composer-cancel"
-                disabled={addSaving}
-                onclick={cancelAddComposer}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        {/if}
         {#if regenInFlight}
           <div class="gen-shimmer gen-shimmer-actions">
             <div class="gen-line short"></div>
@@ -2495,8 +2550,8 @@
               <button
                 type="button"
                 class="add-item-btn"
-                onclick={openAddComposer}
-                disabled={addingItem || !canAddActionItem}
+                onclick={openAddRow}
+                disabled={hasEmptyPhantom || !canAddActionItem}
                 aria-label="Add action item"
               >
                 <svg
@@ -2519,64 +2574,49 @@
             {/if}
           </div>
         </div>
-        {#if !addingItem}
+        {#if call.action_items.length === 0}
           <p class="empty-hint">
             No action items for this call yet. Add one if you want to
             track a follow-up task for this conversation.
           </p>
-        {/if}
-        {#if addingItem}
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <form
-            class="ai-composer"
-            onkeydown={onAddComposerKeydown}
-            onsubmit={(e) => e.preventDefault()}
-            aria-label="Add action item"
-          >
-            <textarea
-              class="ai-composer-desc"
-              bind:value={addDescDraft}
-              disabled={addSaving}
-              rows="3"
-              placeholder="Describe the task…"
-              aria-label="New action item description"
-            ></textarea>
-            <div class="ai-composer-picker">
-              <SpeakerRenamePicker
-                bind:value={addAssigneeValue}
-                roster={memberRoster}
-                rosterLoaded={memberRosterLoaded}
-                saving={false}
-                variant="stack"
-                autofocus={false}
-                placeholder="Assign to a teammate…"
-                noMatchHint="No match — leave empty to keep this item unassigned."
-                onpick={onAddPickerPick}
-                oncancel={clearAddAssignee}
+        {:else}
+          <!-- #126: phantom rows inserted by Add item render here via
+               the ActionItem mirror pair. No separate composer. -->
+          <ul class="actions">
+            {#each call.action_items as item, i (item.id)}
+              <ActionItem
+                {item}
+                users={memberRoster}
+                callId={call.id}
+                index={i}
+                colorFor={speakerColor}
+                canEdit={canEditSummary}
+                editingDescription={activeRowEdit.kind === "description" &&
+                  activeRowEdit.itemId === item.id}
+                editingOwner={activeRowEdit.kind === "owner" &&
+                  activeRowEdit.itemId === item.id}
+                pending={item.id.startsWith("__pending__")}
+                saving={patchingItemIds.has(item.id)}
+                editError={actionItemErrors[item.id] ?? ""}
+                confirmingDelete={confirmingDeleteId === item.id}
+                deleting={deletingId === item.id}
+                deleteError={deleteErrors[item.id] ?? ""}
+                onDescriptionEditRequest={onDescriptionEditRequest}
+                onOwnerEditRequest={onOwnerEditRequest}
+                onDescriptionSave={onDescriptionSave}
+                onOwnerSave={onOwnerSave}
+                onDescriptionCancel={onDescriptionCancel}
+                onOwnerCancel={onOwnerCancel}
+                onPendingSave={onPendingSave}
+                onPendingDiscard={onPendingDiscard}
+                onEditErrorClear={onEditErrorClear}
+                ondeleterequest={onActionItemDeleteRequest}
+                ondeleteconfirm={onActionItemDeleteConfirm}
+                ondeletecancel={onActionItemDeleteCancel}
+                ontoggle={canEditSummary ? onActionItemToggle : undefined}
               />
-            </div>
-            {#if addError}
-              <p class="ai-composer-err" role="alert">{addError}</p>
-            {/if}
-            <div class="ai-composer-actions">
-              <button
-                type="button"
-                class="ai-composer-save"
-                disabled={addSaving || addDescDraft.trim().length === 0}
-                onclick={saveAddComposer}
-              >
-                {addSaving ? "Saving…" : "Save"}
-              </button>
-              <button
-                type="button"
-                class="ai-composer-cancel"
-                disabled={addSaving}
-                onclick={cancelAddComposer}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
+            {/each}
+          </ul>
         {/if}
       </section>
     {:else if call.status !== "complete" && call.status !== "failed"}
@@ -3644,101 +3684,10 @@
     max-width: 56ch;
   }
 
-  /* Inline-add composer. Rhythm mirrors `.ai-editor` inside
-     `ActionItem.svelte`: textarea, picker, optional error, Save +
-     Cancel. Duplicated here rather than lifted because the composer
-     is page-scoped (ui-phase-3 Decision B — don't proliferate mirror
-     pairs). */
-  .ai-composer {
-    display: flex;
-    flex-direction: column;
-    gap: 0.55rem;
-    width: 100%;
-    min-width: 0;
-    padding: 0.75rem 0 0.2rem;
-    border-top: 1px solid var(--hairline);
-    margin-top: 0.3rem;
-    animation: ai-composer-in 150ms ease-out;
-  }
-  @keyframes ai-composer-in {
-    from {
-      opacity: 0;
-      transform: translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .ai-composer {
-      animation: none;
-    }
-  }
-
-  .ai-composer-desc {
-    width: 100%;
-    min-height: 5.5rem;
-    padding: 0.55rem 0.7rem;
-    border: 1px solid var(--hairline-hi);
-    border-radius: 10px;
-    background: var(--ink-1);
-    color: var(--bone-0);
-    font: inherit;
-    font-size: 0.9rem;
-    line-height: 1.5;
-    resize: vertical;
-  }
-  .ai-composer-desc:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .ai-composer-desc:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  .ai-composer-picker {
-    position: relative;
-  }
-
-  .ai-composer-err {
-    margin: 0;
-    padding: 0.4rem 0.55rem;
-    border-radius: 6px;
-    background: var(--live-soft);
-    color: var(--live);
-    font-size: 0.82rem;
-  }
-
-  .ai-composer-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-  }
-  .ai-composer-save,
-  .ai-composer-cancel {
-    padding: 0.38rem 0.9rem;
-    border-radius: 6px;
-    font-size: 0.82rem;
-    font: inherit;
-    font-weight: 500;
-    cursor: pointer;
-    border: 1px solid var(--hairline);
-    background: var(--ink-2);
-    color: var(--bone-1);
-  }
-  .ai-composer-save {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: var(--ink-0);
-  }
-  .ai-composer-save:disabled,
-  .ai-composer-cancel:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
+  /* #126 (v0.4.2): the separate `.ai-composer` block retired — Add
+     item now appends a phantom row directly to the list and the
+     row's own textarea IS the composer. Rules moved to
+     ActionItem.svelte (.ai-edit-desc, .ai-edit-err). */
 
   .gen-shimmer {
     padding: 0.2rem 0;

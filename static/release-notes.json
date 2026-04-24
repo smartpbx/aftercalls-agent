@@ -1,4 +1,13 @@
 {
+  "0.4.2": {
+    "headline": "Click-to-edit action items — tap to edit, tap the owner chip to reassign; Windows drag fix",
+    "changes": [
+      "Click anywhere on an action item's description to edit it in place. No pencil icon, no Save button — blur, Enter, or Tab commits; Escape cancels. Shift+Enter inserts a newline.",
+      "Click the owner chip to reassign. The chip becomes a picker inline; pick a teammate and it commits on the spot. An × inside the chip clears the owner.",
+      "Add item appends a new row inline — cursor lands in the description, your name is the default owner, blur saves. No separate composer block.",
+      "Windows: dragging the top bar to move the window works again. This broke a few releases ago when the update pill gained wrap support; the drag surface is now restored across the whole bar."
+    ]
+  },
   "0.4.1": {
     "headline": "Action-items polish — name chips after rename, click-outside to cancel, regenerate runs in the background",
     "changes": [

@@ -24,6 +24,9 @@
     type MeActionItem,
     type ActionsStatusFilter,
     type MeActionItemsResponse,
+    type ActionsActiveRowEdit,
+    type ActionsDescriptionSave,
+    type ActionsOwnerSave,
   } from "$lib/ActionsList.svelte";
   import type { ActionItemUser } from "$lib/ActionItem.svelte";
 
@@ -240,6 +243,130 @@
   function onRetry() {
     void loadFirst();
   }
+
+  // ── Click-to-edit machinery (#126 / v0.4.2) ───────────────────────
+  // Mirrors the portal /actions wrapper; invoke replaces fetch.
+  let activeRowEdit = $state<ActionsActiveRowEdit>({ kind: "none" });
+  let patchingItemIds = $state<Set<string>>(new Set());
+  let actionItemErrors = $state<Record<string, string>>({});
+
+  function markPatching(itemId: string, on: boolean) {
+    if (on) {
+      patchingItemIds = new Set([...patchingItemIds, itemId]);
+    } else {
+      patchingItemIds = new Set(
+        [...patchingItemIds].filter((id) => id !== itemId),
+      );
+    }
+  }
+
+  function onDescriptionEditRequest(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    activeRowEdit = { kind: "description", itemId: payload.item.id };
+  }
+  function onOwnerEditRequest(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    activeRowEdit = { kind: "owner", itemId: payload.item.id };
+  }
+
+  async function onDescriptionSave(payload: ActionsDescriptionSave) {
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const updated = (await invoke("patch_action_item", {
+        callId: payload.callId,
+        itemId: payload.itemId,
+        body: { description: payload.description },
+      })) as MeActionItem;
+      items = items.map((it) =>
+        it.id === payload.itemId
+          ? { ...it, description: updated.description }
+          : it,
+      );
+      if (
+        activeRowEdit.kind === "description" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "none" };
+      }
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg = /workspace|team|member/i.test(raw)
+        ? "That teammate isn't in your workspace. Pick someone from your team."
+        : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+    } finally {
+      markPatching(payload.itemId, false);
+    }
+  }
+
+  async function onOwnerSave(payload: ActionsOwnerSave) {
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const updated = (await invoke("patch_action_item", {
+        callId: payload.callId,
+        itemId: payload.itemId,
+        body: { assignee_user_id: payload.assigneeUserId },
+      })) as MeActionItem;
+      items = items.map((it) =>
+        it.id === payload.itemId
+          ? { ...it, assignee_user_id: updated.assignee_user_id }
+          : it,
+      );
+      if (
+        activeRowEdit.kind === "owner" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "none" };
+      }
+    } catch (e: any) {
+      const raw = String(e?.message ?? e ?? "");
+      const msg = /workspace|team|member/i.test(raw)
+        ? "That teammate isn't in your workspace. Pick someone from your team."
+        : "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+    } finally {
+      markPatching(payload.itemId, false);
+    }
+  }
+
+  function onDescriptionCancel(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (
+      activeRowEdit.kind === "description" &&
+      activeRowEdit.itemId === payload.item.id
+    ) {
+      activeRowEdit = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+  function onOwnerCancel(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (
+      activeRowEdit.kind === "owner" &&
+      activeRowEdit.itemId === payload.item.id
+    ) {
+      activeRowEdit = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+  function onEditErrorClear(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (actionItemErrors[payload.item.id]) {
+      actionItemErrors = {
+        ...actionItemErrors,
+        [payload.item.id]: "",
+      };
+    }
+  }
 </script>
 
 <svelte:head>
@@ -258,8 +385,19 @@
   {orgMembers}
   {transientError}
   {togglingIds}
+  canEdit={true}
+  {activeRowEdit}
+  {patchingItemIds}
+  {actionItemErrors}
   onfilterchange={onFilterChange}
   ontoggle={onToggle}
   onloadmore={loadMore}
   onretry={onRetry}
+  onDescriptionEditRequest={onDescriptionEditRequest}
+  onOwnerEditRequest={onOwnerEditRequest}
+  onDescriptionSave={onDescriptionSave}
+  onOwnerSave={onOwnerSave}
+  onDescriptionCancel={onDescriptionCancel}
+  onOwnerCancel={onOwnerCancel}
+  onEditErrorClear={onEditErrorClear}
 />

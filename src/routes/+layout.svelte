@@ -1070,16 +1070,17 @@
         <span class="crumb" data-tauri-drag-region>{pageTitle}</span>
       </div>
 
-      <div class="strip-right">
+      <div class="strip-right" data-tauri-drag-region>
         {#if orphans.length > 0}
           <!-- Orphan recovery pill (#63). Same shape as the update
                pill: a thin rounded chip with status pip + label +
                primary + dismiss action. Sig-yellow pip so it reads
                as an interrupt without the warning-red weight. -->
-          <div class="update">
-            <span class="pip sig"></span>
+          <div class="update" data-tauri-drag-region>
+            <span class="pip sig" data-tauri-drag-region></span>
             <span
               class="update-label"
+              data-tauri-drag-region
               title={`${orphans.length} unfinished call${orphans.length === 1 ? "" : "s"} from before the last restart`}
             >
               {orphans.length} unfinished call{orphans.length === 1 ? "" : "s"}
@@ -1105,11 +1106,12 @@
           </div>
         {/if}
         {#if updateAvailable}
-          <div class="update">
+          <div class="update" data-tauri-drag-region>
             {#if updateState === "downloading"}
-              <span class="pip working"></span>
+              <span class="pip working" data-tauri-drag-region></span>
               <span
                 class="update-label"
+                data-tauri-drag-region
                 title={`Updating to v${updateAvailable.version}…${updateTotal > 0 ? ` ${Math.min(100, Math.round((updateDownloaded / updateTotal) * 100))}%` : ""}`}
               >
                 Updating to v{updateAvailable.version}…
@@ -1118,16 +1120,17 @@
                 {/if}
               </span>
             {:else if updateState === "ready"}
-              <span class="pip done"></span>
-              <span class="update-label" title="Restarting…">Restarting…</span>
+              <span class="pip done" data-tauri-drag-region></span>
+              <span class="update-label" data-tauri-drag-region title="Restarting…">Restarting…</span>
             {:else if updateState === "error"}
-              <span class="pip failed"></span>
-              <span class="update-label" title={updateError}>Update failed</span>
+              <span class="pip failed" data-tauri-drag-region></span>
+              <span class="update-label" data-tauri-drag-region title={updateError}>Update failed</span>
               <button class="update-dismiss" onclick={dismissUpdate}>Dismiss</button>
             {:else}
-              <span class="pip sig"></span>
+              <span class="pip sig" data-tauri-drag-region></span>
               <span
                 class="update-label"
+                data-tauri-drag-region
                 title={`v${updateAvailable.version} available`}
               >
                 v{updateAvailable.version} available
@@ -1137,10 +1140,11 @@
             {/if}
           </div>
         {:else if linuxUpdateAvailable}
-          <div class="update">
-            <span class="pip sig"></span>
+          <div class="update" data-tauri-drag-region>
+            <span class="pip sig" data-tauri-drag-region></span>
             <span
               class="update-label"
+              data-tauri-drag-region
               title={`v${linuxUpdateAvailable} available`}
             >
               v{linuxUpdateAvailable} available
@@ -1154,28 +1158,28 @@
           </div>
         {/if}
 
-        <div class="indicator">
+        <div class="indicator" data-tauri-drag-region>
           {#if recording && pipelineStage && pipelineStage !== "done"}
             <!-- Back-to-back case: user's recording a new call while the
                  previous one is still processing. Keep both visible so
                  the pipeline progress isn't lost behind the live pill. -->
-            <span class="pip live"></span>
-            <span class="ind-label">Recording</span>
-            <span class="ind-sep">·</span>
-            <span class="pip {pipelineStage}"></span>
-            <span class="ind-label">{stageLabel[pipelineStage] ?? pipelineStage}</span>
+            <span class="pip live" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>Recording</span>
+            <span class="ind-sep" data-tauri-drag-region>·</span>
+            <span class="pip {pipelineStage}" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>{stageLabel[pipelineStage] ?? pipelineStage}</span>
           {:else if recording}
-            <span class="pip live"></span>
-            <span class="ind-label">Recording</span>
+            <span class="pip live" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>Recording</span>
           {:else if pipelineStage && pipelineStage !== "done"}
-            <span class="pip {pipelineStage}"></span>
-            <span class="ind-label">{stageLabel[pipelineStage] ?? pipelineStage}</span>
+            <span class="pip {pipelineStage}" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>{stageLabel[pipelineStage] ?? pipelineStage}</span>
           {:else if pipelineStage === "done"}
-            <span class="pip done"></span>
-            <span class="ind-label">Saved</span>
+            <span class="pip done" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>Saved</span>
           {:else}
-            <span class="pip idle"></span>
-            <span class="ind-label">Idle</span>
+            <span class="pip idle" data-tauri-drag-region></span>
+            <span class="ind-label" data-tauri-drag-region>Idle</span>
           {/if}
         </div>
 
