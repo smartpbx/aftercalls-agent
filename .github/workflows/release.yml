@@ -52,12 +52,19 @@ jobs:
           # GitHub-release attachment + no Spaces publish unless
           # workflow_dispatch input `enable_mac_publish` is true. See
           # the comment on `enable_mac_publish` for the gating rationale.
+          #
+          # `experimental: true` flips per-job continue-on-error so the
+          # publish-to-spaces job can fire after Linux + Windows even
+          # when a macOS runner is queued for 30+ min (#41 follow-up).
           - os: macos-13
             target: x86_64-apple-darwin
+            experimental: true
           - os: macos-14
             target: aarch64-apple-darwin
+            experimental: true
 
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
 
     steps:
       - uses: actions/checkout@v4
