@@ -5,6 +5,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
+  import { portalErrorToText } from "$lib/portalError";
 
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
@@ -85,7 +86,7 @@
       await invoke("logout");
       goto("/login");
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       signingOut = false;
     }
@@ -357,7 +358,7 @@
       });
       prefsSavedAt = Date.now();
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -568,7 +569,7 @@
         vault.path = chosen;
       }
     } catch (e) {
-      vaultError = String(e);
+      vaultError = portalErrorToText(e);
     }
   }
 
@@ -583,7 +584,7 @@
       });
       vaultSavedAt = Date.now();
     } catch (e) {
-      vaultError = String(e);
+      vaultError = portalErrorToText(e);
     } finally {
       vaultSaving = false;
     }

@@ -25,7 +25,12 @@
     type SzmPushResponse,
   } from "$lib/SendToZohoModal.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
-  import { isPortalError, type PortalError } from "$lib/portalError";
+  import {
+    isPortalError,
+    portalErrorToText,
+    type PortalError,
+  } from "$lib/portalError";
+  import ShareCallModal from "$lib/ShareCallModal.svelte";
 
   type Utterance = {
     idx: number;
@@ -59,6 +64,10 @@
     source: "llm" | "manual";
     created_at: string;
     order_index: number;
+    // #173 — due-date metadata. `due_at` is `YYYY-MM-DD` only when
+    // `due_kind === "dated"`; null otherwise.
+    due_kind: "none" | "asap" | "dated";
+    due_at: string | null;
   };
 
   type Call = {
@@ -92,6 +101,10 @@
     display_name: string;
     role: string;
     org_display_name: string;
+    /// #215 — per-org feature flags. Optional so older auth.json
+    /// files (before this field landed) deserialize cleanly; missing
+    /// keys default to false → Zoho UI hidden.
+    features?: { zoho?: boolean };
   };
 
   function prettyApp(raw: string | null): string | null {
@@ -251,6 +264,11 @@
   // open call-detail tabs without requiring a reload. The store seeds
   // via `refresh()` in onMount and listens for the `storage` event.
   let zohoConnected = $derived(zohoStore.connected);
+  // #215 — per-org feature gate. Even if the cached `zohoStore`
+  // reports a live connection, hide the entire Send-to-CRM surface
+  // when `me.features.zoho` is false. Backend double-checks via 404
+  // on every Zoho route, so this is purely UX.
+  let zohoFeatureEnabled = $derived(!!me?.features?.zoho);
   let zohoFallbackOwnerName = $derived(zohoStore.connectedByDisplayName);
   let zohoModalOpen = $state(false);
   let zohoPushed = $derived(
@@ -301,22 +319,54 @@
           callId,
           body,
         })) as SzmPushResponse;
-      } catch (e: any) {
-        // Tauri command errors come back as plain strings; reshape
-        // into a fetch-style error for the modal's error-classifier.
-        const msg = String(e ?? "");
-        const status = parseStatusFromInvokeError(msg);
-        const err = new Error(msg) as Error & { status?: number };
+      } catch (e: unknown) {
+        // Tauri command now returns a structured PortalError (#124
+        // sweep). Reshape into a fetch-style `{message, status}` so
+        // the modal's existing 429 / 404 / 502 classifier keeps
+        // working without re-plumbing every branch.
+        const status = portalErrorToStatus(e);
+        const message = portalErrorMessage(e);
+        const err = new Error(message) as Error & { status?: number };
         if (status) err.status = status;
         throw err;
       }
     },
   };
 
-  function parseStatusFromInvokeError(msg: string): number | undefined {
-    // portal helper formats backend non-success as `backend <CODE>: <body>`.
-    const m = msg.match(/backend (\d{3})/);
-    return m ? Number(m[1]) : undefined;
+  function portalErrorToStatus(e: unknown): number | undefined {
+    // Map the structured `kind` discriminator back onto an HTTP status
+    // for legacy callsites that still branch on numeric codes. `network`
+    // and `other` deliberately return undefined so the caller's
+    // "unable to reach the server" branch fires.
+    if (!isPortalError(e)) return undefined;
+    switch (e.kind) {
+      case "cooldown":
+        return 429;
+      case "bad_request":
+        return 400;
+      case "unauthorized":
+        return 401;
+      case "forbidden":
+        return 403;
+      case "not_found":
+        return 404;
+      case "server":
+        return e.status;
+      default:
+        return undefined;
+    }
+  }
+
+  function portalErrorMessage(e: unknown): string {
+    if (isPortalError(e)) {
+      if (e.kind === "unauthorized") return "Not signed in.";
+      if (e.kind === "forbidden") return "Not allowed.";
+      if (e.kind === "not_found") return "Not found.";
+      if (e.kind === "cooldown") return "Try again in a moment.";
+      // bad_request / network / server / other all carry message.
+      return ("message" in e && e.message) || "Request failed.";
+    }
+    return String((e as { message?: string })?.message ?? e ?? "");
   }
 
   function openZohoUrl(url: string) {
@@ -338,6 +388,113 @@
   }
 
   const zohoPriorPush: SzmPriorPush | null = null;
+
+  // ── Share call (#35 / #243) ─────────────────────────────────────
+  // The portal's call-detail page mounts ShareCallModal with a fetch-
+  // backed api object; on the agent the same modal mounts with these
+  // Tauri-command shims (identical surface, different transport).
+  // Errors arrive as PortalError (#124) — reshape to plain
+  // Error so the modal's catch blocks render a sensible message.
+  let shareModalOpen = $state(false);
+
+  function openShareModal() {
+    shareModalOpen = true;
+  }
+  function closeShareModal() {
+    shareModalOpen = false;
+  }
+
+  // Owner-or-admin gate — same posture as the portal copy. The agent
+  // is almost always viewing the user's own recordings (the local-
+  // session pipeline lands them in this org), so a member-role agent
+  // user can share their own calls. Cross-org shares already 403 at
+  // the backend, so a wrong-side click is just a benign warning.
+  let canShare = $derived.by(() => !!me && !!call);
+
+  type ShareIncluded = {
+    manual_notes: boolean;
+    summary: boolean;
+    action_items: boolean;
+    transcript: boolean;
+    audio: boolean;
+    allow_download: boolean;
+  };
+
+  function portalErrorToError(e: unknown): Error {
+    if (isPortalError(e)) {
+      const pe = e as PortalError;
+      switch (pe.kind) {
+        case "forbidden":
+          return new Error("You don't have permission to share this call.");
+        case "not_found":
+          return new Error("This call no longer exists.");
+        case "unauthorized":
+          return new Error("Sign in again to manage shares.");
+        case "network":
+          return new Error("Network error — try again in a moment.");
+        case "bad_request":
+          return new Error(pe.message || "The request was rejected.");
+        case "server":
+        case "other":
+        case "cooldown":
+        default:
+          return new Error("Couldn't reach the server. Try again.");
+      }
+    }
+    return e instanceof Error ? e : new Error(String(e));
+  }
+
+  const shareApi = {
+    createShare: async (
+      id: string,
+      expiresInDays: number | null,
+      includedSections?: ShareIncluded,
+    ) => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (expiresInDays !== null) body.expires_in_days = expiresInDays;
+        if (includedSections) body.included_sections = includedSections;
+        return (await invoke("create_call_share", {
+          callId: id,
+          body,
+        })) as {
+          id: string;
+          token: string;
+          url: string;
+          expires_at: string | null;
+          created_at: string;
+          included_sections: ShareIncluded;
+        };
+      } catch (e) {
+        throw portalErrorToError(e);
+      }
+    },
+    listShares: async (id: string) => {
+      try {
+        return (await invoke("list_call_shares", { callId: id })) as Array<{
+          id: string;
+          call_id: string;
+          url: null;
+          created_by: string | null;
+          created_at: string;
+          expires_at: string | null;
+          revoked_at: string | null;
+          view_count: number;
+          status: "active" | "expired" | "revoked";
+          included_sections: ShareIncluded;
+        }>;
+      } catch (e) {
+        throw portalErrorToError(e);
+      }
+    },
+    revokeShare: async (callId: string, shareId: string) => {
+      try {
+        await invoke("revoke_call_share", { callId, shareId });
+      } catch (e) {
+        throw portalErrorToError(e);
+      }
+    },
+  };
 
   // Member viewing an admin-shared call: read-only. In the agent the
   // user is almost always the owner (local-session path) but we still
@@ -468,7 +625,10 @@
     | { kind: "none" }
     | { kind: "summary"; draft: string; saving: boolean; error: string }
     | { kind: "row-description"; itemId: string }
-    | { kind: "row-owner"; itemId: string };
+    | { kind: "row-owner"; itemId: string }
+    // #173 — due-date editor mutual-exclusion. Mirrors the existing
+    // row-description / row-owner pattern.
+    | { kind: "row-due"; itemId: string };
 
   let editFocus = $state<EditFocus>({ kind: "none" });
   let patchingItemIds = $state<Set<string>>(new Set());
@@ -700,6 +860,66 @@
     actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
 
+  // ── #173: due-date edit handlers ─────────────────────────────────
+  function onDueEditRequest(payload: { item: ActionItemRow }) {
+    if (!canEditSummary) return;
+    editFocus = { kind: "row-due", itemId: payload.item.id };
+  }
+  function onDueCancel(payload: { item: ActionItemRow }) {
+    if (
+      editFocus.kind === "row-due" &&
+      editFocus.itemId === payload.item.id
+    ) {
+      editFocus = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+  async function onDueSave(
+    payload:
+      | { itemId: string; kind: "none" }
+      | { itemId: string; kind: "asap" }
+      | { itemId: string; kind: "dated"; dueAt: string },
+  ) {
+    if (!call) return;
+    if (payload.itemId.startsWith("__pending__")) return;
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const body =
+        payload.kind === "dated"
+          ? { due_kind: "dated" as const, due_at: payload.dueAt }
+          : payload.kind === "asap"
+            ? { due_kind: "asap" as const, due_at: null }
+            : { due_kind: "none" as const, due_at: null };
+      const updated = (await invoke("patch_action_item", {
+        callId: call.id,
+        itemId: payload.itemId,
+        body,
+      })) as ActionItemRow;
+      call = {
+        ...call,
+        action_items: call.action_items.map((ai) =>
+          ai.id === updated.id ? updated : ai,
+        ),
+      };
+      if (
+        editFocus.kind === "row-due" &&
+        editFocus.itemId === payload.itemId
+      ) {
+        editFocus = { kind: "none" };
+      }
+    } catch (e) {
+      actionItemErrors = {
+        ...actionItemErrors,
+        [payload.itemId]: "Save failed. Check your connection and try again.",
+      };
+      console.warn("action item due save failed", e);
+    } finally {
+      markPatching(payload.itemId, false);
+    }
+  }
+
   function openAddRow() {
     if (!call) return;
     if (!canAddActionItem) return;
@@ -720,6 +940,10 @@
       source: "manual",
       created_at: new Date().toISOString(),
       order_index: orderIndex,
+      // #173 — phantom defaults to "no due date". The user can set
+      // one after the row commits.
+      due_kind: "none",
+      due_at: null,
     };
     call = {
       ...call,
@@ -1318,7 +1542,7 @@
       trace("loadAudio done", { src: audioSrc, err: audioError });
     } catch (e) {
       trace("onMount FATAL", e);
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       loading = false;
       trace("onMount end loading=false");
@@ -1398,7 +1622,7 @@
       });
       highlights = [...highlights, created].sort((a, b) => a.start_ms - b.start_ms);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -1429,7 +1653,7 @@
         autoDetectResult = "";
       }, 4000);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       autoDetecting = false;
     }
@@ -1440,7 +1664,7 @@
       await invoke("delete_highlight", { id });
       highlights = highlights.filter((h) => h.id !== id);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -1454,7 +1678,7 @@
         h.id === id ? { ...h, label, kind: kind ?? h.kind } : h,
       );
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -1655,7 +1879,7 @@
       await writeText(text);
       flashCopied(label);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -1664,7 +1888,7 @@
       await writeHtml(html, plain);
       flashCopied(label);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -1801,7 +2025,7 @@
       );
       cancelEdit();
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       savingEdit = false;
     }
@@ -1881,7 +2105,7 @@
       };
       scheduleBulkDismiss();
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
       bulkStatus = {
         kind: "error",
         from,
@@ -1914,7 +2138,7 @@
         bulkDismissTimer = null;
       }
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       bulkUndoBusy = false;
     }
@@ -2094,7 +2318,7 @@
       });
       window.location.href = "/calls";
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
       deleting = false;
     }
   }
@@ -2368,7 +2592,7 @@
       call = await invoke<Call>("get_call", { id: call.id });
       cancelSpeakerRename();
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       savingSpeaker = false;
     }
@@ -2807,9 +3031,45 @@
             {/if}
           </div>
         </div>
-        <button class="delete" disabled={deleting} onclick={askDeleteCall}>
-          {deleting ? "Deleting…" : "Delete"}
-        </button>
+        <!-- #244 Action bar (right side). Group Share | Send to CRM
+             | Delete together — these are the "what to do with this
+             call" actions. Copy + Regenerate stay in the Summary
+             block-head (read-only / iterate-on-this-call). Cluster
+             ordering: least-destructive on the left, most on the
+             right (Share -> Send to CRM -> Delete). -->
+        <div class="head-actions">
+          {#if canShare}
+            <button
+              type="button"
+              class="head-action share"
+              onclick={openShareModal}
+              disabled={regenInFlight}
+            >
+              Share
+            </button>
+          {/if}
+          {#if zohoFeatureEnabled && zohoConnected && call.status === "complete"}
+            <button
+              type="button"
+              class="head-action send-crm"
+              onclick={openSendToZoho}
+              disabled={regenInFlight}
+            >
+              Send to CRM
+              {#if zohoPushed}
+                <span class="pip done crm-pip" aria-hidden="true"></span>
+                <span class="visually-hidden">Already pushed</span>
+              {/if}
+            </button>
+          {/if}
+          <button
+            class="delete"
+            disabled={deleting}
+            onclick={askDeleteCall}
+          >
+            {deleting ? "Deleting…" : "Delete"}
+          </button>
+        </div>
       </div>
     </header>
 
@@ -3210,22 +3470,11 @@
                   </svg>
                 </button>
               {/if}
-              <!-- #186 Send to CRM. Hidden when org isn't connected
-                   (zohoConnected resolved on mount via Tauri command). -->
-              {#if zohoConnected && call.status === "complete"}
-                <button
-                  type="button"
-                  class="copy-btn send-crm"
-                  onclick={openSendToZoho}
-                  disabled={regenInFlight}
-                >
-                  Send to CRM
-                </button>
-                {#if zohoPushed}
-                  <span class="pip done crm-pip" aria-hidden="true"></span>
-                  <span class="visually-hidden">Already pushed</span>
-                {/if}
-              {/if}
+              <!-- #244: Send to CRM moved to the page-header action
+                   cluster (Share | Send to CRM | Delete). The summary
+                   block-head keeps only the read-only / iterate-on-
+                   this-summary controls (Copy, Regenerate, edit). -->
+
             </div>
           {/if}
         </div>
@@ -3392,6 +3641,8 @@
                   editFocus.itemId === item.id}
                 editingOwner={editFocus.kind === "row-owner" &&
                   editFocus.itemId === item.id}
+                editingDue={editFocus.kind === "row-due" &&
+                  editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
                 editError={actionItemErrors[item.id] ?? ""}
@@ -3400,10 +3651,13 @@
                 deleteError={deleteErrors[item.id] ?? ""}
                 onDescriptionEditRequest={onDescriptionEditRequest}
                 onOwnerEditRequest={onOwnerEditRequest}
+                onDueEditRequest={onDueEditRequest}
                 onDescriptionSave={onDescriptionSave}
                 onOwnerSave={onOwnerSave}
+                onDueSave={onDueSave}
                 onDescriptionCancel={onDescriptionCancel}
                 onOwnerCancel={onOwnerCancel}
+                onDueCancel={onDueCancel}
                 onPendingSave={onPendingSave}
                 onPendingDiscard={onPendingDiscard}
                 onEditErrorClear={onEditErrorClear}
@@ -3489,6 +3743,8 @@
                   editFocus.itemId === item.id}
                 editingOwner={editFocus.kind === "row-owner" &&
                   editFocus.itemId === item.id}
+                editingDue={editFocus.kind === "row-due" &&
+                  editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
                 editError={actionItemErrors[item.id] ?? ""}
@@ -3497,10 +3753,13 @@
                 deleteError={deleteErrors[item.id] ?? ""}
                 onDescriptionEditRequest={onDescriptionEditRequest}
                 onOwnerEditRequest={onOwnerEditRequest}
+                onDueEditRequest={onDueEditRequest}
                 onDescriptionSave={onDescriptionSave}
                 onOwnerSave={onOwnerSave}
+                onDueSave={onDueSave}
                 onDescriptionCancel={onDescriptionCancel}
                 onOwnerCancel={onOwnerCancel}
+                onDueCancel={onDueCancel}
                 onPendingSave={onPendingSave}
                 onPendingDiscard={onPendingDiscard}
                 onEditErrorClear={onEditErrorClear}
@@ -3877,11 +4136,28 @@
   </div>
 {/if}
 
-{#if zohoModalOpen && call}
+{#if shareModalOpen && call}
+  <!-- #243 Share-call modal — agent mirror. Same byte-identical
+       component file as the portal; the api object below is the
+       only seam where the surfaces diverge (Tauri commands here,
+       fetch on the portal). Errors arrive as PortalError (#124)
+       and get reshaped to plain Error so the modal's catch blocks
+       render a sensible message. -->
+  <ShareCallModal
+    callId={call.id}
+    callTitle={call.title}
+    api={shareApi}
+    onClose={closeShareModal}
+  />
+{/if}
+
+{#if zohoModalOpen && call && zohoFeatureEnabled}
   <!-- #186 Send-to-CRM modal. Mirror pair: agent supplies the api
        transport via Tauri commands (zoho_search_records /
        zoho_push_call), portal supplies it via window.fetch. The
-       modal stays byte-identical between surfaces. -->
+       modal stays byte-identical between surfaces. #215 — never mount
+       when the per-org Zoho gate is OFF; the button can't open it but
+       a stale store value could otherwise leave the modal renderable. -->
   <SendToZohoModal
     callId={call.id}
     existingTags={call.tags ?? []}
@@ -4035,6 +4311,42 @@
     background: var(--bone-3);
     display: inline-block;
     margin-right: 0.3rem;
+  }
+
+  /* #244 Action cluster on the call header — Share | Send to CRM |
+     Delete grouped together. Buttons share the same padding /
+     border-radius so the group reads as one row of equally-weighted
+     "what to do with this call" actions; Delete keeps its --live
+     hover so the destructive action is still visually distinct. */
+  .head-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: flex-start;
+  }
+  .head-action {
+    padding: 0.4rem 0.85rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-1);
+    color: var(--bone-1);
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .head-action:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .head-action:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .head-action.send-crm {
+    position: relative;
+  }
+  .head-action.send-crm .crm-pip {
+    margin-left: 0.4rem;
   }
 
   .delete {

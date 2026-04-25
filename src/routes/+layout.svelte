@@ -15,6 +15,7 @@
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
   import ToastHost from "$lib/ToastHost.svelte";
+  import { portalErrorToText } from "$lib/portalError";
   import "../app.css";
 
   let { children } = $props();
@@ -34,6 +35,11 @@
     /// to false when absent.
     is_platform_staff?: boolean;
     org_display_name: string;
+    /// #215 — per-org feature flags. Optional so older auth.json
+    /// files deserialize cleanly; missing keys default to false (the
+    /// gate hides Zoho UI on those, matching the per-org-disabled
+    /// state). Backend re-checks via 404 — this is purely UX.
+    features?: { zoho?: boolean };
   };
 
   let me = $state<Me | null>(null);
@@ -107,7 +113,7 @@
     try {
       await invoke<string>("stop_recording");
     } catch (e) {
-      noteError = typeof e === "string" ? e : String(e);
+      noteError = portalErrorToText(e);
       stoppingNote = false;
     }
   }
@@ -773,7 +779,7 @@
       // user explicitly before we relaunch so the app doesn't just vanish.
       await relaunch();
     } catch (e) {
-      updateError = String(e);
+      updateError = portalErrorToText(e);
       updateState = "error";
     }
   }
@@ -860,7 +866,7 @@
       autoAckOpen = false;
       await triggerAutoStart();
     } catch (e) {
-      autoAckError = String(e).replace(/^Error:\s*/, "");
+      autoAckError = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {
       autoAckSubmitting = false;
     }
@@ -963,18 +969,26 @@
       // ADMIN surfaces live on the portal; agent has no local routes.
       // External=true routes clicks through openPortalLink().
       const nope = (_p: string) => false;
+      const adminItems: NavItem[] = [
+        { href: "/admin/users", label: "Team", match: nope, icon: ICON_TEAM, external: true },
+        { href: "/admin", label: "Org", match: nope, icon: ICON_ORG, external: true },
+        { href: "/admin/vocab", label: "Vocab", match: nope, icon: ICON_VOCAB, external: true },
+      ];
+      // #215: per-org Zoho gate. Hide the rail entry when
+      // `features.zoho` is false; the backend 404s every Zoho route
+      // for those orgs anyway, so a click would land on the portal's
+      // /admin/zoho page which redirects back. Skipping the rail
+      // entry just keeps the surface clean.
+      if (me?.features?.zoho) {
+        // #186: CRM (Zoho) connect page — admin opens it in the
+        // browser via openPortalLink. The agent has no local
+        // routes for admin surfaces.
+        adminItems.push({ href: "/admin/zoho", label: "CRM", match: nope, icon: ICON_CRM, external: true });
+      }
       sections.push({
         id: "admin",
         label: "Admin",
-        items: [
-          { href: "/admin/users", label: "Team", match: nope, icon: ICON_TEAM, external: true },
-          { href: "/admin", label: "Org", match: nope, icon: ICON_ORG, external: true },
-          { href: "/admin/vocab", label: "Vocab", match: nope, icon: ICON_VOCAB, external: true },
-          // #186: CRM (Zoho) connect page — admin opens it in the
-          // browser via openPortalLink. The agent has no local
-          // routes for admin surfaces.
-          { href: "/admin/zoho", label: "CRM", match: nope, icon: ICON_CRM, external: true },
-        ],
+        items: adminItems,
       });
     }
     if (isStaff) {
@@ -1542,7 +1556,7 @@
           try {
             await invoke<string>("start_self_note");
           } catch (e) {
-            noteError = typeof e === "string" ? e : String(e);
+            noteError = portalErrorToText(e);
           }
         }}
       >

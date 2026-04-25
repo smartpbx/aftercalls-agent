@@ -291,6 +291,26 @@ pub struct AuthFile {
     /// auth.json files (written before this field existed) readable.
     #[serde(default)]
     pub recording_acknowledged: bool,
+    /// #215 — per-org feature flags. Same backward-compat posture as
+    /// the other additive fields: serde default of an all-false snapshot
+    /// keeps older auth.json files parseable, and the next login
+    /// repopulates from `/v1/auth/me`. The Send-to-CRM affordances + the
+    /// `/admin/zoho` admin link gate on `features.zoho` so a stale
+    /// auth.json from before this field landed simply hides the Zoho UI
+    /// (matching the per-org-disabled state). The backend is still the
+    /// security boundary; this is purely UX.
+    #[serde(default)]
+    pub features: FeatureFlags,
+}
+
+/// Mirror of the backend's `FeaturesSnapshot` shape (see
+/// `backend/src/routes/features.rs`). Serde default = all-false so
+/// older auth.json + missing-key cases land as "feature OFF" — same
+/// semantics as the backend's absent-row default.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct FeatureFlags {
+    #[serde(default)]
+    pub zoho: bool,
 }
 
 pub fn read_auth_file() -> Result<Option<AuthFile>> {

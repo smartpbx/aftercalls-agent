@@ -19,6 +19,7 @@
     playStartCueIfEnabled,
   } from "$lib/compliance";
   import NotesPanel from "$lib/NotesPanel.svelte";
+  import { portalErrorToText } from "$lib/portalError";
 
   // Platform string reported to the backend on recording-ack (#44).
   // Kept here (not Rust-side) because navigator UA is already in the
@@ -486,7 +487,7 @@
       if (!ok) return; // Modal opened (or aborted) — resume happens later.
       await actuallyStartRecording();
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     }
   }
 
@@ -581,7 +582,7 @@
         await invoke("confirm_auto_start");
       }
     } catch (e) {
-      ackError = String(e).replace(/^Error:\s*/, "");
+      ackError = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {
       ackSubmitting = false;
     }
@@ -623,7 +624,7 @@
         copiedNotice = false;
       }, 2000);
     } catch (e) {
-      copyError = String(e).replace(/^Error:\s*/, "");
+      copyError = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {
       copyingNotice = false;
     }
@@ -650,7 +651,7 @@
         sourcePath: picked,
       });
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       importing = false;
     }

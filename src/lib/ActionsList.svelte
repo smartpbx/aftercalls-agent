@@ -12,7 +12,10 @@
   // diff-check viable — no invoke() on agent vs fetch() on portal
   // living inside the mirrored file.
 
-  import type { ActionItemUser } from "./ActionItem.svelte";
+  import type {
+    ActionItemUser,
+    ActionItemDueKind,
+  } from "./ActionItem.svelte";
 
   // Row as served by the me-scoped backend endpoint. The page
   // wrapper's fetch / invoke decodes into this shape. Fields mirror
@@ -31,12 +34,25 @@
     created_by_user_id: string | null;
     call_title: string | null;
     call_recorded_at: string;
+    // #173 — due-date metadata; mirrors the per-call ActionItem
+    // shape so the row component renders identically across surfaces.
+    due_kind: ActionItemDueKind;
+    due_at: string | null;
   };
 
   // Segmented filter values. Whitelisted at the page wrapper before
   // this prop lands, so malformed URL params never reach the
   // component.
   export type ActionsStatusFilter = "open" | "done" | "all";
+
+  // #173 — Due filter buckets for the /actions page. `all` is the
+  // default (no narrow); the others restrict + flip the sort.
+  export type ActionsDueFilter =
+    | "all"
+    | "overdue"
+    | "today"
+    | "week"
+    | "none";
 
   // Envelope shape the backend's `GET /v1/me/action-items` returns.
   // Re-exported here so both surfaces (portal fetch, agent Tauri
@@ -74,10 +90,13 @@
   // page wrapper owns the PATCH. Mutual-exclusion state (`activeRowEdit`)
   // lives in the page wrapper so row-across-page coordination is
   // the wrapper's responsibility.
+  // #173 — `"due"` extends the discriminated union so the row-level
+  // due-date editor is mutually exclusive with description / owner.
   export type ActionsActiveRowEdit =
     | { kind: "none" }
     | { kind: "description"; itemId: string }
-    | { kind: "owner"; itemId: string };
+    | { kind: "owner"; itemId: string }
+    | { kind: "due"; itemId: string };
 
   export type ActionsDescriptionSave = {
     itemId: string;
@@ -89,6 +108,13 @@
     callId: string;
     assigneeUserId: string | null;
   };
+  // #173 — due-date save event flowing through ActionsList. Carries
+  // call_id alongside the kind/dueAt so the page wrapper can route
+  // the PATCH to the right call-scoped endpoint.
+  export type ActionsDueSave =
+    | { itemId: string; callId: string; kind: "none" }
+    | { itemId: string; callId: string; kind: "asap" }
+    | { itemId: string; callId: string; kind: "dated"; dueAt: string };
 </script>
 
 <script lang="ts">
@@ -140,6 +166,11 @@
 
     // Events — page wrapper owns all side effects.
     onfilterchange?: (next: ActionsStatusFilter) => void;
+    // #173 — Due filter parallels the status filter wiring. When set
+    // to anything other than "all", the backend flips its sort to
+    // `due_at ASC NULLS LAST` so dated rows surface first.
+    due?: ActionsDueFilter;
+    onduefilterchange?: (next: ActionsDueFilter) => void;
     ontoggle?: (e: ActionsToggleEvent) => void;
     onloadmore?: () => void;
     onretry?: () => void;
@@ -168,6 +199,15 @@
       item: { id: string; call_id: string };
     }) => void;
     onEditErrorClear?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+
+    // #173 — due-date edit lifecycle, parallel to description / owner.
+    onDueEditRequest?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onDueSave?: (payload: ActionsDueSave) => void;
+    onDueCancel?: (payload: {
       item: { id: string; call_id: string };
     }) => void;
 
@@ -205,6 +245,8 @@
     togglingIds = new Set<string>(),
     colorFor,
     onfilterchange,
+    due = "all" as ActionsDueFilter,
+    onduefilterchange,
     ontoggle,
     onloadmore,
     onretry,
@@ -219,6 +261,9 @@
     onDescriptionCancel,
     onOwnerCancel,
     onEditErrorClear,
+    onDueEditRequest,
+    onDueSave: onDueSaveProp,
+    onDueCancel,
     onactionitemchipaction,
     activeChipItemId = null,
     activeChipOccurrenceIndex = null,
@@ -255,6 +300,30 @@
       callId,
       assigneeUserId: payload.assigneeUserId,
     });
+  }
+  // #173 — same callId-pin pattern for the due-date save event.
+  function onDueSaveForward(
+    payload:
+      | { itemId: string; kind: "none" }
+      | { itemId: string; kind: "asap" }
+      | { itemId: string; kind: "dated"; dueAt: string },
+  ) {
+    const callId = findCallId(payload.itemId);
+    if (!callId) return;
+    if (payload.kind === "dated") {
+      onDueSaveProp?.({
+        itemId: payload.itemId,
+        callId,
+        kind: "dated",
+        dueAt: payload.dueAt,
+      });
+    } else {
+      onDueSaveProp?.({
+        itemId: payload.itemId,
+        callId,
+        kind: payload.kind,
+      });
+    }
   }
 
   // Subhead copy mirrors ui-phase-4 §Copy verbatim. The three
@@ -298,9 +367,25 @@
     { v: "all", label: "All" },
   ];
 
+  // #173 — Due filter dropdown options. We keep this as a select
+  // (not a segmented control) because there are five options and the
+  // segmented pattern would dominate the filter row visually.
+  const dueOptions: Array<{ v: ActionsDueFilter; label: string }> = [
+    { v: "all", label: "All" },
+    { v: "overdue", label: "Overdue" },
+    { v: "today", label: "Due today" },
+    { v: "week", label: "This week" },
+    { v: "none", label: "No date" },
+  ];
+
   function setFilter(next: ActionsStatusFilter) {
     if (next === status) return;
     onfilterchange?.(next);
+  }
+
+  function setDueFilter(next: ActionsDueFilter) {
+    if (next === due) return;
+    onduefilterchange?.(next);
   }
 
   // The child ActionItem's `ontoggle` fires with `item: ActionItem`
@@ -399,6 +484,26 @@
         </label>
       {/each}
     </div>
+    <!-- #173: Due filter dropdown. Native <select> for the same
+         reason the date-range filter on /calls uses one — five
+         options is past the point where a segmented control reads
+         cleanly, and the native picker carries keyboard + AT
+         conventions for free. URL persistence via `?due=...` lives
+         in the page wrapper. -->
+    <label class="actions-due-label">
+      <span class="actions-due-label-text">Due</span>
+      <select
+        class="actions-due-select"
+        class:actions-due-select-active={due !== "all"}
+        value={due}
+        onchange={(e) =>
+          setDueFilter((e.currentTarget as HTMLSelectElement).value as ActionsDueFilter)}
+      >
+        {#each dueOptions as opt (opt.v)}
+          <option value={opt.v}>{opt.label}</option>
+        {/each}
+      </select>
+    </label>
   </div>
 
   {#if transientError}
@@ -456,15 +561,20 @@
             activeRowEdit.itemId === item.id}
           editingOwner={activeRowEdit.kind === "owner" &&
             activeRowEdit.itemId === item.id}
+          editingDue={activeRowEdit.kind === "due" &&
+            activeRowEdit.itemId === item.id}
           saving={patchingItemIds.has(item.id)}
           editError={actionItemErrors[item.id] ?? ""}
           onDescriptionEditRequest={(p) =>
             onDescriptionEditRequest?.({ item: p.item })}
           onOwnerEditRequest={(p) => onOwnerEditRequest?.({ item: p.item })}
+          onDueEditRequest={(p) => onDueEditRequest?.({ item: p.item })}
           onDescriptionSave={onDescriptionSaveForward}
           onOwnerSave={onOwnerSaveForward}
+          onDueSave={onDueSaveForward}
           onDescriptionCancel={(p) => onDescriptionCancel?.({ item: p.item })}
           onOwnerCancel={(p) => onOwnerCancel?.({ item: p.item })}
+          onDueCancel={(p) => onDueCancel?.({ item: p.item })}
           onEditErrorClear={(p) => onEditErrorClear?.({ item: p.item })}
           ontoggle={(payload) =>
             !togglingIds.has(item.id) && handleRowToggle(payload)}
@@ -753,6 +863,61 @@
   @media (max-width: 520px) {
     .actions-page {
       padding: 1.25rem 1rem 2rem;
+    }
+  }
+
+  /* ── #173: Due filter select ─────────────────────────────────── */
+
+  .actions-due-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 1.6rem;
+  }
+  .actions-due-label-text {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--bone-3);
+  }
+  .actions-due-select {
+    appearance: none;
+    -webkit-appearance: none;
+    padding: 0.4rem 1.8rem 0.4rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ink-1);
+    color: var(--bone-1);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    /* Caret glyph baked into the background so the chrome reads
+       consistently across platforms. Cream stroke on the inline
+       SVG hard-coded since data: URIs can't read CSS vars. */
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none' stroke='%23a3a39c' stroke-width='1.5' stroke-linecap='round'><path d='M1 1l4 4 4-4'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 0.6rem center;
+    transition: border-color 150ms linear, color 150ms linear;
+  }
+  .actions-due-select:hover {
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
+  }
+  .actions-due-select-active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .actions-due-select:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .actions-due-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .actions-due-select {
+      transition: none;
     }
   }
 </style>

@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
+  import { portalErrorToText } from "$lib/portalError";
 
   const REMEMBERED_EMAIL_KEY = "aftercalls.login.rememberedEmail";
 
@@ -53,8 +54,8 @@
       // fire the release-notes modal personalized to the signed-in name.
       window.dispatchEvent(new Event("aftercalls-login"));
       goto("/");
-    } catch (e: any) {
-      error = String(e).replace(/^Error:\s*/, "");
+    } catch (e: unknown) {
+      error = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {
       submitting = false;
     }

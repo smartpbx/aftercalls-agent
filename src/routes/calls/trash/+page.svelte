@@ -4,6 +4,7 @@
   import { replaceState, afterNavigate } from "$app/navigation";
   import { page } from "$app/state";
   import DateInput from "$lib/DateInput.svelte";
+  import { portalErrorToText } from "$lib/portalError";
 
   // Mirrors the portal's trash view. Deleted calls live here for
   // 30 days before the backend's nightly purge drops them for good.
@@ -79,7 +80,7 @@
         toDate: toDate ? `${toDate}T23:59:59Z` : null,
       });
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       loading = false;
     }
@@ -135,7 +136,7 @@
       await invoke("restore_call", { id: row.id });
       rows = rows.filter((r) => r.id !== row.id);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       delete busy[row.id];
     }
@@ -154,7 +155,7 @@
       });
       rows = rows.filter((r) => r.id !== row.id);
     } catch (e) {
-      error = String(e);
+      error = portalErrorToText(e);
     } finally {
       delete busy[row.id];
     }

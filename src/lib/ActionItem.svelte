@@ -16,6 +16,10 @@
     email: string;
   };
 
+  // #173 — discriminator for the due-date column. Wire tokens match
+  // the backend `action_due_kind` enum 1:1.
+  export type ActionItemDueKind = "none" | "asap" | "dated";
+
   // Structured action item as served by the backend's GET
   // /v1/calls/{id}/action-items (Phase 1 of the v0.4.0 bundle).
   // Fields mirror the backend `ActionItem` DTO 1:1.
@@ -30,6 +34,10 @@
     source: "llm" | "manual";
     created_at: string;
     order_index: number;
+    // #173 — due-date metadata. `due_at` is `YYYY-MM-DD` only when
+    // `due_kind === "dated"`; null otherwise.
+    due_kind: ActionItemDueKind;
+    due_at: string | null;
   };
 
   // Legacy (v0.4.1) combined-save payload. Retained for
@@ -63,6 +71,15 @@
     description: string;
     assigneeUserId: string | null;
   };
+
+  // #173 — due-date save event. The row dispatches whichever of the
+  // three kinds the user picked; on `dated` the picker chose a
+  // `YYYY-MM-DD` date. Parent translates into a PATCH that sends
+  // `due_kind` and (for dated) `due_at`.
+  export type ActionItemDueSave =
+    | { itemId: string; kind: "none" }
+    | { itemId: string; kind: "asap" }
+    | { itemId: string; kind: "dated"; dueAt: string };
 </script>
 
 <script lang="ts">
@@ -115,6 +132,7 @@
     type OrgMemberLite,
     type SpeakerPick,
   } from "./SpeakerRenamePicker.svelte";
+  import DateInput from "./DateInput.svelte";
   import { formatRelativeTime } from "./time";
 
   // Phase 4 (#105): /actions page row context. When the row is rendered
@@ -169,6 +187,9 @@
     //                        tabindex) are suppressed.
     editingDescription?: boolean;
     editingOwner?: boolean;
+    // #173 — edit mode for the due-date row affordance. Mutually
+    // exclusive with description / owner edit (parent enforces).
+    editingDue?: boolean;
     pending?: boolean;
     saving?: boolean;
     editError?: string;
@@ -189,6 +210,12 @@
     onOwnerCancel?: (payload: { item: ActionItem }) => void;
     onPendingSave?: (payload: ActionItemPendingSave) => void;
     onPendingDiscard?: () => void;
+    // #173 — due-date edit lifecycle. Mirrors the description /
+    // owner pattern: request opens the editor, save commits a PATCH,
+    // cancel discards.
+    onDueEditRequest?: (payload: { item: ActionItem }) => void;
+    onDueSave?: (payload: ActionItemDueSave) => void;
+    onDueCancel?: (payload: { item: ActionItem }) => void;
     // Fired on every keystroke while an error is visible — the
     // parent uses this to clear `actionItemErrors[item.id]` so the
     // next blur / Enter can attempt a fresh commit (retry-by-typing
@@ -238,6 +265,7 @@
     colorFor,
     editingDescription = false,
     editingOwner = false,
+    editingDue = false,
     pending = false,
     saving = false,
     editError = "",
@@ -253,6 +281,9 @@
     onOwnerCancel,
     onPendingSave,
     onPendingDiscard,
+    onDueEditRequest,
+    onDueSave,
+    onDueCancel,
     onEditErrorClear,
     ondeleterequest,
     ondeleteconfirm,
@@ -280,7 +311,7 @@
   // checkbox / hover affordances. "Anything editing" treats
   // description-edit, owner-edit, and phantom pending-edit the same
   // way for most surface rules.
-  let anyEditing = $derived(editingDescription || editingOwner);
+  let anyEditing = $derived(editingDescription || editingOwner || editingDue);
 
   // Phase 4 (#105): row check-off wiring. Disabled while editing,
   // saving, deleting, or when the row is a phantom (no backend id
@@ -677,6 +708,145 @@
     };
   });
 
+  // ── #173: Due-date affordance + inline editor ──────────────────
+  //
+  // Read-mode chip surfaces the row's due state next to the assignee
+  // chip. Three visual cases:
+  //   - kind='dated' + due_at < today + status='open' → "Overdue {date}", live-red
+  //   - kind='dated'                                    → "Due {date}", subtle teal
+  //   - kind='asap'                                     → "ASAP", olive
+  //   - kind='none'                                     → no chip, but a faint
+  //                                                       "+ Due" affordance for
+  //                                                       canEdit users.
+  // Click → request edit; the edit lane renders a segmented
+  // [None][ASAP][On date] control with a DateInput beneath when On
+  // date is selected.
+
+  // Local draft state for the due-date editor. Re-seeded on entry so
+  // a cancel-then-reopen doesn't leak previous draft state.
+  let dueDraftKind = $state<ActionItemDueKind>("none");
+  let dueDraftDate = $state<string>("");
+  $effect(() => {
+    if (editingDue) {
+      dueDraftKind = item.due_kind;
+      // Seed the date picker with the existing date when present;
+      // otherwise leave it empty so picking "On date" prompts the
+      // user to choose.
+      dueDraftDate = item.due_at ?? "";
+    }
+  });
+
+  // Format helpers. We avoid `Intl.DateTimeFormat` for small chips —
+  // the YYYY-MM-DD wire shape parses without TZ and the formatted
+  // chip uses month-abbrev + day, no year (matching how Linear /
+  // Things render due chips). The year shows up in the picker.
+  const MONTH_ABBREV = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+  function formatDueChipDate(iso: string): string {
+    // ISO 'YYYY-MM-DD' → 'Apr 30'. Avoid `new Date(iso)` which
+    // interprets ISO dates as UTC and shifts a day in negative-UTC
+    // locales (the same DateInput-era trap).
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+    const [, m, d] = iso.split("-").map(Number);
+    return `${MONTH_ABBREV[m - 1]} ${d}`;
+  }
+
+  // Today as YYYY-MM-DD in local time. Used both for the overdue
+  // comparison and for the DateInput's `min`-seed default.
+  function todayIso(): string {
+    const t = new Date();
+    const y = t.getFullYear();
+    const m = String(t.getMonth() + 1).padStart(2, "0");
+    const d = String(t.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  // Lexical compare on YYYY-MM-DD is correct.
+  let dueIsOverdue = $derived.by(() => {
+    if (item.due_kind !== "dated" || !item.due_at) return false;
+    if (item.status !== "open") return false;
+    return item.due_at < todayIso();
+  });
+  let dueChipText = $derived.by(() => {
+    if (item.due_kind === "asap") return "ASAP";
+    if (item.due_kind === "dated" && item.due_at) {
+      if (dueIsOverdue) return `Overdue ${formatDueChipDate(item.due_at)}`;
+      return `Due ${formatDueChipDate(item.due_at)}`;
+    }
+    return "";
+  });
+  let hasDueChip = $derived(item.due_kind !== "none" && dueChipText !== "");
+
+  function requestDueEdit() {
+    if (!canEdit) return;
+    if (saving || deleting) return;
+    onDueEditRequest?.({ item });
+  }
+
+  function commitDue() {
+    if (dueDraftKind === "none") {
+      onDueSave?.({ itemId: item.id, kind: "none" });
+      return;
+    }
+    if (dueDraftKind === "asap") {
+      onDueSave?.({ itemId: item.id, kind: "asap" });
+      return;
+    }
+    // dated — require a non-empty draft date; otherwise treat the
+    // commit as a cancel (the user moved away without picking).
+    const trimmed = dueDraftDate.trim();
+    if (!trimmed) {
+      onDueCancel?.({ item });
+      return;
+    }
+    onDueSave?.({ itemId: item.id, kind: "dated", dueAt: trimmed });
+  }
+
+  function cancelDue() {
+    onDueCancel?.({ item });
+  }
+
+  function pickDueKind(next: ActionItemDueKind) {
+    dueDraftKind = next;
+    // Auto-commit None and ASAP — there's no second step. Dated
+    // waits for the DateInput's onchange before committing so the
+    // user has a chance to pick a real date.
+    if (next === "none" || next === "asap") {
+      commitDue();
+    } else if (next === "dated" && dueDraftDate) {
+      // If the row was already dated and we re-clicked On date with
+      // the existing date pre-loaded, commit the unchanged value as
+      // a no-op so the editor closes. The parent's optimistic-flip
+      // handler short-circuits when `due_kind` + `due_at` haven't
+      // changed.
+      commitDue();
+    }
+  }
+
+  function onDueDatePicked(value: string) {
+    dueDraftDate = value;
+    // Picking a date on the inline DateInput auto-commits — same
+    // pattern as the SpeakerRenamePicker's `onpick`. Empty value
+    // (Clear button) demotes the row back to "no date" by sending
+    // kind='none'.
+    if (!value) {
+      dueDraftKind = "none";
+      onDueSave?.({ itemId: item.id, kind: "none" });
+      return;
+    }
+    dueDraftKind = "dated";
+    onDueSave?.({ itemId: item.id, kind: "dated", dueAt: value });
+  }
+
+  function onDueKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDue();
+    }
+  }
+
   // ── Phase 3 (#104): delete affordance + inline confirm ─────────
 
   function handleDeleteRequest() {
@@ -961,8 +1131,102 @@
         </span>
       {/if}
     {/if}
+    <!-- #173: due-date chip + edit lane. Three branches:
+         1. editingDue          → segmented control + (optionally) DateInput
+         2. read-mode w/ due    → coloured chip (Overdue red / Due teal / ASAP olive)
+         3. read-mode no due    → faint "+ Due" affordance for canEdit users -->
+    {#if editingDue}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="ai-due-editor"
+        role="group"
+        aria-label="Set due date for action item {index + 1}"
+        onkeydown={onDueKeydown}
+      >
+        <div class="ai-due-segmented" role="radiogroup" aria-label="Due type">
+          <button
+            type="button"
+            class="ai-due-seg"
+            class:ai-due-seg-active={dueDraftKind === "none"}
+            role="radio"
+            aria-checked={dueDraftKind === "none"}
+            disabled={saving}
+            onclick={() => pickDueKind("none")}
+          >
+            None
+          </button>
+          <button
+            type="button"
+            class="ai-due-seg"
+            class:ai-due-seg-active={dueDraftKind === "asap"}
+            role="radio"
+            aria-checked={dueDraftKind === "asap"}
+            disabled={saving}
+            onclick={() => pickDueKind("asap")}
+          >
+            ASAP
+          </button>
+          <button
+            type="button"
+            class="ai-due-seg"
+            class:ai-due-seg-active={dueDraftKind === "dated"}
+            role="radio"
+            aria-checked={dueDraftKind === "dated"}
+            disabled={saving}
+            onclick={() => pickDueKind("dated")}
+          >
+            On date
+          </button>
+        </div>
+        {#if dueDraftKind === "dated"}
+          <DateInput
+            value={dueDraftDate}
+            onchange={onDueDatePicked}
+            ariaLabel="Due date"
+            placeholder="Pick a date"
+          />
+        {/if}
+      </div>
+    {:else if hasDueChip}
+      {#if canEdit}
+        <button
+          type="button"
+          class="ai-due-chip-btn"
+          aria-label="Change due date"
+          onclick={requestDueEdit}
+        >
+          <span
+            class="ai-due-chip"
+            class:ai-due-chip-overdue={dueIsOverdue}
+            class:ai-due-chip-asap={item.due_kind === "asap"}
+            class:ai-due-chip-dated={item.due_kind === "dated" && !dueIsOverdue}
+          >
+            {dueChipText}
+          </span>
+        </button>
+      {:else}
+        <span
+          class="ai-due-chip"
+          class:ai-due-chip-overdue={dueIsOverdue}
+          class:ai-due-chip-asap={item.due_kind === "asap"}
+          class:ai-due-chip-dated={item.due_kind === "dated" && !dueIsOverdue}
+        >
+          {dueChipText}
+        </span>
+      {/if}
+    {:else if canEdit && !editingDescription && !editingOwner}
+      <button
+        type="button"
+        class="ai-due-add"
+        aria-label="Set due date"
+        onclick={requestDueEdit}
+      >
+        <span aria-hidden="true">＋</span>
+        <span>Due</span>
+      </button>
+    {/if}
   </span>
-  {#if canEdit && !editingDescription && !pending}
+  {#if canEdit && !editingDescription && !editingDue && !pending}
     {#if confirmingDelete}
       <!-- Phase 3 inline confirm. Unchanged from v0.4.1 except for
            the outer guard — pending (phantom) rows don't render trash
@@ -1369,12 +1633,16 @@
   }
 
   /* During description-edit: hide the trailing assignee chip + trash
-     so the editor owns the row's horizontal space. Owner-edit does
-     NOT hide trash (ui-spec D7). */
+     + due chip so the editor owns the row's horizontal space. Owner-
+     edit does NOT hide trash (ui-spec D7). */
   .ai-editing .ai-assignee,
   .ai-editing .ai-assignee-empty,
   .ai-editing .ai-assignee-wrap,
-  .ai-editing .ai-assignee-btn {
+  .ai-editing .ai-assignee-btn,
+  .ai-editing .ai-due-chip,
+  .ai-editing .ai-due-chip-btn,
+  .ai-editing .ai-due-add,
+  .ai-editing .ai-due-editor {
     display: none;
   }
   .ai-editing .ai-actions {
@@ -1574,5 +1842,174 @@
   }
   .ai-done .actx-context {
     color: var(--bone-4);
+  }
+
+  /* ── #173: Due-date chip + editor ─────────────────────────────── */
+
+  /* Pill-shaped chip; identical baseline alignment to the assignee
+     chip so the two sit on the same row. Color tokens encode the
+     three states (overdue → live red, dated → accent teal, asap →
+     olive complete). All chips share the same shape so the eye
+     reads "this is a metadata pill" regardless of state. */
+  .ai-due-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.05rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1.4;
+    align-self: baseline;
+    white-space: nowrap;
+    border: 1px solid var(--hairline);
+    color: var(--bone-1);
+    background: var(--ink-1);
+  }
+  .ai-due-chip-dated {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--hairline));
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--ink-1));
+  }
+  .ai-due-chip-asap {
+    border-color: color-mix(in srgb, var(--olive) 50%, var(--hairline));
+    color: var(--olive);
+    background: color-mix(in srgb, var(--olive) 10%, var(--ink-1));
+  }
+  .ai-due-chip-overdue {
+    border-color: var(--live);
+    color: var(--live);
+    background: var(--live-soft);
+  }
+  /* Done rows mute the chip — same as the assignee strikethrough
+     pattern. */
+  .ai-done .ai-due-chip {
+    opacity: 0.5;
+    text-decoration: line-through;
+  }
+
+  /* Wrapper button so click + focus-ring land naturally. Inherits
+     the same low-key hover treatment as the assignee chip. */
+  .ai-due-chip-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    border-radius: 999px;
+    font: inherit;
+    color: inherit;
+    transition: opacity 150ms linear;
+  }
+  .ai-due-chip-btn:hover {
+    opacity: 0.85;
+  }
+  .ai-due-chip-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-due-chip-btn {
+      transition: none;
+    }
+  }
+
+  /* Faint "+ Due" affordance for canEdit users on rows without a
+     due date. Hidden until row hover / focus to keep the empty
+     state visually quiet. */
+  .ai-due-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0.05rem 0.4rem;
+    border: 1px dashed var(--hairline-hi);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--bone-3);
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+    opacity: 0;
+    align-self: baseline;
+    transition: opacity 150ms linear, border-color 150ms linear,
+      color 150ms linear;
+  }
+  .ai-row:hover .ai-due-add,
+  .ai-due-add:focus-visible {
+    opacity: 1;
+  }
+  .ai-due-add:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  @media (hover: none) {
+    .ai-due-add {
+      opacity: 0.7;
+    }
+  }
+  .ai-due-add:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-due-add {
+      transition: none;
+    }
+  }
+
+  /* Editor lane — segmented control + (optionally) DateInput stacked
+     beneath it. Stack vertical because horizontal would push the row
+     too wide on narrow viewports; the 11rem min-width matches the
+     owner editor's reservation for visual rhythm. */
+  .ai-due-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    align-self: baseline;
+    min-width: 11rem;
+    margin-left: auto;
+  }
+  .ai-due-segmented {
+    display: inline-flex;
+    gap: 0.15rem;
+    padding: 0.15rem;
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    border-radius: 6px;
+  }
+  .ai-due-seg {
+    flex: 1 1 auto;
+    padding: 0.25rem 0.55rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background 120ms linear, color 120ms linear;
+  }
+  .ai-due-seg:hover:not(:disabled) {
+    color: var(--bone-0);
+    background: var(--ink-2);
+  }
+  .ai-due-seg-active {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    box-shadow: inset 0 0 0 1px var(--hairline-hi);
+  }
+  .ai-due-seg:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .ai-due-seg:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-due-seg {
+      transition: none;
+    }
   }
 </style>

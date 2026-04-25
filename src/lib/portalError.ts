@@ -38,3 +38,40 @@ export function isPortalError(e: unknown): e is PortalError {
     k === "other"
   );
 }
+
+/// Render any caught value (PortalError, Error, string) as a single
+/// human-readable string. Used by error banners that don't need to
+/// branch on `kind` and just want to surface something the user can
+/// read — replaces `String(e)` callsites that would otherwise render
+/// `[object Object]` after the #124 sweep migrated commands away from
+/// stringified errors.
+export function portalErrorToText(e: unknown): string {
+  if (isPortalError(e)) {
+    switch (e.kind) {
+      case "cooldown":
+        return `Too many requests — try again in ${e.retry_after_seconds}s.`;
+      case "bad_request":
+        return e.message || "Request rejected.";
+      case "unauthorized":
+        return "Not signed in. Please log in again.";
+      case "forbidden":
+        return "You don't have permission to do that.";
+      case "not_found":
+        return "Not found.";
+      case "network":
+        return "Can't reach the server. Check your connection.";
+      case "server":
+        return e.message || `Server error (${e.status}).`;
+      case "other":
+        return e.message || "Something went wrong.";
+    }
+  }
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  // Fallback: avoid `[object Object]` for unexpected shapes.
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}

@@ -65,13 +65,13 @@ pub fn load_notes(app: AppHandle, session_id: String) -> Result<String, String> 
 /// session_dir on disk is no longer the source of truth — the
 /// backend row is.
 #[tauri::command]
-pub async fn update_call_notes(call_id: String, notes: String) -> Result<(), String> {
-    let cfg = crate::config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    crate::portal::update_call_notes(backend, &call_id, &notes)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn update_call_notes(
+    call_id: String,
+    notes: String,
+) -> Result<(), crate::error::PortalError> {
+    let cfg = crate::config::Config::load().map_err(crate::error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| crate::error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    crate::portal::update_call_notes(backend, &call_id, &notes).await
 }

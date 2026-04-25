@@ -1,4 +1,14 @@
 {
+  "0.8.0": {
+    "headline": "Due dates on action items, richer call sharing, and team-specific AI prompts",
+    "changes": [
+      "Due dates on action items. The AI infers a due date when a call mentions one (\"by Friday\", \"end of month\", \"ASAP\") and the date appears as a chip on the item. Edit any item to change or clear it, mark it ASAP, or pick a date. Filter the Action items page by Overdue / Today / This week / No date.",
+      "Share-call upgrades. Pick exactly what each link exposes — manual notes off by default, summary / action items / transcript / audio individually toggleable, with an opt-in download button. The public viewer now uses the same waveform player as the rest of the app.",
+      "Customize the AI for your team. Admins can now add an additions block to the summary and action-items prompts under Settings → AI prompts — teach the model your naming conventions or what to emphasize. Append-only and length-capped; the core formatting guarantees stay intact.",
+      "Send to CRM and Share now live on the desktop app too — not just the portal. The action bar groups Share, Send to CRM, and Delete together for fast access.",
+      "Smoother numeric searches in CRM record pickers. Looking up a Deal by a number string (e.g. \"122\") works again without the upstream complaint."
+    ]
+  },
   "0.7.2": {
     "headline": "Share calls publicly, smoother screen recording, sign in once from the desktop app",
     "changes": [

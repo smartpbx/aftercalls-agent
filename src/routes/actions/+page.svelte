@@ -24,10 +24,12 @@
   import ActionsList, {
     type MeActionItem,
     type ActionsStatusFilter,
+    type ActionsDueFilter,
     type MeActionItemsResponse,
     type ActionsActiveRowEdit,
     type ActionsDescriptionSave,
     type ActionsOwnerSave,
+    type ActionsDueSave,
   } from "$lib/ActionsList.svelte";
   import type { ActionItemUser } from "$lib/ActionItem.svelte";
   import {
@@ -51,6 +53,8 @@
   const PAGE_SIZE = 50;
 
   let status = $state<ActionsStatusFilter>("open");
+  // #173 — Due filter, persisted in `?due=...`. Defaults to "all".
+  let dueFilter = $state<ActionsDueFilter>("all");
   let items = $state<MeActionItem[]>([]);
   let nextCursor = $state<string | null>(null);
   // #130b — three filter-stable counts sourced from the backend
@@ -75,6 +79,20 @@
     return "open";
   }
 
+  function readDueFromUrl(): ActionsDueFilter {
+    if (typeof window === "undefined") return "all";
+    const raw = new URL(window.location.href).searchParams.get("due");
+    if (
+      raw === "overdue" ||
+      raw === "today" ||
+      raw === "week" ||
+      raw === "none"
+    ) {
+      return raw;
+    }
+    return "all";
+  }
+
   function writeStatusToUrl(next: ActionsStatusFilter) {
     if (typeof window === "undefined") return;
     const u = new URL(window.location.href);
@@ -93,6 +111,17 @@
     replaceState(u.pathname + u.search, page.state);
   }
 
+  function writeDueToUrl(next: ActionsDueFilter) {
+    if (typeof window === "undefined") return;
+    const u = new URL(window.location.href);
+    if (next === "all") {
+      u.searchParams.delete("due");
+    } else {
+      u.searchParams.set("due", next);
+    }
+    replaceState(u.pathname + u.search, page.state);
+  }
+
   async function loadFirst() {
     loading = true;
     error = null;
@@ -100,7 +129,7 @@
     try {
       const resp = await invoke<MeActionItemsResponse>(
         "list_me_action_items",
-        { status, cursor: null, limit: PAGE_SIZE },
+        { status, cursor: null, limit: PAGE_SIZE, due: dueFilter },
       );
       items = resp.items;
       nextCursor = resp.next_cursor;
@@ -121,7 +150,7 @@
     try {
       const resp = await invoke<MeActionItemsResponse>(
         "list_me_action_items",
-        { status, cursor: nextCursor, limit: PAGE_SIZE },
+        { status, cursor: nextCursor, limit: PAGE_SIZE, due: dueFilter },
       );
       items = [...items, ...resp.items];
       nextCursor = resp.next_cursor;
@@ -150,6 +179,7 @@
 
   onMount(() => {
     status = readStatusFromUrl();
+    dueFilter = readDueFromUrl();
     void loadOrgMembers();
     void loadFirst();
   });
@@ -158,6 +188,15 @@
     if (next === status) return;
     status = next;
     writeStatusToUrl(next);
+    nextCursor = null;
+    items = [];
+    await loadFirst();
+  }
+
+  async function onDueFilterChange(next: ActionsDueFilter) {
+    if (next === dueFilter) return;
+    dueFilter = next;
+    writeDueToUrl(next);
     nextCursor = null;
     items = [];
     await loadFirst();
@@ -262,8 +301,12 @@
     // navigation (popstate) should trigger a resync.
     if (type !== "popstate") return;
     const urlStatus = readStatusFromUrl();
-    if (urlStatus === status) return;
+    const urlDue = readDueFromUrl();
+    const statusChanged = urlStatus !== status;
+    const dueChanged = urlDue !== dueFilter;
+    if (!statusChanged && !dueChanged) return;
     status = urlStatus;
+    dueFilter = urlDue;
     nextCursor = null;
     items = [];
     void loadFirst();
@@ -389,6 +432,63 @@
       activeRowEdit = { kind: "none" };
     }
     actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+
+  // ── #173: due-date edit handlers ────────────────────────────────
+  function onDueEditRequest(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    activeRowEdit = { kind: "due", itemId: payload.item.id };
+  }
+  function onDueCancel(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (
+      activeRowEdit.kind === "due" &&
+      activeRowEdit.itemId === payload.item.id
+    ) {
+      activeRowEdit = { kind: "none" };
+    }
+    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+  }
+  async function onDueSave(payload: ActionsDueSave) {
+    if (patchingItemIds.has(payload.itemId)) return;
+    markPatching(payload.itemId, true);
+    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
+    try {
+      const body =
+        payload.kind === "dated"
+          ? { due_kind: "dated" as const, due_at: payload.dueAt }
+          : payload.kind === "asap"
+            ? { due_kind: "asap" as const, due_at: null }
+            : { due_kind: "none" as const, due_at: null };
+      const updated = (await invoke("patch_action_item", {
+        callId: payload.callId,
+        itemId: payload.itemId,
+        body,
+      })) as MeActionItem;
+      items = items.map((it) =>
+        it.id === payload.itemId
+          ? {
+              ...it,
+              due_kind: updated.due_kind,
+              due_at: updated.due_at,
+            }
+          : it,
+      );
+      if (
+        activeRowEdit.kind === "due" &&
+        activeRowEdit.itemId === payload.itemId
+      ) {
+        activeRowEdit = { kind: "none" };
+      }
+    } catch (e: unknown) {
+      const msg = "Save failed. Check your connection and try again.";
+      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      void e;
+    } finally {
+      markPatching(payload.itemId, false);
+    }
   }
   function onEditErrorClear(payload: {
     item: { id: string; call_id: string };
@@ -544,16 +644,21 @@
   {activeRowEdit}
   {patchingItemIds}
   {actionItemErrors}
+  due={dueFilter}
   onfilterchange={onFilterChange}
+  onduefilterchange={onDueFilterChange}
   ontoggle={onToggle}
   onloadmore={loadMore}
   onretry={onRetry}
   onDescriptionEditRequest={onDescriptionEditRequest}
   onOwnerEditRequest={onOwnerEditRequest}
+  onDueEditRequest={onDueEditRequest}
   onDescriptionSave={onDescriptionSave}
   onOwnerSave={onOwnerSave}
+  onDueSave={onDueSave}
   onDescriptionCancel={onDescriptionCancel}
   onOwnerCancel={onOwnerCancel}
+  onDueCancel={onDueCancel}
   onEditErrorClear={onEditErrorClear}
   onactionitemchipaction={openActionItemChip}
   activeChipItemId={activeChip?.itemId ?? null}

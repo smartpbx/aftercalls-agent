@@ -439,12 +439,11 @@ async fn list_calls(
     // backend, which parses with `chrono::DateTime<Utc>`.
     from_date: Option<String>,
     to_date: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
     let tags = tags.unwrap_or_default();
     portal::list_calls(
         backend,
@@ -455,22 +454,18 @@ async fn list_calls(
         to_date.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn tag_suggestions(
     kind: Option<String>,
     q: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::tag_suggestions(backend, kind.as_deref(), q.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::tag_suggestions(backend, kind.as_deref(), q.as_deref()).await
 }
 
 #[tauri::command]
@@ -484,12 +479,11 @@ async fn list_trashed(
     // on the JS side; backend narrows by `recorded_at`.
     from_date: Option<String>,
     to_date: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
     let scope = scope.as_deref().unwrap_or("mine");
     portal::list_trashed(
         backend,
@@ -498,19 +492,15 @@ async fn list_trashed(
         to_date.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn restore_call(id: String) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::restore_call(backend, &id)
-        .await
-        .map_err(|e| e.to_string())
+async fn restore_call(id: String) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::restore_call(backend, &id).await
 }
 
 #[tauri::command]
@@ -518,27 +508,23 @@ async fn permadelete_call(
     app: AppHandle,
     id: String,
     session_id: Option<String>,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::permadelete_call(backend, &id)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::permadelete_call(backend, &id).await?;
     cleanup_local_session(&app, session_id.as_deref()).await;
     Ok(())
 }
 
 #[tauri::command]
-async fn get_call(id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::get_call(backend, &id).await.map_err(|e| e.to_string())
+async fn get_call(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_call(backend, &id).await
 }
 
 #[tauri::command]
@@ -584,18 +570,19 @@ struct LoginResult {
     // Surfaced to the layout + Record page so the PIPEDA ack modal
     // (#44) knows not to prompt a user who's already acknowledged.
     recording_acknowledged: bool,
+    /// #215 — per-org feature flags. Mirrors the backend's
+    /// `FeaturesSnapshot` shape; the SvelteKit layout + call-detail
+    /// page gate the Send-to-CRM affordances on `features.zoho`.
+    features: config::FeatureFlags,
 }
 
 #[tauri::command]
-async fn login(email: String, password: String) -> Result<LoginResult, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    let auth = portal::login(backend, &email, &password)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn login(email: String, password: String) -> Result<LoginResult, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let auth = portal::login(backend, &email, &password).await?;
     Ok(LoginResult {
         user_id: auth.user_id,
         email: auth.email,
@@ -606,22 +593,22 @@ async fn login(email: String, password: String) -> Result<LoginResult, String> {
         is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
+        features: auth.features,
     })
 }
 
 #[tauri::command]
-async fn logout() -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::logout(backend).await.map_err(|e| e.to_string())
+async fn logout() -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::logout(backend).await
 }
 
 #[tauri::command]
-fn current_user() -> Result<Option<LoginResult>, String> {
-    let auth = config::read_auth_file().map_err(|e| e.to_string())?;
+fn current_user() -> Result<Option<LoginResult>, error::PortalError> {
+    let auth = config::read_auth_file().map_err(error::PortalError::from)?;
     Ok(auth.map(|a| LoginResult {
         user_id: a.user_id,
         email: a.email,
@@ -632,6 +619,7 @@ fn current_user() -> Result<Option<LoginResult>, String> {
         is_platform_staff: a.is_platform_staff,
         org_display_name: a.org_display_name,
         recording_acknowledged: a.recording_acknowledged,
+        features: a.features,
     }))
 }
 
@@ -643,15 +631,12 @@ fn current_user() -> Result<Option<LoginResult>, String> {
 async fn update_me(
     first_name: String,
     last_name: String,
-) -> Result<LoginResult, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    let auth = portal::update_me(backend, &first_name, &last_name)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<LoginResult, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let auth = portal::update_me(backend, &first_name, &last_name).await?;
     Ok(LoginResult {
         user_id: auth.user_id,
         email: auth.email,
@@ -662,6 +647,7 @@ async fn update_me(
         is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
+        features: auth.features,
     })
 }
 
@@ -682,15 +668,12 @@ async fn update_me(
 /// network is down, or the backend rejects the mint (e.g. an
 /// impersonating session — `mint` rejects those outright per #181).
 #[tauri::command]
-async fn mint_handoff_url() -> Result<String, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    let token = portal::mint_handoff_token(backend)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn mint_handoff_url() -> Result<String, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let token = portal::mint_handoff_token(backend).await?;
     let portal_base = derive_portal_base(&backend.url);
     Ok(format!("{portal_base}/handoff?token={token}"))
 }
@@ -773,15 +756,12 @@ mod handoff_url_tests {
 /// another device just because their local auth.json predates this
 /// field. Returns true on 200, false on 404, error otherwise.
 #[tauri::command]
-async fn get_recording_ack() -> Result<bool, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    let resp = portal::get_recording_ack(backend)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn get_recording_ack() -> Result<bool, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let resp = portal::get_recording_ack(backend).await?;
     Ok(resp.is_some())
 }
 
@@ -793,15 +773,12 @@ async fn get_recording_ack() -> Result<bool, String> {
 async fn post_recording_ack(
     agent_version: String,
     platform: String,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::post_recording_ack(backend, &agent_version, &platform)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::post_recording_ack(backend, &agent_version, &platform).await?;
     // Best-effort mirror: flip the cached flag in auth.json. If the
     // write fails (rare — bad perms), we've still succeeded on the
     // server side and the next `get_recording_ack` call will reflect
@@ -816,105 +793,81 @@ async fn post_recording_ack(
 }
 
 #[tauri::command]
-async fn get_recording_prefs() -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::get_recording_prefs(backend)
-        .await
-        .map_err(|e| e.to_string())
+async fn get_recording_prefs() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_recording_prefs(backend).await
 }
 
 #[tauri::command]
-async fn get_org_vocab() -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::get_org_vocab(backend)
-        .await
-        .map_err(|e| e.to_string())
+async fn get_org_vocab() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_org_vocab(backend).await
 }
 
 #[tauri::command]
 async fn set_org_vocab(
     custom_spelling: serde_json::Value,
     word_boost: Vec<String>,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::set_org_vocab(backend, &custom_spelling, &word_boost)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::set_org_vocab(backend, &custom_spelling, &word_boost).await
 }
 
 #[tauri::command]
-async fn list_highlights(call_id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::list_highlights(backend, &call_id)
-        .await
-        .map_err(|e| e.to_string())
+async fn list_highlights(call_id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::list_highlights(backend, &call_id).await
 }
 
 #[tauri::command]
 async fn create_highlight(
     call_id: String,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::create_highlight(backend, &call_id, &body)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::create_highlight(backend, &call_id, &body).await
 }
 
 #[tauri::command]
-async fn update_highlight(id: String, body: serde_json::Value) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::update_highlight(backend, &id, &body)
-        .await
-        .map_err(|e| e.to_string())
+async fn update_highlight(id: String, body: serde_json::Value) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::update_highlight(backend, &id, &body).await
 }
 
 #[tauri::command]
-async fn auto_highlight(call_id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::auto_highlight(backend, &call_id)
-        .await
-        .map_err(|e| e.to_string())
+async fn auto_highlight(call_id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::auto_highlight(backend, &call_id).await
 }
 
 #[tauri::command]
-async fn delete_highlight(id: String) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::delete_highlight(backend, &id)
-        .await
-        .map_err(|e| e.to_string())
+async fn delete_highlight(id: String) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::delete_highlight(backend, &id).await
 }
 
 // ── Vault (Obsidian) per-machine settings ────────────────────────────
@@ -966,15 +919,12 @@ fn set_vault_settings(
 }
 
 #[tauri::command]
-async fn get_audio_urls(id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::get_audio_urls(backend, &id)
-        .await
-        .map_err(|e| e.to_string())
+async fn get_audio_urls(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_audio_urls(backend, &id).await
 }
 
 #[derive(serde::Serialize)]
@@ -1201,15 +1151,12 @@ async fn download_audio(url: String, dest: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_peaks(id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::get_peaks(backend, &id)
-        .await
-        .map_err(|e| e.to_string())
+async fn get_peaks(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_peaks(backend, &id).await
 }
 
 #[tauri::command]
@@ -1217,15 +1164,12 @@ async fn delete_call(
     app: AppHandle,
     id: String,
     session_id: Option<String>,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::delete_call(backend, &id)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::delete_call(backend, &id).await?;
     // Soft-deleted calls are filtered out by the backend's
     // get_call_by_session (deleted_at IS NULL), so leaving the local
     // session_dir on disk makes scan_orphans flag it as an unfinished
@@ -1258,15 +1202,12 @@ async fn update_utterance_speaker(
     // maps to snake_case Rust args), so the UI invokes this with
     // `speakerUserId`.
     speaker_user_id: Option<String>,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::update_utterance(backend, &id, idx, &speaker, speaker_user_id.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::update_utterance(backend, &id, idx, &speaker, speaker_user_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -1279,12 +1220,11 @@ async fn rename_speaker(
     // existing global rename; non-empty → subset-only rewrite on
     // backend.
     utterance_ids: Option<Vec<i32>>,
-) -> Result<u64, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
+) -> Result<u64, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
     portal::rename_speaker(
         backend,
         &id,
@@ -1294,37 +1234,30 @@ async fn rename_speaker(
         utterance_ids.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 // Slim org roster for the speaker-rename autocomplete (#65). Any
 // authed member can read; callers that aren't logged in surface the
 // auth-header error which the UI already swallows.
 #[tauri::command]
-async fn org_members() -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::list_org_members(backend)
-        .await
-        .map_err(|e| e.to_string())
+async fn org_members() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::list_org_members(backend).await
 }
 
 #[tauri::command]
 async fn update_call_tags(
     id: String,
     tags: serde_json::Value,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::update_call_tags(backend, &id, &tags)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::update_call_tags(backend, &id, &tags).await
 }
 
 // ── Phase 2 (#19): resummarize + edit-in-place ────────────────────
@@ -1384,15 +1317,12 @@ async fn patch_action_item(
 async fn add_client_allowlist_entry(
     name: String,
     source: String,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::add_client_allowlist_entry(backend, &name, &source)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::add_client_allowlist_entry(backend, &name, &source).await
 }
 
 /// POST /v1/calls/{id}/action-items/manual — Phase 3 (#104) manual
@@ -1412,6 +1342,60 @@ async fn add_action_item(
     portal::add_action_item(backend, &call_id, &body).await
 }
 
+// ── Share call CRUD shims (#243) ────────────────────────────────────
+//
+// Three IPC commands wrapping the backend's owner-side share routes
+// (#35). The frontend modal calls these via `invoke()` and gets back
+// the same JSON the portal's fetch wrapper would surface. Errors
+// flow as the structured `PortalError` shape (#124) so the agent
+// UI doesn't regex-sniff stringified messages.
+
+/// POST /v1/calls/{id}/shares — body shape:
+///   {expires_in_days?: number | null, included_sections?: {...}}
+/// Returns the create-time response (raw token + assembled URL +
+/// echoed `included_sections`). Token is shown once; subsequent
+/// list calls never recover it.
+#[tauri::command]
+async fn create_call_share(
+    call_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::create_call_share(backend, &call_id, &body).await
+}
+
+/// GET /v1/calls/{id}/shares — list active + historical shares.
+/// Returns an array of summaries (status + view count + per-link
+/// toggle row). Never includes the raw token / URL.
+#[tauri::command]
+async fn list_call_shares(
+    call_id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::list_call_shares(backend, &call_id).await
+}
+
+/// DELETE /v1/calls/{id}/shares/{share_id} — flip `revoked_at`. The
+/// public reader 401s any subsequent open. Idempotent on already-
+/// revoked rows.
+#[tauri::command]
+async fn revoke_call_share(
+    call_id: String,
+    share_id: String,
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::revoke_call_share(backend, &call_id, &share_id).await
+}
+
 /// GET /v1/me/action-items — Phase 4 (#105). Returns the caller's
 /// own action items across every call in their org. Cursor-paginated;
 /// the frontend passes `cursor=null` for the first page and feeds
@@ -1422,13 +1406,24 @@ async fn list_me_action_items(
     status: String,
     cursor: Option<String>,
     limit: Option<i64>,
+    // #173 — Due filter forwarded straight to the backend's
+    // `?due=...` param. Default `all` matches the backend default.
+    due: Option<String>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
         message: "no backend configured".into(),
     })?;
     let resolved_limit = limit.unwrap_or(50);
-    portal::list_me_action_items(backend, &status, cursor.as_deref(), resolved_limit).await
+    let resolved_due = due.unwrap_or_else(|| "all".to_string());
+    portal::list_me_action_items(
+        backend,
+        &status,
+        cursor.as_deref(),
+        resolved_limit,
+        &resolved_due,
+    )
+    .await
 }
 
 /// DELETE /v1/calls/{id}/action-items/{item_id} — Phase 3 (#104).
@@ -1454,15 +1449,12 @@ async fn delete_action_item(
 /// the frontend treats it as "not connected" and just hides the
 /// button.
 #[tauri::command]
-async fn zoho_status() -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::zoho_status(backend)
-        .await
-        .map_err(|e| e.to_string())
+async fn zoho_status() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_status(backend).await
 }
 
 /// GET /v1/zoho/record-types — record-type picker payload (#197).
@@ -1472,15 +1464,12 @@ async fn zoho_status() -> Result<serde_json::Value, String> {
 /// modal's `recordTypesError` banner; the picker keeps working with
 /// the v1 fallback.
 #[tauri::command]
-async fn zoho_record_types() -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::zoho_record_types(backend)
-        .await
-        .map_err(|e| e.to_string())
+async fn zoho_record_types() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_record_types(backend).await
 }
 
 /// GET /v1/zoho/records?module=…&q=… — Zoho record search (#186).
@@ -1490,15 +1479,12 @@ async fn zoho_record_types() -> Result<serde_json::Value, String> {
 async fn zoho_search_records(
     module: String,
     q: String,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::zoho_search_records(backend, &module, &q)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_search_records(backend, &module, &q).await
 }
 
 /// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
@@ -1508,15 +1494,12 @@ async fn zoho_search_records(
 async fn zoho_push_call(
     call_id: String,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::zoho_push_call(backend, &call_id, &body)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_push_call(backend, &call_id, &body).await
 }
 
 
@@ -2142,6 +2125,12 @@ pub fn run() {
             add_action_item,
             delete_action_item,
             list_me_action_items,
+            // #243 — share-call CRUD shims (mirrors the portal's
+            // `api.calls.{create,list,revoke}Share`). All three return
+            // the structured PortalError shape from #124.
+            create_call_share,
+            list_call_shares,
+            revoke_call_share,
             get_recording_ack,
             post_recording_ack,
             get_recording_prefs,

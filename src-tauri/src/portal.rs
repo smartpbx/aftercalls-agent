@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
-use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend};
+use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags};
 use crate::error::{from_status, parse_retry_after, PortalError};
 
 #[derive(Deserialize)]
@@ -53,6 +53,11 @@ struct MeResponse {
     // Defaulted to false so older server responses don't break decode.
     #[serde(default)]
     recording_acknowledged: bool,
+    /// #215 — per-org feature flags. Default = all-false so a backend
+    /// response from before this field landed lands as "feature OFF",
+    /// matching the absent-row default.
+    #[serde(default)]
+    features: FeatureFlags,
 }
 
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
@@ -125,6 +130,7 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         org_slug: p.user.org_slug,
         org_display_name: p.user.org_display_name,
         recording_acknowledged: p.user.recording_acknowledged,
+        features: p.user.features,
     }
 }
 
@@ -134,24 +140,26 @@ pub async fn login(
     backend: &Backend,
     email: &str,
     password: &str,
-) -> Result<AuthFile> {
-    let client = client()?;
+) -> std::result::Result<AuthFile, PortalError> {
+    let c = client().map_err(PortalError::from)?;
     let url = format!("{}/v1/auth/login", backend.url.trim_end_matches('/'));
-    let resp = client
+    let resp = c
         .post(&url)
         .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("login failed ({s}): {t}");
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
     }
-    let payload: AuthResponsePayload =
-        resp.json().await.context("decode login")?;
+    let payload: AuthResponsePayload = resp
+        .json()
+        .await
+        .map_err(PortalError::from)?;
     let auth = merge_auth(payload);
-    write_auth_file(&auth)?;
+    write_auth_file(&auth).map_err(PortalError::from)?;
     Ok(auth)
 }
 
@@ -164,16 +172,18 @@ pub async fn update_me(
     backend: &Backend,
     first_name: &str,
     last_name: &str,
-) -> Result<AuthFile> {
+) -> std::result::Result<AuthFile, PortalError> {
     let body = serde_json::json!({
         "first_name": first_name,
         "last_name": last_name,
     });
-    let resp = patch_json(backend, "/v1/auth/me", body).await?;
+    let resp = patch_json_typed(backend, "/v1/auth/me", body).await?;
     // The endpoint returns MeResponse — same shape as AuthResponsePayload.user.
-    let me: MeResponse = serde_json::from_value(resp).context("decode update_me")?;
-    let existing = read_auth_file()?
-        .ok_or_else(|| anyhow!("no auth on disk — please sign in again"))?;
+    let me: MeResponse =
+        serde_json::from_value(resp).map_err(PortalError::from)?;
+    let existing = read_auth_file()
+        .map_err(PortalError::from)?
+        .ok_or_else(|| PortalError::Unauthorized)?;
     // Preserve the tokens (the backend doesn't reissue them on a
     // profile edit); just merge the renamed identity fields so the
     // next `current_user` / autofill sees the new values.
@@ -193,8 +203,9 @@ pub async fn update_me(
         org_slug: me.org_slug,
         org_display_name: me.org_display_name,
         recording_acknowledged: me.recording_acknowledged,
+        features: me.features,
     };
-    write_auth_file(&merged)?;
+    write_auth_file(&merged).map_err(PortalError::from)?;
     Ok(merged)
 }
 
@@ -204,32 +215,36 @@ pub async fn update_me(
 /// already-authenticated instead of bouncing through /login. We only
 /// need the raw token from the response — the backend's `expires_at`
 /// is informational (the server is the only authority on TTL).
-pub async fn mint_handoff_token(backend: &Backend) -> Result<String> {
-    let resp = post_json(backend, "/v1/auth/handoff/mint", serde_json::json!({}))
-        .await
-        .context("mint handoff token")?;
+pub async fn mint_handoff_token(backend: &Backend) -> std::result::Result<String, PortalError> {
+    let resp = post_json_typed(backend, "/v1/auth/handoff/mint", serde_json::json!({})).await?;
     let token = resp
         .get("token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("mint response missing token"))?;
+        .ok_or_else(|| PortalError::Other {
+            message: "mint response missing token".into(),
+        })?;
     Ok(token.to_string())
 }
 
 /// Revoke the refresh token on the server and wipe auth.json locally.
-pub async fn logout(backend: &Backend) -> Result<()> {
-    if let Some(auth) = read_auth_file()? {
-        let client = client()?;
+pub async fn logout(backend: &Backend) -> std::result::Result<(), PortalError> {
+    if let Some(auth) = read_auth_file().map_err(PortalError::from)? {
+        let c = client().map_err(PortalError::from)?;
         let url = format!(
             "{}/v1/auth/logout",
             backend.url.trim_end_matches('/')
         );
-        let _ = client
+        // Best-effort: a server-side revoke failure shouldn't block
+        // the local wipe (mirrors the previous `let _ = …` shape). If
+        // the user is offline we still want auth.json cleared so the
+        // next launch lands on the login screen.
+        let _ = c
             .post(&url)
             .json(&serde_json::json!({ "refresh_token": auth.refresh_token }))
             .send()
             .await;
     }
-    crate::config::delete_auth_file()?;
+    crate::config::delete_auth_file().map_err(PortalError::from)?;
     Ok(())
 }
 
@@ -245,7 +260,7 @@ pub async fn list_calls(
     // backend's `serde(default) = None` default.
     from_date: Option<&str>,
     to_date: Option<&str>,
-) -> Result<Value> {
+) -> std::result::Result<Value, PortalError> {
     // Tag filters are passed as repeated ?tag= params; missing = no
     // filter. scope=all restricts to admin/superadmin; user= narrows
     // scope=all to one member's calls. `from_date` / `to_date` add
@@ -288,7 +303,7 @@ pub async fn list_calls(
             path.push_str(&urlencoding_minimal(v));
         }
     }
-    get_json(backend, &path).await
+    get_json_typed(backend, &path).await
 }
 
 pub async fn list_trashed(
@@ -298,7 +313,7 @@ pub async fn list_trashed(
     // passed through to the backend which narrows by `recorded_at`.
     from_date: Option<&str>,
     to_date: Option<&str>,
-) -> Result<Value> {
+) -> std::result::Result<Value, PortalError> {
     let mut path = String::from("/v1/calls/trashed");
     let mut params: Vec<(String, String)> = Vec::new();
     if let Some(s) = scope {
@@ -329,35 +344,38 @@ pub async fn list_trashed(
             path.push_str(&urlencoding_minimal(v));
         }
     }
-    get_json(backend, &path).await
+    get_json_typed(backend, &path).await
 }
 
-pub async fn restore_call(backend: &Backend, id: &str) -> Result<()> {
-    post_json(backend, &format!("/v1/calls/{id}/restore"), serde_json::json!({})).await?;
-    Ok(())
+pub async fn restore_call(backend: &Backend, id: &str) -> std::result::Result<(), PortalError> {
+    post_nop_typed(backend, &format!("/v1/calls/{id}/restore"), serde_json::json!({})).await
 }
 
-pub async fn permadelete_call(backend: &Backend, id: &str) -> Result<()> {
+pub async fn permadelete_call(backend: &Backend, id: &str) -> std::result::Result<(), PortalError> {
     // Matches the same auth-header wiring delete_call uses.
-    let client = reqwest::Client::new();
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
     let url = format!(
         "{}/v1/calls/{}?permanent=true",
         backend.url.trim_end_matches('/'),
         id,
     );
-    let resp = client
+    let resp = c
         .delete(&url)
-        .header("Authorization", build_auth_header(backend).await?)
+        .header("authorization", auth)
         .send()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("permadelete call returned {}", resp.status());
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
     }
-    Ok(())
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
 }
 
-pub async fn get_call(backend: &Backend, id: &str) -> Result<Value> {
-    get_json(backend, &format!("/v1/calls/{id}")).await
+pub async fn get_call(backend: &Backend, id: &str) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{id}")).await
 }
 
 /// Narrow lookup used by the orphan-recovery scanner (#63). Returns
@@ -399,12 +417,12 @@ pub async fn update_utterance(
     idx: i32,
     speaker: &str,
     speaker_user_id: Option<&str>,
-) -> Result<()> {
+) -> std::result::Result<(), PortalError> {
     // #82: forward the optional FK. When `None` the field is still
     // emitted as `null` so the backend's `Option<Uuid>` deserializer
     // keeps the current (speaker-only) behaviour. An older backend
     // ignores the unknown field via serde's default-deny.
-    patch_nop(
+    patch_nop_typed(
         backend,
         &format!("/v1/calls/{id}/utterances/{idx}"),
         serde_json::json!({
@@ -425,7 +443,7 @@ pub async fn rename_speaker(
     // (subset rename) and skips summary/participants/action-item
     // prose. `None` or empty slice → global rename (pre-existing).
     utterance_ids: Option<&[i32]>,
-) -> Result<u64> {
+) -> std::result::Result<u64, PortalError> {
     // Only include `to_user_id` / `utterance_ids` in the payload when
     // we have them. Omitting `to_user_id` leaves existing FKs on
     // matching rows untouched (backend `Option<Uuid>` with
@@ -445,7 +463,7 @@ pub async fn rename_speaker(
             );
         }
     }
-    let body: Value = post_json(
+    let body: Value = post_json_typed(
         backend,
         &format!("/v1/calls/{id}/rename-speaker"),
         payload,
@@ -481,16 +499,16 @@ pub async fn fetch_vocab(backend: &Backend) -> Result<OrgVocab> {
     })
 }
 
-pub async fn get_org_vocab(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/org/vocab").await
+pub async fn get_org_vocab(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/org/vocab").await
 }
 
 pub async fn set_org_vocab(
     backend: &Backend,
     custom_spelling: &Value,
     word_boost: &[String],
-) -> Result<()> {
-    put_nop(
+) -> std::result::Result<(), PortalError> {
+    put_nop_typed(
         backend,
         "/v1/org/vocab",
         serde_json::json!({
@@ -501,29 +519,42 @@ pub async fn set_org_vocab(
     .await
 }
 
-pub async fn list_highlights(backend: &Backend, call_id: &str) -> Result<Value> {
-    get_json(backend, &format!("/v1/calls/{call_id}/highlights")).await
+pub async fn list_highlights(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{call_id}/highlights")).await
 }
 
 pub async fn create_highlight(
     backend: &Backend,
     call_id: &str,
     body: &Value,
-) -> Result<Value> {
-    post_json(backend, &format!("/v1/calls/{call_id}/highlights"), body.clone()).await
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(backend, &format!("/v1/calls/{call_id}/highlights"), body.clone()).await
 }
 
-pub async fn update_highlight(backend: &Backend, id: &str, body: &Value) -> Result<()> {
-    patch_nop(backend, &format!("/v1/highlights/{id}"), body.clone()).await
+pub async fn update_highlight(
+    backend: &Backend,
+    id: &str,
+    body: &Value,
+) -> std::result::Result<(), PortalError> {
+    patch_nop_typed(backend, &format!("/v1/highlights/{id}"), body.clone()).await
 }
 
-pub async fn delete_highlight(backend: &Backend, id: &str) -> Result<()> {
-    delete_nop(backend, &format!("/v1/highlights/{id}")).await
+pub async fn delete_highlight(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<(), PortalError> {
+    delete_nop_typed(backend, &format!("/v1/highlights/{id}")).await
 }
 
-pub async fn auto_highlight(backend: &Backend, call_id: &str) -> Result<Value> {
+pub async fn auto_highlight(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Value, PortalError> {
     // LLM call can run a minute+ on a long transcript; bump the timeout.
-    post_with_timeout(
+    post_with_timeout_typed(
         backend,
         &format!("/v1/calls/{call_id}/auto-highlight"),
         serde_json::Value::Null,
@@ -532,16 +563,19 @@ pub async fn auto_highlight(backend: &Backend, call_id: &str) -> Result<Value> {
     .await
 }
 
-pub async fn get_audio_urls(backend: &Backend, id: &str) -> Result<Value> {
-    get_json(backend, &format!("/v1/calls/{id}/audio-urls")).await
+pub async fn get_audio_urls(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{id}/audio-urls")).await
 }
 
-pub async fn get_peaks(backend: &Backend, id: &str) -> Result<Value> {
-    get_json(backend, &format!("/v1/calls/{id}/peaks.json")).await
+pub async fn get_peaks(backend: &Backend, id: &str) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{id}/peaks.json")).await
 }
 
-pub async fn delete_call(backend: &Backend, id: &str) -> Result<()> {
-    delete_nop(backend, &format!("/v1/calls/{id}")).await
+pub async fn delete_call(backend: &Backend, id: &str) -> std::result::Result<(), PortalError> {
+    delete_nop_typed(backend, &format!("/v1/calls/{id}")).await
 }
 
 // ── Tags (#57) ───────────────────────────────────────────────────────
@@ -554,8 +588,8 @@ pub async fn update_call_notes(
     backend: &Backend,
     id: &str,
     notes: &str,
-) -> Result<()> {
-    patch_nop(
+) -> std::result::Result<(), PortalError> {
+    patch_nop_typed(
         backend,
         &format!("/v1/calls/{id}/notes"),
         serde_json::json!({ "notes": notes }),
@@ -569,8 +603,8 @@ pub async fn update_call_tags(
     backend: &Backend,
     id: &str,
     tags: &Value,
-) -> Result<()> {
-    patch_nop(
+) -> std::result::Result<(), PortalError> {
+    patch_nop_typed(
         backend,
         &format!("/v1/calls/{id}/tags"),
         serde_json::json!({ "tags": tags }),
@@ -640,8 +674,8 @@ pub async fn add_client_allowlist_entry(
     backend: &Backend,
     name: &str,
     source: &str,
-) -> Result<Value> {
-    post_json(
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
         backend,
         "/v1/org/client-allowlist",
         serde_json::json!({
@@ -699,6 +733,10 @@ pub async fn list_me_action_items(
     status: &str,
     cursor: Option<&str>,
     limit: i64,
+    // #173 — Due filter token. `"all"` is the default and is omitted
+    // from the URL (matches the portal helper's serialisation rule
+    // so the wire shapes line up). Other values pass through.
+    due: &str,
 ) -> std::result::Result<Value, PortalError> {
     let mut path = String::from("/v1/me/action-items?");
     path.push_str("status=");
@@ -710,6 +748,10 @@ pub async fn list_me_action_items(
             path.push_str("&cursor=");
             path.push_str(&urlencoding_minimal(c));
         }
+    }
+    if !due.is_empty() && due != "all" {
+        path.push_str("&due=");
+        path.push_str(&urlencoding_minimal(due));
     }
     get_json_typed(backend, &path).await
 }
@@ -746,7 +788,7 @@ pub async fn tag_suggestions(
     backend: &Backend,
     kind: Option<&str>,
     q: Option<&str>,
-) -> Result<Value> {
+) -> std::result::Result<Value, PortalError> {
     let mut path = String::from("/v1/calls/tag-suggestions");
     let mut first = true;
     let mut push = |k: &str, v: &str| {
@@ -766,21 +808,21 @@ pub async fn tag_suggestions(
     if let Some(v) = q {
         push("q", v);
     }
-    get_json(backend, &path).await
+    get_json_typed(backend, &path).await
 }
 
 /// GET /v1/org/zoho/status — used on call-detail mount to gate the
 /// "Send to CRM" button. Returns the same shape as the portal's
 /// `api.zoho.status()`. (#186)
-pub async fn zoho_status(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/org/zoho/status").await
+pub async fn zoho_status(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/org/zoho/status").await
 }
 
 /// GET /v1/zoho/record-types — record-type picker payload (#197).
 /// Returns `{ standard, custom, custom_refreshed_at }`. The agent
 /// modal calls this on mount to populate the Step-1 radio list.
-pub async fn zoho_record_types(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/zoho/record-types").await
+pub async fn zoho_record_types(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/zoho/record-types").await
 }
 
 /// GET /v1/zoho/records?module=…&q=… — Step 2 of SendToZohoModal. (#186)
@@ -788,13 +830,13 @@ pub async fn zoho_search_records(
     backend: &Backend,
     module: &str,
     q: &str,
-) -> Result<Value> {
+) -> std::result::Result<Value, PortalError> {
     let path = format!(
         "/v1/zoho/records?module={}&q={}",
         urlencoding_minimal(module),
         urlencoding_minimal(q),
     );
-    get_json(backend, &path).await
+    get_json_typed(backend, &path).await
 }
 
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
@@ -804,13 +846,75 @@ pub async fn zoho_push_call(
     backend: &Backend,
     call_id: &str,
     body: &Value,
-) -> Result<Value> {
-    post_json(
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
         backend,
         &format!("/v1/calls/{call_id}/zoho/push"),
         body.clone(),
     )
     .await
+}
+
+// ── Share call (#35 / #243) ─────────────────────────────────────────
+//
+// Three CRUD helpers wrapping the backend's owner-side share routes.
+// All three return a typed `PortalError` (#124) so the agent UI can
+// switch on `kind === "forbidden"` / `"network"` instead of regex-
+// sniffing a stringified error. The Tauri commands in lib.rs forward
+// these verbatim to the front-end.
+
+/// POST /v1/calls/{id}/shares — mint a new share token. The backend
+/// returns the raw token + assembled URL exactly once; subsequent
+/// list calls only see the SHA256-hashed row. The `body` is shaped
+/// by the front-end (`{expires_in_days?, included_sections?}`) and
+/// forwarded verbatim so this stays in sync with the portal's
+/// `api.calls.createShare` automatically.
+pub async fn create_call_share(
+    backend: &Backend,
+    call_id: &str,
+    body: &Value,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        &format!("/v1/calls/{call_id}/shares"),
+        body.clone(),
+    )
+    .await
+}
+
+/// GET /v1/calls/{id}/shares — list active + historical shares for
+/// the call. The list never includes the raw token / URL; the manage-
+/// shares UI shows status + view count + per-link toggle chips. (#243)
+pub async fn list_call_shares(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{call_id}/shares")).await
+}
+
+/// DELETE /v1/calls/{id}/shares/{share_id} — flip `revoked_at` on
+/// the share row. Idempotent — re-revoking a revoked row is a no-op
+/// 204. Returns `()` on success; backend non-2xxs surface as a typed
+/// `PortalError`. (#243)
+pub async fn revoke_call_share(
+    backend: &Backend,
+    call_id: &str,
+    share_id: &str,
+) -> std::result::Result<(), PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/calls/{call_id}/shares/{share_id}",
+        backend.url.trim_end_matches('/'),
+    );
+    let resp = c.delete(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
 }
 
 /// Tiny URL-encoder for the handful of characters we need to escape
@@ -878,11 +982,14 @@ pub async fn generate_peaks(backend: &Backend, call_id: &str) -> Result<Value> {
 // ── PIPEDA recording-ack + notice prefs (#44, #45, #48) ──────────────
 
 /// Returns Some(Value) with `accepted_at` when the user has accepted,
-/// None on 404 (not yet accepted). Any other status is an error so
-/// callers don't mistake a network blip for an un-accepted user.
-pub async fn get_recording_ack(backend: &Backend) -> Result<Option<Value>> {
+/// None on 404 (not yet accepted). Any other status surfaces as a
+/// structured `PortalError` so callers don't mistake a network blip
+/// for an un-accepted user.
+pub async fn get_recording_ack(
+    backend: &Backend,
+) -> std::result::Result<Option<Value>, PortalError> {
     let auth = build_auth_header(backend).await?;
-    let c = client()?;
+    let c = client().map_err(PortalError::from)?;
     let url = format!(
         "{}/v1/me/recording-ack",
         backend.url.trim_end_matches('/')
@@ -891,17 +998,18 @@ pub async fn get_recording_ack(backend: &Backend) -> Result<Option<Value>> {
         .get(&url)
         .header("authorization", auth)
         .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        .await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
     }
-    let v: Value = resp.json().await.context("decode recording-ack")?;
+    let text = resp.text().await.map_err(PortalError::from)?;
+    let v: Value = serde_json::from_str(&text).map_err(PortalError::from)?;
     Ok(Some(v))
 }
 
@@ -909,8 +1017,8 @@ pub async fn post_recording_ack(
     backend: &Backend,
     agent_version: &str,
     platform: &str,
-) -> Result<()> {
-    post_json(
+) -> std::result::Result<(), PortalError> {
+    post_nop_typed(
         backend,
         "/v1/me/recording-ack",
         serde_json::json!({
@@ -918,12 +1026,11 @@ pub async fn post_recording_ack(
             "platform": platform,
         }),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
-pub async fn get_recording_prefs(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/org/recording-prefs").await
+pub async fn get_recording_prefs(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/org/recording-prefs").await
 }
 
 // ── Org member roster (#65) ──────────────────────────────────────────
@@ -932,8 +1039,8 @@ pub async fn get_recording_prefs(backend: &Backend) -> Result<Value> {
 /// Used by the speaker-rename picker on the call-detail page. Backend
 /// endpoint is readable by any authed user (not admin-gated), so the
 /// normal `build_auth_header` flow suffices.
-pub async fn list_org_members(backend: &Backend) -> Result<Value> {
-    get_json(backend, "/v1/org/members").await
+pub async fn list_org_members(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/org/members").await
 }
 
 // ── HTTP primitives ──────────────────────────────────────────────────
@@ -960,10 +1067,11 @@ async fn get_json(backend: &Backend, path: &str) -> Result<Value> {
         .context("decode")
 }
 
-async fn post_json(backend: &Backend, path: &str, body: Value) -> Result<Value> {
-    post_with_timeout(backend, path, body, Duration::from_secs(60)).await
-}
-
+// Pipeline-internal POST helper. Stays on `anyhow::Result` because
+// the only callers (`transcribe` / `summarize` / `generate_peaks`)
+// thread their failures through pipeline.rs's `anyhow` flow rather
+// than the Tauri-IPC path. Tauri commands now use `*_typed` siblings
+// that surface a structured `PortalError` to the frontend.
 async fn post_with_timeout(
     backend: &Backend,
     path: &str,
@@ -993,84 +1101,6 @@ async fn post_with_timeout(
     serde_json::from_str(&text).context("decode")
 }
 
-async fn put_nop(backend: &Backend, path: &str, body: Value) -> Result<()> {
-    let auth = build_auth_header(backend).await?;
-    let c = client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = c
-        .put(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("PUT {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
-    }
-    Ok(())
-}
-
-async fn patch_nop(backend: &Backend, path: &str, body: Value) -> Result<()> {
-    let auth = build_auth_header(backend).await?;
-    let c = client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = c
-        .patch(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("PATCH {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
-    }
-    Ok(())
-}
-
-async fn patch_json(backend: &Backend, path: &str, body: Value) -> Result<Value> {
-    let auth = build_auth_header(backend).await?;
-    let c = client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = c
-        .patch(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("PATCH {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
-    }
-    let text = resp.text().await.unwrap_or_default();
-    if text.is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_str(&text).context("decode patch")
-}
-
-async fn delete_nop(backend: &Backend, path: &str) -> Result<()> {
-    let auth = build_auth_header(backend).await?;
-    let c = client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = c
-        .delete(&url)
-        .header("authorization", auth)
-        .send()
-        .await
-        .with_context(|| format!("DELETE {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
-    }
-    Ok(())
-}
 
 // ── Typed primitives (#124) ───────────────────────────────────────────
 //
@@ -1156,6 +1186,89 @@ async fn patch_json_typed(
             return Ok(Value::Null);
         }
         return serde_json::from_str(&text).map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+// `*_nop_typed` siblings mirror the no-body-needed flavours. Same
+// classification path as the `_json_typed` helpers — non-2xx funnels
+// through `from_status` so the frontend receives the structured shape
+// (#124 follow-up: extending the pattern beyond the original six).
+
+async fn patch_nop_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+) -> std::result::Result<(), PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .patch(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+async fn put_nop_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+) -> std::result::Result<(), PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .put(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+async fn post_nop_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+) -> std::result::Result<(), PortalError> {
+    // Thin wrapper that discards the body — many of our POSTs return
+    // 200/204 with payloads we don't read on the agent side.
+    let _ = post_json_typed(backend, path, body).await?;
+    Ok(())
+}
+
+async fn delete_nop_typed(
+    backend: &Backend,
+    path: &str,
+) -> std::result::Result<(), PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .delete(&url)
+        .header("authorization", auth)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
     }
     let retry = parse_retry_after(resp.headers());
     let body = resp.text().await.unwrap_or_default();
