@@ -1,5 +1,6 @@
 mod config;
 mod detector;
+mod error;
 mod notes;
 mod pipeline;
 mod portal;
@@ -474,6 +475,10 @@ async fn tag_suggestions(
 
 #[tauri::command]
 async fn list_trashed(
+    // #176 — Mine / All-team scope parity with the portal's trash
+    // view. Defaults to "mine" so non-admins keep their existing
+    // behavior; the UI only shows the All-team pill for admin/owner.
+    scope: Option<String>,
     // #163 (v0.5.2) — optional date-range filter on the trash list.
     // Agent UI passes `YYYY-MM-DDTHH:MM:SSZ` strings already expanded
     // on the JS side; backend narrows by `recorded_at`.
@@ -485,9 +490,10 @@ async fn list_trashed(
         .backend
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
+    let scope = scope.as_deref().unwrap_or("mine");
     portal::list_trashed(
         backend,
-        None,
+        Some(scope),
         from_date.as_deref(),
         to_date.as_deref(),
     )
@@ -657,6 +663,106 @@ async fn update_me(
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
     })
+}
+
+// ── Session handoff (#34) ────────────────────────────────────────────
+
+/// Mint a single-use, 60-second session-handoff token via the backend
+/// and return a fully-qualified `<portal>/handoff?token=<t>` URL the
+/// user-menu's "Open web app" handler can pass straight to `openUrl`.
+///
+/// Building the URL Rust-side (rather than just the token) keeps the
+/// portal base URL — derived from the configured backend host with the
+/// `api.` → `app.` swap that mirrors `portal/src/lib/api.ts` — out of
+/// the SvelteKit bundle and centralised next to the existing backend
+/// config. The browser opens, the page redeems, the user lands on
+/// /calls without a second login.
+///
+/// Returns `Err` if the user isn't signed in (no auth.json), the
+/// network is down, or the backend rejects the mint (e.g. an
+/// impersonating session — `mint` rejects those outright per #181).
+#[tauri::command]
+async fn mint_handoff_url() -> Result<String, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    let token = portal::mint_handoff_token(backend)
+        .await
+        .map_err(|e| e.to_string())?;
+    let portal_base = derive_portal_base(&backend.url);
+    Ok(format!("{portal_base}/handoff?token={token}"))
+}
+
+/// Map an api-host backend URL to the matching portal-host URL.
+/// Mirrors portal/src/lib/api.ts §resolveBase in reverse:
+/// `api.aftercalls.io` ↔ `app.aftercalls.io`. Localhost dev splits the
+/// two by port (`:3001` API → `:5173` portal); we hard-code the dev
+/// pair because that's what `pnpm dev` ships and it matches the
+/// existing legacy setup. Anything we don't recognise falls through
+/// untouched — the worst case is the browser lands on the api host
+/// and renders nothing, and the user can re-launch from a fresh build.
+fn derive_portal_base(api_url: &str) -> String {
+    let trimmed = api_url.trim_end_matches('/');
+    // Production: api.<apex> → app.<apex>.
+    if let Some(rest) = trimmed.strip_prefix("https://api.") {
+        return format!("https://app.{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://api.") {
+        return format!("http://app.{rest}");
+    }
+    // Local dev: 127.0.0.1:3001 → 127.0.0.1:5173 (matches pnpm dev).
+    if trimmed.contains("127.0.0.1:3001") || trimmed.contains("localhost:3001") {
+        return trimmed
+            .replace("127.0.0.1:3001", "127.0.0.1:5173")
+            .replace("localhost:3001", "localhost:5173");
+    }
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod handoff_url_tests {
+    use super::derive_portal_base;
+
+    #[test]
+    fn derive_portal_base_prod_https() {
+        assert_eq!(
+            derive_portal_base("https://api.aftercalls.io"),
+            "https://app.aftercalls.io",
+        );
+    }
+
+    #[test]
+    fn derive_portal_base_trims_trailing_slash() {
+        assert_eq!(
+            derive_portal_base("https://api.aftercalls.io/"),
+            "https://app.aftercalls.io",
+        );
+    }
+
+    #[test]
+    fn derive_portal_base_dev_localhost() {
+        assert_eq!(
+            derive_portal_base("http://127.0.0.1:3001"),
+            "http://127.0.0.1:5173",
+        );
+        assert_eq!(
+            derive_portal_base("http://localhost:3001"),
+            "http://localhost:5173",
+        );
+    }
+
+    #[test]
+    fn derive_portal_base_unknown_pattern_passes_through() {
+        // Custom staging URL we don't know about — fall through; the
+        // handoff path may end up wrong but we return SOMETHING usable
+        // rather than failing the click.
+        assert_eq!(
+            derive_portal_base("https://staging.example/"),
+            "https://staging.example",
+        );
+    }
 }
 
 // ── PIPEDA recording-ack + org prefs (#44, #45, #48) ─────────────────
@@ -901,6 +1007,13 @@ struct AppPrefs {
     /// Shipped default "Super+Shift+R"; `None` disables the global
     /// hotkey entirely (tray + UI Record button + CLI keep working).
     record_toggle_shortcut: Option<String>,
+    /// #56 — per-machine toggle for the spoken recording-start
+    /// announcement. Surfaced in Settings only when the org's
+    /// `recording_notification_mode` is `user`; when the org is in
+    /// `enforced` mode the announcement plays unconditionally and
+    /// the toggle is hidden. Default false so existing installs
+    /// don't suddenly start speaking.
+    consent_announcement_enabled: bool,
 }
 
 #[tauri::command]
@@ -919,6 +1032,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         input_device: cfg.input_device,
         self_note_shortcut: cfg.self_note_shortcut,
         record_toggle_shortcut: cfg.record_toggle_shortcut,
+        consent_announcement_enabled: cfg.consent_announcement_enabled,
     })
 }
 
@@ -937,6 +1051,7 @@ fn set_app_prefs(
     input_device: Option<String>,
     self_note_shortcut: Option<String>,
     record_toggle_shortcut: Option<String>,
+    consent_announcement_enabled: bool,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
@@ -992,6 +1107,7 @@ fn set_app_prefs(
     cfg.input_device = input_device;
     cfg.self_note_shortcut = self_note_shortcut.clone();
     cfg.record_toggle_shortcut = record_toggle_shortcut.clone();
+    cfg.consent_announcement_enabled = consent_announcement_enabled;
     cfg.save().map_err(|e| e.to_string())?;
     // #149 — re-register the self-note hotkey in place if it changed.
     // Best-effort: a failure to bind (portal denied, combo in use)
@@ -1214,57 +1330,49 @@ async fn update_call_tags(
 // ── Phase 2 (#19): resummarize + edit-in-place ────────────────────
 
 /// POST /v1/calls/{id}/resummarize. Returns the updated CallDetail
-/// on success; on 429 cooldown the error string is shaped as
-/// `cooldown:{N}` so the front-end can split it back into a
-/// numeric retry_after_seconds + render a countdown.
+/// on success; failures bubble up as a structured `PortalError`
+/// (#124) so the front-end can switch on `kind === "cooldown"` /
+/// `"network"` / `"server"` instead of regex-sniffing a stringified
+/// error message.
 #[tauri::command]
-async fn resummarize_call(id: String) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::resummarize_call(backend, &id)
-        .await
-        .map_err(|e| e.to_string())
+async fn resummarize_call(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::resummarize_call(backend, &id).await
 }
 
 /// PATCH /v1/calls/{id}. Accepts tri-state fields verbatim from the
 /// front-end JSON; forwarded to the backend without re-shaping so
 /// the TS side is the authoritative definition of "absent vs null
-/// vs value".
+/// vs value". Errors arrive as `PortalError` (#124).
 #[tauri::command]
 async fn patch_call(
     id: String,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::patch_call(backend, &id, &body)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::patch_call(backend, &id, &body).await
 }
 
 /// PATCH /v1/calls/{id}/action-items/{item_id}. Returns the updated
-/// row; cross-org assignee writes bubble up as 400 which the caller
-/// renders as an inline picker error.
+/// row; cross-org assignee writes bubble up as `PortalError::BadRequest`
+/// (#124) which the caller renders as an inline picker error.
 #[tauri::command]
 async fn patch_action_item(
     call_id: String,
     item_id: String,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::patch_action_item(backend, &call_id, &item_id, &body)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::patch_action_item(backend, &call_id, &item_id, &body).await
 }
 
 /// POST /v1/org/client-allowlist — auto-populate from the chip-menu
@@ -1290,60 +1398,54 @@ async fn add_client_allowlist_entry(
 /// POST /v1/calls/{id}/action-items/manual — Phase 3 (#104) manual
 /// add. Body is forwarded verbatim; frontend pre-shapes
 /// `{description, assignee_user_id?}`. Backend returns 201 with the
-/// created row which the caller appends to local state.
+/// created row which the caller appends to local state. Errors
+/// arrive as `PortalError` (#124).
 #[tauri::command]
 async fn add_action_item(
     call_id: String,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::add_action_item(backend, &call_id, &body)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::add_action_item(backend, &call_id, &body).await
 }
 
 /// GET /v1/me/action-items — Phase 4 (#105). Returns the caller's
 /// own action items across every call in their org. Cursor-paginated;
 /// the frontend passes `cursor=null` for the first page and feeds
-/// `next_cursor` back on follow-up pages.
+/// `next_cursor` back on follow-up pages. Errors arrive as
+/// `PortalError` (#124).
 #[tauri::command]
 async fn list_me_action_items(
     status: String,
     cursor: Option<String>,
     limit: Option<i64>,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
     let resolved_limit = limit.unwrap_or(50);
-    portal::list_me_action_items(backend, &status, cursor.as_deref(), resolved_limit)
-        .await
-        .map_err(|e| e.to_string())
+    portal::list_me_action_items(backend, &status, cursor.as_deref(), resolved_limit).await
 }
 
 /// DELETE /v1/calls/{id}/action-items/{item_id} — Phase 3 (#104).
 /// 404 is converted to Ok(()) on the portal helper side so the TS
 /// frontend's deleteActionItem matches the portal's "silent success
-/// on already-gone" behaviour (ui-phase-3 §G).
+/// on already-gone" behaviour (ui-phase-3 §G). Errors arrive as
+/// `PortalError` (#124).
 #[tauri::command]
 async fn delete_action_item(
     call_id: String,
     item_id: String,
-) -> Result<(), String> {
-    let cfg = config::Config::load().map_err(|e| e.to_string())?;
-    let backend = cfg
-        .backend
-        .as_ref()
-        .ok_or_else(|| "no backend configured".to_string())?;
-    portal::delete_action_item(backend, &call_id, &item_id)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::delete_action_item(backend, &call_id, &item_id).await
 }
 
 /// GET /v1/org/zoho/status — Zoho connection probe (#186). Used by
@@ -1999,6 +2101,11 @@ pub fn run() {
             logout,
             current_user,
             update_me,
+            // #34 — agent → portal session handoff. Frontend calls this
+            // from the user-menu "Open web app" item; returns a fully-
+            // qualified handoff URL the menu hands straight to
+            // `openUrl`.
+            mint_handoff_url,
             list_calls,
             tag_suggestions,
             list_trashed,

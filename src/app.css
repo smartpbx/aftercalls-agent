@@ -466,3 +466,122 @@ select {
   user-select: none;
   font-family: var(--font-sans);
 }
+
+/* ── Toast / transient notification (#119) ─────────────────────────
+ * Bottom-right stack. Variants share a single shape (icon + body +
+ * close); semantic color comes from the variant accent stripe + glyph
+ * tint, drawn from the existing palette tokens — no new colors. The
+ * ToastHost component slices `toast.items` to MAX_VISIBLE; this CSS
+ * lays out the visible stack in `column-reverse` so the most-recent
+ * push sits at the visual top of the bottom-right corner.
+ *
+ * design.md §Pattern library "Toast (transient notification)".
+ */
+.toast-host {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 70;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.6rem;
+  pointer-events: none;            /* host is a passthrough; toasts re-enable */
+  max-width: min(420px, calc(100vw - 2.5rem));
+}
+.toast {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: 1.25rem 1fr auto;
+  align-items: start;
+  gap: 0.6rem;
+  padding: 0.65rem 0.75rem 0.7rem;
+  background: var(--ink-1);
+  border: 1px solid var(--hairline-hi);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  box-shadow: 0 14px 32px -12px rgba(0, 0, 0, 0.55);
+  font-size: 0.85rem;
+  color: var(--bone-1);
+  animation: toast-in 200ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.toast-info    { border-left-color: var(--bone-2); }
+.toast-success { border-left-color: var(--olive); }
+.toast-warning { border-left-color: var(--sig); }
+.toast-error   { border-left-color: var(--live); }
+.toast-glyph {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.2;
+  width: 1.25rem;
+  height: 1.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.toast-info    .toast-glyph { color: var(--bone-0); background: color-mix(in srgb, var(--bone-2) 22%, transparent); }
+.toast-success .toast-glyph { color: var(--olive); background: var(--olive-soft); }
+.toast-warning .toast-glyph { color: var(--sig); background: color-mix(in srgb, var(--sig) 22%, transparent); }
+.toast-error   .toast-glyph { color: var(--live); background: var(--live-soft); }
+.toast-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.toast-msg {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--bone-0);
+  word-wrap: break-word;
+}
+.toast-action {
+  align-self: flex-start;
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--hairline-hi);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.toast-action:hover {
+  color: var(--accent-hi);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.toast-close {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--bone-3);
+  font-size: 1rem;
+  line-height: 1;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+  flex-shrink: 0;
+}
+.toast-close:hover {
+  color: var(--bone-0);
+  background: var(--ink-2);
+}

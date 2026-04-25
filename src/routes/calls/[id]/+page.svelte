@@ -24,6 +24,8 @@
     type SzmSearchResult,
     type SzmPushResponse,
   } from "$lib/SendToZohoModal.svelte";
+  import { zohoStore } from "$lib/stores/zoho.svelte";
+  import { isPortalError, type PortalError } from "$lib/portalError";
 
   type Utterance = {
     idx: number;
@@ -243,9 +245,14 @@
   // bits: `zoho_status` / `zoho_search_records` / `zoho_push_call`
   // ride through Tauri commands rather than fetch; `zohoUrlHandler`
   // delegates to plugin-opener's openUrl.
-  let zohoConnected = $state(false);
+  //
+  // #218: org-level connection state lives in `zohoStore` so a Zoho
+  // OAuth connect from another tab/window flows back into already-
+  // open call-detail tabs without requiring a reload. The store seeds
+  // via `refresh()` in onMount and listens for the `storage` event.
+  let zohoConnected = $derived(zohoStore.connected);
+  let zohoFallbackOwnerName = $derived(zohoStore.connectedByDisplayName);
   let zohoModalOpen = $state(false);
-  let zohoFallbackOwnerName = $state<string | null>(null);
   let zohoPushed = $derived(
     !!call?.tags?.some(
       (t) => t.kind === "custom" && t.value === "zoho:pushed",
@@ -422,23 +429,23 @@
       // Success also clears any prior async-error callout.
       regenAsyncError = null;
       startCooldownTicker(30);
-    } catch (e: any) {
-      // Tauri errors round-trip as plain strings. Our resummarize
-      // command shapes 429s as `cooldown:{N}` so we can parse the
-      // retry window out. Server-side failures come through as
-      // whatever message the Rust side attached. We don't have an
-      // HTTP status at this layer — everything non-cooldown is
-      // treated as a server error (the Tauri updater marshals both
-      // 5xx and network errors into the same plain-string bucket).
-      const msg = String(e?.message ?? e ?? "");
-      const cooldownMatch = msg.match(/^cooldown:(\d+)$/);
-      if (cooldownMatch) {
-        const retry = Number(cooldownMatch[1]);
-        regenCooldownMsg = "cooldown";
-        startCooldownTicker(retry > 0 ? retry : 30);
-      } else if (/network|connect|timeout|offline/i.test(msg)) {
-        regenAsyncError =
-          "Couldn't reach the server to regenerate. Check your connection and try again.";
+    } catch (e: unknown) {
+      // #124: Tauri ships our `Result<_, PortalError>` errors as a
+      // structured object (`{kind, ...}`) so we can switch on `kind`
+      // instead of regex-sniffing the message. Anything that isn't
+      // shaped like a PortalError (shouldn't happen in practice)
+      // falls back to the generic try-again branch.
+      if (isPortalError(e)) {
+        if (e.kind === "cooldown") {
+          regenCooldownMsg = "cooldown";
+          startCooldownTicker(e.retry_after_seconds > 0 ? e.retry_after_seconds : 30);
+        } else if (e.kind === "network") {
+          regenAsyncError =
+            "Couldn't reach the server to regenerate. Check your connection and try again.";
+        } else {
+          regenAsyncError =
+            "Couldn't regenerate the summary. Your existing summary and action items are unchanged. Try again in a moment.";
+        }
       } else {
         regenAsyncError =
           "Couldn't regenerate the summary. Your existing summary and action items are unchanged. Try again in a moment.";
@@ -448,41 +455,67 @@
     }
   }
 
-  // Inline summary edit ─────────────────────────────────────────────
-  let summaryEditing = $state(false);
-  let summaryDraft = $state("");
-  let summarySaving = $state(false);
-  let summaryError = $state("");
+  // ── Edit-focus state machine (#118) ───────────────────────────────
+  //
+  // Mirrors the portal #118 refactor: a single tagged union covers
+  // both Summary inline-edit and per-row Action-item edit, so the
+  // type system rules out `summaryEditing && row-editing` as an
+  // invalid combination. The `summary` variant carries draft + saving
+  // + error; row variants carry only itemId (per-row PATCH in-flight
+  // and per-row error stay parallel because multiple rows can save
+  // concurrently).
+  type EditFocus =
+    | { kind: "none" }
+    | { kind: "summary"; draft: string; saving: boolean; error: string }
+    | { kind: "row-description"; itemId: string }
+    | { kind: "row-owner"; itemId: string };
 
+  let editFocus = $state<EditFocus>({ kind: "none" });
+  let patchingItemIds = $state<Set<string>>(new Set());
+  let actionItemErrors = $state<Record<string, string>>({});
+
+  // Inline summary edit ─────────────────────────────────────────────
   function startSummaryEdit() {
     if (!call) return;
-    summaryDraft = call.summary_text ?? "";
-    summaryError = "";
-    summaryEditing = true;
+    editFocus = {
+      kind: "summary",
+      draft: call.summary_text ?? "",
+      saving: false,
+      error: "",
+    };
   }
   function cancelSummaryEdit() {
-    summaryEditing = false;
-    summaryDraft = "";
-    summaryError = "";
+    if (editFocus.kind !== "summary") return;
+    editFocus = { kind: "none" };
+  }
+  function updateSummaryDraft(next: string) {
+    if (editFocus.kind !== "summary") return;
+    editFocus = { ...editFocus, draft: next };
   }
   async function saveSummaryEdit() {
     if (!call) return;
-    summarySaving = true;
-    summaryError = "";
+    if (editFocus.kind !== "summary") return;
+    const draft = editFocus.draft;
+    editFocus = { ...editFocus, saving: true, error: "" };
     try {
-      const trimmed = summaryDraft.trim();
+      const trimmed = draft.trim();
       const fresh = (await invoke("patch_call", {
         id: call.id,
-        body: { summary_text: trimmed.length === 0 ? null : summaryDraft },
+        body: { summary_text: trimmed.length === 0 ? null : draft },
       })) as Call;
       fresh.notes = notesBuffer;
       call = fresh;
-      summaryEditing = false;
+      editFocus = { kind: "none" };
     } catch (e: any) {
-      summaryError = "Save failed. Check your connection and try again.";
       console.warn("summary save failed", e);
-    } finally {
-      summarySaving = false;
+      // Re-read editFocus in case the user cancelled mid-flight.
+      if (editFocus.kind === "summary") {
+        editFocus = {
+          ...editFocus,
+          saving: false,
+          error: "Save failed. Check your connection and try again.",
+        };
+      }
     }
   }
   function onSummaryKeydown(e: KeyboardEvent) {
@@ -499,23 +532,13 @@
     }
   }
 
-  // ── Action-item edit state machine (#126 / v0.4.2) ────────────────
+  // ── Action-item edit state machine (#126 / v0.4.2 / #118) ────────
   //
-  // Row-scoped discriminated-union replaces the Phase 2
-  // `editingActionItemId` singleton + Phase 3 separate-composer
-  // state. See the portal mirror for the full architect commentary;
-  // this agent-surface version routes PATCH / POST through `invoke`
-  // instead of fetch but keeps the same state semantics. Mutual
-  // exclusion is parent-enforced; per-row PATCH in-flight tracked
-  // via `patchingItemIds: Set<string>`.
-  type ActiveRowEdit =
-    | { kind: "none" }
-    | { kind: "description"; itemId: string }
-    | { kind: "owner"; itemId: string };
-
-  let activeRowEdit = $state<ActiveRowEdit>({ kind: "none" });
-  let patchingItemIds = $state<Set<string>>(new Set());
-  let actionItemErrors = $state<Record<string, string>>({});
+  // Row-scoped subset of `editFocus`. See the portal mirror for the
+  // full architect commentary; this agent-surface version routes
+  // PATCH / POST through `invoke` instead of fetch but keeps the
+  // same state semantics. Mutual exclusion is parent-enforced;
+  // per-row PATCH in-flight tracked via `patchingItemIds: Set<string>`.
 
   let canAddActionItem = $derived.by(() => {
     if (!canEditSummary) return false;
@@ -526,8 +549,8 @@
   // Disable Add item while a phantom row is already open AND empty.
   let hasEmptyPhantom = $derived.by(() => {
     if (!call) return false;
-    const active = activeRowEdit;
-    if (active.kind !== "description") return false;
+    const active = editFocus;
+    if (active.kind !== "row-description") return false;
     if (!active.itemId.startsWith("__pending__")) return false;
     const row = call.action_items.find((ai) => ai.id === active.itemId);
     if (!row) return false;
@@ -546,11 +569,11 @@
 
   async function onDescriptionEditRequest(payload: { item: ActionItemRow }) {
     if (!canEditSummary) return;
-    activeRowEdit = { kind: "description", itemId: payload.item.id };
+    editFocus = { kind: "row-description", itemId: payload.item.id };
   }
   async function onOwnerEditRequest(payload: { item: ActionItemRow }) {
     if (!canEditSummary) return;
-    activeRowEdit = { kind: "owner", itemId: payload.item.id };
+    editFocus = { kind: "row-owner", itemId: payload.item.id };
   }
 
   async function onDescriptionSave(payload: {
@@ -575,16 +598,19 @@
         ),
       };
       if (
-        activeRowEdit.kind === "description" &&
-        activeRowEdit.itemId === payload.itemId
+        editFocus.kind === "row-description" &&
+        editFocus.itemId === payload.itemId
       ) {
-        activeRowEdit = { kind: "none" };
+        editFocus = { kind: "none" };
       }
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg = /workspace|team|member/i.test(raw)
-        ? "That teammate isn't in your workspace. Pick someone from your team."
-        : "Save failed. Check your connection and try again.";
+    } catch (e: unknown) {
+      // #124: bad_request from the backend means the assignee isn't
+      // in the org (FK reject). Anything else (network / server /
+      // other) shows the generic "check your connection" message.
+      const msg =
+        isPortalError(e) && e.kind === "bad_request"
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
       actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
       console.warn("action item description save failed", e);
     } finally {
@@ -594,10 +620,10 @@
 
   function onDescriptionCancel(payload: { item: ActionItemRow }) {
     if (
-      activeRowEdit.kind === "description" &&
-      activeRowEdit.itemId === payload.item.id
+      editFocus.kind === "row-description" &&
+      editFocus.itemId === payload.item.id
     ) {
-      activeRowEdit = { kind: "none" };
+      editFocus = { kind: "none" };
     }
     actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
@@ -623,10 +649,10 @@
         ),
       };
       if (
-        activeRowEdit.kind === "owner" &&
-        activeRowEdit.itemId === payload.itemId
+        editFocus.kind === "row-owner" &&
+        editFocus.itemId === payload.itemId
       ) {
-        activeRowEdit = { kind: "description", itemId: payload.itemId };
+        editFocus = { kind: "row-description", itemId: payload.itemId };
       }
       return;
     }
@@ -646,16 +672,17 @@
         ),
       };
       if (
-        activeRowEdit.kind === "owner" &&
-        activeRowEdit.itemId === payload.itemId
+        editFocus.kind === "row-owner" &&
+        editFocus.itemId === payload.itemId
       ) {
-        activeRowEdit = { kind: "none" };
+        editFocus = { kind: "none" };
       }
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg = /workspace|team|member/i.test(raw)
-        ? "That teammate isn't in your workspace. Pick someone from your team."
-        : "Save failed. Check your connection and try again.";
+    } catch (e: unknown) {
+      // #124: structured-error matching — see onDescriptionSave.
+      const msg =
+        isPortalError(e) && e.kind === "bad_request"
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
       actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
       console.warn("action item owner save failed", e);
     } finally {
@@ -665,10 +692,10 @@
 
   function onOwnerCancel(payload: { item: ActionItemRow }) {
     if (
-      activeRowEdit.kind === "owner" &&
-      activeRowEdit.itemId === payload.item.id
+      editFocus.kind === "row-owner" &&
+      editFocus.itemId === payload.item.id
     ) {
-      activeRowEdit = { kind: "none" };
+      editFocus = { kind: "none" };
     }
     actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
@@ -698,7 +725,7 @@
       ...call,
       action_items: [...call.action_items, phantom],
     };
-    activeRowEdit = { kind: "description", itemId: phantomId };
+    editFocus = { kind: "row-description", itemId: phantomId };
     queueMicrotask(() => {
       const el = document.querySelector<HTMLTextAreaElement>(
         ".ai-row.ai-editing .ai-edit-desc",
@@ -713,12 +740,12 @@
   }) {
     if (!call) return;
     if (
-      activeRowEdit.kind !== "description" ||
-      !activeRowEdit.itemId.startsWith("__pending__")
+      editFocus.kind !== "row-description" ||
+      !editFocus.itemId.startsWith("__pending__")
     ) {
       return;
     }
-    const phantomId = activeRowEdit.itemId;
+    const phantomId = editFocus.itemId;
     if (patchingItemIds.has(phantomId)) return;
     markPatching(phantomId, true);
     actionItemErrors = { ...actionItemErrors, [phantomId]: "" };
@@ -736,12 +763,13 @@
           ai.id === phantomId ? created : ai,
         ),
       };
-      activeRowEdit = { kind: "none" };
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg = /workspace|team|member/i.test(raw)
-        ? "That teammate isn't in your workspace. Pick someone from your team."
-        : "Save failed. Check your connection and try again.";
+      editFocus = { kind: "none" };
+    } catch (e: unknown) {
+      // #124: structured-error matching — see onDescriptionSave.
+      const msg =
+        isPortalError(e) && e.kind === "bad_request"
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
       actionItemErrors = { ...actionItemErrors, [phantomId]: msg };
       console.warn("action item phantom save failed", e);
     } finally {
@@ -752,18 +780,18 @@
   function onPendingDiscard() {
     if (!call) return;
     if (
-      activeRowEdit.kind !== "description" ||
-      !activeRowEdit.itemId.startsWith("__pending__")
+      editFocus.kind !== "row-description" ||
+      !editFocus.itemId.startsWith("__pending__")
     ) {
       return;
     }
-    const phantomId = activeRowEdit.itemId;
+    const phantomId = editFocus.itemId;
     if (patchingItemIds.has(phantomId)) return;
     call = {
       ...call,
       action_items: call.action_items.filter((ai) => ai.id !== phantomId),
     };
-    activeRowEdit = { kind: "none" };
+    editFocus = { kind: "none" };
     const nextErr = { ...actionItemErrors };
     delete nextErr[phantomId];
     actionItemErrors = nextErr;
@@ -1295,19 +1323,13 @@
       loading = false;
       trace("onMount end loading=false");
     }
-    // #186: probe the org's Zoho connection so the call-detail page
-    // can show/hide the "Send to CRM" button. Failure (env-disabled,
-    // network down) just leaves the button hidden.
-    try {
-      const status = (await invoke("zoho_status")) as {
-        connected: boolean;
-        connected_by?: { display_name: string };
-      };
-      zohoConnected = !!status.connected;
-      zohoFallbackOwnerName = status.connected_by?.display_name ?? null;
-    } catch {
-      zohoConnected = false;
-    }
+    // #186 + #218: probe the org's Zoho connection so the call-detail
+    // page can show/hide the "Send to CRM" button. Routes through
+    // `zohoStore` so cross-tab/window connects flip the button live.
+    // The store swallows transport failures (env-disabled, network
+    // down) and reports `connected: false`.
+    zohoStore.ensureCrossTabListener();
+    zohoStore.refresh();
     // Live-refresh while the call is still being processed. Users
     // land here as soon as the transcript is in; summary + action
     // items pop in reactively as the backend finishes them. Stops
@@ -1467,6 +1489,11 @@
   async function loadAudio() {
     if (!call) return;
     audioError = "";
+    // Fresh load = fresh auto-retry budget for #83's refresh-on-error
+    // path. Reset here (and in retryAudio) so users navigating into a
+    // call always get one auto-recovery attempt before we surface the
+    // inline retry UI.
+    audioReloadRetried = false;
     // Stale blob URLs from the old fetch-then-blob path may still be
     // hanging around; revoke any we own. New path doesn't create blobs.
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
@@ -1534,6 +1561,7 @@
     if (!call) return;
     audioError = "";
     audioUrlsError = false;
+    audioReloadRetried = false;
     try {
       audioUrls = await invoke("get_audio_urls", { id: page.params.id });
       trace("get_audio_urls ok (manual retry)", audioUrls);
@@ -2094,6 +2122,94 @@
   }
   function onPause() {
     playing = false;
+  }
+
+  // #83: rapid scrubbing on long calls in WebKitGTK (Tauri's webview on
+  // Linux) sometimes leaves the <audio> element in MEDIA_ERR_NETWORK
+  // or MEDIA_ERR_DECODE — Range requests get cancelled mid-flight and
+  // the element doesn't auto-recover. From that state, setting
+  // currentTime is a no-op until src is re-set. The portal doesn't see
+  // this because Chromium / Firefox handle Range cancellation cleanly.
+  //
+  // Refresh-on-error: re-mint the presigned URL, swap src, restore the
+  // playhead, resume playback. Capped at one auto-retry per src to
+  // avoid loops on a hard failure (expired token, bucket gone, etc.) —
+  // we then surface the existing inline retry UI.
+  let audioReloadInFlight = $state(false);
+  let audioReloadRetried = $state(false);
+  async function onAudioError() {
+    if (!audioEl) return;
+    // The browser sometimes fires `error` during teardown when src is
+    // emptied — the element's error object is null in that case. Skip.
+    if (!audioEl.error) return;
+    trace("audio error", {
+      code: audioEl.error.code,
+      message: audioEl.error.message,
+      currentTime: audioEl.currentTime,
+    });
+    if (audioReloadInFlight) return;
+    if (audioReloadRetried) {
+      // We already retried once for this src. Surface the inline
+      // retry button (matches the audioUrlsError UX) instead of
+      // silently looping.
+      audioError = "Playback interrupted — retry.";
+      audioUrlsError = true;
+      return;
+    }
+    audioReloadInFlight = true;
+    audioReloadRetried = true;
+    const resumeAtMs = Math.floor(audioEl.currentTime * 1000);
+    const wasPlaying = !audioEl.paused;
+    try {
+      // Re-mint the presigned URL. The old one might be expired
+      // (TTL = 15 min) or the Range stream might have hit a transient
+      // network blip; either way, a fresh src clears the error state.
+      const fresh = await invoke<typeof audioUrls>("get_audio_urls", {
+        id: page.params.id,
+      });
+      audioUrls = fresh;
+      audioUrlsError = false;
+      const remote = fresh && fresh.mixed;
+      if (!remote) {
+        audioError = "Audio unavailable — try again shortly.";
+        return;
+      }
+      // Force the element to reload by clearing first. WebKitGTK keeps
+      // the error sticky if you assign the same-host URL on top of an
+      // errored src without an empty assignment in between.
+      audioSrc = "";
+      // Microtask flush so Svelte writes the empty src before we set
+      // the new one — otherwise the framework may collapse both
+      // assignments into a single update and skip the reload.
+      await Promise.resolve();
+      audioSrc = remote;
+      audioError = "";
+      // Wait for metadata so currentTime + play() are valid. Without
+      // this the seek lands at 0 on the new stream.
+      await new Promise<void>((resolve) => {
+        if (!audioEl) return resolve();
+        if (audioEl.readyState >= 1) return resolve();
+        const done = () => {
+          audioEl?.removeEventListener("loadedmetadata", done);
+          resolve();
+        };
+        audioEl.addEventListener("loadedmetadata", done, { once: true });
+        // Defensive timeout — if metadata never arrives, give up
+        // gracefully rather than hanging the reload promise.
+        setTimeout(done, 5000);
+      });
+      if (audioEl) {
+        const maxSec = call ? call.duration_ms / 1000 : Infinity;
+        audioEl.currentTime = Math.max(0, Math.min(maxSec, resumeAtMs / 1000));
+        if (wasPlaying) void audioEl.play();
+      }
+    } catch (e) {
+      trace("audio reload failed", e);
+      audioError = "Couldn't load audio — retry.";
+      audioUrlsError = true;
+    } finally {
+      audioReloadInFlight = false;
+    }
   }
 
   function togglePlay() {
@@ -2821,6 +2937,7 @@
         ontimeupdate={onTimeUpdate}
         onplay={onPlay}
         onpause={onPause}
+        onerror={onAudioError}
         preload="auto"
       ></audio>
 
@@ -3024,7 +3141,7 @@
         {/if}
         <div class="block-head">
           <h2>Summary</h2>
-          {#if !summaryEditing}
+          {#if editFocus.kind !== "summary"}
             <div class="block-head-actions">
               <button
                 class="copy-btn"
@@ -3121,35 +3238,37 @@
               Writing summary<span class="gen-dots"></span>
             </p>
           </div>
-        {:else if summaryEditing}
+        {:else if editFocus.kind === "summary"}
           <div class="summary-editor-wrap">
             <textarea
               class="summary-editor"
-              bind:value={summaryDraft}
+              value={editFocus.draft}
+              oninput={(e) =>
+                updateSummaryDraft((e.currentTarget as HTMLTextAreaElement).value)}
               onkeydown={onSummaryKeydown}
-              disabled={summarySaving}
+              disabled={editFocus.saving}
               aria-label="Summary body"
             ></textarea>
             <p class="summary-hint">
               <code>&lt;name&gt;Firstname L.&lt;/name&gt;</code> marks a teammate chip. Edit the tag to match the roster name.
             </p>
-            {#if summaryError}
-              <p class="summary-err" role="alert">{summaryError}</p>
+            {#if editFocus.error}
+              <p class="summary-err" role="alert">{editFocus.error}</p>
             {/if}
             <div class="summary-edit-actions">
               <button
                 type="button"
                 class="summary-save"
                 onclick={saveSummaryEdit}
-                disabled={summarySaving}
+                disabled={editFocus.saving}
               >
-                {summarySaving ? "Saving…" : "Save"}
+                {editFocus.saving ? "Saving…" : "Save"}
               </button>
               <button
                 type="button"
                 class="summary-cancel"
                 onclick={cancelSummaryEdit}
-                disabled={summarySaving}
+                disabled={editFocus.saving}
               >
                 Cancel
               </button>
@@ -3269,10 +3388,10 @@
                 totalInList={call.action_items.length}
                 colorFor={speakerColor}
                 canEdit={canEditSummary}
-                editingDescription={activeRowEdit.kind === "description" &&
-                  activeRowEdit.itemId === item.id}
-                editingOwner={activeRowEdit.kind === "owner" &&
-                  activeRowEdit.itemId === item.id}
+                editingDescription={editFocus.kind === "row-description" &&
+                  editFocus.itemId === item.id}
+                editingOwner={editFocus.kind === "row-owner" &&
+                  editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
                 editError={actionItemErrors[item.id] ?? ""}
@@ -3366,10 +3485,10 @@
                 totalInList={call.action_items.length}
                 colorFor={speakerColor}
                 canEdit={canEditSummary}
-                editingDescription={activeRowEdit.kind === "description" &&
-                  activeRowEdit.itemId === item.id}
-                editingOwner={activeRowEdit.kind === "owner" &&
-                  activeRowEdit.itemId === item.id}
+                editingDescription={editFocus.kind === "row-description" &&
+                  editFocus.itemId === item.id}
+                editingOwner={editFocus.kind === "row-owner" &&
+                  editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
                 editError={actionItemErrors[item.id] ?? ""}

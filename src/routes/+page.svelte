@@ -45,6 +45,20 @@
   let recording = $state(false);
   let sessionDir = $state("");
   let error = $state("");
+  // #142 follow-up — Call / Note mode toggle. "call" routes the
+  // primary record button through start_recording (mic + system
+  // loopback, full pipeline). "note" routes through start_self_note
+  // (mic-only dictation, capped by max_self_note_minutes). Mirrors
+  // the Mine/All-team scope-pill pattern shipped in #176.
+  // Disabled while a recording is live so the user can't flip mode
+  // mid-capture and confuse which shortcut is bound.
+  let recordMode = $state<"call" | "note">("call");
+  // Resolved shortcut strings for the kbd-row + record-button title.
+  // Loaded from `get_app_prefs` on mount; null = user disabled the
+  // hotkey in Settings, in which case the kbd-row is hidden for
+  // that mode.
+  let recordToggleShortcut = $state<string | null>("Super+Shift+R");
+  let selfNoteShortcut = $state<string | null>("Super+Shift+N");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
   // Latest known call id for the in-flight pipeline. Populated on
@@ -371,10 +385,14 @@
         manual_notes_enabled: boolean;
         wayland_hotkey_notice_dismissed: boolean;
         input_device: string | null;
+        record_toggle_shortcut: string | null;
+        self_note_shortcut: string | null;
       }>("get_app_prefs");
       manualNotesEnabled = !!prefs?.manual_notes_enabled;
       hotkeyNoteAppPrefs = prefs;
       hotkeyNoteDismissed = !!prefs?.wayland_hotkey_notice_dismissed;
+      recordToggleShortcut = prefs?.record_toggle_shortcut ?? null;
+      selfNoteShortcut = prefs?.self_note_shortcut ?? null;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -455,6 +473,14 @@
         sessionDir = await invoke<string>("stop_recording");
         return;
       }
+      // Note mode bypasses the PIPEDA ack — a self-note is mic-only
+      // dictation by the user, no other participants to consent.
+      // Same shape the keyboard shortcut + tray menu have used since
+      // v0.4.5.
+      if (recordMode === "note") {
+        await actuallyStartSelfNote();
+        return;
+      }
       // Gate on PIPEDA ack (#44) before touching the recorder.
       const ok = await ensureRecordingAcknowledged("manual");
       if (!ok) return; // Modal opened (or aborted) — resume happens later.
@@ -478,6 +504,26 @@
       console.warn("start cue failed", e);
     }
     sessionDir = await invoke<string>("start_recording");
+  }
+
+  // #142 follow-up — note-to-self path from the record-page tab.
+  // Same Tauri command the global hotkey + tray menu invoke; mic-only
+  // capture, capped by `max_self_note_minutes`. No PIPEDA ack: a
+  // self-note has only one participant.
+  async function actuallyStartSelfNote() {
+    pipelineStage = "";
+    pipelineError = "";
+    openableCallId = "";
+    try {
+      // #56 — selfNote: true plays the chime but suppresses the
+      // spoken consent announcement. A self-note has only one
+      // participant (the user dictating); no other party to disclose
+      // to. Mirrors the PIPEDA-ack bypass for self-notes above.
+      await playStartCueIfEnabled({ selfNote: true });
+    } catch (e) {
+      console.warn("start cue failed", e);
+    }
+    sessionDir = await invoke<string>("start_self_note");
   }
 
   // Returns true when the caller may proceed with recording
@@ -633,6 +679,41 @@
     await invoke("keep_auto_recording");
   }
 
+  // #142 follow-up — the kbd-row + record-button title attribute
+  // both pull from these. `activeShortcut` reflects whichever mode
+  // is currently selected; `null` means the user disabled that
+  // hotkey in Settings, in which case the kbd-row is hidden for
+  // that mode (tooltip falls back to the action verb only).
+  let activeShortcut = $derived(
+    recordMode === "call" ? recordToggleShortcut : selfNoteShortcut,
+  );
+  // Split a "Super+Shift+R" canonical shortcut into individual
+  // <span class="kbd"> chunks for the kbd-row. Filters falsy parts
+  // so the row collapses cleanly when the shortcut is null.
+  let activeShortcutKeys = $derived(
+    (activeShortcut ?? "")
+      .split("+")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  // Title-attribute string used as the record-button tooltip. Folds
+  // the shortcut + mode into one line so the user always sees the
+  // configured combo (or a "Set in Settings" hint when disabled).
+  let recordBtnTitle = $derived.by(() => {
+    const verb = recording
+      ? "Stop recording"
+      : recordMode === "note"
+        ? "Start note to self"
+        : "Start recording";
+    if (activeShortcut) return `${verb} (${activeShortcut})`;
+    return `${verb} — set a global shortcut in Settings`;
+  });
+
+  function setRecordMode(next: "call" | "note") {
+    if (recording) return; // never flip mode mid-capture
+    recordMode = next;
+  }
+
   function fmtTimer(ms: number) {
     const s = Math.floor(ms / 1000);
     const h = Math.floor(s / 3600);
@@ -728,18 +809,67 @@
   {/if}
 
   <section class="cta" style="--i: 2">
+    <!-- #142 follow-up — Call / Note mode tabs. Same scope-pill
+         visual the admin Mine/All-team toggle uses on /calls and
+         /calls/trash (#176). Disabled mid-capture so the user can't
+         flip the mode while a recording is live (the running session
+         was started in the previous mode; switching the label would
+         lie about what the Stop button is going to do). Copy-notice
+         button is hidden in Note mode — a self-note has only one
+         participant, no consent message to paste. -->
+    <div class="record-tabs" role="tablist" aria-label="Recording mode">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={recordMode === "call"}
+        class="scope-pill"
+        class:active={recordMode === "call"}
+        disabled={recording}
+        onclick={() => setRecordMode("call")}
+      >
+        Call
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={recordMode === "note"}
+        class="scope-pill"
+        class:active={recordMode === "note"}
+        disabled={recording}
+        onclick={() => setRecordMode("note")}
+      >
+        Note
+      </button>
+    </div>
+
     <div class="cta-row">
-      <!-- Primary action — button flips to live state with inline timer. -->
+      <!-- Primary action — button flips to live state with inline timer.
+           In Note mode the verb + aria-label change to "note to self"
+           and the keyboard-shortcut tooltip surfaces the combo bound
+           to that mode. -->
       <button
         class="record-btn"
         class:live={recording}
         onclick={toggle}
-        aria-label={recording ? "Stop recording" : "Start recording"}
+        aria-label={recording
+          ? "Stop recording"
+          : recordMode === "note"
+            ? "Start note to self"
+            : "Start recording"}
+        title={recordBtnTitle}
       >
         <span class="record-icon">
           {#if recording}
             <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
               <rect x="4.5" y="4.5" width="11" height="11" rx="1.5" fill="currentColor" />
+            </svg>
+          {:else if recordMode === "note"}
+            <!-- Mic glyph for Note mode so the icon also signals
+                 "mic-only dictation" (no system loopback). -->
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <rect x="6" y="2" width="4" height="7" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M4 8.5a4 4 0 0 0 8 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              <path d="M8 12.5v1.5M6.2 14h3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
           {:else}
             <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
@@ -748,7 +878,11 @@
           {/if}
         </span>
         <span class="record-text">
-          {recording ? "Stop recording" : "Start recording"}
+          {recording
+            ? "Stop recording"
+            : recordMode === "note"
+              ? "Start note to self"
+              : "Start recording"}
         </span>
         {#if recording}
           <span class="record-timer">{fmtTimer(elapsedMs)}</span>
@@ -758,25 +892,30 @@
       <!-- Copy a PIPEDA-compliant recording notice to the clipboard
            (#45) so the user can paste it into meeting chat as the
            "I'm recording, here's why, here's the retention posture"
-           heads-up to other participants. -->
-      <button
-        type="button"
-        class="copy-notice-btn"
-        onclick={copyNotice}
-        disabled={copyingNotice}
-        aria-live="polite"
-      >
-        {copiedNotice ? "Copied ✓" : copyingNotice ? "Copying…" : "Copy notice"}
-      </button>
+           heads-up to other participants. Hidden in Note mode — no
+           other participant on a self-note. -->
+      {#if recordMode === "call"}
+        <button
+          type="button"
+          class="copy-notice-btn"
+          onclick={copyNotice}
+          disabled={copyingNotice}
+          aria-live="polite"
+        >
+          {copiedNotice ? "Copied ✓" : copyingNotice ? "Copying…" : "Copy notice"}
+        </button>
+      {/if}
     </div>
 
     <div class="cta-secondary">
-      <span class="kbd-row">
-        <span class="kbd">Super</span>
-        <span class="kbd">Shift</span>
-        <span class="kbd">R</span>
-      </span>
-      <span class="sep">·</span>
+      {#if activeShortcutKeys.length}
+        <span class="kbd-row" title={recordBtnTitle}>
+          {#each activeShortcutKeys as part (part)}
+            <span class="kbd">{part}</span>
+          {/each}
+        </span>
+        <span class="sep">·</span>
+      {/if}
       <button class="link" disabled={importing} onclick={importRecording}>
         {importing ? "Importing…" : "Import a file"}
       </button>
@@ -1029,6 +1168,43 @@
     align-items: flex-start;
     gap: 0.85rem;
     padding: 0.4rem 0 0.8rem;
+  }
+
+  /* #142 follow-up — Call / Note mode tabs. Mirrors the .scope-pill
+     pattern shipped in #176 (agent + portal trash views) so the
+     visual vocabulary across "binary toggle on top of a list" is
+     consistent. Pills are local to this route — design.md treats
+     scope pills as a shared idiom but each route currently inlines
+     them, so we follow precedent rather than promote into app.css. */
+  .record-tabs {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .scope-pill {
+    padding: 0.4rem 0.9rem;
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    color: var(--bone-2);
+    border-radius: 999px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition:
+      border-color 0.15s,
+      color 0.15s,
+      background 0.15s;
+  }
+  .scope-pill:hover:not(:disabled):not(.active) {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+  }
+  .scope-pill.active {
+    border-color: var(--accent);
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+  }
+  .scope-pill:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   /* Primary + Copy notice share a row; Copy notice is the ghost

@@ -24,6 +24,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { screenRecording } from "$lib/stores/recording.svelte";
 
   interface Props {
     onClose: () => void;
@@ -100,11 +101,35 @@
   // button shows up at all. Some webviews (older WebKitGTK, certain
   // Linux distros without the desktop portal) lack getDisplayMedia.
   let canRecord = $state(false);
+  // #216: pre-record audio toggle. Default off — preserves the v0.7.1
+  // PII posture (mic capture is a separate consent surface). User
+  // opts in deliberately for narration use cases.
+  let audioEnabled = $state(false);
+  // #216: feature-detected separately from canRecord. Some webviews
+  // expose getDisplayMedia but not getUserMedia; we hide the toggle
+  // when the API isn't there.
+  let canCaptureMic = $state(false);
   // Preview modal (tier-2) state.
   let previewingLocalId = $state<string | null>(null);
 
-  // Derived + mimeType negotiation results.
-  const recording = $derived(recorder !== null);
+  // Derived + mimeType negotiation results. Renamed from `recording`
+  // to `isRecording` (#216) so it doesn't read as the imported
+  // screen-recording store.
+  const isRecording = $derived(recorder !== null);
+
+  // #216: floater → dialog signal. The floating control bumps
+  // `screenRecording.stopRequestId` when the user clicks Stop; this
+  // effect observes the bumped counter and routes through our local
+  // stopRecording(). Keeps the OS-handle ownership inside the
+  // dialog without exporting refs upward.
+  let lastSeenStopRequest = 0;
+  $effect(() => {
+    const id = screenRecording.stopRequestId;
+    if (id !== lastSeenStopRequest) {
+      lastSeenStopRequest = id;
+      if (recorder) stopRecording();
+    }
+  });
 
   // Modal scaffolding ────────────────────────────────────────────
   let modalEl = $state<HTMLDivElement | null>(null);
@@ -139,8 +164,14 @@
           MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus") ||
           MediaRecorder.isTypeSupported("video/webm"));
       canRecord = !!recorderReady;
+      // #216: mic capture is a separate API. Some webviews expose
+      // getDisplayMedia but not getUserMedia, or vice versa.
+      canCaptureMic =
+        hasApi &&
+        typeof navigator.mediaDevices.getUserMedia === "function";
     } catch {
       canRecord = false;
+      canCaptureMic = false;
     }
   });
 
@@ -160,6 +191,12 @@
       clearInterval(recorderTickHandle);
       recorderTickHandle = null;
     }
+    // #216: reset the screen-recording store on dialog teardown so
+    // the floating control disappears even if the user closes the
+    // dialog mid-recording (the recorder.stop() above would also
+    // fire onstop → markIdle, but it's async; reset here ensures
+    // the floater hides immediately).
+    screenRecording.markIdle();
     // Revoke all object URLs we minted so the webview doesn't leak
     // bytes for the lifetime of the page.
     for (const a of attachments) {
@@ -193,8 +230,19 @@
     return null;
   }
 
+  /** #216 defensive helper: stop every track on a stream, ignoring
+   * per-track errors. Used on early-exit paths so PipeWire / portal
+   * capture handles release immediately when MediaRecorder fails to
+   * construct or the stream comes back empty. */
+  function stopAllTracks(stream: MediaStream | null) {
+    if (!stream) return;
+    for (const t of stream.getTracks()) {
+      try { t.stop(); } catch { /* ignore */ }
+    }
+  }
+
   async function startRecording() {
-    if (submitting || recording) return;
+    if (submitting || isRecording) return;
     if (attachments.length >= MAX_ATTACHMENTS) return;
     recorderError = null;
     const mimeType = pickMimeType();
@@ -202,17 +250,24 @@
       recorderError = "Screen recording isn't supported on this system.";
       return;
     }
-    let stream: MediaStream;
+
+    // #216: signal "starting" up-front so the floater doesn't briefly
+    // flash the wrong state if anything async takes time.
+    screenRecording.markStarting();
+
+    let displayStream: MediaStream;
     try {
-      // v2 scope: video-only capture. System-audio + mic capture are
-      // deliberately excluded — they're a separate PII surface and
-      // deserve their own consent flow. Document this inline so the
-      // next editor doesn't "helpfully" flip audio to true.
-      stream = await navigator.mediaDevices.getDisplayMedia({
+      // Screen capture: video only. Mic, when enabled, is layered
+      // separately via getUserMedia below. Avoiding
+      // `getDisplayMedia({audio:true})` deliberately — that captures
+      // *system* audio (notifications, music, other tabs) which is a
+      // much larger PII surface than user narration.
+      displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
         audio: false,
       });
     } catch (e) {
+      screenRecording.markIdleAfterAbort();
       // User cancelled picker OR permission denied. Distinguish by
       // error name — NotAllowedError is the user's choice (silent),
       // anything else gets a visible banner.
@@ -224,17 +279,79 @@
       return;
     }
 
+    // #216 defensive (Linux WebKitGTK): some xdg-desktop-portal
+    // builds resolve getDisplayMedia with no video tracks on certain
+    // cancel paths. Constructing a MediaRecorder over a track-less
+    // stream then crashes the webview. Bail cleanly instead.
+    if (displayStream.getVideoTracks().length === 0) {
+      stopAllTracks(displayStream);
+      screenRecording.markIdleAfterAbort();
+      recorderError =
+        "Screen recording didn't return a video stream. Try again or pick a different window.";
+      return;
+    }
+
+    // #216: layer mic in if the user opted in. Failure here is
+    // non-fatal — proceed with video-only and surface a soft notice.
+    let micStream: MediaStream | null = null;
+    if (audioEnabled && canCaptureMic) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        });
+      } catch (e) {
+        const name = (e as { name?: string })?.name;
+        if (name === "NotAllowedError") {
+          recorderError =
+            "Microphone access was denied. Recording will continue without audio.";
+        } else {
+          recorderError =
+            "Couldn't access the microphone. Recording will continue without audio.";
+        }
+        // Continue without mic — display capture is already live.
+      }
+    }
+
+    // Combine video + mic into one MediaStream for MediaRecorder.
+    // The webm container handles multi-track natively; opus encoding
+    // is part of the negotiated mimeType when codecs allow it.
+    const combined = new MediaStream();
+    for (const t of displayStream.getVideoTracks()) combined.addTrack(t);
+    if (micStream) {
+      for (const t of micStream.getAudioTracks()) combined.addTrack(t);
+    }
+
     recorderChunks = [];
     recorderBytes = 0;
     recorderElapsedMs = 0;
     recordingStartedAt = Date.now();
-    recorderStream = stream;
+    recorderStream = combined;
 
-    const rec = new MediaRecorder(stream, { mimeType });
+    // #216 defensive (Linux): MediaRecorder construction can throw
+    // synchronously on WebKitGTK even when isTypeSupported was
+    // optimistic — capability check and constructor sometimes
+    // disagree on PipeWire-backed capture. Wrap to surface a friendly
+    // error and tear down the stream so PipeWire releases the handle.
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(combined, { mimeType });
+    } catch (e) {
+      stopAllTracks(displayStream);
+      stopAllTracks(micStream);
+      stopAllTracks(combined);
+      recorderStream = null;
+      screenRecording.markIdleAfterAbort();
+      const msg = (e as Error)?.message ?? String(e);
+      recorderError = `Couldn't start the recorder (${msg}). Try again or report this if it keeps happening.`;
+      return;
+    }
+
     rec.ondataavailable = (ev) => {
       if (ev.data && ev.data.size > 0) {
         recorderChunks.push(ev.data);
         recorderBytes += ev.data.size;
+        screenRecording.setProgress(recorderElapsedMs, recorderBytes);
         if (recorderBytes >= MAX_VIDEO_BYTES) {
           // Hard-cap: auto-stop so we never hold more bytes than the
           // backend accepts. A few hundred KB slack is fine because
@@ -253,10 +370,27 @@
       }
     };
     rec.onstop = () => {
+      // Mark finalising on the store first so the floater shows
+      // "Finishing…" while we assemble the blob.
+      screenRecording.markFinalising();
       finaliseRecording();
     };
+    rec.onerror = () => {
+      // WebKitGTK occasionally fires onerror with a generic event;
+      // treat any error as a fatal stop and surface a banner so the
+      // user knows the recording is over.
+      recorderError =
+        "The recorder hit an error and stopped. Anything captured so far will be attached.";
+      // Don't call stopRecording — recorder is already in the
+      // erroring path. The browser will fire onstop next.
+    };
+    // #216 fix: assign `recorder` BEFORE wiring track-end handlers.
+    // The previous code captured the closure over `recorder`, and on
+    // a fast user-cancel the track ended *before* the assignment ran,
+    // skipping cleanup.
+    recorder = rec;
     // Browser chrome "Stop sharing" button → track ends → we stop.
-    stream.getVideoTracks().forEach((t) => {
+    displayStream.getVideoTracks().forEach((t) => {
       t.onended = () => {
         if (recorder) stopRecording();
       };
@@ -264,11 +398,15 @@
     // Timeslice = 1 s so `dataavailable` fires frequently and the
     // running-size accounting stays close to reality.
     rec.start(1000);
-    recorder = rec;
 
     recorderTickHandle = setInterval(() => {
       recorderElapsedMs = Date.now() - recordingStartedAt;
+      screenRecording.setProgress(recorderElapsedMs, recorderBytes);
     }, 250);
+
+    // #216: flip the store to "recording", which hides the dialog
+    // (dialogHidden = true) and reveals the floating stop control.
+    screenRecording.markRecording();
   }
 
   function stopRecording() {
@@ -293,7 +431,13 @@
     }
     const rec = recorder;
     recorder = null;
-    if (!rec || recorderChunks.length === 0) return;
+    if (!rec || recorderChunks.length === 0) {
+      // Edge case: stop fired with zero chunks (very-short recording
+      // or PipeWire didn't push any data). Reset the store so the
+      // dialog re-appears and the floater goes away.
+      screenRecording.markIdle();
+      return;
+    }
     const type = rec.mimeType || "video/webm";
     // Server-side mime is always plain `video/webm` — stripped of
     // codec suffix because browsers sometimes emit
@@ -327,14 +471,13 @@
     recorderChunks = [];
     recorderBytes = 0;
     recorderElapsedMs = 0;
+    // #216: clearing the store re-shows the dialog so the user can
+    // finalise the report (now with the recording attached as a chip).
+    screenRecording.markIdle();
   }
 
-  function fmtRecTime(ms: number): string {
-    const total = Math.floor(ms / 1000);
-    const mm = Math.floor(total / 60);
-    const ss = total % 60;
-    return `${mm.toString().padStart(2, "0")}:${ss.toString().padStart(2, "0")}`;
-  }
+  // #216: fmtRecTime moved to RecordingFloatingControl — the dialog
+  // no longer renders a live timer (the floater does).
 
   function openPreview(localId: string) {
     previewingLocalId = localId;
@@ -631,7 +774,7 @@
   const canSubmit = $derived(
     !submitting &&
       !succeeded &&
-      !recording &&
+      !isRecording &&
       title.trim() !== "" &&
       body.trim() !== "",
   );
@@ -646,6 +789,13 @@
   );
 </script>
 
+<!-- #216: while a recording is live, the dialog hides itself
+     entirely so the user can navigate the rest of the app to
+     demonstrate the bug. The component stays mounted — `title`,
+     `body`, and `attachments` state survives across the hide/show.
+     The floating control (`<RecordingFloatingControl />` mounted in
+     +layout) provides the visible stop affordance. -->
+{#if !screenRecording.dialogHidden}
 <div
   class="rn-backdrop"
   role="button"
@@ -786,35 +936,28 @@
           {#if recorderError}
             <div class="ri-attach-warning" role="alert">{recorderError}</div>
           {/if}
-          {#if recording}
-            <!-- Live recorder strip. Shows timer + running size so
-                 the user can judge when to stop before the auto-stop
-                 trips at 100 MB. -->
-            <div class="ri-recorder-live" aria-live="polite">
-              <span class="ri-recorder-dot" aria-hidden="true"></span>
-              <span class="ri-recorder-time">
-                Recording {fmtRecTime(recorderElapsedMs)}
+          <!-- #216: pre-record audio toggle. Shown only when the
+               webview supports both display + user media; default
+               off, so a user opting in is a deliberate consent
+               choice. The notice copy below shifts when this is on. -->
+          {#if canRecord && canCaptureMic}
+            <label class="ri-audio-toggle">
+              <input
+                type="checkbox"
+                bind:checked={audioEnabled}
+                disabled={submitting || isRecording}
+              />
+              <span class="ri-audio-label">
+                Capture microphone audio (your narration)
               </span>
-              <span class="ri-recorder-size">
-                {fmtBytes(recorderBytes)}
-              </span>
-              <button
-                type="button"
-                class="ri-recorder-stop"
-                onclick={stopRecording}
-              >Stop recording</button>
-            </div>
-            <p class="ri-recorder-hint">
-              Anything visible on the captured area will be attached —
-              review before sending.
-            </p>
+            </label>
           {/if}
           <div class="ri-attach-actions">
             <button
               type="button"
               class="ri-attach-btn"
               onclick={addAttachments}
-              disabled={submitting || recording || remainingSlots <= 0}
+              disabled={submitting || isRecording || remainingSlots <= 0}
             >
               {#if attachments.length === 0}
                 Add screenshots
@@ -824,18 +967,25 @@
                 Add more
               {/if}
             </button>
-            {#if canRecord && !recording}
+            {#if canRecord && !isRecording}
               <button
                 type="button"
                 class="ri-attach-btn"
                 onclick={startRecording}
                 disabled={submitting || remainingSlots <= 0}
-                aria-describedby={!canRecord
-                  ? `${titleId}-rec-hint`
-                  : undefined}
               >Record screen</button>
             {/if}
           </div>
+          {#if canRecord && !isRecording}
+            <!-- #216: brief hint about what happens when the user
+                 clicks Record screen. Keeps the surprise low and
+                 tells them where to look for the stop control. -->
+            <p class="ri-recorder-hint">
+              Recording stays live while you navigate the app to
+              demonstrate the issue. A floating control in the
+              bottom-right corner shows the timer and lets you stop.
+            </p>
+          {/if}
         </div>
 
         <div class="ri-telemetry-summary">
@@ -875,9 +1025,16 @@
           >
           Attachments may include information visible on your screen —
           <strong>including passwords, messages, and other sensitive
-          content</strong>. Review each item before sending. Recent
-          diagnostic logs from this device are included automatically.
-          By clicking "Send report" you consent to this.
+          content</strong>.
+          {#if audioEnabled && canCaptureMic}
+            <strong
+              >Your microphone will be captured for the duration of
+              the recording.</strong
+            >
+          {/if}
+          Review each item before sending. Recent diagnostic logs from
+          this device are included automatically. By clicking "Send
+          report" you consent to this.
         </p>
       {/if}
     </div>
@@ -923,6 +1080,7 @@
     </div>
   </div>
 </div>
+{/if}
 
 {#if previewAttachment && previewAttachment.kind === "video" && previewAttachment.previewUrl}
   <!-- Tier-2 preview modal. Same backdrop pattern as the main
@@ -1204,59 +1362,38 @@
     flex-wrap: wrap;
   }
 
-  /* #203: live-recording strip with mm:ss timer, running size, and
-   * an inline "Stop recording" button. Sits above the hint copy and
-   * below the chip list (all still inside `.ri-attach-row`). */
-  .ri-recorder-live {
+  /* #216: pre-record audio toggle. Reads as an inline option
+   * directly above the two action buttons. Off by default; the
+   * label is sized to be obvious without dominating the dialog. */
+  .ri-audio-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 0.55rem;
-    padding: 0.4rem 0.65rem;
-    background: color-mix(in srgb, var(--live) 10%, transparent);
-    border: 1px solid var(--live);
-    border-radius: var(--radius-sm, 6px);
+    gap: 0.45rem;
+    color: var(--bone-2);
+    font-size: 0.78rem;
+    cursor: pointer;
+    user-select: none;
     align-self: flex-start;
   }
-  .ri-recorder-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--live);
-    animation: ri-recorder-pulse 1.4s ease-in-out infinite;
-    flex-shrink: 0;
-  }
-  @keyframes ri-recorder-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.35; }
-  }
-  .ri-recorder-time {
-    color: var(--bone-0);
-    font-family: var(--font-mono);
-    font-size: 0.82rem;
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-  }
-  .ri-recorder-size {
-    color: var(--bone-2);
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
-    font-variant-numeric: tabular-nums;
-  }
-  .ri-recorder-stop {
-    appearance: none;
-    border: 1px solid var(--live);
-    background: var(--live);
-    color: var(--ink-0);
-    font-size: 0.78rem;
-    font-weight: 600;
-    padding: 0.3rem 0.75rem;
-    border-radius: 999px;
+  .ri-audio-toggle input[type="checkbox"] {
+    accent-color: var(--accent);
     cursor: pointer;
-    margin-left: 0.3rem;
   }
-  .ri-recorder-stop:hover {
-    filter: brightness(1.1);
+  .ri-audio-toggle input[type="checkbox"]:disabled {
+    cursor: not-allowed;
   }
+  .ri-audio-toggle:has(input:disabled) {
+    color: var(--bone-4);
+    cursor: not-allowed;
+  }
+  .ri-audio-label {
+    line-height: 1.3;
+  }
+
+  /* #216: the in-dialog live-recorder strip from #203 was removed.
+   * The dialog now hides itself entirely while recording is live;
+   * the floating control component carries the live UI. The hint
+   * style below survives — used pre-record to set expectations. */
   .ri-recorder-hint {
     margin: 0;
     color: var(--bone-3);

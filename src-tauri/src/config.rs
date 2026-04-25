@@ -116,6 +116,17 @@ pub struct Config {
     /// CLI keep working.
     #[serde(default = "default_record_toggle_shortcut")]
     pub record_toggle_shortcut: Option<String>,
+    /// #56 — when true, the spoken recording-start announcement
+    /// ("Please note — this call is being recorded") plays after the
+    /// start chime. Defaults OFF: the chime alone is sufficient for
+    /// most users, and an unexpected voice on the very first
+    /// recording would surprise people. The org-level
+    /// `recording_notification_mode = enforced` path bypasses this
+    /// pref entirely — compliance posture set by an admin can't be
+    /// silenced from local Settings. Serde default keeps existing
+    /// config.toml files loading cleanly.
+    #[serde(default)]
+    pub consent_announcement_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -183,6 +194,7 @@ impl Config {
                 input_device: None,
                 self_note_shortcut: default_self_note_shortcut(),
                 record_toggle_shortcut: default_record_toggle_shortcut(),
+                consent_announcement_enabled: false,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

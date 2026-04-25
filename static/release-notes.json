@@ -1,4 +1,15 @@
 {
+  "0.7.2": {
+    "headline": "Share calls publicly, smoother screen recording, sign in once from the desktop app",
+    "changes": [
+      "Share a call with anyone via a public link. The new Share button on any call generates a secure URL — recipients see the transcript, summary, audio, and action items in a read-only view, no aftercalls account needed. Set an expiry, revoke any time, see view counts.",
+      "Record page learns Call vs Note tabs. Switch between recording a call and dictating a note to self right from the record page — no menu hunt. The keyboard shortcut shows on the button as a tooltip.",
+      "Screen recording for support reports stays out of your way. Start a recording, the dialog tucks into the corner with a duration + size readout and a Stop button — keep using the app to demonstrate the issue, then come back to send. Optional microphone capture so you can narrate.",
+      "Open the web app from the desktop and stay signed in. The user-menu \"Open web app\" link now hands off your session — no re-login on the browser side.",
+      "Smoother CRM experience. Custom modules sit alongside the standards in the record-type picker with a filter input; clicking anywhere on a record-type row selects it; standard-module search (Contact, Deal, Account, Lead, Quote) works correctly again.",
+      "Configurable max recording length in Settings (default 2 hours). For 3-hour-plus calls, bump it; the cap protects against runaway recordings filling your disk."
+    ]
+  },
   "0.7.1": {
     "headline": "Screen recording for support, a client-name allowlist, and Zoho custom modules",
     "changes": [

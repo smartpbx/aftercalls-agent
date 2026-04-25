@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend};
+use crate::error::{from_status, parse_retry_after, PortalError};
 
 #[derive(Deserialize)]
 struct AuthResponsePayload {
@@ -195,6 +196,23 @@ pub async fn update_me(
     };
     write_auth_file(&merged)?;
     Ok(merged)
+}
+
+/// #34 — mint a single-use, 60s session-handoff token. The user-menu
+/// "Open web app" handler calls this, then opens the system browser at
+/// `<portal_base>/handoff?token=<t>` so the launched browser lands
+/// already-authenticated instead of bouncing through /login. We only
+/// need the raw token from the response — the backend's `expires_at`
+/// is informational (the server is the only authority on TTL).
+pub async fn mint_handoff_token(backend: &Backend) -> Result<String> {
+    let resp = post_json(backend, "/v1/auth/handoff/mint", serde_json::json!({}))
+        .await
+        .context("mint handoff token")?;
+    let token = resp
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("mint response missing token"))?;
+    Ok(token.to_string())
 }
 
 /// Revoke the refresh token on the server and wipe auth.json locally.
@@ -565,11 +583,13 @@ pub async fn update_call_tags(
 /// POST /v1/calls/{id}/resummarize — regenerate summary + AI action
 /// items against the call's stored transcript. Backend enforces a
 /// 30s per-call cooldown; when we hit it the backend returns 429
-/// with `{error: "cooldown", retry_after_seconds: N}`. Surface the
-/// retry window by prefixing the error message with "cooldown:{N}"
-/// so the Tauri IPC layer can parse it and render a countdown,
-/// matching the portal's Error.retryAfterSeconds shape.
-pub async fn resummarize_call(backend: &Backend, id: &str) -> Result<Value> {
+/// with `{error: "cooldown", retry_after_seconds: N}`.
+///
+/// Returns `PortalError::Cooldown { retry_after_seconds }` on 429 so
+/// the frontend can surface the retry window without sniffing a
+/// stringified error (#124). Other backend statuses map through
+/// `from_status` to their structured variants.
+pub async fn resummarize_call(backend: &Backend, id: &str) -> std::result::Result<Value, PortalError> {
     // Same 600s ceiling as transcribe/summarize: the LLM call can
     // take a minute or two on a real call, and an agent user that
     // triggered the regenerate shouldn't see an IPC timeout before
@@ -582,45 +602,30 @@ pub async fn resummarize_call(backend: &Backend, id: &str) -> Result<Value> {
         "{}/v1/calls/{id}/resummarize",
         backend.url.trim_end_matches('/'),
     );
-    let resp = c
-        .post(&url)
-        .header("authorization", auth)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let resp = c.post(&url).header("authorization", auth).send().await?;
     let status = resp.status();
     if status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return serde_json::from_str(&text).context("decode resummarize");
+        let text = resp.text().await.map_err(PortalError::from)?;
+        return serde_json::from_str(&text).map_err(PortalError::from);
     }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        // Parse the retry window from the body first, then the
-        // Retry-After header as a fallback. Fold it into the error
-        // message using a prefix the Tauri command can split back
-        // out on the Rust side; ts-side error messages flow through
-        // `e.toString()` which only carries the string.
-        let retry_header = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let text = resp.text().await.unwrap_or_default();
-        let retry_body: Option<u64> = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("retry_after_seconds").and_then(|n| n.as_u64()));
-        let retry = retry_body.or(retry_header).unwrap_or(0);
-        anyhow::bail!("cooldown:{retry}");
-    }
-    let t = resp.text().await.unwrap_or_default();
-    anyhow::bail!("backend {status}: {t}");
+    let retry_header = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry_header))
 }
 
 /// PATCH /v1/calls/{id} — partial update of summary_text / title /
 /// matched_client. Tri-state server-side: each field is either
 /// absent, null (clear), or a string (set). The Tauri front-end
 /// passes pre-shaped JSON so we forward verbatim.
-pub async fn patch_call(backend: &Backend, id: &str, body: &Value) -> Result<Value> {
-    patch_json(backend, &format!("/v1/calls/{id}"), body.clone()).await
+///
+/// Returns the structured `PortalError` shape on failure (#124) so
+/// the call-detail page can render kind-specific copy without regex.
+pub async fn patch_call(
+    backend: &Backend,
+    id: &str,
+    body: &Value,
+) -> std::result::Result<Value, PortalError> {
+    patch_json_typed(backend, &format!("/v1/calls/{id}"), body.clone()).await
 }
 
 /// POST /v1/org/client-allowlist — auto-populate the persistent
@@ -649,14 +654,16 @@ pub async fn add_client_allowlist_entry(
 
 /// PATCH /v1/calls/{id}/action-items/{item_id} — edit one action
 /// item row. Cross-org assignee writes surface as 400 per #82, which
-/// the UI renders as an inline error beneath the assignee picker.
+/// the UI renders as an inline error beneath the assignee picker
+/// (now keyed on `PortalError::BadRequest.message` rather than a
+/// regex on a stringified anyhow::Error, #124).
 pub async fn patch_action_item(
     backend: &Backend,
     call_id: &str,
     item_id: &str,
     body: &Value,
-) -> Result<Value> {
-    patch_json(
+) -> std::result::Result<Value, PortalError> {
+    patch_json_typed(
         backend,
         &format!("/v1/calls/{call_id}/action-items/{item_id}"),
         body.clone(),
@@ -667,14 +674,14 @@ pub async fn patch_action_item(
 /// POST /v1/calls/{id}/action-items/manual — manual-add (#104).
 /// `body` carries `{description, assignee_user_id?}`. Backend returns
 /// 201 with the fully-stitched row. Cross-org assignee FK surfaces
-/// as 400 with the usual "teammate isn't in your workspace" message
-/// shape.
+/// as 400; under the structured-error shape (#124) the frontend
+/// matches `kind === "bad_request"` instead of regex-sniffing.
 pub async fn add_action_item(
     backend: &Backend,
     call_id: &str,
     body: &Value,
-) -> Result<Value> {
-    post_json(
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
         backend,
         &format!("/v1/calls/{call_id}/action-items/manual"),
         body.clone(),
@@ -686,13 +693,13 @@ pub async fn add_action_item(
 /// /actions page. Query params are passed opaquely so the shape stays
 /// in sync with the portal helper automatically; the frontend builds
 /// a normalized string (`?status=…&limit=…&cursor=…`) before
-/// invoking.
+/// invoking. Returns a typed `PortalError` (#124).
 pub async fn list_me_action_items(
     backend: &Backend,
     status: &str,
     cursor: Option<&str>,
     limit: i64,
-) -> Result<Value> {
+) -> std::result::Result<Value, PortalError> {
     let mut path = String::from("/v1/me/action-items?");
     path.push_str("status=");
     path.push_str(&urlencoding_minimal(status));
@@ -704,37 +711,33 @@ pub async fn list_me_action_items(
             path.push_str(&urlencoding_minimal(c));
         }
     }
-    get_json(backend, &path).await
+    get_json_typed(backend, &path).await
 }
 
 /// DELETE /v1/calls/{id}/action-items/{item_id} — hard delete (#104).
 /// Backend returns 204 on success, 404 when the row is already gone;
 /// we map 404 to Ok(()) so the frontend's flow matches the portal's
 /// `calls.deleteActionItem` (ui-phase-3 §G "404 is silent success").
-/// Every other non-2xx is a real error.
+/// Every other non-2xx surfaces as a structured `PortalError` (#124).
 pub async fn delete_action_item(
     backend: &Backend,
     call_id: &str,
     item_id: &str,
-) -> Result<()> {
+) -> std::result::Result<(), PortalError> {
     let auth = build_auth_header(backend).await?;
-    let c = client()?;
+    let c = client().map_err(PortalError::from)?;
     let url = format!(
         "{}/v1/calls/{call_id}/action-items/{item_id}",
         backend.url.trim_end_matches('/'),
     );
-    let resp = c
-        .delete(&url)
-        .header("authorization", auth)
-        .send()
-        .await
-        .with_context(|| format!("DELETE {url}"))?;
+    let resp = c.delete(&url).header("authorization", auth).send().await?;
     let status = resp.status();
     if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
         return Ok(());
     }
-    let t = resp.text().await.unwrap_or_default();
-    anyhow::bail!("backend {status}: {t}");
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
 }
 
 /// Prefix-match tag suggestions for the Add-tag popover autocomplete.
@@ -1067,4 +1070,94 @@ async fn delete_nop(backend: &Backend, path: &str) -> Result<()> {
         anyhow::bail!("backend {s}: {t}");
     }
     Ok(())
+}
+
+// ── Typed primitives (#124) ───────────────────────────────────────────
+//
+// Mirrors the `*_json` / `*_nop` helpers above but returns
+// `Result<_, PortalError>` so the Tauri-command layer ships the
+// structured shape to the frontend. Existing untyped helpers stay in
+// place for callers (auth / pipeline / recovery) that still want the
+// `anyhow::Error` flow — only the six commands listed in #124
+// migrate here.
+
+async fn get_json_typed(backend: &Backend, path: &str) -> std::result::Result<Value, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        let text = resp.text().await.map_err(PortalError::from)?;
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+async fn post_json_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+) -> std::result::Result<Value, PortalError> {
+    post_with_timeout_typed(backend, path, body, Duration::from_secs(60)).await
+}
+
+async fn post_with_timeout_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+    timeout: Duration,
+) -> std::result::Result<Value, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = reqwest::Client::builder().timeout(timeout).build()?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        let text = resp.text().await.map_err(PortalError::from)?;
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+async fn patch_json_typed(
+    backend: &Backend,
+    path: &str,
+    body: Value,
+) -> std::result::Result<Value, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .patch(&url)
+        .header("authorization", auth)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        let text = resp.text().await.map_err(PortalError::from)?;
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
 }

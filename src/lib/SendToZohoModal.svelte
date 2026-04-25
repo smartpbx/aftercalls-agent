@@ -183,6 +183,28 @@
   let recordTypesError = $state<string | null>(null);
   let chosenType = $state<RecordType>(STANDARD_FALLBACK[0]);
 
+  // Step-1 record-type filter (#221). Modal-session only — closing
+  // and reopening the modal resets to empty, since the whole
+  // component re-mounts under {#if zohoModalOpen}.
+  let typeFilter = $state("");
+  function rtypeMatches(rt: RecordType, q: string): boolean {
+    if (q.length === 0) return true;
+    const needle = q.toLowerCase();
+    return (
+      rt.label.toLowerCase().includes(needle) ||
+      rt.api_name.toLowerCase().includes(needle)
+    );
+  }
+  const filteredStandard = $derived(
+    standardTypes.filter((rt) => rtypeMatches(rt, typeFilter.trim())),
+  );
+  const filteredCustom = $derived(
+    customTypes.filter((rt) => rtypeMatches(rt, typeFilter.trim())),
+  );
+  const filteredEmpty = $derived(
+    filteredStandard.length === 0 && filteredCustom.length === 0,
+  );
+
   // Step-2 search.
   let query = $state("");
   let results = $state<SzmSearchResult[]>([]);
@@ -209,6 +231,12 @@
   let pushResponse = $state<SzmPushResponse | null>(null);
   let pushErrorMsg = $state<string | null>(null);
 
+  // Minimum chars before firing a Zoho search. Mirrors backend
+  // `SEARCH_MIN_CHARS` (#219); Zoho rejects shorter values from
+  // `(Field:contains:X)` with a 400 that would surface as the
+  // misleading "Search unavailable" banner.
+  const SEARCH_MIN_CHARS = 2;
+
   $effect(() => {
     // Reactive search effect. Re-runs on query change with a 250ms
     // debounce; older in-flight requests get superseded by checking
@@ -216,6 +244,13 @@
     if (step !== 2) return;
     const q = query.trim();
     if (q.length === 0) {
+      results = [];
+      searchError = null;
+      searchInFlight = false;
+      return;
+    }
+    if (q.length < SEARCH_MIN_CHARS) {
+      // 1-char queries: empty results + helper hint, no network hop.
       results = [];
       searchError = null;
       searchInFlight = false;
@@ -532,14 +567,24 @@
       {:else if step === 1}
         <fieldset class="szm-rtype">
           <legend>Record type</legend>
-          {#each standardTypes as rt (rt.api_name)}
+          <!-- Filter input (#221). Empty value = original list.
+               Live substring match against label + api_name; both
+               standards and customs filter through the same gate.
+               Modal-session only: closing/reopening resets it. -->
+          <input
+            type="search"
+            class="szm-rtype-filter"
+            bind:value={typeFilter}
+            placeholder="Filter record types"
+            aria-label="Filter record types"
+          />
+          {#each filteredStandard as rt (rt.api_name)}
             <label class="szm-rtype-opt">
               <input
                 type="radio"
                 name="szm-rtype"
-                value={rt.api_name}
-                checked={chosenType.api_name === rt.api_name}
-                onchange={() => (chosenType = rt)}
+                value={rt}
+                bind:group={chosenType}
               />
               <span class="szm-rtype-text">
                 <span class="szm-rtype-name">{rt.label}</span>
@@ -547,23 +592,23 @@
               </span>
             </label>
           {/each}
-          {#if customTypes.length > 0}
+          {#if filteredCustom.length > 0}
             <!-- Divider only renders when this org has custom modules
-                 (#197). Sort order is alphabetic by singular_label,
+                 with at least one matching the active filter (#197 +
+                 #221). Sort order is alphabetic by singular_label,
                  already applied in loadRecordTypes(). -->
             <div
               class="szm-rtype-divider"
               role="presentation"
               aria-hidden="true"
             ></div>
-            {#each customTypes as rt (rt.api_name)}
+            {#each filteredCustom as rt (rt.api_name)}
               <label class="szm-rtype-opt">
                 <input
                   type="radio"
                   name="szm-rtype"
-                  value={rt.api_name}
-                  checked={chosenType.api_name === rt.api_name}
-                  onchange={() => (chosenType = rt)}
+                  value={rt}
+                  bind:group={chosenType}
                 />
                 <span class="szm-rtype-text">
                   <span class="szm-rtype-name">{rt.label}</span>
@@ -571,6 +616,12 @@
                 </span>
               </label>
             {/each}
+          {/if}
+          {#if filteredEmpty}
+            <!-- Empty state when no record type matches the filter. -->
+            <p class="szm-rtype-empty" role="status">
+              No record types match "{typeFilter.trim()}".
+            </p>
           {/if}
           {#if recordTypesError}
             <!-- Non-blocking — the picker still works for standards. -->
@@ -600,6 +651,11 @@
             {:else if query.trim().length === 0}
               <p class="szm-results-hint">
                 Type to search {chosenType.label} in your Zoho account.
+              </p>
+            {:else if query.trim().length < SEARCH_MIN_CHARS}
+              <!-- Below min — no network hop yet (#219). -->
+              <p class="szm-results-hint">
+                Keep typing to search {chosenType.label}.
               </p>
             {:else if results.length === 0}
               <p class="szm-results-hint">
@@ -942,6 +998,12 @@
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
+    /* Make the whole row a single click target (#220). The label
+       wraps both the radio + this text block, but inner span layout
+       can absorb the click before the browser's "click label →
+       toggle child input" semantics fire. Forcing pointer-events
+       to skip these spans keeps the click target as the label. */
+    pointer-events: none;
   }
   .szm-rtype-name {
     color: var(--bone-0);
@@ -964,6 +1026,31 @@
     margin: 0.3rem 0 0;
     color: var(--bone-3);
     font-size: 0.78rem;
+  }
+  /* Filter input above the radio list (#221). Sits flush with the
+     legend so the picker still reads as one block; matches the
+     Step-2 search input's tone but tightened a notch. */
+  .szm-rtype-filter {
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    margin: 0 0 0.15rem;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-0);
+    color: var(--bone-0);
+    font: inherit;
+    font-size: 0.85rem;
+    box-sizing: border-box;
+  }
+  .szm-rtype-filter:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .szm-rtype-empty {
+    margin: 0.3rem 0 0;
+    color: var(--bone-3);
+    font-size: 0.82rem;
+    font-style: italic;
   }
 
   /* Step 2 — search */

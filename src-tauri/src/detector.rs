@@ -28,8 +28,10 @@ const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(5);
 /// Safety net for a crashed / force-quit softphone (#74). If the
 /// consumer has been gone this long and the user hasn't answered the
 /// end-prompt, the recording is force-stopped via the same code path
-/// as manual Stop. Six consecutive polls at POLL_INTERVAL=5s.
-const CONSUMER_GONE_FORCE_STOP: Duration = Duration::from_secs(30);
+/// as manual Stop. Three consecutive polls at POLL_INTERVAL=5s — fast
+/// enough that a SIGKILL'd softphone can't keep the recorder pinned
+/// open for more than ~15s while still tolerating a brief restart.
+const CONSUMER_GONE_FORCE_STOP: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug)]
 pub enum UserDecision {
@@ -60,7 +62,7 @@ enum Phase {
     Idle,
     AwaitingStartConfirm { consumer: String },
     Recording { consumer: String, gone_since: Option<Instant> },
-    /// `gone_since` is inherited from Recording so the 30s force-stop
+    /// `gone_since` is inherited from Recording so the 15s force-stop
     /// watchdog (#74) measures total consumer-absence, not just time
     /// spent waiting on the user. Without this a user who walks away
     /// from an end-prompt would keep the recorder running until they

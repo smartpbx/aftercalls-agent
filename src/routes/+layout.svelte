@@ -13,6 +13,8 @@
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import Avatar from "$lib/Avatar.svelte";
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
+  import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
+  import ToastHost from "$lib/ToastHost.svelte";
   import "../app.css";
 
   let { children } = $props();
@@ -1020,6 +1022,30 @@
       console.warn("openUrl failed", e);
     }
   }
+  // #34 — Open web app, but logged-in. The agent already authed this
+  // user against the backend; calling `mint_handoff_url` gets a
+  // single-use, 60s URL on the portal's `/handoff` page that exchanges
+  // the token for a normal access+refresh bundle and lands on /calls.
+  // No second password prompt for the system browser.
+  //
+  // Falls back to the un-authed link on any error so the worst case is
+  // "the user lands on /login" rather than "the menu item silently
+  // does nothing." Common failure modes: backend unreachable (offline
+  // recording), refresh token expired (user reopens after a long idle).
+  async function openWebApp() {
+    closeUserMenu();
+    try {
+      const url = await invoke<string>("mint_handoff_url");
+      await openUrl(url);
+    } catch (e) {
+      console.warn("mint_handoff_url failed; falling back to /calls", e);
+      try {
+        await openUrl("https://app.aftercalls.io/calls");
+      } catch (e2) {
+        console.warn("openUrl fallback failed", e2);
+      }
+    }
+  }
   async function manualUpdateCheck() {
     closeUserMenu();
     // #79: explicit user action bypasses the processing gate. If
@@ -1203,7 +1229,7 @@
           <button
             class="um-item"
             role="menuitem"
-            onclick={() => openPortalLink("/calls")}
+            onclick={openWebApp}
           >
             Open web app <span class="um-ext" aria-hidden="true">↗</span>
           </button>
@@ -1250,6 +1276,13 @@
   </aside>
 
   <div class="main">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- The Windows-only dblclick mirrors the native title-bar
+         maximize gesture. Keyboard + assistive-tech users have
+         an accessible alternative: the explicit Maximize/Restore
+         button rendered below in .win-controls (with aria-label).
+         Adding a role here would mis-classify the topstrip; this
+         is window chrome, not interactive content. -->
     <header
       class="topstrip"
       class:has-win-controls={isWindows}
@@ -1691,6 +1724,17 @@
 {#if reportDialogOpen}
   <ReportIssueDialog onClose={closeReportDialog} />
 {/if}
+
+<!-- #119 — Toast / transient-notification host. Mounted once at the
+     layout root so notices surface above every page (including the
+     auth + welcome bare layouts). The host renders nothing until the
+     store has live items. -->
+<ToastHost />
+
+<!-- #216 — Persistent screen-recording control. Mounted at the
+     layout root so it stays visible while the report dialog is
+     hidden. Renders nothing while no recording is in flight. -->
+<RecordingFloatingControl />
 
 <style>
   .booting {

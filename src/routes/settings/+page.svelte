@@ -4,6 +4,7 @@
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
 
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
@@ -146,6 +147,18 @@
   // create_call and optionally feed into the summary. Off by default
   // so the record screen stays minimal for non-note-takers.
   let manualNotesEnabled = $state(false);
+  // #56 — per-machine pref for the spoken recording-start
+  // announcement. Defaults OFF so an existing user's first recording
+  // after upgrade doesn't unexpectedly speak. Hidden from the UI
+  // entirely when the org's recording_notification_mode is
+  // 'enforced' (compliance posture is mandatory; no toggle to flip)
+  // or 'off' (chime suppressed → speech makes no sense).
+  let consentAnnouncementEnabled = $state(false);
+  // Org-level recording notification mode, fetched once on mount so
+  // the row can decide whether to render itself. Null while loading;
+  // treated as 'user' on error so the toggle stays visible (a
+  // backend hiccup shouldn't lock the user out of opting in).
+  let recordingNotificationMode = $state<RecordingNotificationMode | null>(null);
   let prefsSavedAt = $state(0);
 
   // ── Launch-at-sign-in (#4) ─────────────────────────────────────────
@@ -294,6 +307,7 @@
         input_device: string | null;
         self_note_shortcut: string | null;
         record_toggle_shortcut: string | null;
+        consent_announcement_enabled: boolean;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -307,6 +321,7 @@
       inputDevice = p.input_device ?? null;
       selfNoteShortcut = p.self_note_shortcut ?? null;
       recordToggleShortcut = p.record_toggle_shortcut ?? null;
+      consentAnnouncementEnabled = p.consent_announcement_enabled ?? false;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -338,6 +353,7 @@
         inputDevice,
         selfNoteShortcut,
         recordToggleShortcut,
+        consentAnnouncementEnabled,
       });
       prefsSavedAt = Date.now();
     } catch (e) {
@@ -526,6 +542,19 @@
     await loadAppPrefs();
     await loadAutostart();
     await loadInputDevices();
+    // #56 — fetch the org's recording-notification mode so the
+    // consent-announcement toggle can decide whether to render.
+    // Cache lives in $lib/compliance, so the Record page and the
+    // auto-detect slide-out share the same in-memory copy. Errors
+    // fall through to mode = null → row treated as 'user'-equivalent
+    // so the user isn't locked out of opting in.
+    try {
+      const rp = await loadRecordingPrefs();
+      recordingNotificationMode = rp?.recording_notification_mode ?? "user";
+    } catch (e) {
+      console.warn("loadRecordingPrefs (settings) failed", e);
+      recordingNotificationMode = "user";
+    }
   });
 
   async function pickVaultDir() {
@@ -1122,6 +1151,62 @@
       </label>
     </div>
 
+    <!-- #56 — spoken recording-start announcement. Visible only when
+         the org's recording_notification_mode is 'user'. In 'enforced'
+         mode the announcement plays unconditionally and there's no
+         local toggle (an admin's compliance posture isn't silenceable
+         here). In 'off' mode the chime is suppressed too, so a
+         spoken announcement on its own would be incoherent — row
+         hidden. While the mode is still loading (null) we keep the
+         row hidden to avoid a flash of UI that disappears. -->
+    {#if recordingNotificationMode === "user"}
+      <div class="pref-row">
+        <div class="pref-label">
+          <span class="pref-title">Spoken recording reminder</span>
+          <span class="pref-hint">
+            Plays a short voice line — "Please note, this call is being
+            recorded" — right after the start chime. Off by default;
+            turn on if a single tone isn't enough disclosure for your
+            calls. Disabled when notification sounds are off.
+          </span>
+        </div>
+        <label class="switch">
+          <input
+            type="checkbox"
+            checked={consentAnnouncementEnabled}
+            disabled={!soundsEnabled}
+            onchange={(e) => {
+              consentAnnouncementEnabled = (e.currentTarget as HTMLInputElement).checked;
+              saveAppPrefs();
+            }}
+          />
+          <span class="track" aria-hidden="true">
+            <span class="knob"></span>
+          </span>
+          <span class="switch-label">
+            {consentAnnouncementEnabled ? "On" : "Off"}
+          </span>
+        </label>
+      </div>
+    {:else if recordingNotificationMode === "enforced"}
+      <!-- Read-only disclosure so admins-applied compliance posture
+           is at least visible to the user — they shouldn't be
+           surprised by a voice line they can't turn off. -->
+      <div class="pref-row">
+        <div class="pref-label">
+          <span class="pref-title">Spoken recording reminder</span>
+          <span class="pref-hint">
+            Your organization requires a spoken reminder when
+            recording starts. It plays after the chime on every
+            recording and can't be turned off here.
+          </span>
+        </div>
+        <span class="enforced-badge" aria-label="Required by your organization">
+          Required
+        </span>
+      </div>
+    {/if}
+
     <div class="pref-row">
       <div class="pref-label">
         <span class="pref-title">Diagnostic telemetry</span>
@@ -1205,9 +1290,10 @@
 
     {#if vault.enabled}
       <div class="vault-field">
-        <label class="field-label">Vault folder</label>
+        <label class="field-label" for="vault-folder-input">Vault folder</label>
         <div class="vault-row">
           <input
+            id="vault-folder-input"
             class="input vault-path"
             placeholder="/home/you/Documents/ObsidianVault"
             bind:value={vault.path}
@@ -1218,8 +1304,9 @@
         </div>
       </div>
       <div class="vault-field">
-        <label class="field-label">Clients subfolder (optional)</label>
+        <label class="field-label" for="vault-clients-subpath-input">Clients subfolder (optional)</label>
         <input
+          id="vault-clients-subpath-input"
           class="input"
           placeholder="20 Clients"
           bind:value={vault.clients_subpath}
@@ -1552,6 +1639,24 @@
   .error-inline {
     color: var(--live);
     font-size: 0.82rem;
+  }
+
+  /* #56 — read-only "Required" pill rendered in place of the toggle
+     when the org's recording_notification_mode is 'enforced'.
+     Mirrors the muted-mono treatment used elsewhere on the page so
+     it reads as informational, not a button. Sits in the same slot
+     a .switch would occupy so the row layout doesn't reflow. */
+  .enforced-badge {
+    flex-shrink: 0;
+    padding: 0.32rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    background: var(--ink-2);
+    color: var(--bone-2);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
   }
 
   /* Autostart row: inline saved-pip next to the switch (row-local, not

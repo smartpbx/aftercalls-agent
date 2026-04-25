@@ -122,12 +122,10 @@ function playNotesAwait(notes: Note[]): Promise<void> {
 // default path is unchanged so every other caller (stop, pipeline
 // done/failed, auto-detect) still honours the local mute toggle.
 //
-// TODO(#48): speech announcement — "Please note, this call is being
-// recorded" — is NOT implemented yet. Web Audio TTS is inconsistent
-// across Tauri's webview backends (webkit2gtk in particular). Ship
-// the tone + the `force`/mode infrastructure now; add speech when we
-// can evaluate a viable path (bundled sample audio OR the Web Speech
-// API with a graceful fallback for platforms that lack a voice).
+// #56: spoken announcement is layered ON TOP of this chime in
+// `compliance.ts:playStartCueIfEnabled` — see `notifyConsentAnnouncement`
+// below. The chime stays here as the unconditional start cue; the
+// announcement is gated on org mode + per-user pref.
 export async function notifyRecordStart(force: boolean = false) {
   // #92: force=true (PIPEDA "enforced" mode, #48) bypasses BOTH the
   // sounds_enabled pref AND the busy gate — compliance cues must play
@@ -179,4 +177,77 @@ export async function notifyAutoDetect() {
     { freq: 880, at: 0,    dur: 0.08, gain: 0.14 },
     { freq: 880, at: 0.18, dur: 0.08, gain: 0.14 },
   ]);
+}
+
+// #56: spoken recording-start announcement ("Please note — this
+// call is being recorded"). Plays a pre-rendered audio sample
+// shipped under agent/static/audio/. Sequencing: callers in
+// `compliance.ts` await `notifyRecordStart` first so the chime
+// lands before the voice — listener hears tone → speech, which
+// matches the "something changed → here's what" framing PIPEDA /
+// two-party-consent jurisdictions prefer.
+//
+// `force` mirrors the chime path: when true (PIPEDA `enforced`
+// mode) the announcement plays even if local sounds are muted.
+// The function tolerates a missing asset (404) gracefully — a
+// fresh checkout without the audio bake (see
+// `agent/static/audio/README.md`) silently skips the speech,
+// chime still plays. We never let this throw into the recorder
+// start path.
+const CONSENT_AUDIO_PATH = "/audio/consent-notice.opus";
+// Cached <audio> element so we don't pay the network/decode cost
+// every time. Lazily created on first play; SvelteKit's static
+// adapter serves /audio/ from `agent/static/`.
+let consentAudio: HTMLAudioElement | null = null;
+let consentAudioMissing = false;
+
+export async function notifyConsentAnnouncement(force: boolean = false) {
+  if (typeof window === "undefined") return;
+  if (consentAudioMissing) return; // already proven absent this session
+  if (!force && !(await soundsEnabled())) return;
+  try {
+    if (!consentAudio) {
+      const a = new Audio(CONSENT_AUDIO_PATH);
+      a.preload = "auto";
+      // Mono announcement intended at conversational volume —
+      // slightly under chime peak so it doesn't startle.
+      a.volume = 0.85;
+      consentAudio = a;
+    }
+    // Reset the playhead so a second consecutive recording start in
+    // the same session replays from the top instead of resuming
+    // mid-utterance.
+    consentAudio.currentTime = 0;
+    await new Promise<void>((resolve) => {
+      const a = consentAudio!;
+      const cleanup = () => {
+        a.removeEventListener("ended", onEnded);
+        a.removeEventListener("error", onError);
+      };
+      const onEnded = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        // 404 / decode error: blacklist for the rest of the session
+        // so we don't keep retrying. Chime still played upstream.
+        consentAudioMissing = true;
+        consentAudio = null;
+        resolve();
+      };
+      a.addEventListener("ended", onEnded, { once: true });
+      a.addEventListener("error", onError, { once: true });
+      a.play().catch(() => {
+        cleanup();
+        consentAudioMissing = true;
+        consentAudio = null;
+        resolve();
+      });
+    });
+  } catch {
+    // Defensive: never let this throw into the recorder start path.
+    consentAudioMissing = true;
+    consentAudio = null;
+  }
 }

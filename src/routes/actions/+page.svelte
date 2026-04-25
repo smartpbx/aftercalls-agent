@@ -36,6 +36,7 @@
   } from "$lib/SummaryText.svelte";
   import ChipMenu from "$lib/ChipMenu.svelte";
   import type { SpeakerPick } from "$lib/SpeakerRenamePicker.svelte";
+  import { isPortalError } from "$lib/portalError";
 
   // Roster shape the Tauri invoke returns. Superset of ActionItemUser
   // so we just map over the relevant fields.
@@ -320,11 +321,14 @@
       ) {
         activeRowEdit = { kind: "none" };
       }
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg = /workspace|team|member/i.test(raw)
-        ? "That teammate isn't in your workspace. Pick someone from your team."
-        : "Save failed. Check your connection and try again.";
+    } catch (e: unknown) {
+      // #124: bad_request from the backend means the assignee isn't
+      // in the org. Anything else is "save failed" with a generic
+      // try-again message.
+      const msg =
+        isPortalError(e) && e.kind === "bad_request"
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
       actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
     } finally {
       markPatching(payload.itemId, false);
@@ -352,11 +356,12 @@
       ) {
         activeRowEdit = { kind: "none" };
       }
-    } catch (e: any) {
-      const raw = String(e?.message ?? e ?? "");
-      const msg = /workspace|team|member/i.test(raw)
-        ? "That teammate isn't in your workspace. Pick someone from your team."
-        : "Save failed. Check your connection and try again.";
+    } catch (e: unknown) {
+      // #124: structured-error matching — see onDescriptionSave above.
+      const msg =
+        isPortalError(e) && e.kind === "bad_request"
+          ? "That teammate isn't in your workspace. Pick someone from your team."
+          : "Save failed. Check your connection and try again.";
       actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
     } finally {
       markPatching(payload.itemId, false);

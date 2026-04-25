@@ -7,8 +7,8 @@
 
   // Mirrors the portal's trash view. Deleted calls live here for
   // 30 days before the backend's nightly purge drops them for good.
-  // Users see their own bin; admins could flip to "all team" via
-  // a future toggle (portal has this — agent keeps it simple).
+  // Users see their own bin; admins + owners can flip to "all team"
+  // (#176, parity with the portal trash view).
 
   type Call = {
     id: string;
@@ -23,10 +23,26 @@
     deleted_at?: string;
   };
 
+  type Me = {
+    email: string;
+    display_name: string;
+    role: string;
+    org_display_name: string;
+  };
+
   let rows = $state<Call[]>([]);
+  let me = $state<Me | null>(null);
   let loading = $state(true);
   let error = $state("");
+  let scope = $state<"mine" | "all">("mine");
   let busy = $state<Record<string, boolean>>({});
+
+  // #176 — only admin + owner see the All-team pill. Non-admins stay
+  // on the implicit `mine` scope (and the backend enforces this
+  // server-side regardless of what the client requests).
+  let canSeeAll = $derived(
+    !!me && (me.role === "admin" || me.role === "owner"),
+  );
 
   // #163 (v0.5.2) — agent mirror of the portal date range (#146). Empty
   // string = unset. Persisted on the URL as `?from=YYYY-MM-DD&to=…`;
@@ -58,6 +74,7 @@
     error = "";
     try {
       rows = await invoke<Call[]>("list_trashed", {
+        scope,
         fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
         toDate: toDate ? `${toDate}T23:59:59Z` : null,
       });
@@ -66,6 +83,12 @@
     } finally {
       loading = false;
     }
+  }
+
+  async function setScope(next: "mine" | "all") {
+    if (scope === next) return;
+    scope = next;
+    await load();
   }
 
   function onDateChange() {
@@ -88,6 +111,9 @@
   }
 
   onMount(async () => {
+    try {
+      me = await invoke<Me | null>("current_user");
+    } catch {}
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
     await load();
@@ -169,6 +195,27 @@
     </div>
     <a class="back" href="/calls">← Back to Calls</a>
   </header>
+
+  <!-- #176 · Mine / All-team scope. Admin + owner only; non-admins
+       stay on the implicit `mine` scope so the pill row is hidden. -->
+  {#if canSeeAll}
+    <div class="scope">
+      <button
+        class="scope-pill"
+        class:active={scope === "mine"}
+        onclick={() => setScope("mine")}
+      >
+        Mine
+      </button>
+      <button
+        class="scope-pill"
+        class:active={scope === "all"}
+        onclick={() => setScope("all")}
+      >
+        All team
+      </button>
+    </div>
+  {/if}
 
   <!-- #163 · Date range. Mirror of /calls on the agent. #189 swapped
        the native <input type="date"> for DateInput because webkit2gtk
@@ -295,6 +342,28 @@
   .back:hover {
     color: var(--bone-0);
   }
+
+  /* #176 · Scope pills (mirror of portal trash). Admin + owner only. */
+  .scope {
+    display: flex;
+    gap: 0.3rem;
+    margin-bottom: 1rem;
+  }
+  .scope-pill {
+    padding: 0.4rem 0.9rem;
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    color: var(--bone-2);
+    border-radius: 999px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .scope-pill.active {
+    border-color: var(--accent);
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+  }
+
   .state {
     color: var(--bone-3);
   }
