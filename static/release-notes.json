@@ -1,4 +1,14 @@
 {
+  "0.7.1": {
+    "headline": "Screen recording for support, a client-name allowlist, and Zoho custom modules",
+    "changes": [
+      "Record your screen when reporting an issue. The report dialog gets a Record screen button next to the existing screenshot option — capture what you're doing, stop whenever, review before you send. Video only; system audio and mic stay off.",
+      "Client-name allowlist. Teach the app which names in your calls are customers rather than teammates; the summary will stop wrapping those names. Populates automatically when you click 'Leave as text' on a name chip, or manage by hand under Settings → Organization → Clients.",
+      "Custom Zoho modules in the record-type picker. If your Zoho has Properties, Projects, or any other custom module, they now show up alongside Contact, Deal, Account, Lead, and Quote. Refresh from the Zoho admin page.",
+      "Support-report attachments tidy up automatically after six months. Older screenshots and recordings age out with a clear 'expired' state rather than a broken-link view.",
+      "Extra confirm on changes during a support session. When our team is signed in as you to help, destructive or irreversible changes now ask for a deliberate confirm before they run."
+    ]
+  },
   "0.7.0": {
     "headline": "Zoho CRM, guided onboarding, and in-app issue reporting",
     "changes": [

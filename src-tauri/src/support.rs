@@ -1,48 +1,79 @@
-//! In-agent "Report an issue" IPC commands (#183).
+//! In-agent "Report an issue" IPC commands (#183, #203).
 //!
-//! Two commands:
+//! Three commands:
 //!   * `inspect_support_attachment(path)` — returns a small file-meta
-//!     record + a base64 data-URL preview suitable for the chip
-//!     thumbnail. Avoids piping bytes through the JS bridge for the
-//!     full upload.
+//!     record suitable for the chip thumbnail. Avoids piping bytes
+//!     through the JS bridge for the full upload.
+//!   * `stage_support_video(bytes, filename)` — writes an in-memory
+//!     webm blob (produced by the webview's MediaRecorder) to a temp
+//!     file under `<temp>/aftercalls-support/<uuid>/`, returns the
+//!     absolute path. Keeps the subsequent presigned-PUT pipeline
+//!     path-based and unchanged between screenshots + videos.
 //!   * `submit_support_report(title, body, metadata, attachments)` —
 //!     orchestrates the whole submit flow:
 //!       1. Flush telemetry so recent diagnostic logs land before the
 //!          report row gets indexed.
 //!       2. POST `/v1/support/reports` to mint the report id +
 //!          presigned PUT URLs for each attachment.
-//!       3. PUT each chosen file directly to Spaces using the signed
+//!       3. PUT each chosen file directly to storage using the signed
 //!          content-type.
 //!       4. POST `.../attachments/finalize` so the backend flips
 //!          `uploaded=TRUE` after the HEAD-verification round-trip.
+//!       5. Best-effort cleanup of any staged temp files.
 //!
 //! The dialog stays vendor-opaque on its own copy; this module talks
 //! to the backend by name (HTTP + presigned URLs) but the user never
 //! sees those mechanics.
 //!
-//! v1 NOTE: this implementation does NOT capture native screenshots
-//! via Tauri's window API — that path is webview-only on most
-//! platforms and stops at the OS-window-frame on Linux/Wayland. The
-//! file-picker route is the v1 entry; v2 will revisit native capture.
+//! v2 NOTE (#203): screen-capture happens in the webview via
+//! `navigator.mediaDevices.getDisplayMedia` + `MediaRecorder`. We
+//! deliberately do NOT pull a native screen-capture crate (e.g.
+//! `scap`) — the webview's standards-based APIs already handle the
+//! per-OS permission flow, return a `MediaStream` ready for encoding,
+//! and don't add to the native dependency graph. See the issue-203
+//! plan for the full rationale.
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::portal::build_auth_header;
 
 // ── Constants (mirror backend caps) ─────────────────────────────────
 
-const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
-const ALLOWED_MIMES: &[&str] = &[
+const MAX_SCREENSHOT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
+const ALLOWED_SCREENSHOT_MIMES: &[&str] = &[
     "image/png",
     "image/jpeg",
     "image/webp",
     "image/gif",
 ];
+const ALLOWED_VIDEO_MIMES: &[&str] = &["video/webm"];
+
+/// Subdir name for staged video blobs under the OS temp dir.
+/// Keeping the parent dir stable lets a crashed agent's next launch
+/// sweep lingering bytes; the per-stage subdir is a random uuid so
+/// two concurrent stages don't collide.
+const STAGE_DIR_NAME: &str = "aftercalls-support";
+
+fn stage_parent() -> PathBuf {
+    std::env::temp_dir().join(STAGE_DIR_NAME)
+}
+
+/// Resolve per-kind upload limits. Mirrors the backend's
+/// `limits_for_kind` helper so a mime that passes the agent's
+/// pre-flight passes the server too.
+fn limits_for_kind(kind: &str) -> Option<(&'static [&'static str], u64)> {
+    match kind {
+        "screenshot" => Some((ALLOWED_SCREENSHOT_MIMES, MAX_SCREENSHOT_BYTES)),
+        "video" => Some((ALLOWED_VIDEO_MIMES, MAX_VIDEO_BYTES)),
+        _ => None,
+    }
+}
 
 // ── inspect_support_attachment ─────────────────────────────────────
 
@@ -93,12 +124,10 @@ fn inspect_inner(path: &str) -> Result<AttachmentInspect> {
         .to_string();
     let mime = mime_from_extension(p);
 
-    // Inline preview is intentionally None in v1 — generating one
-    // requires either a base64 dep or piping bytes through the JS
-    // bridge, both of which add weight for a 24×24 thumbnail.
-    // The chip falls back to a placeholder rect with the filename
-    // visible. v2 (screen-record + native capture) will revisit.
-    let _ = ALLOWED_MIMES; // referenced by submit; keep the symbol live
+    // Inline preview is intentionally None — generating one requires
+    // either a base64 dep or piping bytes through the JS bridge, both
+    // of which add weight for a 24×24 thumbnail. The chip falls back
+    // to a placeholder rect with the filename visible.
     Ok(AttachmentInspect {
         path: path.to_string(),
         filename,
@@ -106,6 +135,97 @@ fn inspect_inner(path: &str) -> Result<AttachmentInspect> {
         size_bytes: size_bytes as i64,
         preview_data_url: None,
     })
+}
+
+// ── stage_support_video ────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct StagedAttachment {
+    /// Absolute path of the temp file we just wrote. Pass this back
+    /// into `submit_support_report` inside the attachment list —
+    /// the submit path reads from disk, so a staged video rides the
+    /// same pipeline as a file-picker screenshot.
+    pub path: String,
+    /// Actual bytes we wrote (for the chip size display).
+    pub size_bytes: i64,
+}
+
+/// Write a webview-produced blob to a temp file so the existing
+/// path-based upload pipeline can ride unchanged. Caller is
+/// responsible for calling `cleanup_staged` after submit finishes
+/// (success or failure); we also belt-and-braces sweep at startup
+/// via `sweep_stage_dir()`.
+#[tauri::command]
+pub fn stage_support_video(
+    bytes: Vec<u8>,
+    filename: String,
+) -> Result<StagedAttachment, String> {
+    stage_support_video_inner(bytes, filename).map_err(|e| e.to_string())
+}
+
+fn stage_support_video_inner(
+    bytes: Vec<u8>,
+    filename: String,
+) -> Result<StagedAttachment> {
+    // Gate on the agent-side max cap so we don't write a megabyte-
+    // heavy blob just to have the server reject it.
+    if bytes.len() as u64 > MAX_VIDEO_BYTES {
+        anyhow::bail!("recording exceeds 100 MB cap");
+    }
+    let safe = sanitise_filename(&filename);
+    // Use a simple random identifier (nanos + rand-ish fallback) to
+    // keep this module dependency-free — we already avoid pulling a
+    // separate uuid crate for the agent.
+    let id_hi = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id_lo = std::process::id() as u128;
+    let stage_id = format!("{:032x}", id_hi.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(id_lo));
+    let subdir = stage_parent().join(&stage_id);
+    std::fs::create_dir_all(&subdir)
+        .with_context(|| format!("create stage dir {}", subdir.display()))?;
+    let full = subdir.join(&safe);
+    std::fs::write(&full, &bytes)
+        .with_context(|| format!("write staged video {}", full.display()))?;
+    Ok(StagedAttachment {
+        path: full.to_string_lossy().into_owned(),
+        size_bytes: bytes.len() as i64,
+    })
+}
+
+fn sanitise_filename(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    // Mirror the backend cap at 120 chars + fall back to a
+    // deterministic default if the whole thing collapses to empty
+    // (the backend would also normalise, but an empty filename
+    // produces a weird-looking chip in the meantime).
+    let trimmed: String = out.chars().take(120).collect();
+    if trimmed.is_empty() { "recording.webm".into() } else { trimmed }
+}
+
+/// Best-effort sweep of lingering staged uploads. Call this at agent
+/// startup. Removes subdirs of `<temp>/aftercalls-support/` older
+/// than 24 h so a crashed submit from yesterday doesn't leak bytes
+/// forever.
+pub fn sweep_stage_dir() {
+    let parent = stage_parent();
+    let Ok(read) = std::fs::read_dir(&parent) else { return };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+    for entry in read.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if modified < cutoff {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 // ── submit_support_report ──────────────────────────────────────────
@@ -116,6 +236,14 @@ pub struct AttachmentSubmit {
     pub filename: String,
     pub mime: String,
     pub size_bytes: i64,
+    /// `screenshot` (default) or `video`. Defaulted for backwards
+    /// compat with any caller still passing the #183 shape.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+}
+
+fn default_kind() -> String {
+    "screenshot".to_string()
 }
 
 #[derive(Deserialize, Serialize)]
@@ -138,9 +266,36 @@ pub async fn submit_support_report(
     metadata: Value,
     attachments: Vec<AttachmentSubmit>,
 ) -> Result<String, String> {
-    submit_inner(title, body, metadata, attachments)
+    // Collect staged paths BEFORE handing off — `submit_inner` may
+    // bail part-way, and we still want the temp bytes gone. A staged
+    // video sits under `<temp>/aftercalls-support/<id>/recording.webm`
+    // so we remove the parent per-stage subdir rather than the file
+    // alone (keeps inode hygiene consistent with how we wrote it).
+    let staged_dirs: Vec<PathBuf> = attachments
+        .iter()
+        .filter_map(|a| {
+            let path = Path::new(&a.path);
+            let parent = path.parent()?;
+            let grandparent = parent.parent()?;
+            if grandparent.file_name().and_then(|s| s.to_str()) == Some(STAGE_DIR_NAME) {
+                Some(parent.to_path_buf())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let result = submit_inner(title, body, metadata, attachments)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+
+    // Best-effort cleanup. Failure to remove a staged dir is
+    // non-fatal — `sweep_stage_dir` at next startup will get it.
+    for dir in &staged_dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    result
 }
 
 async fn submit_inner(
@@ -162,11 +317,15 @@ async fn submit_inner(
         return Err(anyhow!("max 5 attachments per report"));
     }
     for a in &attachments {
-        if !ALLOWED_MIMES.contains(&a.mime.as_str()) {
+        let Some((allowed_mimes, max_bytes)) = limits_for_kind(&a.kind) else {
+            return Err(anyhow!("unsupported attachment kind: {}", a.kind));
+        };
+        if !allowed_mimes.contains(&a.mime.as_str()) {
             return Err(anyhow!("unsupported mime: {}", a.mime));
         }
-        if a.size_bytes < 0 || a.size_bytes as u64 > MAX_ATTACHMENT_BYTES {
-            return Err(anyhow!("attachment too large (max 25 MB)"));
+        if a.size_bytes < 0 || a.size_bytes as u64 > max_bytes {
+            let cap_mb = max_bytes / (1024 * 1024);
+            return Err(anyhow!("attachment too large (max {cap_mb} MB)"));
         }
     }
 
@@ -210,7 +369,7 @@ async fn submit_inner(
         "attachments": attachments
             .iter()
             .map(|a| serde_json::json!({
-                "kind": "screenshot",
+                "kind": a.kind,
                 "filename": a.filename,
                 "size_bytes": a.size_bytes,
                 "mime": a.mime,

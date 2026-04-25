@@ -623,6 +623,30 @@ pub async fn patch_call(backend: &Backend, id: &str, body: &Value) -> Result<Val
     patch_json(backend, &format!("/v1/calls/{id}"), body.clone()).await
 }
 
+/// POST /v1/org/client-allowlist — auto-populate the persistent
+/// client-allowlist when a user clicks "Leave as text" on a chip
+/// (#195). Fire-and-forget from the front-end's point of view:
+/// 201 / 200 / 4xx / 5xx all swallowed. Duplicates are collapsed
+/// by the server's UNIQUE constraint and surface as 200 with the
+/// existing row; past the 500-entry cap the server returns 409.
+/// Either way the unlink already succeeded locally, so no user
+/// action needed.
+pub async fn add_client_allowlist_entry(
+    backend: &Backend,
+    name: &str,
+    source: &str,
+) -> Result<Value> {
+    post_json(
+        backend,
+        "/v1/org/client-allowlist",
+        serde_json::json!({
+            "name": name,
+            "source": source,
+        }),
+    )
+    .await
+}
+
 /// PATCH /v1/calls/{id}/action-items/{item_id} — edit one action
 /// item row. Cross-org assignee writes surface as 400 per #82, which
 /// the UI renders as an inline error beneath the assignee picker.
@@ -747,6 +771,13 @@ pub async fn tag_suggestions(
 /// `api.zoho.status()`. (#186)
 pub async fn zoho_status(backend: &Backend) -> Result<Value> {
     get_json(backend, "/v1/org/zoho/status").await
+}
+
+/// GET /v1/zoho/record-types — record-type picker payload (#197).
+/// Returns `{ standard, custom, custom_refreshed_at }`. The agent
+/// modal calls this on mount to populate the Step-1 radio list.
+pub async fn zoho_record_types(backend: &Backend) -> Result<Value> {
+    get_json(backend, "/v1/zoho/record-types").await
 }
 
 /// GET /v1/zoho/records?module=…&q=… — Step 2 of SendToZohoModal. (#186)

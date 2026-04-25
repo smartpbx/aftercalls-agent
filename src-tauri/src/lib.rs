@@ -1267,6 +1267,26 @@ async fn patch_action_item(
         .map_err(|e| e.to_string())
 }
 
+/// POST /v1/org/client-allowlist — auto-populate from the chip-menu
+/// "Leave as text" path (#195). Fire-and-forget: the frontend calls
+/// this and ignores the result so a failure doesn't nag the user.
+/// Duplicates / cap rejections are server-side no-ops from the
+/// caller's perspective.
+#[tauri::command]
+async fn add_client_allowlist_entry(
+    name: String,
+    source: String,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::add_client_allowlist_entry(backend, &name, &source)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// POST /v1/calls/{id}/action-items/manual — Phase 3 (#104) manual
 /// add. Body is forwarded verbatim; frontend pre-shapes
 /// `{description, assignee_user_id?}`. Backend returns 201 with the
@@ -1339,6 +1359,24 @@ async fn zoho_status() -> Result<serde_json::Value, String> {
         .as_ref()
         .ok_or_else(|| "no backend configured".to_string())?;
     portal::zoho_status(backend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// GET /v1/zoho/record-types — record-type picker payload (#197).
+/// Returns `{ standard, custom, custom_refreshed_at }` so the
+/// SendToZohoModal Step-1 picker can render standards + customs with
+/// a divider. Failure (network, 404 not connected) bubbles to the
+/// modal's `recordTypesError` banner; the picker keeps working with
+/// the v1 fallback.
+#[tauri::command]
+async fn zoho_record_types() -> Result<serde_json::Value, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let backend = cfg
+        .backend
+        .as_ref()
+        .ok_or_else(|| "no backend configured".to_string())?;
+    portal::zoho_record_types(backend)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1993,6 +2031,7 @@ pub fn run() {
             resummarize_call,
             patch_call,
             patch_action_item,
+            add_client_allowlist_entry,
             add_action_item,
             delete_action_item,
             list_me_action_items,
@@ -2006,13 +2045,18 @@ pub fn run() {
             // Connect/disconnect happens on the portal admin page; the
             // agent links out via openUrl, so no connect command here.
             zoho_status,
+            zoho_record_types,
             zoho_search_records,
             zoho_push_call,
             notes::save_notes,
             notes::load_notes,
             notes::update_call_notes,
             // #183 — in-agent support reports.
+            // #203 — stage_support_video lands webview-produced webm
+            // blobs on a temp path so the existing path-based submit
+            // pipeline rides unchanged.
             support::inspect_support_attachment,
+            support::stage_support_video,
             support::submit_support_report,
         ])
         .setup(|app| {
@@ -2030,6 +2074,12 @@ pub fn run() {
                 None,
                 None,
             );
+
+            // #203: sweep any lingering support-report video stage
+            // dirs older than 24 h. If a crash interrupted a submit
+            // yesterday, those temp bytes get cleaned up here rather
+            // than sitting forever. Non-blocking and best-effort.
+            support::sweep_stage_dir();
 
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;

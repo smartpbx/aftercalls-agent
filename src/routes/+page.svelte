@@ -174,8 +174,20 @@
   );
   let notesSaveTimer = 0;
   let notesPending: string | null = null;
+  // #194: seed value for the TipTap editor on remount mid-recording.
+  // Notes are written to <session_dir>/notes.md during typing, but a
+  // route-nav unmounts the editor and the next mount comes up empty
+  // unless we re-read from disk. notesInitialFor tracks which
+  // session_id we've already issued a load_notes for, so the same
+  // session never gets seeded twice. notesUserTyped flips on the
+  // first onchange callback and prevents a slow load_notes resolve
+  // from clobbering keystrokes the user managed to land in the gap.
+  let notesInitial = $state("");
+  let notesInitialFor = "";
+  let notesUserTyped = false;
   function scheduleNotesSave(text: string) {
     if (!currentSessionId) return;
+    notesUserTyped = true;
     notesPending = text;
     clearTimeout(notesSaveTimer);
     notesSaveTimer = window.setTimeout(async () => {
@@ -192,6 +204,33 @@
       }
     }, 500);
   }
+  // Whenever the active session changes, reset the seed and try to
+  // rehydrate from disk. Empty/missing notes.md → empty string, so
+  // a fresh recording starts blank without a special branch.
+  $effect(() => {
+    const sid = currentSessionId;
+    if (!sid) {
+      notesInitial = "";
+      notesInitialFor = "";
+      notesUserTyped = false;
+      return;
+    }
+    if (notesInitialFor === sid) return;
+    notesInitialFor = sid;
+    notesUserTyped = false;
+    notesInitial = "";
+    invoke<string>("load_notes", { sessionId: sid })
+      .then((text) => {
+        // Only seed if (a) we're still on the same session, and
+        // (b) the user hasn't already started typing in the editor
+        // during the IPC round-trip — otherwise their keystrokes
+        // would be overwritten by setContent in NotesPanel's effect.
+        if (notesInitialFor === sid && !notesUserTyped) {
+          notesInitial = text ?? "";
+        }
+      })
+      .catch((e) => console.warn("load_notes failed", e));
+  });
 
   async function openCallInBrowser() {
     if (!openableCallId) return;
@@ -784,12 +823,14 @@
   <!-- Manual notes panel (#73). Opt-in via Settings; only visible
        during an active recording so there's no empty editor on the
        page when idle. Keyed on session_id so a new recording gets a
-       fresh editor state (the CodeMirror instance is destroyed + re-
-       created rather than carrying stale text between calls). -->
+       fresh editor state (the TipTap instance is destroyed + re-
+       created rather than carrying stale text between calls). #194:
+       value={notesInitial} seeds the editor from notes.md when the
+       user navigates away and back mid-recording. -->
   {#if manualNotesEnabled && recording && currentSessionId}
     <section class="notes" style="--i: 3">
       {#key currentSessionId}
-        <NotesPanel onchange={scheduleNotesSave} />
+        <NotesPanel value={notesInitial} onchange={scheduleNotesSave} />
       {/key}
     </section>
   {/if}

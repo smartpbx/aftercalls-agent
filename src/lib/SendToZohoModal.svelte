@@ -23,7 +23,32 @@
     pushed_by_display_name?: string | null;
     zoho_url?: string | null;
   };
+  /** Record-type entry as returned by /v1/zoho/record-types (#197).
+   *  The picker treats `singular_label` as the human label,
+   *  `plural_label` as the search-page heading. Custom modules carry
+   *  resolved `search_field` / `name_field`; standards leave them
+   *  empty (the backend uses a hard-coded map). */
+  export type SzmRecordType = {
+    api_name: string;
+    plural_label: string;
+    singular_label: string;
+    search_field?: string;
+    name_field?: string;
+  };
+
+  /** /v1/zoho/record-types response shape — standards + customs +
+   *  last-refresh hint. Custom-module discovery (#197) populates the
+   *  `custom` slice on connect or via the admin Refresh button. */
+  export type SzmRecordTypes = {
+    standard: SzmRecordType[];
+    custom: SzmRecordType[];
+    custom_refreshed_at?: string | null;
+  };
+
   export type SzmApi = {
+    /** Fetch the org's record-type allowlist — standards + customs.
+     *  Surface-specific transport per the mirror-pair invariant. */
+    recordTypes: () => Promise<SzmRecordTypes>;
     searchRecords: (
       module: string,
       q: string,
@@ -122,20 +147,41 @@
   const liveId = `szm-live-${Math.random().toString(36).slice(2, 9)}`;
   let liveAnnouncement = $state("");
 
-  // Step-1 record type picker. v1 ships these 5 hardcoded options.
+  // Step-1 record type picker. v2 (#197) fetches the list at mount —
+  // standards always present, customs cached server-side from the
+  // org's `/settings/modules?type=Custom` discovery.
   type RecordType = {
     api_name: string;
     label: string;
     kicker: string;
+    /** True for entries from the cached custom-modules list. Drives
+     *  the divider + sub-label copy; never sent to the backend. */
+    is_custom: boolean;
   };
-  const RECORD_TYPES: RecordType[] = [
-    { api_name: "Contacts", label: "Contact", kicker: "Person" },
-    { api_name: "Deals", label: "Deal", kicker: "Opportunity" },
-    { api_name: "Accounts", label: "Account", kicker: "Company" },
-    { api_name: "Leads", label: "Lead", kicker: "Unqualified lead" },
-    { api_name: "Quotes", label: "Quote", kicker: "Quote document" },
+  // Hard-coded standard kickers — keep the v1 copy verbatim for the
+  // 5 standards so the visible copy doesn't regress on a partial
+  // record-types fetch.
+  const STANDARD_KICKERS: Record<string, string> = {
+    Contacts: "Person",
+    Deals: "Opportunity",
+    Accounts: "Company",
+    Leads: "Unqualified lead",
+    Quotes: "Quote document",
+  };
+  // Fallback used when fetching record types fails — keeps the v1 push
+  // path alive even if the network drops the discovery hop.
+  const STANDARD_FALLBACK: RecordType[] = [
+    { api_name: "Contacts", label: "Contact", kicker: "Person", is_custom: false },
+    { api_name: "Deals", label: "Deal", kicker: "Opportunity", is_custom: false },
+    { api_name: "Accounts", label: "Account", kicker: "Company", is_custom: false },
+    { api_name: "Leads", label: "Lead", kicker: "Unqualified lead", is_custom: false },
+    { api_name: "Quotes", label: "Quote", kicker: "Quote document", is_custom: false },
   ];
-  let chosenType = $state<RecordType>(RECORD_TYPES[0]);
+  let standardTypes = $state<RecordType[]>(STANDARD_FALLBACK);
+  let customTypes = $state<RecordType[]>([]);
+  let recordTypesLoading = $state(true);
+  let recordTypesError = $state<string | null>(null);
+  let chosenType = $state<RecordType>(STANDARD_FALLBACK[0]);
 
   // Step-2 search.
   let query = $state("");
@@ -227,7 +273,57 @@
   onMount(async () => {
     await tick();
     focusFirstInteractive();
+    // Fetch record types in parallel with the focus sequence (#197).
+    // We deliberately don't block focus on this — Step 1 renders with
+    // the v1 fallback list immediately, then upgrades to the
+    // discovered list when it arrives. On fetch failure, the fallback
+    // keeps the push path alive.
+    void loadRecordTypes();
   });
+
+  async function loadRecordTypes() {
+    recordTypesLoading = true;
+    recordTypesError = null;
+    try {
+      const out = await api.recordTypes();
+      // Standards: prefer backend labels but use the local kicker map
+      // so we don't show "Contacts/Contact/Person" inconsistently if
+      // the backend label drift.
+      const standards: RecordType[] = (out.standard ?? []).map((m) => ({
+        api_name: m.api_name,
+        label: m.singular_label || m.api_name,
+        kicker: STANDARD_KICKERS[m.api_name] ?? m.plural_label ?? "",
+        is_custom: false,
+      }));
+      // Customs: alphabetic by singular_label.
+      const customs: RecordType[] = (out.custom ?? [])
+        .map((m) => ({
+          api_name: m.api_name,
+          label: m.singular_label || m.api_name,
+          kicker: "Custom module",
+          is_custom: true,
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+      if (standards.length > 0) {
+        standardTypes = standards;
+      }
+      customTypes = customs;
+      // Re-bind the selection to the freshly-loaded standards entry
+      // (so identity-equality on the radio group works) — fall back to
+      // the first standard if the previous chosen entry is no longer
+      // in either list.
+      const all = [...standardTypes, ...customTypes];
+      const match = all.find((t) => t.api_name === chosenType.api_name);
+      chosenType = match ?? standardTypes[0];
+    } catch (e: any) {
+      // Keep the fallback standards list; surface a small error
+      // banner so the user knows custom modules aren't available.
+      recordTypesError =
+        "Couldn't load custom modules. Standard records still work.";
+    } finally {
+      recordTypesLoading = false;
+    }
+  }
 
   async function focusFirstInteractive() {
     if (!modalEl) return;
@@ -436,7 +532,7 @@
       {:else if step === 1}
         <fieldset class="szm-rtype">
           <legend>Record type</legend>
-          {#each RECORD_TYPES as rt (rt.api_name)}
+          {#each standardTypes as rt (rt.api_name)}
             <label class="szm-rtype-opt">
               <input
                 type="radio"
@@ -451,6 +547,37 @@
               </span>
             </label>
           {/each}
+          {#if customTypes.length > 0}
+            <!-- Divider only renders when this org has custom modules
+                 (#197). Sort order is alphabetic by singular_label,
+                 already applied in loadRecordTypes(). -->
+            <div
+              class="szm-rtype-divider"
+              role="presentation"
+              aria-hidden="true"
+            ></div>
+            {#each customTypes as rt (rt.api_name)}
+              <label class="szm-rtype-opt">
+                <input
+                  type="radio"
+                  name="szm-rtype"
+                  value={rt.api_name}
+                  checked={chosenType.api_name === rt.api_name}
+                  onchange={() => (chosenType = rt)}
+                />
+                <span class="szm-rtype-text">
+                  <span class="szm-rtype-name">{rt.label}</span>
+                  <span class="szm-rtype-kicker">{rt.kicker}</span>
+                </span>
+              </label>
+            {/each}
+          {/if}
+          {#if recordTypesError}
+            <!-- Non-blocking — the picker still works for standards. -->
+            <p class="szm-rtype-err" role="status">
+              {recordTypesError}
+            </p>
+          {/if}
         </fieldset>
       {:else if step === 2}
         <div class="szm-search">
@@ -824,6 +951,19 @@
   .szm-rtype-kicker {
     color: var(--bone-3);
     font-size: 0.75rem;
+  }
+  /* Divider between standard + custom modules (#197). Hairline
+     keeps the rest of the surface coherent; 0.4rem vertical breathing
+     room mirrors the standard pip-row separation in app.css. */
+  .szm-rtype-divider {
+    height: 1px;
+    background: var(--hairline);
+    margin: 0.3rem 0.2rem;
+  }
+  .szm-rtype-err {
+    margin: 0.3rem 0 0;
+    color: var(--bone-3);
+    font-size: 0.78rem;
   }
 
   /* Step 2 — search */

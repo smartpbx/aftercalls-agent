@@ -437,6 +437,10 @@
   ) {
     if (!activeChip) return;
     const ac = activeChip;
+    // #195 — external-mode unlink auto-populates the persistent
+    // client-allowlist. Fire-and-forget via the Tauri command.
+    const shouldRememberClient = ac.isExternal && action === "unlink";
+    const rememberName = ac.inner;
     let replacement: string | undefined;
     if (action === "rename") {
       const user = pick?.user;
@@ -493,6 +497,13 @@
       console.warn("chip action failed", e);
     } finally {
       closeChipMenu();
+    }
+    // #195 fire-and-forget allowlist add.
+    if (shouldRememberClient && rememberName) {
+      invoke("add_client_allowlist_entry", {
+        name: rememberName,
+        source: "unlink",
+      }).catch((e) => console.debug("allowlist add failed", e));
     }
   }
 

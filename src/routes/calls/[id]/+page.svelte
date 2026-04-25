@@ -20,6 +20,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import SendToZohoModal, {
     type SzmPriorPush,
+    type SzmRecordTypes,
     type SzmSearchResult,
     type SzmPushResponse,
   } from "$lib/SendToZohoModal.svelte";
@@ -263,6 +264,12 @@
   // api.zoho.* helpers — that's what keeps the SendToZohoModal mirror
   // pair byte-identical between portal and agent.
   const zohoApi = {
+    recordTypes: async (): Promise<SzmRecordTypes> => {
+      // #197: backend returns `{ standard, custom, custom_refreshed_at }`.
+      // Tauri command bubbles errors as plain strings — the modal's
+      // catch turns those into a benign banner.
+      return (await invoke("zoho_record_types")) as SzmRecordTypes;
+    },
     searchRecords: async (
       module: string,
       q: string,
@@ -2459,6 +2466,12 @@
   ) {
     if (!activeChip || !call) return;
     const ac = activeChip;
+    // #195 — external-mode unlink auto-populates the persistent
+    // client-allowlist via the `add_client_allowlist_entry` Tauri
+    // command. Fire-and-forget. Captured before the finally block
+    // nulls `activeChip`.
+    const shouldRememberClient = ac.isExternal && action === "unlink";
+    const rememberName = ac.inner;
     let replacement: string | undefined;
     if (action === "rename") {
       const user = pick?.user;
@@ -2533,6 +2546,13 @@
       console.warn("chip action failed", e);
     } finally {
       closeChipMenu();
+    }
+    // #195 fire-and-forget allowlist add.
+    if (shouldRememberClient && rememberName) {
+      invoke("add_client_allowlist_entry", {
+        name: rememberName,
+        source: "unlink",
+      }).catch((e) => console.debug("allowlist add failed", e));
     }
   }
 </script>

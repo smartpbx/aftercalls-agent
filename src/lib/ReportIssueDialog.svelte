@@ -47,27 +47,64 @@
   let telemetryOpen = $state(false);
 
   // Attachments ──────────────────────────────────────────────────
+  type AttachmentKind = "screenshot" | "video";
   type Attachment = {
     /** Stable client-side id; server assigns its own UUID once submit lands. */
     localId: string;
+    /**
+     * Path for file-picker screenshots. For in-memory recordings, this
+     * is populated at submit time by `stage_support_video` — until
+     * then it stays empty and `blob` holds the bytes.
+     */
     filePath: string;
     filename: string;
     mime: string;
     sizeBytes: number;
-    /** dataURL preview rendered as the chip thumbnail. */
+    /** dataURL / objectURL preview rendered as the chip thumbnail. */
     previewUrl: string | null;
     /** Set when the file fails local validation (size/type). Excluded from submit. */
     error: string | null;
+    /** #203: screenshot or video. Drives per-kind caps + chip UX. */
+    kind: AttachmentKind;
+    /**
+     * #203: in-memory webm blob produced by MediaRecorder. Staged to
+     * a temp file by `stage_support_video` on submit. `null` for
+     * file-picker screenshots.
+     */
+    blob: Blob | null;
   };
   let attachments = $state<Attachment[]>([]);
   const MAX_ATTACHMENTS = 5;
-  const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+  const MAX_SCREENSHOT_BYTES = 25 * 1024 * 1024;
+  const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
+  // #203: warn at 90 MB so the user can choose to stop recording
+  // cleanly before auto-stop kicks at 100 MB.
+  const VIDEO_WARN_BYTES = 90 * 1024 * 1024;
   const ALLOWED_MIME = [
     "image/png",
     "image/jpeg",
     "image/webp",
     "image/gif",
   ];
+
+  // Screen-recording state (#203) ───────────────────────────────
+  let recorder: MediaRecorder | null = null;
+  let recorderStream: MediaStream | null = null;
+  let recorderChunks: Blob[] = [];
+  let recorderBytes = $state(0);
+  let recorderElapsedMs = $state(0);
+  let recorderTickHandle: ReturnType<typeof setInterval> | null = null;
+  let recordingStartedAt = 0;
+  let recorderError = $state<string | null>(null);
+  // Feature-detected once at mount; controls whether the Record
+  // button shows up at all. Some webviews (older WebKitGTK, certain
+  // Linux distros without the desktop portal) lack getDisplayMedia.
+  let canRecord = $state(false);
+  // Preview modal (tier-2) state.
+  let previewingLocalId = $state<string | null>(null);
+
+  // Derived + mimeType negotiation results.
+  const recording = $derived(recorder !== null);
 
   // Modal scaffolding ────────────────────────────────────────────
   let modalEl = $state<HTMLDivElement | null>(null);
@@ -84,13 +121,51 @@
     openerEl = (document.activeElement as HTMLElement | null) ?? null;
     await tick();
     titleInput?.focus();
+
+    // #203 feature-detection. `navigator.mediaDevices.getDisplayMedia`
+    // is absent on some older webviews (notably WebKitGTK < 2.38 or
+    // distros without an xdg-desktop-portal). `MediaRecorder.isTypeSupported`
+    // also varies — we need at least one webm flavour to work.
+    try {
+      const hasApi =
+        typeof navigator !== "undefined" &&
+        !!navigator.mediaDevices &&
+        typeof navigator.mediaDevices.getDisplayMedia === "function" &&
+        typeof MediaRecorder !== "undefined" &&
+        typeof MediaRecorder.isTypeSupported === "function";
+      const recorderReady =
+        hasApi &&
+        (MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus") ||
+          MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus") ||
+          MediaRecorder.isTypeSupported("video/webm"));
+      canRecord = !!recorderReady;
+    } catch {
+      canRecord = false;
+    }
   });
 
   onDestroy(() => {
+    // Tear down any live recorder so closing the dialog mid-record
+    // doesn't leave a dangling OS capture session.
+    if (recorder) {
+      try { recorder.stop(); } catch { /* ignore */ }
+    }
+    if (recorderStream) {
+      for (const t of recorderStream.getTracks()) {
+        try { t.stop(); } catch { /* ignore */ }
+      }
+      recorderStream = null;
+    }
+    if (recorderTickHandle) {
+      clearInterval(recorderTickHandle);
+      recorderTickHandle = null;
+    }
     // Revoke all object URLs we minted so the webview doesn't leak
     // bytes for the lifetime of the page.
     for (const a of attachments) {
-      if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+      if (a.previewUrl && a.previewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(a.previewUrl);
+      }
     }
     if (openerEl && document.contains(openerEl)) {
       try {
@@ -100,6 +175,173 @@
       }
     }
   });
+
+  // ── Recorder controls (#203) ───────────────────────────────────
+  function pickMimeType(): string | null {
+    const candidates = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+    ];
+    for (const c of candidates) {
+      try {
+        if (MediaRecorder.isTypeSupported(c)) return c;
+      } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  async function startRecording() {
+    if (submitting || recording) return;
+    if (attachments.length >= MAX_ATTACHMENTS) return;
+    recorderError = null;
+    const mimeType = pickMimeType();
+    if (!mimeType) {
+      recorderError = "Screen recording isn't supported on this system.";
+      return;
+    }
+    let stream: MediaStream;
+    try {
+      // v2 scope: video-only capture. System-audio + mic capture are
+      // deliberately excluded — they're a separate PII surface and
+      // deserve their own consent flow. Document this inline so the
+      // next editor doesn't "helpfully" flip audio to true.
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      });
+    } catch (e) {
+      // User cancelled picker OR permission denied. Distinguish by
+      // error name — NotAllowedError is the user's choice (silent),
+      // anything else gets a visible banner.
+      const name = (e as { name?: string })?.name;
+      if (name !== "NotAllowedError" && name !== "AbortError") {
+        recorderError =
+          "Couldn't start screen recording. Check system permissions and try again.";
+      }
+      return;
+    }
+
+    recorderChunks = [];
+    recorderBytes = 0;
+    recorderElapsedMs = 0;
+    recordingStartedAt = Date.now();
+    recorderStream = stream;
+
+    const rec = new MediaRecorder(stream, { mimeType });
+    rec.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        recorderChunks.push(ev.data);
+        recorderBytes += ev.data.size;
+        if (recorderBytes >= MAX_VIDEO_BYTES) {
+          // Hard-cap: auto-stop so we never hold more bytes than the
+          // backend accepts. A few hundred KB slack is fine because
+          // `ondataavailable` is async-batched; server HEAD check
+          // gates the final size regardless.
+          liveAnnouncement = "Recording stopped automatically at 100 MB.";
+          stopRecording();
+        } else if (
+          recorderBytes >= VIDEO_WARN_BYTES &&
+          recorderBytes - ev.data.size < VIDEO_WARN_BYTES
+        ) {
+          // Crossed the warn threshold on THIS chunk — one-shot notice.
+          liveAnnouncement =
+            "Recording is about to reach the 100 MB limit.";
+        }
+      }
+    };
+    rec.onstop = () => {
+      finaliseRecording();
+    };
+    // Browser chrome "Stop sharing" button → track ends → we stop.
+    stream.getVideoTracks().forEach((t) => {
+      t.onended = () => {
+        if (recorder) stopRecording();
+      };
+    });
+    // Timeslice = 1 s so `dataavailable` fires frequently and the
+    // running-size accounting stays close to reality.
+    rec.start(1000);
+    recorder = rec;
+
+    recorderTickHandle = setInterval(() => {
+      recorderElapsedMs = Date.now() - recordingStartedAt;
+    }, 250);
+  }
+
+  function stopRecording() {
+    if (!recorder) return;
+    try {
+      if (recorder.state !== "inactive") recorder.stop();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function finaliseRecording() {
+    if (recorderTickHandle) {
+      clearInterval(recorderTickHandle);
+      recorderTickHandle = null;
+    }
+    if (recorderStream) {
+      for (const t of recorderStream.getTracks()) {
+        try { t.stop(); } catch { /* ignore */ }
+      }
+      recorderStream = null;
+    }
+    const rec = recorder;
+    recorder = null;
+    if (!rec || recorderChunks.length === 0) return;
+    const type = rec.mimeType || "video/webm";
+    // Server-side mime is always plain `video/webm` — stripped of
+    // codec suffix because browsers sometimes emit
+    // `video/webm;codecs=vp9,opus` in rec.mimeType. Backend allow-list
+    // is strict-equal on the bare container type.
+    const storedMime = type.split(";")[0]?.trim() || "video/webm";
+    const blob = new Blob(recorderChunks, { type });
+    const sizeBytes = blob.size;
+    // Human-friendly filename; backend sanitiser normalises anyway.
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .slice(0, 19);
+    const filename = `recording-${stamp}.webm`;
+    const previewUrl = URL.createObjectURL(blob);
+    const overCap = sizeBytes > MAX_VIDEO_BYTES;
+    attachments = [
+      ...attachments,
+      {
+        localId: crypto.randomUUID(),
+        filePath: "",
+        filename,
+        mime: storedMime,
+        sizeBytes,
+        previewUrl,
+        error: overCap ? "Too large (max 100 MB)" : null,
+        kind: "video",
+        blob,
+      },
+    ];
+    recorderChunks = [];
+    recorderBytes = 0;
+    recorderElapsedMs = 0;
+  }
+
+  function fmtRecTime(ms: number): string {
+    const total = Math.floor(ms / 1000);
+    const mm = Math.floor(total / 60);
+    const ss = total % 60;
+    return `${mm.toString().padStart(2, "0")}:${ss.toString().padStart(2, "0")}`;
+  }
+
+  function openPreview(localId: string) {
+    previewingLocalId = localId;
+  }
+  function closePreview() {
+    previewingLocalId = null;
+  }
 
   // Validation helpers ───────────────────────────────────────────
   function validate(): boolean {
@@ -171,7 +413,7 @@
       }>("inspect_support_attachment", { path });
 
       const sizeError =
-        meta.size_bytes > MAX_ATTACHMENT_BYTES
+        meta.size_bytes > MAX_SCREENSHOT_BYTES
           ? "Too large (max 25 MB)"
           : null;
       const mimeError = ALLOWED_MIME.includes(meta.mime)
@@ -189,6 +431,8 @@
           sizeBytes: meta.size_bytes,
           previewUrl: meta.preview_data_url,
           error,
+          kind: "screenshot",
+          blob: null,
         },
       ];
     } catch (e) {
@@ -256,16 +500,51 @@
     };
 
     try {
+      // #203: any in-memory video needs a disk path before the
+      // backend pipeline can read it. Stage here — serial because
+      // blobs are large and the Tauri bridge serialises one at a
+      // time anyway. On stage failure we bail the whole submit.
+      const staged: { att: Attachment; path: string }[] = [];
+      for (const a of valid) {
+        if (a.kind === "video" && a.blob) {
+          const buf = new Uint8Array(await a.blob.arrayBuffer());
+          const result = await invoke<{
+            path: string;
+            size_bytes: number;
+          }>("stage_support_video", {
+            // Tauri 2 serialises a `number[]` into Rust `Vec<u8>`.
+            // Using Array.from over Uint8Array keeps the bridge happy
+            // without a base64 round-trip.
+            bytes: Array.from(buf),
+            filename: a.filename,
+          });
+          staged.push({ att: a, path: result.path });
+        }
+      }
+
       await invoke("submit_support_report", {
         title: title.trim(),
         body: body.trim(),
         metadata,
-        attachments: valid.map((a) => ({
-          path: a.filePath,
-          filename: a.filename,
-          mime: a.mime,
-          size_bytes: a.sizeBytes,
-        })),
+        attachments: valid.map((a) => {
+          if (a.kind === "video") {
+            const hit = staged.find((s) => s.att.localId === a.localId);
+            return {
+              path: hit?.path ?? "",
+              filename: a.filename,
+              mime: a.mime,
+              size_bytes: a.sizeBytes,
+              kind: a.kind,
+            };
+          }
+          return {
+            path: a.filePath,
+            filename: a.filename,
+            mime: a.mime,
+            size_bytes: a.sizeBytes,
+            kind: a.kind,
+          };
+        }),
       });
       succeeded = true;
       submitting = false;
@@ -350,11 +629,20 @@
 
   const remainingSlots = $derived(MAX_ATTACHMENTS - attachments.length);
   const canSubmit = $derived(
-    !submitting && !succeeded && title.trim() !== "" && body.trim() !== "",
+    !submitting &&
+      !succeeded &&
+      !recording &&
+      title.trim() !== "" &&
+      body.trim() !== "",
   );
   const totalAttempted = $derived(attachments.length);
   const oversizedCount = $derived(
     attachments.filter((a) => a.error != null).length,
+  );
+  const previewAttachment = $derived(
+    previewingLocalId
+      ? attachments.find((a) => a.localId === previewingLocalId) ?? null
+      : null,
   );
 </script>
 
@@ -440,7 +728,7 @@
 
         <div class="ri-attach-row">
           {#if attachments.length > 0}
-            <ul class="ri-chip-list" aria-label="Attached screenshots">
+            <ul class="ri-chip-list" aria-label="Attached files">
               {#each attachments as a (a.localId)}
                 <li
                   class="ri-chip"
@@ -448,7 +736,13 @@
                   class:chip-uploading={submitting && a.error == null}
                   data-mime={a.mime}
                 >
-                  {#if a.previewUrl}
+                  {#if a.kind === "video"}
+                    <span
+                      class="ri-chip-thumb video-thumb"
+                      aria-hidden="true"
+                      title="Screen recording"
+                    >▶</span>
+                  {:else if a.previewUrl}
                     <img
                       class="ri-chip-thumb"
                       src={a.previewUrl}
@@ -462,6 +756,15 @@
                   <span class="ri-chip-size">{fmtBytes(a.sizeBytes)}</span>
                   {#if a.error}
                     <span class="ri-chip-error">{a.error}</span>
+                  {/if}
+                  {#if a.kind === "video" && !a.error}
+                    <button
+                      type="button"
+                      class="ri-chip-preview"
+                      aria-label={`Preview ${a.filename}`}
+                      onclick={() => openPreview(a.localId)}
+                      disabled={submitting}
+                    >Preview</button>
                   {/if}
                   <button
                     type="button"
@@ -480,20 +783,59 @@
               sent.
             </div>
           {/if}
-          <button
-            type="button"
-            class="ri-attach-btn"
-            onclick={addAttachments}
-            disabled={submitting || remainingSlots <= 0}
-          >
-            {#if attachments.length === 0}
-              Add screenshots
-            {:else if remainingSlots <= 0}
-              5 of 5 — limit reached
-            {:else}
-              Add more
+          {#if recorderError}
+            <div class="ri-attach-warning" role="alert">{recorderError}</div>
+          {/if}
+          {#if recording}
+            <!-- Live recorder strip. Shows timer + running size so
+                 the user can judge when to stop before the auto-stop
+                 trips at 100 MB. -->
+            <div class="ri-recorder-live" aria-live="polite">
+              <span class="ri-recorder-dot" aria-hidden="true"></span>
+              <span class="ri-recorder-time">
+                Recording {fmtRecTime(recorderElapsedMs)}
+              </span>
+              <span class="ri-recorder-size">
+                {fmtBytes(recorderBytes)}
+              </span>
+              <button
+                type="button"
+                class="ri-recorder-stop"
+                onclick={stopRecording}
+              >Stop recording</button>
+            </div>
+            <p class="ri-recorder-hint">
+              Anything visible on the captured area will be attached —
+              review before sending.
+            </p>
+          {/if}
+          <div class="ri-attach-actions">
+            <button
+              type="button"
+              class="ri-attach-btn"
+              onclick={addAttachments}
+              disabled={submitting || recording || remainingSlots <= 0}
+            >
+              {#if attachments.length === 0}
+                Add screenshots
+              {:else if remainingSlots <= 0}
+                5 of 5 — limit reached
+              {:else}
+                Add more
+              {/if}
+            </button>
+            {#if canRecord && !recording}
+              <button
+                type="button"
+                class="ri-attach-btn"
+                onclick={startRecording}
+                disabled={submitting || remainingSlots <= 0}
+                aria-describedby={!canRecord
+                  ? `${titleId}-rec-hint`
+                  : undefined}
+              >Record screen</button>
             {/if}
-          </button>
+          </div>
         </div>
 
         <div class="ri-telemetry-summary">
@@ -522,18 +864,20 @@
             <li>Your operating system</li>
             <li>Recent diagnostic logs from this session</li>
             <li>Window size and display theme</li>
+            <li>Any screenshots or screen recordings you added</li>
           </ul>
         </div>
 
         <p class="ri-notice">
           <strong
-            >Your message and any screenshots go to the aftercalls
-            team.</strong
+            >Your message, any screenshots, and any screen recordings
+            go to the aftercalls team.</strong
           >
-          Attachments may include information from your account (call
-          titles, transcripts, contact names) — only the team will see
-          them. Recent diagnostic logs from this device are included
-          automatically. By clicking "Send report" you consent to this.
+          Attachments may include information visible on your screen —
+          <strong>including passwords, messages, and other sensitive
+          content</strong>. Review each item before sending. Recent
+          diagnostic logs from this device are included automatically.
+          By clicking "Send report" you consent to this.
         </p>
       {/if}
     </div>
@@ -579,6 +923,63 @@
     </div>
   </div>
 </div>
+
+{#if previewAttachment && previewAttachment.kind === "video" && previewAttachment.previewUrl}
+  <!-- Tier-2 preview modal. Same backdrop pattern as the main
+       dialog so keyboard-only users can dismiss with Esc. We
+       intentionally do NOT focus-trap the outer dialog away — the
+       user lands back in the report modal on close. -->
+  <div
+    class="rn-backdrop preview-backdrop"
+    role="button"
+    tabindex="-1"
+    aria-label="Close recording preview"
+    onclick={closePreview}
+    onkeydown={(e) => {
+      if (e.key === "Escape") closePreview();
+    }}
+  >
+    <div
+      class="rn-modal preview-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Preview of ${previewAttachment.filename}`}
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          closePreview();
+        }
+      }}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <h2>Recording preview</h2>
+      </div>
+      <div class="rn-body preview-body">
+        <video
+          class="preview-video"
+          src={previewAttachment.previewUrl}
+          controls
+          preload="metadata"
+        >
+          <track kind="captions" />
+        </video>
+        <p class="preview-caption">
+          {previewAttachment.filename} · {fmtBytes(previewAttachment.sizeBytes)}
+        </p>
+      </div>
+      <div class="rn-actions">
+        <span></span>
+        <button
+          type="button"
+          class="rn-dismiss"
+          onclick={closePreview}
+        >Close preview</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   /* Locally-scoped — nothing in this file edits app.css. The shared
@@ -703,6 +1104,39 @@
     display: inline-block;
     background: var(--ink-2);
   }
+  /* #203: video thumbnail uses a simple play-glyph tile — deliberately
+   * not a first-frame poster, which would need a hidden <video> +
+   * canvas draw just for a chip visual. The "Preview" button in the
+   * same chip opens the full <video> if the user wants to check
+   * the recording before submitting. */
+  .ri-chip-thumb.video-thumb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+    font-size: 0.82rem;
+    font-weight: 600;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+  }
+  .ri-chip-preview {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--hairline-hi);
+    color: var(--bone-2);
+    font-size: 0.72rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .ri-chip-preview:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--bone-0);
+  }
+  .ri-chip-preview:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   .ri-chip-name {
     max-width: 18ch;
     overflow: hidden;
@@ -741,7 +1175,6 @@
 
   .ri-attach-btn {
     appearance: none;
-    align-self: flex-start;
     border: 1px solid var(--hairline-hi);
     background: transparent;
     color: var(--bone-1);
@@ -759,6 +1192,106 @@
     opacity: 0.6;
     cursor: not-allowed;
     color: var(--bone-4);
+  }
+
+  /* #203: side-by-side action row for "Add screenshots" + "Record
+   * screen". Was a single button that self-aligned flex-start; now
+   * wrapped so both buttons sit together and wrap naturally on
+   * narrow widths. */
+  .ri-attach-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  /* #203: live-recording strip with mm:ss timer, running size, and
+   * an inline "Stop recording" button. Sits above the hint copy and
+   * below the chip list (all still inside `.ri-attach-row`). */
+  .ri-recorder-live {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.4rem 0.65rem;
+    background: color-mix(in srgb, var(--live) 10%, transparent);
+    border: 1px solid var(--live);
+    border-radius: var(--radius-sm, 6px);
+    align-self: flex-start;
+  }
+  .ri-recorder-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--live);
+    animation: ri-recorder-pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  @keyframes ri-recorder-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  .ri-recorder-time {
+    color: var(--bone-0);
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .ri-recorder-size {
+    color: var(--bone-2);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .ri-recorder-stop {
+    appearance: none;
+    border: 1px solid var(--live);
+    background: var(--live);
+    color: var(--ink-0);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.3rem 0.75rem;
+    border-radius: 999px;
+    cursor: pointer;
+    margin-left: 0.3rem;
+  }
+  .ri-recorder-stop:hover {
+    filter: brightness(1.1);
+  }
+  .ri-recorder-hint {
+    margin: 0;
+    color: var(--bone-3);
+    font-size: 0.78rem;
+    line-height: 1.4;
+  }
+
+  /* #203: tier-2 preview modal. Sits above the main report dialog
+   * by virtue of being rendered after it in DOM order (both are
+   * position-fixed z-index-default from `.rn-backdrop`), so the
+   * second backdrop covers the first. */
+  .preview-backdrop {
+    /* Bump z-index over the base rn-backdrop so click-through goes
+     * to the preview first. */
+    z-index: 100;
+  }
+  .preview-modal {
+    max-width: 640px;
+  }
+  .preview-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .preview-video {
+    width: 100%;
+    max-height: 420px;
+    background: var(--ink-3);
+    border-radius: var(--radius-sm, 6px);
+  }
+  .preview-caption {
+    margin: 0;
+    color: var(--bone-3);
+    font-size: 0.78rem;
+    text-align: center;
   }
 
   .ri-attach-warning {
