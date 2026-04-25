@@ -55,10 +55,13 @@ jobs:
           #
           # `experimental: true` flips per-job continue-on-error so the
           # publish-to-spaces job can fire after Linux + Windows even
-          # when a macOS runner is queued for 30+ min (#41 follow-up).
-          - os: macos-13
-            target: x86_64-apple-darwin
-            experimental: true
+          # when a macOS runner is queued (#41 follow-up).
+          #
+          # 2026-04-25: macos-13 (Intel) dropped from the matrix —
+          # GitHub deprecated the label in late 2025 and our jobs sat
+          # in queue 7+ hours. Apple Silicon (macos-14, aarch64) covers
+          # native ARM builds; Intel-Mac users run via Rosetta 2 until
+          # signing (#68) + a paid macos-13-large self-hosted alt land.
           - os: macos-14
             target: aarch64-apple-darwin
             experimental: true
