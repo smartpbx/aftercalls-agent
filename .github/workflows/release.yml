@@ -5,6 +5,16 @@ name: release
 # uploads installers + .sig files + latest.json to a draft GitHub
 # release, and the follow-up publish-to-spaces job mirrors everything
 # to the DO Spaces updater channel the installed apps poll.
+#
+# macOS (Intel + Apple Silicon) builds are gated artifact-only until
+# code-signing + notarization land (see #41 / #68). The Mac job runs
+# `pnpm tauri build` directly (NOT tauri-action) so its outputs DON'T
+# get attached to the GitHub release, then uploads the .dmg as a
+# workflow artifact for internal QA. The publish-to-spaces job only
+# pulls assets that ARE attached to the release, so unsigned mac
+# bundles never reach the public updater channel. Flip
+# `enable_mac_publish: true` on workflow_dispatch (after #68 lands)
+# to attach + publish.
 
 on:
   push:
@@ -15,6 +25,11 @@ on:
       tag:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
+      enable_mac_publish:
+        description: "Attach macOS .dmg to GH release + publish to Spaces. Leave false until signing (#68) lands; default uploads .dmg as a workflow artifact only."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -28,7 +43,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # macOS entries are conservative: build artifacts only, no
+          # GitHub-release attachment + no Spaces publish unless
+          # workflow_dispatch input `enable_mac_publish` is true. See
+          # the comment on `enable_mac_publish` for the gating rationale.
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
@@ -67,11 +94,16 @@ jobs:
           EOF
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
           cache-on-failure: true
+          # Bucket the cache by target triple so the two macOS runners
+          # don't fight over the same key.
+          key: ${{ matrix.target }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -142,7 +174,41 @@ jobs:
           Get-FileHash -Algorithm SHA256 "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe" | Format-List Algorithm,Hash
           Get-ChildItem src-tauri/binaries/
 
-      - name: Build + publish signed release
+      # macOS sidecar — evermeet.cx ships LGPL-only static builds for
+      # both Intel and Apple Silicon. Same license posture as the
+      # Linux/Windows sidecars above. The archive layout is a flat
+      # zip containing a single `ffmpeg` binary. The download URLs
+      # are arch-specific:
+      #   - Intel:  https://evermeet.cx/ffmpeg/getrelease/zip
+      #   - AS:     https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip
+      # (evermeet hosts both arches; the path differs.)
+      # TODO(#69): pin to specific version + sha256 once #41 ships.
+      - name: Fetch ffmpeg sidecar (macOS)
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          set -eux
+          mkdir -p src-tauri/binaries
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            URL="https://www.osxexperts.net/ffmpeg711arm.zip"
+          else
+            URL="https://www.osxexperts.net/ffmpeg711intel.zip"
+          fi
+          curl -sSL "$URL" -o /tmp/ffmpeg.zip
+          echo "ffmpeg archive sha256:"
+          shasum -a 256 /tmp/ffmpeg.zip
+          mkdir -p /tmp/ffmpeg-stage
+          unzip -o /tmp/ffmpeg.zip -d /tmp/ffmpeg-stage
+          # The zip contains a single top-level `ffmpeg` binary.
+          FFMPEG_BIN=$(find /tmp/ffmpeg-stage -name ffmpeg -type f | head -n1)
+          cp "$FFMPEG_BIN" \
+            "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
+          chmod +x "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
+          echo "bundled binary sha256:"
+          shasum -a 256 "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
+          ls -lh src-tauri/binaries/
+
+      - name: Build + publish signed release (Linux + Windows)
+        if: matrix.os == 'ubuntu-24.04' || matrix.os == 'windows-latest'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -171,6 +237,84 @@ jobs:
           # SIGABRTs on Arch / NixOS / some Ubuntu combos. We build a
           # slim system-webkit AppImage ourselves in the next step.
           args: ${{ matrix.os == 'ubuntu-24.04' && '--bundles deb rpm' || '' }}
+
+      # macOS — build .dmg + .app via tauri-bundler directly. Bypassing
+      # tauri-action means the artifacts DON'T get attached to the
+      # GitHub release, which is the whole point of the artifact-only
+      # gate: unsigned .dmgs would launch with the "unidentified
+      # developer" Gatekeeper block and we don't want them on the
+      # public updater channel before #68 lands.
+      #
+      # Pass --target so the runner produces a single-arch bundle
+      # matching the matrix triple. macos-13 → x86_64, macos-14 → arm64.
+      - name: Build macOS .dmg (artifact-only)
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          # Even with no signing identity present, tauri-bundler still
+          # runs ad-hoc codesign so the .app launches at all on the
+          # build machine. The .dmg won't pass Gatekeeper on a fresh
+          # install — that's the whole point of the gate.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -eux
+          pnpm tauri build --target ${{ matrix.target }}
+          ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/dmg/" || true
+          ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/macos/" || true
+
+      - name: Stage macOS bundles
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          set -eux
+          STAGE=/tmp/macos-stage
+          mkdir -p "$STAGE"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          # Copy any .dmg + matching .sig the bundler emitted.
+          if [ -d "$BUNDLE_DIR/dmg" ]; then
+            cp "$BUNDLE_DIR/dmg/"*.dmg "$STAGE/" 2>/dev/null || true
+            cp "$BUNDLE_DIR/dmg/"*.dmg.sig "$STAGE/" 2>/dev/null || true
+          fi
+          # Also tar up the .app for QA workflows that want the raw
+          # bundle (e.g. `xattr -cr` + drag-to-Applications).
+          if [ -d "$BUNDLE_DIR/macos" ]; then
+            cd "$BUNDLE_DIR/macos"
+            for app in *.app; do
+              [ -d "$app" ] || continue
+              TAR_NAME="${app%.app}-${{ matrix.target }}.app.tar.gz"
+              tar czf "$STAGE/$TAR_NAME" "$app"
+            done
+            cd -
+          fi
+          ls -la "$STAGE"
+
+      - name: Upload macOS workflow artifact
+        if: startsWith(matrix.os, 'macos-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}-${{ github.event.inputs.tag || github.ref_name }}
+          path: /tmp/macos-stage/*
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Optional: attach mac bundles to the GitHub release. Default
+      # off — flip via the workflow_dispatch input once code-signing
+      # + notarization (#68) is in place. Tag-pushed runs never set
+      # this input, so the production release path stays unchanged.
+      - name: Attach macOS bundles to GH release
+        if: startsWith(matrix.os, 'macos-') && github.event.inputs.enable_mac_publish == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eux
+          shopt -s nullglob
+          cd /tmp/macos-stage
+          files=( *.dmg *.dmg.sig *.tar.gz )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no macOS bundles to attach"
+            exit 0
+          fi
+          gh release upload "$TAG" "${files[@]}" --clobber
 
       # Slim system-webkit AppImage. tauri-bundler's AppImage target
       # unconditionally runs linuxdeploy-plugin-gtk.sh, which bundles a
@@ -353,6 +497,11 @@ jobs:
   # entry (we passed --bundles deb rpm to skip its crashy AppImage),
   # so we add it here from the .sig file produced by the slim-
   # AppImage step above.
+  #
+  # macOS bundles are NOT attached to the GH release by default, so
+  # they never appear here. When `enable_mac_publish` is flipped on
+  # post-#68, the .dmgs will land via `gh release download` and get
+  # mirrored to Spaces alongside everything else.
   publish-to-spaces:
     needs: release
     runs-on: ubuntu-24.04

@@ -26,6 +26,17 @@ Linux: requires `libwebkit2gtk-4.1` and `libgtk-3` on the host. On
 Arch: `pacman -S webkit2gtk-4.1 gtk3`. On Debian/Ubuntu:
 `apt install libwebkit2gtk-4.1-0 libgtk-3-0`.
 
+## Supported platforms
+
+- **Linux x86_64** — AppImage, .deb, .rpm, sysweblink tarball.
+- **Windows x86_64** — .msi, NSIS .exe.
+- **macOS** — coming soon. CI builds Intel + Apple Silicon .dmgs as
+  workflow artifacts on every release tag, but the public installer
+  channel won't include them until code-signing + notarization are
+  in place (tracked in #41 / #68). Internal QA can grab the unsigned
+  .dmg from the workflow run's "Artifacts" panel and dismiss the
+  Gatekeeper warning manually (`xattr -cr aftercalls.app`).
+
 ## ffmpeg sidecar
 
 A self-contained ffmpeg binary is downloaded per-platform by CI and
