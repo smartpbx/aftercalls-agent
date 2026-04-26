@@ -1,4 +1,11 @@
 {
+  "0.9.1": {
+    "headline": "Keyboard shortcuts, less-intrusive call-detect notification, Zoho Meeting ingest",
+    "changes": [
+      "Keyboard shortcuts across the app. Common keys now work in the portal and desktop app — Space plays/pauses audio, ←/→ seek, j/k move between calls or action items, Space toggles an item done, ? opens a shortcut overlay any time. Full list at aftercalls.io/help#keyboard-shortcuts; the agent's Settings page has a link too.",
+      "Less-intrusive call-detect notification. When the desktop app detects a call but its window isn't focused, it now shows a system notification with 'Record' and 'Not now' buttons instead of slamming the full window to the foreground. Click Record to start; ignore it for 30 seconds and it dismisses on its own. The in-app slide-out (when the window is already open) is unchanged."
+    ]
+  },
   "0.9.0": {
     "headline": "Reliability release: offline-resilient saves, processing-delay UX, onboarding polish, and ops hardening",
     "changes": [

@@ -16,6 +16,12 @@
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
   import ToastHost from "$lib/ToastHost.svelte";
+  import ShortcutsOverlay from "$lib/ShortcutsOverlay.svelte";
+  import {
+    initShortcutListener,
+    registerShortcuts,
+    toggleHelp,
+  } from "$lib/shortcuts.svelte";
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { portalErrorToText } from "$lib/portalError";
@@ -68,6 +74,11 @@
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
   let unlistenAutoDetect: UnlistenFn | null = null;
+  // #89 — separate listener for the OS-native actionable notification
+  // (mic-detect "Record this call?" toast). Wired alongside the
+  // existing auto-detect slide-out so both surfaces drive the same
+  // autoRecordClick / autoDismiss handlers — no parallel state.
+  let unlistenNotifyAction: UnlistenFn | null = null;
 
   // #142 · v0.4.5 — note-to-self overlay helpers. Kept close to the
   // overlay state declaration so additions/removals stay localised.
@@ -526,7 +537,22 @@
   }
 
 
+  // #282 — shared keyboard shortcuts. The window-level handler is
+  // initialized once and lives for the session; the global context
+  // owns the `?` overlay toggle. Per-page contexts (calls list, call
+  // detail, actions) register on mount and tear down on destroy.
+  let teardownGlobalShortcuts: (() => void) | null = null;
+
   onMount(async () => {
+    // #282 — start the shared shortcut listener + register the
+    // always-on global bindings.
+    initShortcutListener();
+    teardownGlobalShortcuts = registerShortcuts(
+      "global",
+      "Global",
+      { "?": () => toggleHelp() },
+      [{ keys: "?", label: "Show this shortcuts panel" }],
+    );
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
     // client-side route transition can take the whole renderer down (blank
     // window + blank devtools). Swallow + log so the UI stays alive.
@@ -687,6 +713,29 @@
       } else if (evt.payload.kind === "cleared") {
         autoPrompt = null;
         autoAckOpen = false;
+      }
+    });
+
+    // #89 — OS-native actionable notification (mic-detect "Record
+    // this call?"). Routes the user's button click back through the
+    // same handlers the in-app slide-out uses, so the PIPEDA-ack flow,
+    // start cue, and detector-side state transitions all run identical
+    // paths whether the user clicked the slide-out or the toast.
+    // `auto_dismissed=true` carries the 30s timeout case; v1 routes
+    // it to autoDismiss exactly like an explicit "Not now" click.
+    unlistenNotifyAction = await listen<{
+      action_id: string;
+      auto_dismissed: boolean;
+    }>("notify-action", (evt) => {
+      // Belt-and-braces: when the user's already on /record the inline
+      // banner there owns the prompt — mirrors the autoPrompt guard
+      // above. Without this a stale toast click could race the in-page
+      // banner.
+      if (isRecordPage) return;
+      if (evt.payload.action_id === "record") {
+        void autoRecordClick();
+      } else {
+        void autoDismiss();
       }
     });
 
@@ -1042,8 +1091,11 @@
     unlistenTray?.();
     unlistenUpdatePoll?.();
     unlistenAutoDetect?.();
+    unlistenNotifyAction?.();
     stopNoteTimer();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
+    teardownGlobalShortcuts?.();
+    teardownGlobalShortcuts = null;
   });
 
   // ── Auto-detect slide-out handlers (#59) ─────────────────────────
@@ -2028,6 +2080,11 @@
      store has live items. -->
 <ToastHost />
 
+<!-- #282 — Keyboard-shortcuts help overlay. Renders nothing until
+     the user presses `?`. Registered shortcut contexts (per-page)
+     drive what's listed inside. -->
+<ShortcutsOverlay />
+
 <!-- #216 — Persistent screen-recording control. Mounted at the
      layout root so it stays visible while the report dialog is
      hidden. Renders nothing while no recording is in flight. -->
@@ -2056,6 +2113,13 @@
   .rail {
     position: sticky;
     top: 0;
+    /* Stacking-context bump (#89 follow-up): the auto-detect slide-out
+       is anchored inside .nav-row and pokes out into the main grid
+       column via `left: calc(100% + 0.6rem)`. Without an explicit
+       z-index here the rail's stacking context loses source-order to
+       the main grid column, so the slide-out renders behind the page
+       content (Discord-call-detected popup bleed-through). */
+    z-index: 10;
     height: 100vh;
     display: flex;
     flex-direction: column;

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+use crate::notify_actions::{self, ActionSpec, NotifyError};
 use crate::recorder::Recorder;
 
 /// Apps we *don't* want to treat as "a call." Matched case-insensitively as
@@ -128,7 +129,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             if let Some(consumer) = consumers.iter().next() {
                 eprintln!("aftercalls: '{consumer}' is using the mic — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: consumer.clone() });
-                maybe_show_window(app, popup_on);
+                maybe_show_window(app, popup_on, PromptKind::Start { consumer });
                 Phase::AwaitingStartConfirm { consumer: consumer.clone() }
             } else {
                 Phase::Idle
@@ -150,7 +151,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                 if since.elapsed() >= CONSUMER_GONE_BEFORE_END_PROMPT {
                     eprintln!("aftercalls: '{consumer}' stopped using mic — prompting to end");
                     emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
-                    maybe_show_window(app, popup_on);
+                    maybe_show_window(app, popup_on, PromptKind::End);
                     Phase::AwaitingEndConfirm { consumer, gone_since: since }
                 } else {
                     Phase::Recording { consumer, gone_since: Some(since) }
@@ -189,7 +190,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
             if let Some(other) = consumers.iter().find(|c| **c != consumer) {
                 eprintln!("aftercalls: new mic consumer '{other}' — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: other.clone() });
-                maybe_show_window(app, popup_on);
+                maybe_show_window(app, popup_on, PromptKind::Start { consumer: other });
                 Phase::AwaitingStartConfirm { consumer: other.clone() }
             } else if still_suppressing {
                 Phase::Suppressed { consumer }
@@ -229,6 +230,12 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
                         "auto_detected",
                         Some(&consumer),
                     );
+                    // Confirmed record — wipe the per-consumer snooze
+                    // so a future mic-detect for the same app (after
+                    // a Stop) can re-toast immediately. The snooze is
+                    // designed to suppress repeat *prompts*, not to
+                    // gate recording.
+                    notify_actions::clear_snooze(&consumer);
                     emit(app, AutoDetectEvent::Cleared);
                     Phase::Recording { consumer, gone_since: None }
                 }
@@ -530,13 +537,77 @@ fn show_window(app: &AppHandle) {
     }
 }
 
+/// Which prompt the detector wants to surface — controls whether we
+/// route through the OS-native actionable toast (start) or the
+/// existing focus-steal `show_window` (end). Carrying the consumer
+/// name on `Start` lets the toast snooze key match the detector's
+/// own per-consumer state.
+enum PromptKind<'a> {
+    Start { consumer: &'a str },
+    /// Mid-recording end-prompt. Kept on the focus-steal path because
+    /// the in-app slide-out for end-prompts lives on the Record page
+    /// and the user is almost always there during a live recording.
+    /// The toast UX (#89) covers start-prompts only.
+    End,
+}
+
 /// #180 — gate the window-show / focus-steal behind the
-/// `auto_detect_popup` pref. When the user has it off, the in-app
-/// `auto-detect` event still fires (the slide-out renders) but we
-/// don't pull the user's cursor / focus away from whatever they're
-/// doing. Tiling-WM / Hyprland use case in the issue.
-fn maybe_show_window(app: &AppHandle, popup_on: bool) {
-    if popup_on {
-        show_window(app);
+/// `auto_detect_popup` pref. When the user has it off, neither the
+/// focus-steal NOR the OS toast fires (the in-app `auto-detect` event
+/// still emits separately so the slide-out renders).
+///
+/// #89 — start-prompts route through the OS-native actionable toast
+/// (`notify_actions`) instead of stealing window focus. The toast
+/// emits `notify-action` on user click, which the layout-level
+/// listener routes back through `confirm_auto_start` /
+/// `dismiss_auto_start` IPC — landing as a `UserDecision` here. If
+/// the toast backend errors (DBus daemon down, Win OS notifications
+/// off, mac bundle missing), we fall through to the legacy
+/// `show_window` so the user is never trapped without a way to act
+/// on the detection.
+fn maybe_show_window(app: &AppHandle, popup_on: bool, kind: PromptKind<'_>) {
+    if !popup_on {
+        return;
+    }
+    match kind {
+        PromptKind::Start { consumer } => {
+            // 30s timeout matches the spec; "Not now" + auto-dismiss
+            // resolve to the same dismiss handler on the frontend so
+            // the detector's Suppressed phase fires either way.
+            let res = notify_actions::show_actionable_notification(
+                app.clone(),
+                "aftercalls",
+                "Record this call?",
+                vec![
+                    ActionSpec { id: "record".into(),  label: "Record".into() },
+                    ActionSpec { id: "dismiss".into(), label: "Not now".into() },
+                ],
+                "notify-action",
+                Duration::from_secs(30),
+                Some(consumer),
+            );
+            match res {
+                Ok(()) => {} // toast posted; wait for the user's choice via IPC
+                Err(NotifyError::PermissionDenied) => {
+                    eprintln!(
+                        "aftercalls: notifications denied by OS — falling back to focus-steal"
+                    );
+                    show_window(app);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "aftercalls: actionable notification failed ({e}) — falling back to focus-steal"
+                    );
+                    show_window(app);
+                }
+            }
+        }
+        PromptKind::End => {
+            // End-prompt path keeps the legacy focus-steal — the
+            // Record page's inline end-banner is the canonical
+            // surface and the user is typically focused on /record
+            // already, so stealing focus is the right behavior.
+            show_window(app);
+        }
     }
 }

@@ -197,6 +197,11 @@
     canEdit?: boolean;
     confirmingDelete?: boolean;
     deleting?: boolean;
+    // #282 — keyboard-driven highlight (j/k navigation on the
+    // /actions page). Page-level state owns this; ActionItem just
+    // paints `data-highlighted` on the row so the scoped CSS below
+    // can show the active rail. No behavior change.
+    highlighted?: boolean;
 
     // #126 (v0.4.2): granular save / cancel / request callbacks.
     // The component fires these; the parent owns PATCH / POST and
@@ -282,6 +287,7 @@
     ontoggle,
     onchipaction,
     activeChipOccurrenceIndex = null,
+    highlighted = false,
   }: Props = $props();
 
   // #140 — surface-bound wrapper around the page's chipaction
@@ -853,6 +859,8 @@
   class:ai-pending={pending}
   class:ai-saving={saving}
   class:ai-actions-page={variant === "actions-page"}
+  data-action-item-id={item.id}
+  data-shortcut-row={highlighted ? "active" : null}
 >
   <!-- #113: scoped aria-live announcer. Narrates click-to-edit
        transitions (silent on mount + on Escape-cancel). CSS is
@@ -1310,6 +1318,13 @@
   }
   :global(.ai-row:last-child) {
     border-bottom: none;
+  }
+  /* #282 — keyboard-driven highlight (j/k on /actions). Mirrors the
+     calls-list active-row styling: subtle accent rail, faint tint.
+     Component-scoped — does not bleed into app.css. */
+  .ai-row[data-shortcut-row="active"] {
+    background: var(--ink-1);
+    box-shadow: inset 2px 0 0 var(--accent);
   }
 
   /* #132.2 — custom-draw the checkbox so the tick glyph is ours to

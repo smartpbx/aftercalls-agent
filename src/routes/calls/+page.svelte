@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { replaceState, afterNavigate } from "$app/navigation";
+  import { goto, replaceState, afterNavigate } from "$app/navigation";
   import DateInput from "$lib/DateInput.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import {
@@ -11,6 +11,7 @@
     PILL_PROCESSING,
     PILL_STILL_WORKING,
   } from "$lib/processing-thresholds";
+  import { registerShortcuts } from "$lib/shortcuts.svelte";
 
   // #57 Tag-aware filter bar.
   //
@@ -382,6 +383,57 @@
   let nowMs = $state(Date.now());
   let nowTimer: ReturnType<typeof setInterval> | undefined;
 
+  // #282 — keyboard shortcuts. Mirrors the portal calls list (j/k +
+  // Enter/o + `/`). Shape kept identical so a future shared
+  // calls-list component can lift this verbatim.
+  let searchInput: HTMLInputElement | undefined = $state();
+  let highlightedCallId = $state<string | null>(null);
+  let visibleIds = $derived.by(() => {
+    const ids: string[] = [];
+    for (const [, items] of groups) for (const c of items) ids.push(c.id);
+    return ids;
+  });
+
+  $effect(() => {
+    if (visibleIds.length === 0) {
+      highlightedCallId = null;
+      return;
+    }
+    if (!highlightedCallId || !visibleIds.includes(highlightedCallId)) {
+      highlightedCallId = visibleIds[0];
+    }
+  });
+
+  function moveHighlight(delta: 1 | -1) {
+    if (visibleIds.length === 0) return;
+    const cur = highlightedCallId
+      ? visibleIds.indexOf(highlightedCallId)
+      : -1;
+    const next = Math.max(
+      0,
+      Math.min(visibleIds.length - 1, (cur < 0 ? 0 : cur) + delta),
+    );
+    highlightedCallId = visibleIds[next];
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLElement>(
+        '[data-shortcut-row="active"]',
+      );
+      el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+  }
+
+  function openHighlighted() {
+    if (highlightedCallId) void goto(`/calls/${highlightedCallId}`);
+  }
+
+  function focusSearch(e: KeyboardEvent) {
+    e.preventDefault();
+    searchInput?.focus();
+    searchInput?.select();
+  }
+
+  let teardownShortcuts: (() => void) | null = null;
+
   onMount(async () => {
     try {
       me = await invoke<Me | null>("current_user");
@@ -393,6 +445,22 @@
     nowTimer = setInterval(() => {
       nowMs = Date.now();
     }, 30_000);
+    teardownShortcuts = registerShortcuts(
+      "calls-list",
+      "Calls list",
+      {
+        j: () => moveHighlight(1),
+        k: () => moveHighlight(-1),
+        enter: () => openHighlighted(),
+        o: () => openHighlighted(),
+        "/": (e) => focusSearch(e),
+      },
+      [
+        { keys: "j k", label: "Next / previous call" },
+        { keys: "enter o", label: "Open the highlighted call" },
+        { keys: "/", label: "Focus the title filter" },
+      ],
+    );
     await load();
   });
 
@@ -401,6 +469,8 @@
       clearInterval(nowTimer);
       nowTimer = undefined;
     }
+    teardownShortcuts?.();
+    teardownShortcuts = null;
   });
 
   // Back/forward navigation: `replaceState` (used for filter-pill
@@ -533,6 +603,7 @@
         type="text"
         placeholder="Filter by title"
         bind:value={query}
+        bind:this={searchInput}
       />
     </div>
     <div class="chip-row">
@@ -795,7 +866,13 @@
           <ul class="entries">
             {#each items as call (call.id)}
               <li>
-                <a href="/calls/{call.id}" class="entry">
+                <a
+                  href="/calls/{call.id}"
+                  class="entry"
+                  data-shortcut-row={highlightedCallId === call.id
+                    ? "active"
+                    : null}
+                >
                   <span class="entry-time">{fmtTime(call.recorded_at)}</span>
                   <div class="entry-body">
                     <h3 class="entry-title">
@@ -1465,6 +1542,16 @@
   }
 
   .entry:hover .entry-title {
+    color: var(--accent);
+  }
+  /* #282 — keyboard-driven highlight (j/k). A subtle accent rail on
+     the left + a faint background tint so the active row is obvious
+     without overpowering hover. */
+  .entry[data-shortcut-row="active"] {
+    background: var(--ink-1);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .entry[data-shortcut-row="active"] .entry-title {
     color: var(--accent);
   }
 

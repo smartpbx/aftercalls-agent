@@ -220,6 +220,11 @@
     // `.name-chip-active` outline lands on the right row.
     activeChipItemId?: string | null;
     activeChipOccurrenceIndex?: number | null;
+
+    // #282 — keyboard-driven highlight (j/k navigation on the
+    // /actions page wrapper). The page owns the highlight state;
+    // ActionsList just forwards it down to the matching ActionItem.
+    highlightedItemId?: string | null;
   };
 
   let {
@@ -255,6 +260,7 @@
     onactionitemchipaction,
     activeChipItemId = null,
     activeChipOccurrenceIndex = null,
+    highlightedItemId = null,
   }: Props = $props();
 
   // Adapters: ActionItem fires with {itemId, description} /
@@ -559,6 +565,7 @@
           activeChipOccurrenceIndex={activeChipItemId === item.id
             ? activeChipOccurrenceIndex
             : null}
+          highlighted={highlightedItemId === item.id}
         />
       {/each}
     </ul>

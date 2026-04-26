@@ -19,10 +19,11 @@
   // store (#254 — dropped the inline `transientError` slot and the
   // per-row `actionItemErrors` Record in the same pass).
 
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { page } from "$app/state";
   import { replaceState, afterNavigate } from "$app/navigation";
+  import { registerShortcuts } from "$lib/shortcuts.svelte";
   import ActionsList, {
     type MeActionItem,
     type ActionsStatusFilter,
@@ -685,6 +686,81 @@
       email: m.email,
     })),
   );
+
+  // ── #282 · Keyboard shortcuts on /actions ─────────────────────────
+  //
+  // Mirrors the portal /actions wiring (j/k highlight, Space toggle,
+  // e edit description). Same shape so a future shared wrapper could
+  // lift this into a hook.
+  let highlightedItemId = $state<string | null>(null);
+
+  $effect(() => {
+    if (items.length === 0) {
+      highlightedItemId = null;
+      return;
+    }
+    if (
+      !highlightedItemId ||
+      !items.some((it) => it.id === highlightedItemId)
+    ) {
+      highlightedItemId = items[0].id;
+    }
+  });
+
+  function moveHighlight(delta: 1 | -1) {
+    if (items.length === 0) return;
+    const cur = highlightedItemId
+      ? items.findIndex((it) => it.id === highlightedItemId)
+      : -1;
+    const next = Math.max(
+      0,
+      Math.min(items.length - 1, (cur < 0 ? 0 : cur) + delta),
+    );
+    highlightedItemId = items[next].id;
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLElement>(
+        '[data-shortcut-row="active"]',
+      );
+      el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+  }
+
+  function toggleHighlighted() {
+    const it = items.find((x) => x.id === highlightedItemId);
+    if (!it) return;
+    const nextStatus: "open" | "done" =
+      it.status === "done" ? "open" : "done";
+    void onToggle({ itemId: it.id, callId: it.call_id, nextStatus });
+  }
+
+  function editHighlighted() {
+    const it = items.find((x) => x.id === highlightedItemId);
+    if (!it) return;
+    onDescriptionEditRequest({ item: { id: it.id, call_id: it.call_id } });
+  }
+
+  let teardownActionShortcuts: (() => void) | null = null;
+  onMount(() => {
+    teardownActionShortcuts = registerShortcuts(
+      "actions",
+      "Action items",
+      {
+        j: () => moveHighlight(1),
+        k: () => moveHighlight(-1),
+        space: () => toggleHighlighted(),
+        e: () => editHighlighted(),
+      },
+      [
+        { keys: "j k", label: "Next / previous action item" },
+        { keys: "space", label: "Toggle done on the highlighted item" },
+        { keys: "e", label: "Edit the highlighted item's description" },
+      ],
+    );
+  });
+  onDestroy(() => {
+    teardownActionShortcuts?.();
+    teardownActionShortcuts = null;
+  });
 </script>
 
 <svelte:head>
@@ -723,6 +799,7 @@
   onactionitemchipaction={openActionItemChip}
   activeChipItemId={activeChip?.itemId ?? null}
   activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}
+  {highlightedItemId}
 />
 
 {#if activeChip}

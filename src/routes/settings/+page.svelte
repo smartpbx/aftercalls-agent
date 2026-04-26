@@ -1122,6 +1122,32 @@
       </div>
     </div>
 
+    <!-- #282 — pointer to the full shortcut catalogue on the public
+         help page. Lives directly under the two recording-shortcut
+         rows so users discovering the recording bindings see there's
+         more they can do. Opens the system browser via the existing
+         Tauri opener plugin (same helper used by the legal links). -->
+    <div class="pref-row shortcut-help-row">
+      <div class="pref-label">
+        <span class="pref-title">All keyboard shortcuts</span>
+        <span class="pref-hint">
+          See every shortcut available across the desktop app and the
+          web portal — playback controls on call pages, list
+          navigation, action-item shortcuts, and more.
+        </span>
+      </div>
+      <a
+        class="settings-link"
+        href="https://aftercalls.io/help#keyboard-shortcuts"
+        onclick={(e) => {
+          e.preventDefault();
+          openUrl("https://aftercalls.io/help#keyboard-shortcuts");
+        }}
+      >
+        See all keyboard shortcuts →
+      </a>
+    </div>
+
     <div class="pref-row">
       <div class="pref-label">
         <span class="pref-title">Manual notes panel</span>
@@ -1848,6 +1874,22 @@
   .add:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+
+  /* #282 — "See all keyboard shortcuts" link sitting under the
+     two recording-shortcut config rows. Borderless link styling so
+     it reads as a pointer rather than a primary action. */
+  .settings-link {
+    flex-shrink: 0;
+    color: var(--accent);
+    font-size: 0.85rem;
+    text-decoration: none;
+    padding: 0.3rem 0.2rem;
+    transition: color 0.15s;
+  }
+  .settings-link:hover {
+    color: var(--accent-hi);
+    text-decoration: underline;
   }
 
   .empty {

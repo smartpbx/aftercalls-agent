@@ -2,6 +2,7 @@ mod config;
 mod detector;
 mod error;
 mod notes;
+mod notify_actions;
 mod pipeline;
 mod portal;
 mod recorder;

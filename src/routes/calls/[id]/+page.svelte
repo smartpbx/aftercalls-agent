@@ -56,6 +56,7 @@
     type ReplaceAnchor,
     type ReplaceScope,
   } from "$lib/ReplaceTextModal.svelte";
+  import { registerShortcuts } from "$lib/shortcuts.svelte";
 
   type Utterance = {
     idx: number;
@@ -3214,6 +3215,44 @@
   });
   onDestroy(() => {
     document.removeEventListener("selectionchange", onSelectionChange);
+  });
+
+  // ── #282 · Keyboard shortcuts for the call-detail player ──────────
+  //
+  // Mirrors the portal call-detail wiring (Space, arrows, comma /
+  // period for fine playback-rate stepping).
+  function nudgeRate(delta: number) {
+    if (!audioEl) return;
+    const next = Math.max(0.5, Math.min(2, +(rate + delta).toFixed(2)));
+    rate = next;
+    audioEl.playbackRate = next;
+  }
+
+  let teardownDetailShortcuts: (() => void) | null = null;
+  onMount(() => {
+    teardownDetailShortcuts = registerShortcuts(
+      "call-detail",
+      "Call detail",
+      {
+        space: () => togglePlay(),
+        arrowleft: () => skip(-10),
+        arrowright: () => skip(10),
+        "shift+arrowleft": () => skip(-30),
+        "shift+arrowright": () => skip(30),
+        ",": () => nudgeRate(-0.25),
+        ".": () => nudgeRate(0.25),
+      },
+      [
+        { keys: "space", label: "Play / pause" },
+        { keys: "← →", label: "Seek -10s / +10s" },
+        { keys: "shift+← shift+→", label: "Seek -30s / +30s" },
+        { keys: ", .", label: "Playback speed -0.25× / +0.25×" },
+      ],
+    );
+  });
+  onDestroy(() => {
+    teardownDetailShortcuts?.();
+    teardownDetailShortcuts = null;
   });
 </script>
 

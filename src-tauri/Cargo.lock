@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -18,6 +18,8 @@ dependencies = [
  "dirs 5.0.1",
  "hound",
  "libc",
+ "mac-notification-sys",
+ "notify-rust",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -34,6 +36,8 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tauri-winrt-notification",
+ "thiserror 1.0.69",
  "tokio",
  "toml 0.8.2",
  "windows 0.58.0",
