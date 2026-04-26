@@ -235,6 +235,7 @@ jobs:
 
             - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
             - **Windows**: .msi or .exe.
+            - **macOS**: .dmg (Apple Silicon). Closed-beta build is unsigned — run `xattr -cr /Applications/aftercalls.app` after install.
 
             All platforms auto-update from a running instance.
 
@@ -306,12 +307,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # Optional: attach mac bundles to the GitHub release. Default
-      # off — flip via the workflow_dispatch input once code-signing
-      # + notarization (#68) is in place. Tag-pushed runs never set
-      # this input, so the production release path stays unchanged.
+      # Attach mac bundles to the GitHub release so publish-to-spaces
+      # picks them up. We're closed beta — testers accept the unsigned
+      # Gatekeeper warning + xattr -cr workaround until #68 lands.
+      # When notarization ships, this step is unchanged; the warning
+      # just goes away for users.
       - name: Attach macOS bundles to GH release
-        if: startsWith(matrix.os, 'macos-') && github.event.inputs.enable_mac_publish == 'true'
+        if: startsWith(matrix.os, 'macos-')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -508,10 +510,11 @@ jobs:
   # so we add it here from the .sig file produced by the slim-
   # AppImage step above.
   #
-  # macOS bundles are NOT attached to the GH release by default, so
-  # they never appear here. When `enable_mac_publish` is flipped on
-  # post-#68, the .dmgs will land via `gh release download` and get
-  # mirrored to Spaces alongside everything else.
+  # macOS bundles attach to the GH release unconditionally (we're
+  # closed beta — testers handle the unsigned Gatekeeper warning until
+  # #68 lands), so the .dmg + .dmg.sig land here via `gh release
+  # download` and get mirrored to Spaces + injected into latest.json
+  # as `darwin-aarch64`.
   publish-to-spaces:
     needs: release
     runs-on: ubuntu-24.04
@@ -528,7 +531,7 @@ jobs:
           gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*'
           ls -la
 
-      - name: Rewrite latest.json URLs to Spaces + inject Linux entry
+      - name: Rewrite latest.json URLs to Spaces + inject Linux + macOS entries
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
           BUCKET: ${{ secrets.SPACES_BUCKET }}
@@ -552,24 +555,41 @@ jobs:
           # Linux updater check would fail signature verification.
           LINUX_SIG=$(cat "/tmp/release/${SLIM_APPIMAGE}.sig")
 
+          # macOS Apple Silicon — optional. Present only when the mac
+          # job emitted a signed .dmg (it always does today, but keep
+          # the conditional so a runner outage doesn't FATAL the whole
+          # publish). Same .sig contract as Linux: already base64.
+          DARWIN_AARCH64_DMG="aftercalls_${VERSION}_aarch64.dmg"
+          if [ -f "/tmp/release/${DARWIN_AARCH64_DMG}.sig" ]; then
+            DARWIN_AARCH64_SIG=$(cat "/tmp/release/${DARWIN_AARCH64_DMG}.sig")
+            DARWIN_AARCH64_URL="$BASE/$DARWIN_AARCH64_DMG"
+          else
+            DARWIN_AARCH64_SIG=""
+            DARWIN_AARCH64_URL=""
+          fi
+
           # 1. Rewrite every existing platform URL to point at Spaces
           #    instead of github.com (running apps hit Spaces since the
           #    GitHub release is private).
-          # 2. Inject linux-x86_64 entry for the slim AppImage —
-          #    tauri-action didn't emit one since we built AppImage
-          #    ourselves outside its pipeline.
+          # 2. Inject linux-x86_64 entry for the slim AppImage.
+          # 3. Inject darwin-aarch64 entry for the mac .dmg (when present).
           jq --arg base "$BASE" \
              --arg linuxurl "$BASE/$SLIM_APPIMAGE" \
-             --arg linuxsig "$LINUX_SIG" '
+             --arg linuxsig "$LINUX_SIG" \
+             --arg macarmurl "$DARWIN_AARCH64_URL" \
+             --arg macarmsig "$DARWIN_AARCH64_SIG" '
             .platforms |= (
               with_entries(
                 .value.url = ($base + "/" + (.value.url | split("/") | .[-1]))
               )
             )
             | .platforms["linux-x86_64"] = { signature: $linuxsig, url: $linuxurl }
+            | if $macarmurl != "" then
+                .platforms["darwin-aarch64"] = { signature: $macarmsig, url: $macarmurl }
+              else . end
           ' /tmp/release/latest.json > /tmp/release/latest.rewritten.json
           mv /tmp/release/latest.rewritten.json /tmp/release/latest.json
-          echo "--- latest.json after rewrite + linux-inject ---"
+          echo "--- latest.json after rewrites ---"
           cat /tmp/release/latest.json
 
       - name: Upload to Spaces
