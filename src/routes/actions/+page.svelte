@@ -45,6 +45,12 @@
   // shared toast store. Replaces the inline `transientError` flash
   // and the per-row `actionItemErrors` Record.
   import { toast } from "$lib/stores/toast.svelte";
+  // #107 — local save-queue. Same shape as the portal sibling but the
+  // queued ops replay through Tauri `invoke` rather than fetch.
+  import {
+    saveQueue,
+    isTransientNetworkError,
+  } from "$lib/stores/saveQueue.svelte";
 
   // Roster shape the Tauri invoke returns. Superset of ActionItemUser
   // so we just map over the relevant fields.
@@ -252,11 +258,23 @@
         body: { status: ev.nextStatus },
       });
     } catch (e: any) {
-      items = prevItems;
-      totalOpen = prevTotalOpen;
-      totalDone = prevTotalDone;
-      toast.error("Couldn't save. Try again.");
-      void e;
+      // #107 — transient network: keep the optimistic flip + counts
+      // and queue the patch. Hard rejects roll back as before.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: ev.callId,
+          itemId: ev.itemId,
+          body: { status: ev.nextStatus },
+          at: Date.now(),
+        });
+      } else {
+        items = prevItems;
+        totalOpen = prevTotalOpen;
+        totalDone = prevTotalDone;
+        toast.error("Couldn't save. Try again.");
+        void e;
+      }
     } finally {
       togglingIds = new Set(
         [...togglingIds].filter((id) => id !== ev.itemId),
@@ -352,14 +370,36 @@
         activeRowEdit = { kind: "none" };
       }
     } catch (e: unknown) {
-      // #124: bad_request from the backend means the assignee isn't
-      // in the org. Anything else is "save failed" with a generic
-      // try-again message.
-      const msg =
-        isPortalError(e) && e.kind === "bad_request"
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      toast.error(msg);
+      // #107 — queue + optimistic apply on transient network failure.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: payload.callId,
+          itemId: payload.itemId,
+          body: { description: payload.description },
+          at: Date.now(),
+        });
+        items = items.map((it) =>
+          it.id === payload.itemId
+            ? { ...it, description: payload.description }
+            : it,
+        );
+        if (
+          activeRowEdit.kind === "description" &&
+          activeRowEdit.itemId === payload.itemId
+        ) {
+          activeRowEdit = { kind: "none" };
+        }
+      } else {
+        // #124: bad_request from the backend means the assignee isn't
+        // in the org. Anything else is "save failed" with a generic
+        // try-again message.
+        const msg =
+          isPortalError(e) && e.kind === "bad_request"
+            ? "That teammate isn't in your workspace. Pick someone from your team."
+            : "Save failed. Check your connection and try again.";
+        toast.error(msg);
+      }
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -386,12 +426,34 @@
         activeRowEdit = { kind: "none" };
       }
     } catch (e: unknown) {
-      // #124: structured-error matching — see onDescriptionSave above.
-      const msg =
-        isPortalError(e) && e.kind === "bad_request"
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      toast.error(msg);
+      // #107 — queue + optimistic apply on transient network failure.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: payload.callId,
+          itemId: payload.itemId,
+          body: { assignee_user_id: payload.assigneeUserId },
+          at: Date.now(),
+        });
+        items = items.map((it) =>
+          it.id === payload.itemId
+            ? { ...it, assignee_user_id: payload.assigneeUserId }
+            : it,
+        );
+        if (
+          activeRowEdit.kind === "owner" &&
+          activeRowEdit.itemId === payload.itemId
+        ) {
+          activeRowEdit = { kind: "none" };
+        }
+      } else {
+        // #124: structured-error matching — see onDescriptionSave above.
+        const msg =
+          isPortalError(e) && e.kind === "bad_request"
+            ? "That teammate isn't in your workspace. Pick someone from your team."
+            : "Save failed. Check your connection and try again.";
+        toast.error(msg);
+      }
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -466,9 +528,37 @@
         activeRowEdit = { kind: "none" };
       }
     } catch (e: unknown) {
-      // #254 — already on toast (today's #173 hotfix). No double-up.
-      toast.error("Save failed. Check your connection and try again.");
-      void e;
+      // #107 — queue + optimistic apply on transient network failure.
+      if (isTransientNetworkError(e)) {
+        const body =
+          payload.kind === "dated"
+            ? { due_kind: "dated" as const, due_at: payload.dueAt }
+            : payload.kind === "asap"
+              ? { due_kind: "asap" as const, due_at: null }
+              : { due_kind: "none" as const, due_at: null };
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: payload.callId,
+          itemId: payload.itemId,
+          body,
+          at: Date.now(),
+        });
+        items = items.map((it) =>
+          it.id === payload.itemId
+            ? { ...it, due_kind: body.due_kind, due_at: body.due_at }
+            : it,
+        );
+        if (
+          activeRowEdit.kind === "due" &&
+          activeRowEdit.itemId === payload.itemId
+        ) {
+          activeRowEdit = { kind: "none" };
+        }
+      } else {
+        // #254 — already on toast (today's #173 hotfix). No double-up.
+        toast.error("Save failed. Check your connection and try again.");
+        void e;
+      }
     } finally {
       markPatching(payload.itemId, false);
     }

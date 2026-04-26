@@ -4,8 +4,19 @@
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { getVersion } from "@tauri-apps/api/app";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
   import { portalErrorToText } from "$lib/portalError";
+
+  // #69 — About card surfaces the running version + the LGPL ffmpeg
+  // notice + a link to the canonical public manifest at
+  // aftercalls.io/licenses. Lives in Settings (rather than a new
+  // Help page) so the existing legal-footer can stay where it is and
+  // we don't restructure the Settings tree. Stays empty / falls back
+  // gracefully if getVersion() rejects (offline-only Tauri command,
+  // shouldn't fail in practice but the rail in +layout.svelte
+  // already uses the same defensive pattern).
+  let appVersion = $state<string | null>(null);
 
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
@@ -555,6 +566,16 @@
     } catch (e) {
       console.warn("loadRecordingPrefs (settings) failed", e);
       recordingNotificationMode = "user";
+    }
+
+    // #69 — load running app version for the About card. getVersion is
+    // a synchronous-feeling Tauri call but still async; it can't
+    // realistically fail here (no IPC over the network), so a missing
+    // value just means we render a single em-dash instead.
+    try {
+      appVersion = await getVersion();
+    } catch (e) {
+      console.warn("getVersion failed", e);
     }
   });
 
@@ -1341,6 +1362,47 @@
 
   {#if error}<p class="error" style="--i: 4">{error}</p>{/if}
 
+  <!-- #69 — About card. Surfaces running version + the LGPL ffmpeg
+       notice next to a link out to the canonical public manifest.
+       The legal-footer below already links to /licenses, but that
+       footer is intentionally muted; this card is where the LGPL
+       notice itself is *visible* in the app, satisfying the
+       "notice in documentation" bar more loudly than a footer
+       link alone. -->
+  <section class="card about-card" style="--i: 4.5">
+    <div class="card-head">
+      <div>
+        <h2>About</h2>
+        <p class="hint">
+          Build info and the open-source components bundled with the
+          desktop app.
+        </p>
+      </div>
+    </div>
+    <dl class="about-grid">
+      <dt>aftercalls</dt>
+      <dd><code>{appVersion ?? "—"}</code></dd>
+    </dl>
+    <p class="about-lgpl">
+      This build bundles a sidecar copy of <strong>ffmpeg</strong>,
+      distributed under the <strong>LGPL v2.1+</strong>. Pinned upstream
+      versions, the LGPL license text, and the corresponding source
+      tarballs (mirrored on our infrastructure so you can fetch them
+      directly) are listed on the
+      <a
+        href="https://aftercalls.io/licenses"
+        onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/licenses"); }}
+      >open-source licenses page</a>.
+    </p>
+    <div class="about-actions">
+      <a
+        class="add"
+        href="https://aftercalls.io/licenses"
+        onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/licenses"); }}
+      >Open source licenses ↗</a>
+    </div>
+  </section>
+
   <footer class="legal-footer" style="--i: 5">
     <a
       href="https://aftercalls.io/help/system-requirements"
@@ -1900,6 +1962,53 @@
   .error {
     color: var(--live);
     font-size: 0.83rem;
+  }
+
+  /* #69 — About card. Mirror of `.card` styling (so it inherits the
+     surrounding rhythm), with a small grid for the version row + an
+     LGPL paragraph that reads as informational, not a CTA. Scoped
+     here so the byte-identity invariant on app.css stays satisfied. */
+  .about-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.4rem 0.9rem;
+    margin: 0 0 0.8rem;
+    align-items: baseline;
+    font-size: 0.86rem;
+  }
+  .about-grid dt {
+    color: var(--bone-3);
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .about-grid dd {
+    margin: 0;
+    color: var(--bone-0);
+  }
+  .about-grid code {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--bone-0);
+  }
+  .about-lgpl {
+    margin: 0 0 0.9rem;
+    color: var(--bone-2);
+    font-size: 0.82rem;
+    line-height: 1.55;
+    max-width: 58ch;
+  }
+  .about-lgpl a {
+    color: var(--accent);
+  }
+  .about-lgpl a:hover {
+    color: var(--accent-hi);
+  }
+  .about-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
   }
 
   .legal-footer {

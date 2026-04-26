@@ -25,7 +25,12 @@ use crate::error::{from_status, parse_retry_after, PortalError};
 /// and falls back to `"unknown"` for legacy clients. Computed once per
 /// process — `CARGO_PKG_VERSION` and `std::env::consts::OS` are both
 /// compile-time / process-constant.
-fn user_agent() -> String {
+///
+/// `pub(crate)` so `upload.rs` (#293) can stamp the same UA on its
+/// reqwest builder without duplicating the format string. Other agent
+/// modules that fire HTTP at the backend should reuse this rather than
+/// re-deriving the format.
+pub(crate) fn user_agent() -> String {
     format!(
         "aftercalls/{} ({})",
         env!("CARGO_PKG_VERSION"),
@@ -1098,6 +1103,30 @@ pub async fn get_recording_prefs(backend: &Backend) -> std::result::Result<Value
 /// normal `build_auth_header` flow suffices.
 pub async fn list_org_members(backend: &Backend) -> std::result::Result<Value, PortalError> {
     get_json_typed(backend, "/v1/org/members").await
+}
+
+/// #107 — backend reachability probe used by the offline indicator.
+/// Hits the unauthenticated `/health` route with a short timeout and
+/// reports success on any 2xx. Auth header is intentionally omitted —
+/// the offline check should keep working when the access token has
+/// expired (the user might be offline AND the JWT might be stale,
+/// without that being a meaningful "offline" signal). Failures are
+/// folded into a single boolean so the frontend doesn't have to
+/// branch on every reqwest variant.
+pub async fn health_check(backend: &Backend) -> bool {
+    let c = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent(user_agent())
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let url = format!("{}/health", backend.url.trim_end_matches('/'));
+    match c.get(&url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 // ── HTTP primitives ──────────────────────────────────────────────────

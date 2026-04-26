@@ -5,6 +5,12 @@
   import { replaceState, afterNavigate } from "$app/navigation";
   import DateInput from "$lib/DateInput.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import {
+    isProcessing,
+    isDelayed,
+    PILL_PROCESSING,
+    PILL_STILL_WORKING,
+  } from "$lib/processing-thresholds";
 
   // #57 Tag-aware filter bar.
   //
@@ -369,6 +375,13 @@
   // listener that lived here in v0.4.5 are gone; the global hotkey and
   // tray menu still work and are unchanged.
 
+  // #286 — derived "still working" pill. Re-evaluated every 30s so a
+  // call that crosses its threshold while the page is open changes
+  // pill state without a refresh. Cleared on unmount so the timer
+  // doesn't leak across navigations.
+  let nowMs = $state(Date.now());
+  let nowTimer: ReturnType<typeof setInterval> | undefined;
+
   onMount(async () => {
     try {
       me = await invoke<Me | null>("current_user");
@@ -377,10 +390,18 @@
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
     if (scope === "all" && canSeeAll) void ensureMemberRoster();
+    nowTimer = setInterval(() => {
+      nowMs = Date.now();
+    }, 30_000);
     await load();
   });
 
-  onDestroy(() => {});
+  onDestroy(() => {
+    if (nowTimer !== undefined) {
+      clearInterval(nowTimer);
+      nowTimer = undefined;
+    }
+  });
 
   // Back/forward navigation: `replaceState` (used for filter-pill
   // clicks) does NOT update `page.url`, so a `$effect` on
@@ -868,7 +889,15 @@
                       {:else if call.source_kind}
                         <span class="chip">{sourceKindLabel(call.source_kind)}</span>
                       {/if}
-                      {#if call.status !== "complete"}
+                      {#if isProcessing(call.status)}
+                        {#if isDelayed(call.status, call.recorded_at, nowMs)}
+                          <span class="chip chip-still" title="Taking a little longer than usual">
+                            {PILL_STILL_WORKING}
+                          </span>
+                        {:else}
+                          <span class="chip chip-sig">{PILL_PROCESSING}</span>
+                        {/if}
+                      {:else if call.status !== "complete"}
                         <span class="chip chip-sig">{call.status}</span>
                       {/if}
                     </div>
@@ -1464,6 +1493,19 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     font-size: 0.64rem;
+  }
+  /* #286 · Post-threshold "Still working" pill. Slightly warmer
+     (soft tint of --sig) + bolder weight so it reads as "we
+     noticed and we're on it" rather than as an error. Mirrors the
+     portal calls-list treatment. */
+  .chip-still {
+    background: rgba(201, 162, 74, 0.14);
+    border-color: rgba(201, 162, 74, 0.45);
+    color: var(--sig);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.5rem;
   }
 
   .entry-dur {

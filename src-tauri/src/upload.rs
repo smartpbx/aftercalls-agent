@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{read_auth_file, AuthFile, Backend};
-use crate::portal::build_auth_header;
+use crate::portal::{build_auth_header, user_agent};
 
 #[derive(Deserialize, Debug, Default)]
 pub struct UploadUrls {
@@ -210,8 +210,16 @@ async fn put_file(
 }
 
 fn http_client() -> Result<reqwest::Client> {
+    // #293 — stamp the same `aftercalls/<ver> (<os>)` UA portal::client()
+    // uses, so backend tracing on `POST /v1/calls` can attribute the
+    // request to a specific agent build instead of logging
+    // `agent_ver = "unknown"`. `attach_note_path` reuses this client too
+    // and benefits from the same attribution; the S3 PUTs in
+    // `upload_audio` ignore custom UAs (Spaces signs `host` + `content-
+    // type`, not user-agent), so the change is a no-op there.
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
+        .user_agent(user_agent())
         .build()?)
 }
 

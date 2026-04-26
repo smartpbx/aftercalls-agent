@@ -25,6 +25,12 @@
     type SzmPushResponse,
   } from "$lib/SendToZohoModal.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
+  // #107 — local save-queue: keep optimistic state + queue mutations
+  // when the failure looks like a transient network/server blip.
+  import {
+    saveQueue,
+    isTransientNetworkError,
+  } from "$lib/stores/saveQueue.svelte";
   // #254 — action-item save / delete / toggle failures route through
   // the shared toast store rather than per-row inline error surfaces.
   // Mirrors the portal handler. Keeps the editor lifecycle clean (no
@@ -35,6 +41,13 @@
     portalErrorToText,
     type PortalError,
   } from "$lib/portalError";
+  import {
+    isProcessing,
+    isDelayed,
+    REASSURANCE_LINE,
+    readyToastMessage,
+    readyTrayBody,
+  } from "$lib/processing-thresholds";
   import ShareCallModal from "$lib/ShareCallModal.svelte";
   import HighlightCorrectMenu, {
     type HighlightAnchor,
@@ -241,8 +254,23 @@
         call = { ...call, notes: sent };
       }
     } catch (e: any) {
-      notesStatus = "error";
-      notesError = String(e?.message ?? e);
+      // #107 — transient network: queue the notes save so it replays
+      // when /health comes back. The OfflineBanner is the visible
+      // signal; the saveQueue's "Saved" toast confirms persistence.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "notes",
+          callId: call.id,
+          notes: sent,
+          at: Date.now(),
+        });
+        if (call) call = { ...call, notes: sent };
+        notesStatus = "saving";
+        notesError = "";
+      } else {
+        notesStatus = "error";
+        notesError = String(e?.message ?? e);
+      }
     }
   }
 
@@ -774,15 +802,42 @@
         editFocus = { kind: "none" };
       }
     } catch (e: unknown) {
-      // #124: bad_request from the backend means the assignee isn't
-      // in the org (FK reject). Anything else (network / server /
-      // other) shows the generic "check your connection" message.
-      const msg =
-        isPortalError(e) && e.kind === "bad_request"
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      toast.error(msg);
-      console.warn("action item description save failed", e);
+      // #107 — transient network: queue the description patch and
+      // optimistically reflect the typed value locally. Hard rejects
+      // (bad_request etc.) keep the existing toast paths.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: call.id,
+          itemId: payload.itemId,
+          body: { description: payload.description },
+          at: Date.now(),
+        });
+        call = {
+          ...call,
+          action_items: call.action_items.map((ai) =>
+            ai.id === payload.itemId
+              ? { ...ai, description: payload.description }
+              : ai,
+          ),
+        };
+        if (
+          editFocus.kind === "row-description" &&
+          editFocus.itemId === payload.itemId
+        ) {
+          editFocus = { kind: "none" };
+        }
+      } else {
+        // #124: bad_request from the backend means the assignee isn't
+        // in the org (FK reject). Anything else (server / other) shows
+        // the generic "check your connection" message.
+        const msg =
+          isPortalError(e) && e.kind === "bad_request"
+            ? "That teammate isn't in your workspace. Pick someone from your team."
+            : "Save failed. Check your connection and try again.";
+        toast.error(msg);
+        console.warn("action item description save failed", e);
+      }
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -840,13 +895,39 @@
         editFocus = { kind: "none" };
       }
     } catch (e: unknown) {
-      // #124: structured-error matching — see onDescriptionSave.
-      const msg =
-        isPortalError(e) && e.kind === "bad_request"
-          ? "That teammate isn't in your workspace. Pick someone from your team."
-          : "Save failed. Check your connection and try again.";
-      toast.error(msg);
-      console.warn("action item owner save failed", e);
+      // #107 — transient network: queue the owner patch + optimistic
+      // local apply. Same pattern as onDescriptionSave above.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: call.id,
+          itemId: payload.itemId,
+          body: { assignee_user_id: payload.assigneeUserId },
+          at: Date.now(),
+        });
+        call = {
+          ...call,
+          action_items: call.action_items.map((ai) =>
+            ai.id === payload.itemId
+              ? { ...ai, assignee_user_id: payload.assigneeUserId }
+              : ai,
+          ),
+        };
+        if (
+          editFocus.kind === "row-owner" &&
+          editFocus.itemId === payload.itemId
+        ) {
+          editFocus = { kind: "none" };
+        }
+      } else {
+        // #124: structured-error matching — see onDescriptionSave.
+        const msg =
+          isPortalError(e) && e.kind === "bad_request"
+            ? "That teammate isn't in your workspace. Pick someone from your team."
+            : "Save failed. Check your connection and try again.";
+        toast.error(msg);
+        console.warn("action item owner save failed", e);
+      }
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -910,9 +991,41 @@
         editFocus = { kind: "none" };
       }
     } catch (e) {
-      // #254 — already on toast (today's #173 hotfix). No double-up.
-      toast.error("Save failed. Check your connection and try again.");
-      console.warn("action item due save failed", e);
+      // #107 — transient network: queue the due-date patch and
+      // optimistically reflect the chosen kind/date locally.
+      if (isTransientNetworkError(e)) {
+        const body =
+          payload.kind === "dated"
+            ? { due_kind: "dated" as const, due_at: payload.dueAt }
+            : payload.kind === "asap"
+              ? { due_kind: "asap" as const, due_at: null }
+              : { due_kind: "none" as const, due_at: null };
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: call.id,
+          itemId: payload.itemId,
+          body,
+          at: Date.now(),
+        });
+        call = {
+          ...call,
+          action_items: call.action_items.map((ai) =>
+            ai.id === payload.itemId
+              ? { ...ai, due_kind: body.due_kind, due_at: body.due_at }
+              : ai,
+          ),
+        };
+        if (
+          editFocus.kind === "row-due" &&
+          editFocus.itemId === payload.itemId
+        ) {
+          editFocus = { kind: "none" };
+        }
+      } else {
+        // #254 — already on toast (today's #173 hotfix). No double-up.
+        toast.error("Save failed. Check your connection and try again.");
+        console.warn("action item due save failed", e);
+      }
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -1100,12 +1213,24 @@
         ),
       };
     } catch (e: any) {
-      call = { ...call, action_items: prevItems };
-      // #254 — was a no-op before (the inline state was never bound
-      // to the template). Toasting via the page-level store gives
-      // the user actual feedback on the failed check-off.
-      toast.error("Couldn't save. Try again.");
-      console.warn("action item toggle failed", e);
+      // #107 — transient network: keep the optimistic flip and queue
+      // the patch for replay. Hard rejects roll back as before.
+      if (isTransientNetworkError(e)) {
+        saveQueue.enqueue({
+          kind: "patchActionItem",
+          callId: call.id,
+          itemId: payload.item.id,
+          body: { status: payload.nextStatus },
+          at: Date.now(),
+        });
+      } else {
+        call = { ...call, action_items: prevItems };
+        // #254 — was a no-op before (the inline state was never bound
+        // to the template). Toasting via the page-level store gives
+        // the user actual feedback on the failed check-off.
+        toast.error("Couldn't save. Try again.");
+        console.warn("action item toggle failed", e);
+      }
     } finally {
       togglingItemIds = new Set(
         [...togglingItemIds].filter((id) => id !== payload.item.id),
@@ -1553,10 +1678,40 @@
   let pollTimer: number | undefined;
   const TERMINAL_STATES = new Set(["complete", "failed"]);
 
+  // #286 — derived "still working" UX. Mirror of the portal detail
+  // page. We tick `nowMs` every 30s so a call that crosses its
+  // threshold while the page is open repaints without a refresh.
+  // `wasDelayed` latches when we see the call in delayed state at
+  // any point during this page-view; on the terminal flip we fire
+  // the in-app toast + a system-tray notification only when the
+  // latch was set, so a fast-completing call doesn't spam the user.
+  // The tray notification reuses the existing tauri-plugin-notification
+  // permission already granted by capabilities/default.json (used by
+  // pipeline.rs::notify_done for the recorder side).
+  let nowMs = $state(Date.now());
+  let nowTimer: ReturnType<typeof setInterval> | undefined;
+  let wasDelayed = $state(false);
+  let readyAnnounced = $state(false);
+
+  $effect(() => {
+    if (!call) return;
+    if (isDelayed(call.status, call.recorded_at, nowMs)) {
+      wasDelayed = true;
+    }
+  });
+
   function startLivePoll() {
     if (!call) return;
     if (TERMINAL_STATES.has(call.status)) return;
     if (pollTimer !== undefined) return;
+    // #286 — start the slow `nowMs` ticker as soon as we know we're
+    // mid-pipeline so the pill / reassurance line repaint without a
+    // refresh. Cleared with the rest of teardown in onDestroy.
+    if (nowTimer === undefined) {
+      nowTimer = setInterval(() => {
+        nowMs = Date.now();
+      }, 30_000);
+    }
     pollTimer = window.setInterval(async () => {
       try {
         const fresh = await invoke<Call>("get_call", {
@@ -1571,6 +1726,39 @@
         if (TERMINAL_STATES.has(fresh.status)) {
           clearInterval(pollTimer);
           pollTimer = undefined;
+          // #286 — fire the "ready" toast + tray notification only
+          // when the call had crossed the delay threshold at some
+          // point during this page-view. Fast-completing calls stay
+          // silent. `complete` only — `failed` gets a separate
+          // downstream surface, not the success notification.
+          if (
+            fresh.status === "complete" &&
+            wasDelayed &&
+            !readyAnnounced
+          ) {
+            readyAnnounced = true;
+            const titleForToast =
+              fresh.title?.trim() ||
+              (fresh.source_kind === "self_note" ? "Note to self" : "");
+            toast.success(readyToastMessage(titleForToast), {
+              action: {
+                label: "View",
+                onClick: () => {
+                  if (typeof window !== "undefined") {
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  }
+                },
+              },
+            });
+            // Tray notification — reuses the existing `notify_done`-
+            // style helper added to lib.rs as `notify_call_ready`.
+            // Fire-and-forget; never let an IPC blip break the
+            // post-terminal pipeline below.
+            void invoke("notify_call_ready", {
+              title: titleForToast || "Your call",
+              body: readyTrayBody(titleForToast),
+            }).catch((e) => trace("notify_call_ready failed", e));
+          }
           // Peaks are generated as part of processing, so peaks_available
           // flips true around the same time status goes terminal. Refresh
           // the audio-urls doc here — the $effect below watches
@@ -1802,6 +1990,11 @@
     if (pollTimer !== undefined) {
       clearInterval(pollTimer);
       pollTimer = undefined;
+    }
+    // #286 — stop the slow ticker that drives the "still working" pill.
+    if (nowTimer !== undefined) {
+      clearInterval(nowTimer);
+      nowTimer = undefined;
     }
     // #84: flush any pending-debounce notes save before we unmount.
     // Tauri commands survive webview route teardown (they run on the
@@ -3053,6 +3246,17 @@
               (untitled)
             {/if}
           </h1>
+          <!-- #286 · Past-threshold reassurance line. Hidden until the
+               call crosses its stage threshold so a normal-pace
+               processing call doesn't show "still working" copy that
+               suggests something's off. Vendor-opaque by design —
+               never alludes to "providers" or external services; the
+               cause is irrelevant to the user. Mirrors the portal. -->
+          {#if isProcessing(call.status) && isDelayed(call.status, call.recorded_at, nowMs)}
+            <p class="still-working" role="status" aria-live="polite">
+              {REASSURANCE_LINE}
+            </p>
+          {/if}
           <div class="chip-row">
             {#if prettyApp(call.source_app)}
               <span class="chip" title={sourceKindLabel(call.source_kind)}>
@@ -5265,6 +5469,18 @@
     color: var(--bone-3);
     font-weight: 400;
     font-style: italic;
+  }
+  /* #286 · Past-threshold reassurance line. Sits under the title
+     when the call has been processing longer than the configured
+     stage threshold. Soft signal-yellow tint so it reads as a
+     status note (not an error). aria-live="polite" on the markup
+     means SR users hear it once when it appears. Mirrors the
+     portal call-detail treatment. */
+  .still-working {
+    margin: 0.45rem 0 0;
+    font-size: 0.85rem;
+    color: var(--sig);
+    line-height: 1.4;
   }
   .gen-dots::after {
     content: "";

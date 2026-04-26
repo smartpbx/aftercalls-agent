@@ -12,9 +12,12 @@
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import Avatar from "$lib/Avatar.svelte";
+  import OfflineBanner from "$lib/OfflineBanner.svelte";
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
   import ToastHost from "$lib/ToastHost.svelte";
+  import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
+  import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import "../app.css";
 
@@ -561,6 +564,14 @@
         line: ev.lineno,
       });
     });
+
+    // #107 — start polling backend reachability so the OfflineBanner
+    // reflects /health roundtrips. Reading `saveQueue.items` ensures
+    // the singleton initialises its online-flip subscriber even when
+    // no save-site has imported it yet (replay needs to be wired
+    // before the user recovers connectivity).
+    onlineStatus.start();
+    void saveQueue.items;
 
     // Route guard: if we have no auth.json, send the user to /login. Do
     // this before subscribing to tray/pipeline events so background work
@@ -1551,6 +1562,12 @@
       </div>
 
       <div class="strip-right" data-tauri-drag-region>
+        <!-- #107 — offline indicator. Sits at the head of the
+             strip-right pill cluster so it shares the existing wrap
+             behaviour (.strip-right is `flex-wrap`); reads from the
+             shared `onlineStatus` store. Renders nothing while the
+             agent's `backend_health` Tauri command is happy. -->
+        <OfflineBanner />
         {#if orphans.length > 0}
           <!-- Orphan recovery pill (#63). Same shape as the update
                pill: a thin rounded chip with status pip + label +

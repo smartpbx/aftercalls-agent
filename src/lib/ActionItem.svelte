@@ -971,6 +971,16 @@
         {/if}
       </a>
     {/if}
+    <!-- #294 — meta cluster wrapper. Reserves a fixed-width column for
+         the optional due-date / ASAP badge so the assignee chip's
+         x-coordinate stays constant row-to-row regardless of badge
+         presence. The owner-cell holds the chip (or its editor /
+         unassigned placeholder); the due-cell holds the badge (or its
+         editor / + Due affordance / a non-breaking-space placeholder
+         when nothing else renders, so the column always occupies its
+         reserved width). The grid only applies above the mobile
+         breakpoint — see `.ai-meta` rules at the bottom of <style>. -->
+    <span class="ai-meta">
     <!-- Owner column. Three branches:
          • owner-edit mode → inline SpeakerRenamePicker in a reserved
            right-side lane. Chip unmounts; picker mounts in place.
@@ -1192,7 +1202,13 @@
         <span aria-hidden="true">＋</span>
         <span>Due</span>
       </button>
+    {:else}
+      <!-- #294 — placeholder so the badge cell still occupies its
+           reserved grid column on rows that render no due affordance
+           (non-canEdit + no due). Not focusable, ignored by AT. -->
+      <span class="ai-meta-placeholder" aria-hidden="true">&nbsp;</span>
     {/if}
+    </span>
   </span>
   {#if canEdit && !editingDescription && !editingDue && !pending}
     {#if confirmingDelete}
@@ -1376,6 +1392,33 @@
     align-items: baseline;
     gap: 0.4rem 0.75rem;
     min-width: 0;
+  }
+
+  /* #294 — meta cluster: assignee chip + optional due badge. A
+     2-column grid with a `minmax(80px, auto)` second column so the
+     badge cell occupies its full width even when the row's due
+     affordance is empty / hidden. Net result: the assignee chip's
+     left edge stays at the same x-coordinate row-to-row, regardless
+     of whether the row carries an "ASAP" / "Due Apr 26" badge.
+
+     `margin-left: auto` takes over from the per-chip `margin-left:
+     auto` rules below — those still apply when .ai-meta is reset on
+     mobile (so the chip continues to hug the right inside the body
+     flexbox on edge cases not visited here). */
+  .ai-meta {
+    display: grid;
+    grid-template-columns: auto minmax(80px, auto);
+    align-items: baseline;
+    gap: 0.4rem;
+    margin-left: auto;
+  }
+  .ai-meta-placeholder {
+    /* The placeholder still needs measurable width so the grid's
+       minmax(80px, auto) pins the column; an `&nbsp;` alone collapses
+       on some browsers. `display: inline-block` + min-width is the
+       portable belt-and-braces. */
+    display: inline-block;
+    min-width: 1px;
   }
 
   /* Done state: strikethrough + dim. */
@@ -1580,7 +1623,10 @@
 
   /* During description-edit: hide the trailing assignee chip + trash
      + due chip so the editor owns the row's horizontal space. Owner-
-     edit does NOT hide trash (ui-spec D7). */
+     edit does NOT hide trash (ui-spec D7). #294 also hides the .ai-
+     meta wrapper outright so its reserved 80px badge column doesn't
+     leave a phantom gap beside the editor. */
+  .ai-editing .ai-meta,
   .ai-editing .ai-assignee,
   .ai-editing .ai-assignee-empty,
   .ai-editing .ai-assignee-wrap,
@@ -2017,6 +2063,21 @@
     .ai-edit-desc {
       font-size: 16px;
       line-height: 1.45;
+    }
+    /* #294 — drop the desktop 2-column grid on mobile. The card-stack
+       puts chips beneath the description in a left-hugging row, so
+       the badge-column reservation is unnecessary (and the grid would
+       fight `.ai-body`'s column flexbox). Switch to inline-flex so
+       chip + badge sit on the same line, wrapping if needed. */
+    .ai-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.4rem;
+      margin-left: 0;
+    }
+    .ai-meta-placeholder {
+      display: none;
     }
     /* Assignee + due chips share a meta row beneath the description.
        `margin-left: auto` from the desktop layout pushes both chips

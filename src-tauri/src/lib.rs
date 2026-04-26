@@ -606,6 +606,24 @@ async fn logout() -> Result<(), error::PortalError> {
     portal::logout(backend).await
 }
 
+/// #107 — offline indicator probe. Returns true when the backend's
+/// `/health` route answers 2xx within a short timeout. Used by the
+/// agent's `onlineStatus` store to drive the topstrip OfflineBanner;
+/// no auth required (matches the route's public stance). Returns
+/// false on every error path — the JS layer only needs the verdict.
+#[tauri::command]
+async fn backend_health() -> bool {
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let backend = match cfg.backend.as_ref() {
+        Some(b) => b,
+        None => return false,
+    };
+    portal::health_check(backend).await
+}
+
 #[tauri::command]
 fn current_user() -> Result<Option<LoginResult>, error::PortalError> {
     let auth = config::read_auth_file().map_err(error::PortalError::from)?;
@@ -2039,6 +2057,35 @@ fn setup_hotkey(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// #286 — Surface the OS-level "your call is ready" tray
+/// notification. Frontend (agent call detail page) calls this when a
+/// previously-delayed pipeline finishes so the user gets pinged even
+/// if the agent window is buried. Mirrors the existing
+/// `pipeline::notify_done` shape — title + short body, fire-and-forget,
+/// Result<()> ignored on the JS side. The notification permission is
+/// already granted via `capabilities/default.json` (`notification:default`,
+/// shipped originally for the recorder pipeline).
+#[tauri::command]
+fn notify_call_ready(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    let display_title = if title.trim().is_empty() {
+        "aftercalls: your call is ready".to_string()
+    } else {
+        format!("aftercalls: '{}' is ready", title.trim())
+    };
+    let display_body = if body.trim().is_empty() {
+        "Your call is ready to view.".to_string()
+    } else {
+        body
+    };
+    app.notification()
+        .builder()
+        .title(display_title)
+        .body(display_body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2099,6 +2146,7 @@ pub fn run() {
             login,
             logout,
             current_user,
+            backend_health,
             update_me,
             // #34 — agent → portal session handoff. Frontend calls this
             // from the user-menu "Open web app" item; returns a fully-
@@ -2171,6 +2219,10 @@ pub fn run() {
             support::inspect_support_attachment,
             support::stage_support_video,
             support::submit_support_report,
+            // #286 — surface the OS tray notification when a
+            // previously-delayed call finishes processing. Called
+            // from the agent call-detail page.
+            notify_call_ready,
         ])
         .setup(|app| {
             // Telemetry must start FIRST so panics during subsequent

@@ -1,4 +1,14 @@
 {
+  "0.9.0": {
+    "headline": "Reliability release: offline-resilient saves, processing-delay UX, onboarding polish, and ops hardening",
+    "changes": [
+      "Offline indicator + automatic save retry. A discreet pill at the top of the window shows when your connection drops. While you're offline, in-progress edits to notes and action items queue locally and save automatically when you're back. Recordings continue to disk regardless.",
+      "'Still working' state for delayed calls. Calls that take longer than usual now switch from a neutral 'Processing' pill to a 'Still working' pill plus a one-line reassurance under the title. When the call's ready, a toast (and a system notification on the desktop app) confirms — no need to keep checking.",
+      "Download the desktop app right from onboarding. The 'Download the app' button on the welcome flow now triggers the right installer for your operating system in-place. No new tab, no manual picking from the downloads page.",
+      "Onboarding slide 4 welcomes everyone. Members no longer skip the team slide. They get an intro to how teammates' calls and notes show up alongside theirs. Admins and owners get an inline invite form right on the slide — no need to navigate away to invite their first teammate.",
+      "Tidier sidebar when not in an integration. The Integrations section in the sidebar now collapses when you're not in it — only the 'Integrations' label shows. Open it to see the connected services."
+    ]
+  },
   "0.8.2": {
     "headline": "macOS auto-updater, fall-behind nudge banner, real product screenshots in onboarding",
     "changes": [
