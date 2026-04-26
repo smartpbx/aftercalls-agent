@@ -119,7 +119,6 @@
 
 <script lang="ts">
   import ActionItem from "./ActionItem.svelte";
-  import { fade } from "svelte/transition";
 
   type Props = {
     // Rows to render. Page wrapper applies filter + merges pages;
@@ -152,10 +151,6 @@
     // to the call-detail ActionItem and catches "assignee was
     // reassigned after the page loaded" cleanly.
     orgMembers: ActionItemUser[];
-    // Transient check-off error. Fixed-position 3s inline note at
-    // top of the list per ui-phase-4 §G (no toast system in-repo).
-    // Page wrapper sets + clears via setTimeout.
-    transientError?: string | null;
     // Optional per-row in-flight flag keyed on item id. When true
     // the ActionItem's checkbox shows a disabled state to prevent
     // a double-PATCH race.
@@ -183,7 +178,6 @@
     canEdit?: boolean;
     activeRowEdit?: ActionsActiveRowEdit;
     patchingItemIds?: Set<string>;
-    actionItemErrors?: Record<string, string>;
     onDescriptionEditRequest?: (payload: {
       item: { id: string; call_id: string };
     }) => void;
@@ -196,9 +190,6 @@
       item: { id: string; call_id: string };
     }) => void;
     onOwnerCancel?: (payload: {
-      item: { id: string; call_id: string };
-    }) => void;
-    onEditErrorClear?: (payload: {
       item: { id: string; call_id: string };
     }) => void;
 
@@ -241,7 +232,6 @@
     nextCursor,
     totals = null,
     orgMembers,
-    transientError = null,
     togglingIds = new Set<string>(),
     colorFor,
     onfilterchange,
@@ -253,14 +243,12 @@
     canEdit = false,
     activeRowEdit = { kind: "none" } as ActionsActiveRowEdit,
     patchingItemIds = new Set<string>(),
-    actionItemErrors = {},
     onDescriptionEditRequest,
     onOwnerEditRequest,
     onDescriptionSave: onDescSaveProp,
     onOwnerSave: onOwnerSaveProp,
     onDescriptionCancel,
     onOwnerCancel,
-    onEditErrorClear,
     onDueEditRequest,
     onDueSave: onDueSaveProp,
     onDueCancel,
@@ -506,19 +494,10 @@
     </label>
   </div>
 
-  {#if transientError}
-    <!-- ui-phase-4 §G: 3s inline note at top of list on PATCH
-         failure. Not a toast system — just a fixed inline element
-         the page wrapper auto-clears via setTimeout. `role="alert"`
-         so AT announces the failure. -->
-    <p
-      class="actions-flash"
-      role="alert"
-      transition:fade={{ duration: 180 }}
-    >
-      {transientError}
-    </p>
-  {/if}
+  <!-- #254 — the inline `.actions-flash` retired. Check-off + edit
+       failures now route through the page-level toast store, so the
+       wrapper page emits `toast.error(...)` instead of priming this
+       slot with a 3s setTimeout-cleared string. -->
 
   <p class="actions-sr-count" aria-live="polite">{countLabel}</p>
 
@@ -564,7 +543,6 @@
           editingDue={activeRowEdit.kind === "due" &&
             activeRowEdit.itemId === item.id}
           saving={patchingItemIds.has(item.id)}
-          editError={actionItemErrors[item.id] ?? ""}
           onDescriptionEditRequest={(p) =>
             onDescriptionEditRequest?.({ item: p.item })}
           onOwnerEditRequest={(p) => onOwnerEditRequest?.({ item: p.item })}
@@ -575,7 +553,6 @@
           onDescriptionCancel={(p) => onDescriptionCancel?.({ item: p.item })}
           onOwnerCancel={(p) => onOwnerCancel?.({ item: p.item })}
           onDueCancel={(p) => onDueCancel?.({ item: p.item })}
-          onEditErrorClear={(p) => onEditErrorClear?.({ item: p.item })}
           ontoggle={(payload) =>
             !togglingIds.has(item.id) && handleRowToggle(payload)}
           onchipaction={onactionitemchipaction}
@@ -730,18 +707,9 @@
     color: var(--accent);
   }
 
-  /* Transient check-off error — fixed inline at top of list. Auto-
-     cleared by the page wrapper after 3s. `--live-soft` background
-     + `--live` text matches the ai-edit-err / ai-confirm-err pair
-     so error surfaces read consistently across the app. */
-  .actions-flash {
-    margin: 0 0 0.8rem;
-    padding: 0.5rem 0.75rem;
-    border-radius: 6px;
-    background: var(--live-soft);
-    color: var(--live);
-    font-size: 0.85rem;
-  }
+  /* #254 — `.actions-flash` retired. The page wrapper now toasts on
+     check-off failure via the shared `toast.error(...)` store
+     instead of priming a 3s inline note here. */
 
   /* aria-live announcement. Visually hidden so the count announces
      on filter change without visible chrome. */
@@ -863,6 +831,59 @@
   @media (max-width: 520px) {
     .actions-page {
       padding: 1.25rem 1rem 2rem;
+    }
+  }
+
+  /* ── #255 part 5: mobile pass ─────────────────────────────────────
+     640px primary breakpoint. Filter pills + due dropdown become
+     touch-first (≥44px targets, ≥16px input font). The Due
+     `<select>` drops onto its own line so neither control truncates
+     when both labels lengthen. Empty-state padding shrinks but stays
+     centered. */
+  @media (max-width: 640px) {
+    .actions-page {
+      padding: 1.25rem 1rem 2rem;
+    }
+    .actions-head {
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .actions-filter-row {
+      gap: 0.6rem;
+      align-items: stretch;
+      margin-bottom: 0.4rem;
+    }
+    .actions-filter {
+      flex: 1 1 100%;
+      gap: 0.25rem;
+      margin-bottom: 0;
+    }
+    .actions-filter-opt {
+      /* ≥44px tap target. Distribute the three pills so they fill
+         the row without squeezing labels off their baseline. */
+      flex: 1 1 0;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0.55rem 0.7rem;
+      font-size: 0.88rem;
+    }
+    .actions-due-label {
+      flex: 1 1 100%;
+      gap: 0.5rem;
+      margin-bottom: 0;
+    }
+    .actions-due-select {
+      /* iOS Safari zooms inputs whose font is <16px on focus —
+         keep the dropdown at the platform baseline. ≥44px tall to
+         match the filter pills. */
+      flex: 1 1 auto;
+      min-height: 44px;
+      padding: 0.6rem 2rem 0.6rem 0.75rem;
+      font-size: 16px;
+      background-position: right 0.75rem center;
+    }
+    .actions-empty {
+      padding: 2rem 1.25rem;
     }
   }
 

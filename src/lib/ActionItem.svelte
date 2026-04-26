@@ -112,17 +112,18 @@
   //     the auto-commit transitions documented in the ui-spec §3 /
   //     architect's §5.4.
   //
-  // State matrix (updated for #126):
+  // State matrix (updated for #126; #254 retired the inline editError /
+  // deleteError surfaces — failures now route through the toast store
+  // owned by the parent page):
   //   default                — read-only row
   //   editingDescription     — inline textarea swap for the description
   //   editingOwner           — inline picker swap for the owner chip
   //   pending                — phantom row, `pending: true`, id prefixed
   //   saving                 — PATCH / POST in flight; .ai-body dims
-  //   error                  — inline error line below the editing
-  //                            surface; draft preserved; commit
-  //                            triggers block until the user retypes
   //   confirmingDelete       — unchanged from Phase 3
-  //   deleting / deleteError — unchanged from Phase 3
+  //   deleting               — DELETE in flight; failures bubble to the
+  //                            page-level toast store rather than an
+  //                            inline `.ai-confirm-err` retry button.
   //
   // Phase 4 still owns `ontoggle` for check-off — wiring unchanged.
 
@@ -178,13 +179,14 @@
     //                        handlers so the user can't fire a
     //                        second blur-commit over an in-flight
     //                        save.
-    //   editError          — inline error line below whichever
-    //                        editor is active (textarea / picker).
-    //                        Parent clears when the user edits the
-    //                        draft again (retry-by-typing).
     //   canEdit            — permission gate. False → all click-to-
     //                        edit affordances (cursor / role /
     //                        tabindex) are suppressed.
+    //
+    // #254 — `editError` / `onEditErrorClear` / `deleteError` retired.
+    // Save + delete failures now flow through the page-level toast
+    // store; the row no longer renders an inline error line or a
+    // confirm-retry button.
     editingDescription?: boolean;
     editingOwner?: boolean;
     // #173 — edit mode for the due-date row affordance. Mutually
@@ -192,11 +194,9 @@
     editingDue?: boolean;
     pending?: boolean;
     saving?: boolean;
-    editError?: string;
     canEdit?: boolean;
     confirmingDelete?: boolean;
     deleting?: boolean;
-    deleteError?: string;
 
     // #126 (v0.4.2): granular save / cancel / request callbacks.
     // The component fires these; the parent owns PATCH / POST and
@@ -216,12 +216,6 @@
     onDueEditRequest?: (payload: { item: ActionItem }) => void;
     onDueSave?: (payload: ActionItemDueSave) => void;
     onDueCancel?: (payload: { item: ActionItem }) => void;
-    // Fired on every keystroke while an error is visible — the
-    // parent uses this to clear `actionItemErrors[item.id]` so the
-    // next blur / Enter can attempt a fresh commit (retry-by-typing
-    // per architect §5.3). Emitted at most once per edit-session
-    // (parent manages the state lifecycle).
-    onEditErrorClear?: (payload: { item: ActionItem }) => void;
 
     // Phase 3 (#104): delete flow. Unchanged.
     ondeleterequest?: (payload: { item: ActionItem }) => void;
@@ -268,11 +262,9 @@
     editingDue = false,
     pending = false,
     saving = false,
-    editError = "",
     canEdit = false,
     confirmingDelete = false,
     deleting = false,
-    deleteError = "",
     onDescriptionEditRequest,
     onOwnerEditRequest,
     onDescriptionSave,
@@ -284,7 +276,6 @@
     onDueEditRequest,
     onDueSave,
     onDueCancel,
-    onEditErrorClear,
     ondeleterequest,
     ondeleteconfirm,
     ondeletecancel,
@@ -362,9 +353,10 @@
   // into and out of edit mode. Silent on mount (first-render `""`);
   // silent on Escape-cancel (first effect clears so a re-enter re-
   // announces). The second effect watches `saving` for a true→false
-  // transition and, when the error channel is clean, announces "…
-  // updated". Cancels don't flip `saving`, so they fall through to
-  // the silent-clear path.
+  // transition and announces "…updated". Failures route through the
+  // page-level toast store (#254) and don't suppress the SR
+  // announcement here — the toast carries the error narration via
+  // its own `role="alert"` host.
   let announceText = $state("");
   let wasSaving = $state(false);
 
@@ -385,9 +377,7 @@
       wasSaving = true;
     } else if (wasSaving) {
       wasSaving = false;
-      if (!editError) {
-        announceText = `Action item ${index + 1} updated`;
-      }
+      announceText = `Action item ${index + 1} updated`;
     }
   });
 
@@ -603,28 +593,13 @@
       return;
     }
   }
-  function onDescInput() {
-    // Typing clears the inline error so the next commit trigger
-    // isn't pre-blocked — retry-by-editing per architect §5.3.
-    if (editError) {
-      onEditErrorClear?.({ item });
-    }
-  }
-  function onDescBlur(e: FocusEvent) {
-    // Blur-commit. Skip if focus moved onto the inline error retry
-    // path (there's no retry button in #126 but this guard is cheap).
-    // Also skip if the row is mid-save — avoids firing a second
-    // blur-commit while the first is still in flight.
+  function onDescBlur(_e: FocusEvent) {
+    // Blur-commit. Skip if the row is mid-save — avoids firing a
+    // second blur-commit while the first is still in flight. #254
+    // retired the editError retry-by-typing gate; failed saves now
+    // surface via the page-level toast store and the user can simply
+    // re-edit + blur again to retry.
     if (saving) return;
-    // If an error is showing we block blur-commit until the user
-    // types (clearing the error) — architect §5.3.
-    if (editError) {
-      // Return focus so the error stays actionable. Using
-      // requestAnimationFrame so the blur event completes first.
-      const el = e.currentTarget as HTMLTextAreaElement;
-      requestAnimationFrame(() => el?.focus());
-      return;
-    }
     commitDescription();
   }
 
@@ -922,12 +897,8 @@
           aria-label="Action item description"
           autofocus
           onkeydown={onDescKeydown}
-          oninput={onDescInput}
           onblur={onDescBlur}
         ></textarea>
-        {#if editError}
-          <p class="ai-edit-err" role="alert">{editError}</p>
-        {/if}
       </div>
     {:else if isEmpty}
       {#if canEdit}
@@ -1025,9 +996,6 @@
           onpick={onPickerPick}
           oncancel={onPickerCancel}
         />
-        {#if editError}
-          <p class="ai-edit-err" role="alert">{editError}</p>
-        {/if}
       </div>
     {:else if resolvedAssignee}
       {#if canEdit}
@@ -1238,42 +1206,25 @@
         aria-label="Confirm delete action item {index + 1}"
         onkeydown={onConfirmKeydown}
       >
-        {#if deleteError}
-          <span class="ai-confirm-err" role="alert">{deleteError}</span>
-          <button
-            type="button"
-            class="ai-confirm-retry"
-            disabled={deleting}
-            onclick={handleDeleteConfirm}
-          >
-            Retry
-          </button>
-          <button
-            type="button"
-            class="ai-confirm-cancel"
-            disabled={deleting}
-            onclick={handleDeleteCancel}
-          >
-            Cancel
-          </button>
-        {:else}
-          <button
-            type="button"
-            class="ai-confirm-delete"
-            disabled={deleting}
-            onclick={handleDeleteConfirm}
-          >
-            {deleting ? "Deleting…" : "Delete"}
-          </button>
-          <button
-            type="button"
-            class="ai-confirm-cancel"
-            disabled={deleting}
-            onclick={handleDeleteCancel}
-          >
-            Cancel
-          </button>
-        {/if}
+        <!-- #254 — failed deletes route through the page-level toast
+             store. The user can simply press Delete again to retry,
+             so the inline `.ai-confirm-err` + Retry button retired. -->
+        <button
+          type="button"
+          class="ai-confirm-delete"
+          disabled={deleting}
+          onclick={handleDeleteConfirm}
+        >
+          {deleting ? "Deleting…" : "Delete"}
+        </button>
+        <button
+          type="button"
+          class="ai-confirm-cancel"
+          disabled={deleting}
+          onclick={handleDeleteCancel}
+        >
+          Cancel
+        </button>
       </span>
     {:else}
       <span class="ai-actions">
@@ -1529,14 +1480,9 @@
     cursor: not-allowed;
   }
 
-  .ai-edit-err {
-    margin: 0;
-    padding: 0.4rem 0.55rem;
-    border-radius: 6px;
-    background: var(--live-soft);
-    color: var(--live);
-    font-size: 0.82rem;
-  }
+  /* #254 — `.ai-edit-err` retired. Save failures now route through the
+     page-level toast store; the row no longer paints an inline error
+     line beneath the textarea / picker. */
 
   /* #126: owner-edit inline surface. Replaces the chip's DOM at the
      right-side lane. Reserves the picker's width so the row doesn't
@@ -1730,8 +1676,7 @@
   }
 
   .ai-confirm-delete,
-  .ai-confirm-cancel,
-  .ai-confirm-retry {
+  .ai-confirm-cancel {
     padding: 0.28rem 0.7rem;
     border-radius: 6px;
     font: inherit;
@@ -1742,14 +1687,12 @@
     background: var(--ink-2);
     color: var(--bone-1);
   }
-  .ai-confirm-delete,
-  .ai-confirm-retry {
+  .ai-confirm-delete {
     border-color: var(--live);
     background: var(--live-soft);
     color: var(--live);
   }
-  .ai-confirm-delete:hover:not(:disabled),
-  .ai-confirm-retry:hover:not(:disabled) {
+  .ai-confirm-delete:hover:not(:disabled) {
     background: var(--live);
     color: var(--ink-0);
   }
@@ -1758,20 +1701,14 @@
     color: var(--accent);
   }
   .ai-confirm-delete:disabled,
-  .ai-confirm-cancel:disabled,
-  .ai-confirm-retry:disabled {
+  .ai-confirm-cancel:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
 
-  .ai-confirm-err {
-    padding: 0.22rem 0.5rem;
-    border-radius: 6px;
-    background: var(--live-soft);
-    color: var(--live);
-    font-size: 0.78rem;
-    line-height: 1.4;
-  }
+  /* #254 — `.ai-confirm-err` + `.ai-confirm-retry` retired alongside
+     the inline retry button. Failed deletes now toast via the page-
+     level store; the user re-presses Delete to retry. */
 
   /* ── Phase 3 (#104): Unassigned chip ─────────────────────────── */
   .ai-assignee-empty {
@@ -2010,6 +1947,168 @@
   @media (prefers-reduced-motion: reduce) {
     .ai-due-seg {
       transition: none;
+    }
+  }
+
+  /* ── #255 part 5: mobile pass ─────────────────────────────────────
+     Below 640px the grid row collapses into a card-stack: checkbox
+     keeps its left column (≥44px tap target), the body wraps onto
+     its own block with the description on top + assignee/due chips
+     beneath, and the trash button gets an explicit ≥44px touch
+     surface. Affordances that are hover-revealed on desktop (×
+     clear-assignee, + Due) become always-visible on touch so users
+     without a pointer can find them. Editor inputs go to 16px font
+     to dodge iOS Safari's focus-zoom.
+
+     All declarations are component-scoped — `app.css` mirror-pair
+     invariant kept intact (#255 acceptance bar). Changes are purely
+     additive @media; the desktop grid path is untouched. */
+  @media (max-width: 640px) {
+    .ai-row {
+      /* Two columns: a 44px checkbox/idx lane + the body. Trash
+         falls to the next row aligned right via grid-column placement
+         on `.ai-actions`. Actions-page rows already hide the idx
+         (spacer width 0) so the lane reads as a clean checkbox column
+         on /actions and as a checkbox+idx column on call-detail. */
+      grid-template-columns: 44px 1fr;
+      column-gap: 0.5rem;
+      row-gap: 0.4rem;
+      padding: 0.85rem 0;
+      align-items: start;
+    }
+    .ai-check {
+      /* Keep the visual box at 16px but enlarge the tap target to
+         ≥44px via padding-box. The native input gets `min-` extents
+         so iOS / Android register full-cell taps even though the
+         glyph stays small. */
+      width: 16px;
+      height: 16px;
+      align-self: start;
+      margin-top: 0.15rem;
+      justify-self: center;
+    }
+    .ai-idx {
+      grid-column: 1;
+      justify-self: center;
+      align-self: start;
+      margin-top: 0.05rem;
+    }
+    /* On the /actions page the spacer occupies the same column as
+       the checkbox; collapse it so the body owns the right-hand
+       column outright. */
+    .ai-idx-spacer {
+      display: none;
+    }
+    .ai-body {
+      grid-column: 2;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.4rem;
+      min-width: 0;
+    }
+    /* Description + editor occupy the full body width on mobile. */
+    .ai-desc,
+    .ai-desc-empty,
+    .ai-desc-editor {
+      width: 100%;
+    }
+    /* iOS focus-zoom dodge — textarea + picker inputs land at 16px
+       regardless of the desktop 0.9rem default. */
+    .ai-edit-desc {
+      font-size: 16px;
+      line-height: 1.45;
+    }
+    /* Assignee + due chips share a meta row beneath the description.
+       `margin-left: auto` from the desktop layout pushes both chips
+       off-screen on a column flexbox; reset so they hug the left
+       edge under the description. */
+    .ai-assignee,
+    .ai-assignee-wrap,
+    .ai-assignee-btn-empty,
+    .ai-assignee-empty {
+      margin-left: 0;
+    }
+    .ai-assignee-wrap {
+      gap: 0.2rem;
+    }
+    /* × clear-assignee + + Due are hover-revealed on desktop. On
+       touch the user has no hover, so make both fully visible. The
+       existing `@media (hover: none)` rule sets opacity 0.7; bump
+       to 1 in the explicit narrow-viewport rule so the affordance
+       reads cleanly when both queries match. ≥44px tap target via
+       padding. */
+    .ai-assignee-clear {
+      opacity: 1;
+      min-width: 32px;
+      min-height: 32px;
+      padding: 0.4rem;
+    }
+    .ai-due-add {
+      opacity: 1;
+      min-height: 32px;
+      padding: 0.3rem 0.6rem;
+      font-size: 0.78rem;
+    }
+    .ai-due-chip-btn {
+      min-height: 32px;
+    }
+    /* Owner editor at narrow widths — stop reserving 11rem (which
+       overflows the 320-360px viewports) and instead fill the body
+       column. Reset margin-left so the editor doesn't push past the
+       column. */
+    .ai-owner-editor {
+      margin-left: 0;
+      min-width: 0;
+      max-width: 100%;
+      width: 100%;
+    }
+    .ai-due-editor {
+      margin-left: 0;
+      width: 100%;
+    }
+    /* Due segmented control — bump segment min-height to ≥44px so
+       the three buttons are tappable. */
+    .ai-due-seg {
+      min-height: 44px;
+      font-size: 0.85rem;
+    }
+    /* Trash button: card-stack drops it onto its own row, right-
+       aligned beneath the body. ≥44px tap target. */
+    .ai-actions {
+      grid-column: 2;
+      justify-self: end;
+      align-self: center;
+    }
+    .ai-del {
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0.6rem;
+      /* Visible at rest on touch — the desktop hover-reveal rule
+         hides this for users without a pointer. */
+      opacity: 0.85;
+    }
+    /* Inline delete-confirm: stack vertically so the buttons keep
+       full width + ≥44px height on narrow viewports. */
+    .ai-confirm {
+      grid-column: 2;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+    }
+    .ai-confirm-delete,
+    .ai-confirm-cancel,
+    .ai-confirm-retry {
+      min-height: 44px;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.85rem;
+    }
+    /* /actions secondary line — give the call-context link its own
+       block + ≥44px tap target so users can navigate to the parent
+       call comfortably from a touch device. */
+    .actx-context {
+      flex-basis: auto;
+      min-height: 32px;
+      padding: 0.2rem 0;
     }
   }
 </style>

@@ -1292,6 +1292,22 @@ async fn patch_call(
     portal::patch_call(backend, &id, &body).await
 }
 
+/// POST /v1/calls/{id}/text-replace — highlight-to-correct (#11).
+/// Body shape mirrors `text_replace::TextReplaceBody` on the backend
+/// (verbatim forwarded so the TS layer stays the source of truth).
+/// Returns `{ replaced, regions }` on success.
+#[tauri::command]
+async fn text_replace(
+    id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::text_replace(backend, &id, &body).await
+}
+
 /// PATCH /v1/calls/{id}/action-items/{item_id}. Returns the updated
 /// row; cross-org assignee writes bubble up as `PortalError::BadRequest`
 /// (#124) which the caller renders as an inline picker error.
@@ -2120,6 +2136,7 @@ pub fn run() {
             update_call_tags,
             resummarize_call,
             patch_call,
+            text_replace,
             patch_action_item,
             add_client_allowlist_entry,
             add_action_item,

@@ -420,6 +420,18 @@
     letter-spacing: 0.04em;
   }
 
+  /* #255 mobile pass — bump time readout so it's legible at arm's
+     length on a phone, and give the row more breathing room below
+     the wave. The wave itself stays touch-scrub via `touch-action:
+     none` + Pointer Events on the wrapper (no handle markup to
+     resize — the playhead is painted onto the canvas). */
+  @media (max-width: 640px) {
+    .time-row {
+      bottom: -26px;
+      font-size: 0.85rem;
+    }
+  }
+
   .overlay {
     position: absolute;
     inset: 0;

@@ -1,4 +1,15 @@
 {
+  "0.8.1": {
+    "headline": "Highlight to correct, mobile-friendly portal, smarter CRM push, integrations menu",
+    "changes": [
+      "Highlight to correct. Highlight any word or phrase in a call's transcript or summary, type the replacement, and choose the scope — just this occurrence, or everywhere in this call. Fixes name and term mistakes in seconds.",
+      "Mobile-friendly portal. Calls list, call detail, action items, share viewer, settings, and admin pages are all designed to work on phones — sidebar collapses to a hamburger, tap targets sized for fingers, audio waveform fills the width and works under touch.",
+      "Smarter CRM push. Pushed Zoho calls now arrive with the audio attached as a Voice Recording, action items list each item's owner inline, and the description is a clean back-link to aftercalls instead of a wall of transcript text. Name chips render as plain text.",
+      "Integrations menu. The admin sidebar's CRM entry is now Integrations with Zoho CRM as the first child — sets up a clean home for the next round (Zoho Meeting and Zoho Cliq are wired in this release; ingest pipeline lands next).",
+      "Customer email inbox unified. Emails to hello@aftercalls.io and in-app issue reports show in one staff inbox with a Source filter, instead of two separate pages.",
+      "Action item errors stay visible. Save / delete / check-off failures now surface as a toast instead of an inline message that vanished mid-action."
+    ]
+  },
   "0.8.0": {
     "headline": "Due dates on action items, richer call sharing, and team-specific AI prompts",
     "changes": [

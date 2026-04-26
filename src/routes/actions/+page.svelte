@@ -15,7 +15,9 @@
   //
   // Check-off wiring: optimistic local flip + `patch_action_item`
   // invoke. Filter-aware per ui-phase-4 §E (same semantics as
-  // portal). On failure: rollback + 3s inline transient note.
+  // portal). On failure: rollback + `toast.error(...)` via the shared
+  // store (#254 — dropped the inline `transientError` slot and the
+  // per-row `actionItemErrors` Record in the same pass).
 
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
@@ -39,6 +41,10 @@
   import ChipMenu from "$lib/ChipMenu.svelte";
   import type { SpeakerPick } from "$lib/SpeakerRenamePicker.svelte";
   import { isPortalError } from "$lib/portalError";
+  // #254 — action-item save / check-off failures route through the
+  // shared toast store. Replaces the inline `transientError` flash
+  // and the per-row `actionItemErrors` Record.
+  import { toast } from "$lib/stores/toast.svelte";
 
   // Roster shape the Tauri invoke returns. Superset of ActionItemUser
   // so we just map over the relevant fields.
@@ -67,8 +73,6 @@
   let loadingMore = $state(false);
   let error = $state<string | null>(null);
   let loadMoreError = $state<string | null>(null);
-  let transientError = $state<string | null>(null);
-  let transientTimer: ReturnType<typeof setTimeout> | null = null;
   let orgMembers = $state<ActionItemUser[]>([]);
   let togglingIds = $state<Set<string>>(new Set());
 
@@ -202,22 +206,6 @@
     await loadFirst();
   }
 
-  function clearTransient() {
-    if (transientTimer) {
-      clearTimeout(transientTimer);
-      transientTimer = null;
-    }
-  }
-
-  function setTransient(msg: string) {
-    clearTransient();
-    transientError = msg;
-    transientTimer = setTimeout(() => {
-      transientError = null;
-      transientTimer = null;
-    }, 3000);
-  }
-
   async function onToggle(ev: {
     itemId: string;
     callId: string;
@@ -267,7 +255,8 @@
       items = prevItems;
       totalOpen = prevTotalOpen;
       totalDone = prevTotalDone;
-      setTransient("Couldn't save. Try again.");
+      toast.error("Couldn't save. Try again.");
+      void e;
     } finally {
       togglingIds = new Set(
         [...togglingIds].filter((id) => id !== ev.itemId),
@@ -320,7 +309,6 @@
   // Mirrors the portal /actions wrapper; invoke replaces fetch.
   let activeRowEdit = $state<ActionsActiveRowEdit>({ kind: "none" });
   let patchingItemIds = $state<Set<string>>(new Set());
-  let actionItemErrors = $state<Record<string, string>>({});
 
   function markPatching(itemId: string, on: boolean) {
     if (on) {
@@ -346,7 +334,6 @@
   async function onDescriptionSave(payload: ActionsDescriptionSave) {
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const updated = (await invoke("patch_action_item", {
         callId: payload.callId,
@@ -372,7 +359,7 @@
         isPortalError(e) && e.kind === "bad_request"
           ? "That teammate isn't in your workspace. Pick someone from your team."
           : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      toast.error(msg);
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -381,7 +368,6 @@
   async function onOwnerSave(payload: ActionsOwnerSave) {
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const updated = (await invoke("patch_action_item", {
         callId: payload.callId,
@@ -405,7 +391,7 @@
         isPortalError(e) && e.kind === "bad_request"
           ? "That teammate isn't in your workspace. Pick someone from your team."
           : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      toast.error(msg);
     } finally {
       markPatching(payload.itemId, false);
     }
@@ -420,7 +406,6 @@
     ) {
       activeRowEdit = { kind: "none" };
     }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
   function onOwnerCancel(payload: {
     item: { id: string; call_id: string };
@@ -431,7 +416,6 @@
     ) {
       activeRowEdit = { kind: "none" };
     }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
 
   // ── #173: due-date edit handlers ────────────────────────────────
@@ -449,12 +433,11 @@
     ) {
       activeRowEdit = { kind: "none" };
     }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+    void payload;
   }
   async function onDueSave(payload: ActionsDueSave) {
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const body =
         payload.kind === "dated"
@@ -483,21 +466,11 @@
         activeRowEdit = { kind: "none" };
       }
     } catch (e: unknown) {
-      const msg = "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      // #254 — already on toast (today's #173 hotfix). No double-up.
+      toast.error("Save failed. Check your connection and try again.");
       void e;
     } finally {
       markPatching(payload.itemId, false);
-    }
-  }
-  function onEditErrorClear(payload: {
-    item: { id: string; call_id: string };
-  }) {
-    if (actionItemErrors[payload.item.id]) {
-      actionItemErrors = {
-        ...actionItemErrors,
-        [payload.item.id]: "",
-      };
     }
   }
 
@@ -638,12 +611,10 @@
   {nextCursor}
   {totals}
   {orgMembers}
-  {transientError}
   {togglingIds}
   canEdit={true}
   {activeRowEdit}
   {patchingItemIds}
-  {actionItemErrors}
   due={dueFilter}
   onfilterchange={onFilterChange}
   onduefilterchange={onDueFilterChange}
@@ -659,7 +630,6 @@
   onDescriptionCancel={onDescriptionCancel}
   onOwnerCancel={onOwnerCancel}
   onDueCancel={onDueCancel}
-  onEditErrorClear={onEditErrorClear}
   onactionitemchipaction={openActionItemChip}
   activeChipItemId={activeChip?.itemId ?? null}
   activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}

@@ -662,6 +662,18 @@ pub async fn patch_call(
     patch_json_typed(backend, &format!("/v1/calls/{id}"), body.clone()).await
 }
 
+/// POST /v1/calls/{id}/text-replace — highlight-to-correct (#11).
+/// Forwards the verbatim JSON body so the TS side stays the
+/// authoritative shape definition. Returns the `{ replaced, regions }`
+/// envelope from the backend or a structured PortalError on failure.
+pub async fn text_replace(
+    backend: &Backend,
+    id: &str,
+    body: &Value,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(backend, &format!("/v1/calls/{id}/text-replace"), body.clone()).await
+}
+
 /// POST /v1/org/client-allowlist — auto-populate the persistent
 /// client-allowlist when a user clicks "Leave as text" on a chip
 /// (#195). Fire-and-forget from the front-end's point of view:

@@ -25,12 +25,24 @@
     type SzmPushResponse,
   } from "$lib/SendToZohoModal.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
+  // #254 — action-item save / delete / toggle failures route through
+  // the shared toast store rather than per-row inline error surfaces.
+  // Mirrors the portal handler. Keeps the editor lifecycle clean (no
+  // draft re-focus on error, no .ai-confirm-err Retry button).
+  import { toast } from "$lib/stores/toast.svelte";
   import {
     isPortalError,
     portalErrorToText,
     type PortalError,
   } from "$lib/portalError";
   import ShareCallModal from "$lib/ShareCallModal.svelte";
+  import HighlightCorrectMenu, {
+    type HighlightAnchor,
+  } from "$lib/HighlightCorrectMenu.svelte";
+  import ReplaceTextModal, {
+    type ReplaceAnchor,
+    type ReplaceScope,
+  } from "$lib/ReplaceTextModal.svelte";
 
   type Utterance = {
     idx: number;
@@ -632,7 +644,6 @@
 
   let editFocus = $state<EditFocus>({ kind: "none" });
   let patchingItemIds = $state<Set<string>>(new Set());
-  let actionItemErrors = $state<Record<string, string>>({});
 
   // Inline summary edit ─────────────────────────────────────────────
   function startSummaryEdit() {
@@ -744,7 +755,6 @@
     if (payload.itemId.startsWith("__pending__")) return;
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const updated = (await invoke("patch_action_item", {
         callId: call.id,
@@ -771,7 +781,7 @@
         isPortalError(e) && e.kind === "bad_request"
           ? "That teammate isn't in your workspace. Pick someone from your team."
           : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      toast.error(msg);
       console.warn("action item description save failed", e);
     } finally {
       markPatching(payload.itemId, false);
@@ -784,13 +794,6 @@
       editFocus.itemId === payload.item.id
     ) {
       editFocus = { kind: "none" };
-    }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
-  }
-
-  function onEditErrorClear(payload: { item: ActionItemRow }) {
-    if (actionItemErrors[payload.item.id]) {
-      actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
     }
   }
 
@@ -818,7 +821,6 @@
     }
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const updated = (await invoke("patch_action_item", {
         callId: call.id,
@@ -843,7 +845,7 @@
         isPortalError(e) && e.kind === "bad_request"
           ? "That teammate isn't in your workspace. Pick someone from your team."
           : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [payload.itemId]: msg };
+      toast.error(msg);
       console.warn("action item owner save failed", e);
     } finally {
       markPatching(payload.itemId, false);
@@ -857,7 +859,6 @@
     ) {
       editFocus = { kind: "none" };
     }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
   }
 
   // ── #173: due-date edit handlers ─────────────────────────────────
@@ -872,7 +873,7 @@
     ) {
       editFocus = { kind: "none" };
     }
-    actionItemErrors = { ...actionItemErrors, [payload.item.id]: "" };
+    void payload;
   }
   async function onDueSave(
     payload:
@@ -884,7 +885,6 @@
     if (payload.itemId.startsWith("__pending__")) return;
     if (patchingItemIds.has(payload.itemId)) return;
     markPatching(payload.itemId, true);
-    actionItemErrors = { ...actionItemErrors, [payload.itemId]: "" };
     try {
       const body =
         payload.kind === "dated"
@@ -910,10 +910,8 @@
         editFocus = { kind: "none" };
       }
     } catch (e) {
-      actionItemErrors = {
-        ...actionItemErrors,
-        [payload.itemId]: "Save failed. Check your connection and try again.",
-      };
+      // #254 — already on toast (today's #173 hotfix). No double-up.
+      toast.error("Save failed. Check your connection and try again.");
       console.warn("action item due save failed", e);
     } finally {
       markPatching(payload.itemId, false);
@@ -972,7 +970,6 @@
     const phantomId = editFocus.itemId;
     if (patchingItemIds.has(phantomId)) return;
     markPatching(phantomId, true);
-    actionItemErrors = { ...actionItemErrors, [phantomId]: "" };
     try {
       const created = (await invoke("add_action_item", {
         callId: call.id,
@@ -994,7 +991,7 @@
         isPortalError(e) && e.kind === "bad_request"
           ? "That teammate isn't in your workspace. Pick someone from your team."
           : "Save failed. Check your connection and try again.";
-      actionItemErrors = { ...actionItemErrors, [phantomId]: msg };
+      toast.error(msg);
       console.warn("action item phantom save failed", e);
     } finally {
       markPatching(phantomId, false);
@@ -1016,31 +1013,27 @@
       action_items: call.action_items.filter((ai) => ai.id !== phantomId),
     };
     editFocus = { kind: "none" };
-    const nextErr = { ...actionItemErrors };
-    delete nextErr[phantomId];
-    actionItemErrors = nextErr;
   }
 
   // ── Phase 3 (#104): row-level delete with inline confirm ─────────
+  // #254 — failures route through the toast store; the per-row
+  // `deleteErrors` Record + the `.ai-confirm-err` Retry button are
+  // gone. The user re-presses Delete to retry.
   let confirmingDeleteId = $state<string | null>(null);
   let deletingId = $state<string | null>(null);
-  let deleteErrors = $state<Record<string, string>>({});
 
   function onActionItemDeleteRequest(payload: { item: ActionItemRow }) {
     confirmingDeleteId = payload.item.id;
-    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
   }
   function onActionItemDeleteCancel(payload: { item: ActionItemRow }) {
     if (deletingId === payload.item.id) return;
     if (confirmingDeleteId === payload.item.id) confirmingDeleteId = null;
-    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
   }
   async function onActionItemDeleteConfirm(payload: {
     item: ActionItemRow;
   }) {
     if (!call || deletingId) return;
     deletingId = payload.item.id;
-    deleteErrors = { ...deleteErrors, [payload.item.id]: "" };
     try {
       // The Rust-side `delete_action_item` converts 404 to Ok(())
       // so "already gone" is indistinguishable from "deleted" here.
@@ -1056,10 +1049,7 @@
       };
       confirmingDeleteId = null;
     } catch (e: any) {
-      deleteErrors = {
-        ...deleteErrors,
-        [payload.item.id]: "Delete failed. Try again.",
-      };
+      toast.error("Delete failed. Try again.");
       console.warn("action item delete failed", e);
     } finally {
       deletingId = null;
@@ -1073,7 +1063,6 @@
   // Optimistic local flip + rollback on failure; no filter-aware
   // removal here (call-detail shows every item for one call).
   let togglingItemIds = $state<Set<string>>(new Set());
-  let togglingError = $state("");
 
   async function onActionItemToggle(payload: {
     item: ActionItemRow;
@@ -1112,10 +1101,10 @@
       };
     } catch (e: any) {
       call = { ...call, action_items: prevItems };
-      togglingError = "Couldn't save. Try again.";
-      setTimeout(() => {
-        togglingError = "";
-      }, 3000);
+      // #254 — was a no-op before (the inline state was never bound
+      // to the template). Toasting via the page-level store gives
+      // the user actual feedback on the failed check-off.
+      toast.error("Couldn't save. Try again.");
       console.warn("action item toggle failed", e);
     } finally {
       togglingItemIds = new Set(
@@ -2895,6 +2884,144 @@
       }).catch((e) => console.debug("allowlist add failed", e));
     }
   }
+
+  // ── Highlight-to-correct (#11) ────────────────────────────────────
+  // Mirror of the portal page's wiring. Listens on the document for
+  // `selectionchange`, surfaces `HighlightCorrectMenu` over selected
+  // text inside `[data-textcorrect-region]`, and on click of
+  // "Replace…" pops `ReplaceTextModal`. Submit invokes the Tauri
+  // `text_replace` command (which forwards to the backend's
+  // /v1/calls/{id}/text-replace) and refetches the call.
+  type CorrectMenuState = {
+    rect: DOMRect;
+    selection: string;
+    anchor: HighlightAnchor;
+  } | null;
+  let correctMenu = $state<CorrectMenuState>(null);
+  type CorrectModalState = {
+    selection: string;
+    anchor: ReplaceAnchor;
+  } | null;
+  let correctModal = $state<CorrectModalState>(null);
+
+  function isInsideTextCorrectRegion(node: Node | null): HTMLElement | null {
+    let n: Node | null = node;
+    while (n) {
+      if (n instanceof HTMLElement && n.dataset.textcorrectRegion) return n;
+      n = n.parentNode;
+    }
+    return null;
+  }
+
+  function computeOccurrenceIndex(
+    haystack: string,
+    needle: string,
+    selectionStart: number,
+  ): number {
+    if (!needle) return 0;
+    let count = 0;
+    let from = 0;
+    while (from < selectionStart) {
+      const at = haystack.indexOf(needle, from);
+      if (at < 0 || at >= selectionStart) break;
+      count++;
+      from = at + needle.length;
+    }
+    return count;
+  }
+
+  function resolveAnchorFromSelection(sel: Selection): HighlightAnchor | null {
+    if (!sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    const container = isInsideTextCorrectRegion(range.startContainer);
+    if (!container) return null;
+    const region = container.dataset.textcorrectRegion as
+      | "transcript"
+      | "summary"
+      | undefined;
+    if (region !== "transcript" && region !== "summary") return null;
+    const text = sel.toString();
+    if (!text) return null;
+    const rowText = container.textContent ?? "";
+    const startOffset = rowText.indexOf(text);
+    const occurrenceIndex =
+      startOffset >= 0 ? computeOccurrenceIndex(rowText, text, startOffset) : 0;
+    if (region === "transcript") {
+      const idxAttr = container.dataset.textcorrectId;
+      if (idxAttr === undefined) return null;
+      const utteranceIdx = Number.parseInt(idxAttr, 10);
+      if (Number.isNaN(utteranceIdx)) return null;
+      return { region: "transcript", utterance_idx: utteranceIdx, occurrence_index: occurrenceIndex };
+    }
+    return { region: "summary", occurrence_index: occurrenceIndex };
+  }
+
+  function onSelectionChange() {
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) {
+      correctMenu = null;
+      return;
+    }
+    const text = sel.toString().trim();
+    if (!text) {
+      correctMenu = null;
+      return;
+    }
+    const anchor = resolveAnchorFromSelection(sel);
+    if (!anchor) {
+      correctMenu = null;
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    correctMenu = { rect, selection: text, anchor };
+  }
+
+  function openReplaceModal(args: {
+    selection: string;
+    anchor: HighlightAnchor;
+  }) {
+    correctModal = { selection: args.selection, anchor: args.anchor };
+    correctMenu = null;
+    document.getSelection()?.removeAllRanges();
+  }
+
+  function closeReplaceModal() {
+    correctModal = null;
+  }
+
+  async function submitReplace(args: {
+    find: string;
+    replace: string;
+    scope: ReplaceScope;
+    anchor: ReplaceAnchor;
+  }) {
+    if (!call) throw new Error("Call not loaded");
+    const result = await invoke<{
+      replaced: number;
+      regions: { transcript: number; summary: number; action_items: number };
+    }>("text_replace", { id: call.id, body: args });
+    try {
+      const fresh = await invoke<Call>("get_call", { id: call.id });
+      call = fresh;
+    } catch (e) {
+      console.warn("post-replace refetch failed", e);
+    }
+    const n = result.replaced;
+    if (n === 0) {
+      toast.info("No matches replaced.");
+    } else {
+      toast.success(`Replaced ${n} time${n === 1 ? "" : "s"}.`);
+    }
+    return result;
+  }
+
+  onMount(() => {
+    document.addEventListener("selectionchange", onSelectionChange);
+  });
+  onDestroy(() => {
+    document.removeEventListener("selectionchange", onSelectionChange);
+  });
 </script>
 
 <!-- reveal class stripped on this route while we isolate the blank-on-click
@@ -3524,7 +3651,11 @@
             </div>
           </div>
         {:else if call.summary_text}
-          <p class="summary">
+          <!-- #11 — `data-textcorrect-region="summary"` opts the
+               paragraph in to the highlight-to-correct selection
+               listener. The listener reads the region from the
+               closest opt-in ancestor to build the anchor. -->
+          <p class="summary" data-textcorrect-region="summary">
             <SummaryText
               text={call.summary_text}
               users={memberRoster}
@@ -3645,10 +3776,8 @@
                   editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
-                editError={actionItemErrors[item.id] ?? ""}
                 confirmingDelete={confirmingDeleteId === item.id}
                 deleting={deletingId === item.id}
-                deleteError={deleteErrors[item.id] ?? ""}
                 onDescriptionEditRequest={onDescriptionEditRequest}
                 onOwnerEditRequest={onOwnerEditRequest}
                 onDueEditRequest={onDueEditRequest}
@@ -3660,7 +3789,6 @@
                 onDueCancel={onDueCancel}
                 onPendingSave={onPendingSave}
                 onPendingDiscard={onPendingDiscard}
-                onEditErrorClear={onEditErrorClear}
                 ondeleterequest={onActionItemDeleteRequest}
                 ondeleteconfirm={onActionItemDeleteConfirm}
                 ondeletecancel={onActionItemDeleteCancel}
@@ -3747,10 +3875,8 @@
                   editFocus.itemId === item.id}
                 pending={item.id.startsWith("__pending__")}
                 saving={patchingItemIds.has(item.id)}
-                editError={actionItemErrors[item.id] ?? ""}
                 confirmingDelete={confirmingDeleteId === item.id}
                 deleting={deletingId === item.id}
-                deleteError={deleteErrors[item.id] ?? ""}
                 onDescriptionEditRequest={onDescriptionEditRequest}
                 onOwnerEditRequest={onOwnerEditRequest}
                 onDueEditRequest={onDueEditRequest}
@@ -3762,7 +3888,6 @@
                 onDueCancel={onDueCancel}
                 onPendingSave={onPendingSave}
                 onPendingDiscard={onPendingDiscard}
-                onEditErrorClear={onEditErrorClear}
                 ondeleterequest={onActionItemDeleteRequest}
                 ondeleteconfirm={onActionItemDeleteConfirm}
                 ondeletecancel={onActionItemDeleteCancel}
@@ -4046,7 +4171,15 @@
                 <Avatar name={u.speaker} color={speakerColor(u.speaker)} size={20} />
                 <span class="utt-speaker-name">{u.speaker}</span>
               </button>
-              <span class="utt-text">{u.text}</span>
+              <!-- #11 — opt-in container for highlight-to-correct.
+                   `data-textcorrect-id` carries the utterance idx the
+                   backend addresses on the `this_occurrence_only`
+                   anchor path. -->
+              <span
+                class="utt-text"
+                data-textcorrect-region="transcript"
+                data-textcorrect-id={u.idx}
+              >{u.text}</span>
             </div>
           {/if}
         {/each}
@@ -4148,6 +4281,28 @@
     callTitle={call.title}
     api={shareApi}
     onClose={closeShareModal}
+  />
+{/if}
+
+<!-- #11 — Highlight-to-correct floating menu + modal. Agent mirror
+     of the portal page wiring; mounts at the end so they overlay
+     everything else. The submit handler uses the Tauri `text_replace`
+     invoke instead of fetch, but the component contract is identical. -->
+{#if correctMenu && canEditSummary}
+  <HighlightCorrectMenu
+    rect={correctMenu.rect}
+    selection={correctMenu.selection}
+    anchor={correctMenu.anchor}
+    onreplace={openReplaceModal}
+    onclose={() => (correctMenu = null)}
+  />
+{/if}
+{#if correctModal && call}
+  <ReplaceTextModal
+    selection={correctModal.selection}
+    anchor={correctModal.anchor}
+    onsubmit={submitReplace}
+    onclose={closeReplaceModal}
   />
 {/if}
 
@@ -4264,6 +4419,12 @@
     transform: translateX(-2px);
   }
 
+  /* #263: title + chip-row + actions live on one row. The title
+     column owns all remaining space (`flex: 1 1 0` + `min-width: 0`)
+     so the chip-row wraps WITHIN the title column instead of pushing
+     the action cluster off-axis or onto a new line. The action
+     cluster never shrinks (`flex-shrink: 0`) and stays right-aligned
+     on the same baseline as the title row. */
   .head-row {
     display: flex;
     align-items: flex-start;
@@ -4272,6 +4433,7 @@
   }
 
   .head-main {
+    flex: 1 1 0;
     min-width: 0;
   }
 
@@ -4323,6 +4485,8 @@
     flex-wrap: wrap;
     gap: 0.4rem;
     align-items: flex-start;
+    flex-shrink: 0;
+    justify-content: flex-end;
   }
   .head-action {
     padding: 0.4rem 0.85rem;
@@ -5610,11 +5774,21 @@
     font-weight: 500;
     letter-spacing: 0.005em;
     line-height: 1.3;
+    /* #263: cap chip width so a single very long tag value can't
+       blow out the title column. The link inside ellipsis-truncates
+       and keeps the full value reachable via the title attribute. */
+    max-width: 100%;
+    min-width: 0;
   }
   .tag-chip-link {
     color: inherit;
     text-decoration: none;
     padding: 0.1rem 0.1rem 0.1rem 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 22ch;
   }
   .tag-chip-link:hover { text-decoration: underline; }
   .tag-chip-x {
