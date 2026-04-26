@@ -280,19 +280,26 @@ jobs:
           STAGE=/tmp/macos-stage
           mkdir -p "$STAGE"
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
-          # Copy any .dmg + matching .sig the bundler emitted.
+          # First-install installer: .dmg. Apple-unsigned during closed
+          # beta — users see Gatekeeper warning + xattr -cr workaround
+          # until #68 lands.
           if [ -d "$BUNDLE_DIR/dmg" ]; then
             cp "$BUNDLE_DIR/dmg/"*.dmg "$STAGE/" 2>/dev/null || true
-            cp "$BUNDLE_DIR/dmg/"*.dmg.sig "$STAGE/" 2>/dev/null || true
           fi
-          # Also tar up the .app for QA workflows that want the raw
-          # bundle (e.g. `xattr -cr` + drag-to-Applications).
+          # Updater bundle: Tauri auto-produces a minisign-signed
+          # *.app.tar.gz + .sig in bundle/macos/ when
+          # createUpdaterArtifacts=true (set in tauri.conf.json). Copy
+          # both, renaming with the target triple so the GH release
+          # listing identifies the arch.
           if [ -d "$BUNDLE_DIR/macos" ]; then
             cd "$BUNDLE_DIR/macos"
-            for app in *.app; do
-              [ -d "$app" ] || continue
-              TAR_NAME="${app%.app}-${{ matrix.target }}.app.tar.gz"
-              tar czf "$STAGE/$TAR_NAME" "$app"
+            for app_tgz in *.app.tar.gz; do
+              [ -f "$app_tgz" ] || continue
+              TAR_NAME="${app_tgz%.app.tar.gz}-${{ matrix.target }}.app.tar.gz"
+              cp "$app_tgz" "$STAGE/$TAR_NAME"
+              if [ -f "${app_tgz}.sig" ]; then
+                cp "${app_tgz}.sig" "$STAGE/${TAR_NAME}.sig"
+              fi
             done
             cd -
           fi
@@ -321,7 +328,7 @@ jobs:
           set -eux
           shopt -s nullglob
           cd /tmp/macos-stage
-          files=( *.dmg *.dmg.sig *.tar.gz )
+          files=( *.dmg *.tar.gz *.tar.gz.sig )
           if [ ${#files[@]} -eq 0 ]; then
             echo "no macOS bundles to attach"
             exit 0
@@ -557,14 +564,15 @@ jobs:
           # Linux updater check would fail signature verification.
           LINUX_SIG=$(cat "/tmp/release/${SLIM_APPIMAGE}.sig")
 
-          # macOS Apple Silicon — optional. Present only when the mac
-          # job emitted a signed .dmg (it always does today, but keep
-          # the conditional so a runner outage doesn't FATAL the whole
-          # publish). Same .sig contract as Linux: already base64.
-          DARWIN_AARCH64_DMG="aftercalls_${VERSION}_aarch64.dmg"
-          if [ -f "/tmp/release/${DARWIN_AARCH64_DMG}.sig" ]; then
-            DARWIN_AARCH64_SIG=$(cat "/tmp/release/${DARWIN_AARCH64_DMG}.sig")
-            DARWIN_AARCH64_URL="$BASE/$DARWIN_AARCH64_DMG"
+          # macOS Apple Silicon updater bundle — Tauri's
+          # *.app.tar.gz + .sig from bundle/macos/. The .dmg is the
+          # first-install path (surfaced via /v1/downloads); the
+          # updater channel only cares about the .app.tar.gz. Optional
+          # so a runner outage doesn't FATAL the whole publish.
+          DARWIN_AARCH64_TGZ="aftercalls-aarch64-apple-darwin.app.tar.gz"
+          if [ -f "/tmp/release/${DARWIN_AARCH64_TGZ}.sig" ]; then
+            DARWIN_AARCH64_SIG=$(cat "/tmp/release/${DARWIN_AARCH64_TGZ}.sig")
+            DARWIN_AARCH64_URL="$BASE/$DARWIN_AARCH64_TGZ"
           else
             DARWIN_AARCH64_SIG=""
             DARWIN_AARCH64_URL=""
