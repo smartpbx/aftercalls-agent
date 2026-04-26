@@ -10,12 +10,28 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
 use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags};
 use crate::error::{from_status, parse_retry_after, PortalError};
+
+/// #179 — explicit User-Agent so backend logs can attribute requests to
+/// a specific agent build + OS without relying on reqwest's default
+/// (`reqwest/0.x.y`). Format: `aftercalls/<version> (<os>)`. Backend's
+/// `parse_agent_version_from_headers` looks for the `aftercalls/` token
+/// and falls back to `"unknown"` for legacy clients. Computed once per
+/// process — `CARGO_PKG_VERSION` and `std::env::consts::OS` are both
+/// compile-time / process-constant.
+fn user_agent() -> String {
+    format!(
+        "aftercalls/{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
+}
 
 #[derive(Deserialize)]
 struct AuthResponsePayload {
@@ -631,6 +647,7 @@ pub async fn resummarize_call(backend: &Backend, id: &str) -> std::result::Resul
     let auth = build_auth_header(backend).await?;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
+        .user_agent(user_agent())
         .build()?;
     let url = format!(
         "{}/v1/calls/{id}/resummarize",
@@ -952,24 +969,38 @@ fn urlencoding_minimal(s: &str) -> String {
 // ── Pipeline (new; the transcription + summary work used to run on the
 //    agent against the user's own keys). ─────────────────────────────
 
-pub async fn transcribe(backend: &Backend, call_id: &str) -> Result<Value> {
+/// #179 — returns `(transcript JSON, x-aftercalls-api-version)` so
+/// `pipeline::decode_error` telemetry can stamp the server build
+/// alongside the malformed response shape. The header is `Option<String>`
+/// because (a) older backends don't set it, (b) a 204-style empty
+/// response carries no body but may still carry the header.
+pub async fn transcribe(
+    backend: &Backend,
+    call_id: &str,
+) -> Result<(Value, Option<String>)> {
     // AssemblyAI job + poll can take a couple minutes on a real call.
-    post_with_timeout(
+    let (value, headers) = post_with_timeout(
         backend,
         &format!("/v1/calls/{call_id}/transcribe"),
         serde_json::Value::Null,
         Duration::from_secs(600),
     )
-    .await
+    .await?;
+    Ok((value, extract_api_version(&headers)))
 }
 
+/// #179 — twin of `transcribe`; second tuple element is the backend's
+/// `x-aftercalls-api-version` header for `pipeline::decode_error`
+/// attribution. `Summary` is the prime decode-mismatch suspect (struct
+/// has grown across releases) so the version stamp is most diagnostic
+/// here.
 pub async fn summarize(
     backend: &Backend,
     call_id: &str,
     transcript: &Value,
     candidate_clients: &[String],
-) -> Result<Value> {
-    post_with_timeout(
+) -> Result<(Value, Option<String>)> {
+    let (value, headers) = post_with_timeout(
         backend,
         &format!("/v1/calls/{call_id}/summarize"),
         serde_json::json!({
@@ -978,17 +1009,31 @@ pub async fn summarize(
         }),
         Duration::from_secs(240),
     )
-    .await
+    .await?;
+    Ok((value, extract_api_version(&headers)))
 }
 
 pub async fn generate_peaks(backend: &Backend, call_id: &str) -> Result<Value> {
-    post_with_timeout(
+    // Headers aren't surfaced — peaks generation isn't a decode-shape
+    // contract the agent inspects. Drop the second tuple element.
+    let (value, _headers) = post_with_timeout(
         backend,
         &format!("/v1/calls/{call_id}/peaks"),
         serde_json::Value::Null,
         Duration::from_secs(180),
     )
-    .await
+    .await?;
+    Ok(value)
+}
+
+/// #179 — pull `x-aftercalls-api-version` off a response. Returns None
+/// when the header is missing (older backend) or non-UTF8 (shouldn't
+/// happen — `SetResponseHeaderLayer` stamps a static ASCII semver).
+fn extract_api_version(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-aftercalls-api-version")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 // ── PIPEDA recording-ack + notice prefs (#44, #45, #48) ──────────────
@@ -1060,6 +1105,7 @@ pub async fn list_org_members(backend: &Backend) -> std::result::Result<Value, P
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .user_agent(user_agent())
         .build()?)
 }
 
@@ -1084,14 +1130,22 @@ async fn get_json(backend: &Backend, path: &str) -> Result<Value> {
 // thread their failures through pipeline.rs's `anyhow` flow rather
 // than the Tauri-IPC path. Tauri commands now use `*_typed` siblings
 // that surface a structured `PortalError` to the frontend.
+//
+// #179 — returns `(Value, HeaderMap)` so callers that care about
+// response headers (transcribe + summarize stamp the
+// `x-aftercalls-api-version` header onto `pipeline::decode_error`
+// telemetry) can read them. Callers that don't care just discard `.1`.
 async fn post_with_timeout(
     backend: &Backend,
     path: &str,
     body: Value,
     timeout: Duration,
-) -> Result<Value> {
+) -> Result<(Value, HeaderMap)> {
     let auth = build_auth_header(backend).await?;
-    let c = reqwest::Client::builder().timeout(timeout).build()?;
+    let c = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(user_agent())
+        .build()?;
     let url = format!("{}{path}", backend.url.trim_end_matches('/'));
     let resp = c
         .post(&url)
@@ -1105,12 +1159,16 @@ async fn post_with_timeout(
         let t = resp.text().await.unwrap_or_default();
         anyhow::bail!("backend {s}: {t}");
     }
+    // Snapshot headers BEFORE consuming the body — `resp.text()` takes
+    // `self`, after which the response (and its headers) are gone.
+    let headers = resp.headers().clone();
     // Tolerate empty responses — a few endpoints return 204.
     let text = resp.text().await.unwrap_or_default();
     if text.is_empty() {
-        return Ok(Value::Null);
+        return Ok((Value::Null, headers));
     }
-    serde_json::from_str(&text).context("decode")
+    let value: Value = serde_json::from_str(&text).context("decode")?;
+    Ok((value, headers))
 }
 
 
@@ -1156,7 +1214,10 @@ async fn post_with_timeout_typed(
     timeout: Duration,
 ) -> std::result::Result<Value, PortalError> {
     let auth = build_auth_header(backend).await?;
-    let c = reqwest::Client::builder().timeout(timeout).build()?;
+    let c = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(user_agent())
+        .build()?;
     let url = format!("{}{path}", backend.url.trim_end_matches('/'));
     let resp = c
         .post(&url)

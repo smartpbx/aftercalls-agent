@@ -182,7 +182,123 @@
     return false;
   }
 
-  async function pollForUpdate(opts?: { userInitiated?: boolean }) {
+  // #177 — how many MINOR versions `local` is behind `manifest`. We
+  // diff on (major*1000 + minor) so a major bump (e.g. 0.x → 1.0)
+  // counts as a single step on the minor axis (1000), not as zero.
+  // Patch differences don't move the result. Returns 0 when local is
+  // ahead of or equal to manifest on the minor axis (caller still
+  // checks `semverGt(manifest, local)` to be sure).
+  function minorVersionsBehind(local: string, manifest: string): number {
+    const pl = local.split(".").map((x) => parseInt(x, 10) || 0);
+    const pm = manifest.split(".").map((x) => parseInt(x, 10) || 0);
+    const lk = (pl[0] ?? 0) * 1000 + (pl[1] ?? 0);
+    const mk = (pm[0] ?? 0) * 1000 + (pm[1] ?? 0);
+    return Math.max(0, mk - lk);
+  }
+
+  // #179 — emit `updater::manifest_fetch` only ONCE per session on the
+  // happy path, plus EVERY error. The manifest URL is hit on every
+  // hourly poll + every refreshStaleNudge tick; logging each one would
+  // bloat agent_logs without diagnostic value (the relevant signal is
+  // "we successfully reached the manifest at all" + "every failure").
+  let manifestFetchEmittedThisSession = false;
+
+  // #179 — fire-and-forget telemetry helper. Mirrors the inline
+  // sendToTelemetry helper in onMount so the updater + nudge code paths
+  // can emit structured events without the layout-error capture
+  // closure. Telemetry-gated server-side; no-op when the user has
+  // telemetry off.
+  function logEvent(
+    level: "info" | "warn" | "error",
+    module: string,
+    message: string,
+    meta?: Record<string, unknown>,
+  ) {
+    invoke("log_event", {
+      input: { level, module, message, meta },
+    }).catch(() => {});
+  }
+
+  // #177 — independent manifest fetch used by both the Linux fallback
+  // (inside pollForUpdate below) and the stale-version nudge poll.
+  // The nudge MUST surface even when `@tauri-apps/plugin-updater`'s
+  // `check()` is silently broken — that's the entire failure mode #177
+  // exists for — so this helper deliberately does not go through any
+  // Tauri plugin code path. Returns the manifest's `version` string
+  // on success, or null on any failure (network, non-2xx, malformed
+  // JSON). Callers must NOT clear cached state on null — the previous
+  // poll's verdict stands until a fresh successful fetch refutes it.
+  //
+  // #179 — emits `updater::manifest_fetch` first-of-session AND on
+  // every error. The flag flips on the first SUCCESS so subsequent
+  // happy-path polls stay quiet; failures always emit so a transient
+  // outage is observable.
+  async function pollManifestVersion(): Promise<string | null> {
+    try {
+      const resp = await fetch(UPDATE_MANIFEST_URL, { cache: "no-store" });
+      if (!resp.ok) {
+        logEvent("info", "updater::manifest_fetch", "manifest fetch non-2xx", {
+          status: resp.status,
+          last_modified: resp.headers.get("last-modified") ?? undefined,
+        });
+        return null;
+      }
+      const doc = (await resp.json()) as { version?: string };
+      const v = doc.version ?? null;
+      if (!manifestFetchEmittedThisSession) {
+        manifestFetchEmittedThisSession = true;
+        logEvent("info", "updater::manifest_fetch", "manifest fetch ok", {
+          status: resp.status,
+          last_modified: resp.headers.get("last-modified") ?? undefined,
+          manifest_version: v ?? undefined,
+        });
+      }
+      return v;
+    } catch (e) {
+      console.warn("manifest fetch failed", e);
+      logEvent("info", "updater::manifest_fetch", "manifest fetch threw", {
+        status: "network_error",
+        error: String((e as any)?.message ?? e),
+      });
+      return null;
+    }
+  }
+
+  // #177 — refresh the stale-version nudge state from the manifest.
+  // Independent of pollForUpdate: even when checkForUpdate() throws
+  // or returns null silently, this still fires and surfaces the
+  // ≥2-minor-behind nudge. On any failure we leave staleNudge as it
+  // was (do NOT false-clear) so a transient network blip doesn't
+  // hide the nudge for users who genuinely need it.
+  async function refreshStaleNudge() {
+    const manifestVersion = await pollManifestVersion();
+    if (!manifestVersion || !version) return;
+    if (
+      semverGt(manifestVersion, version) &&
+      minorVersionsBehind(version, manifestVersion) >= 2
+    ) {
+      if (
+        !staleNudge ||
+        semverGt(manifestVersion, staleNudge.manifestVersion)
+      ) {
+        staleNudge = { manifestVersion };
+      }
+    } else {
+      staleNudge = null;
+    }
+  }
+
+  // #179 — `trigger` discriminates which call site initiated the poll
+  // ("mount" / "interval" / "user" / "post-pipeline"). Threaded into
+  // the `updater::check_start` + `updater::check_result` telemetry
+  // events so log queries can ask "did the hourly tick fire on Nick's
+  // machine?" without correlating timestamps. `userInitiated` keeps
+  // its existing semantics (bypass the busy-gate) so the manual
+  // "Check for updates" menu item still surfaces the answer mid-call.
+  async function pollForUpdate(opts: {
+    trigger: "mount" | "interval" | "user" | "post-pipeline";
+    userInitiated?: boolean;
+  }) {
     // Don't clobber an in-flight install — the Update object is the
     // one being downloaded right now and swapping it out would break
     // the progress callback. We DO still re-check in the
@@ -196,18 +312,30 @@
     // pill was already on screen from an earlier poll, it stays.
     // Manual "Check for updates" from the user menu bypasses via
     // userInitiated — the user asked, surface the answer.
-    if (!opts?.userInitiated) {
+    let deferredForBusy = false;
+    if (!opts.userInitiated) {
       try {
         const busy = await invoke<boolean>("is_processing");
         if (busy) {
           updateCheckDeferred = true;
-          return;
+          deferredForBusy = true;
         }
       } catch (e) {
         // If the probe fails for any reason, fall through to the
         // normal poll rather than suppressing updates silently.
         console.warn("is_processing probe failed", e);
       }
+    }
+    // #179 — emit `updater::check_start` BEFORE the early-return so a
+    // deferred-for-busy poll is observable (today the busy-gate
+    // silently drops, which made debugging the original Nick incident
+    // harder than it should have been).
+    logEvent("info", "updater::check_start", "checkForUpdate begin", {
+      trigger: opts.trigger,
+      deferred_for_busy: deferredForBusy,
+    });
+    if (deferredForBusy) {
+      return;
     }
     // Primary path: Tauri's updater plugin. Works for Windows, macOS,
     // and AppImage Linux. Returns null for non-AppImage Linux installs.
@@ -221,35 +349,51 @@
         if (!updateAvailable || semverGt(u.version, updateAvailable.version)) {
           updateAvailable = u;
         }
+        // #179 — `update` outcome. The version stamp is the manifest's
+        // verdict; `manifest_version` makes the diff between local +
+        // remote inspectable from the row alone.
+        logEvent("info", "updater::check_result", "checkForUpdate -> update", {
+          outcome: "update",
+          manifest_version: u.version,
+        });
         return;
       }
       // `check()` returned null: there is no update. If we had a
       // cached Update from a previous poll (edge case: manifest
       // rolled back), clear it so the pill doesn't lie.
       updateAvailable = null;
+      // #179 — the `null` outcome is the one the original Nick
+      // incident was blind to. Stamping the manifest's view (via
+      // pollManifestVersion) lets staff distinguish "running latest"
+      // from "updater plugin silently broken".
+      const manifestVersion = await pollManifestVersion();
+      logEvent("info", "updater::check_result", "checkForUpdate -> null", {
+        outcome: "null",
+        manifest_version: manifestVersion ?? undefined,
+      });
     } catch (e) {
       // Network blip or non-AppImage Linux — retry next tick, fall
       // through to the Linux manifest-fetch fallback below.
       console.warn("update check failed", e);
+      logEvent("info", "updater::check_result", "checkForUpdate threw", {
+        outcome: "error",
+        error: String((e as any)?.message ?? e),
+      });
     }
     // Linux-only fallback for .deb/.rpm/tarball users (updater returned
     // null or threw because the running binary isn't an AppImage).
+    // #177 — fetch is now delegated to `pollManifestVersion()` so the
+    // stale-nudge poll and this fallback share the same code path.
     if (isLinux) {
-      try {
-        const resp = await fetch(UPDATE_MANIFEST_URL, { cache: "no-store" });
-        if (!resp.ok) return;
-        const doc = (await resp.json()) as { version?: string };
-        if (!doc.version || !version) return;
-        if (semverGt(doc.version, version)) {
-          // Same refresh logic: only replace when newer.
-          if (!linuxUpdateAvailable || semverGt(doc.version, linuxUpdateAvailable)) {
-            linuxUpdateAvailable = doc.version;
-          }
-        } else {
-          linuxUpdateAvailable = null;
+      const manifestVersion = await pollManifestVersion();
+      if (!manifestVersion || !version) return;
+      if (semverGt(manifestVersion, version)) {
+        // Same refresh logic: only replace when newer.
+        if (!linuxUpdateAvailable || semverGt(manifestVersion, linuxUpdateAvailable)) {
+          linuxUpdateAvailable = manifestVersion;
         }
-      } catch (e) {
-        console.warn("linux manifest fetch failed", e);
+      } else {
+        linuxUpdateAvailable = null;
       }
     }
   }
@@ -297,6 +441,15 @@
   // and the topstrip renders a "v0.x.y out — get it" pill that opens
   // /downloads in the user's browser.
   let linuxUpdateAvailable = $state<string | null>(null);
+  // #177 — stale-version nudge. Fires when the running binary is ≥ 2
+  // minor versions behind the manifest's `latest.json`. Independent of
+  // `updateAvailable` (the Tauri-updater pill) so it surfaces even
+  // when `check()` is silently broken — the failure mode that landed
+  // two real customers months behind. Non-dismissible by design;
+  // takes precedence over `updateAvailable` in the topstrip render
+  // (a stale install means the regular updater path is unreliable,
+  // so we want the manual download nudge to win).
+  let staleNudge = $state<{ manifestVersion: string } | null>(null);
 
   // Post-update welcome. On each auth session we compare the running
   // binary's version against the last one we showed release notes for
@@ -455,7 +608,15 @@
         // cleared so this is a no-op.
         if (!recording && updateCheckDeferred) {
           updateCheckDeferred = false;
-          pollForUpdate();
+          // #177 — fire both checks in parallel; same URL, browser
+          // HTTP cache deduplicates within the process.
+          // #179 — trigger="post-pipeline" because the recording-stop
+          // path is conceptually the same "work just finished, re-poll"
+          // signal as the pipeline-done path below.
+          void Promise.all([
+            pollForUpdate({ trigger: "post-pipeline" }),
+            refreshStaleNudge(),
+          ]);
         }
       },
     );
@@ -468,7 +629,12 @@
         // to 60min for the next hourly tick.
         if (updateCheckDeferred) {
           updateCheckDeferred = false;
-          pollForUpdate();
+          // #177 — fire both checks in parallel; the nudge is
+          // independent of pollForUpdate's plugin path.
+          void Promise.all([
+            pollForUpdate({ trigger: "post-pipeline" }),
+            refreshStaleNudge(),
+          ]);
         }
         setTimeout(() => {
           if (pipelineStage === "done" || pipelineStage === "failed")
@@ -552,10 +718,20 @@
     // Users who leave the tray running for days were only getting
     // updates on next cold launch — now they'll see the "vX.Y.Z
     // available" pill within ~1h of a release landing.
-    await pollForUpdate();
+    // #177 — refreshStaleNudge() runs alongside on every trigger so
+    // the nudge surfaces even when checkForUpdate() is broken.
+    // #179 — trigger="mount" on first poll, "interval" on subsequent
+    // hourly ticks; both flow into `updater::check_start` meta.
+    await Promise.all([
+      pollForUpdate({ trigger: "mount" }),
+      refreshStaleNudge(),
+    ]);
     const updateTimer = window.setInterval(
       () => {
-        pollForUpdate();
+        void Promise.all([
+          pollForUpdate({ trigger: "interval" }),
+          refreshStaleNudge(),
+        ]);
       },
       60 * 60 * 1000,
     );
@@ -762,8 +938,19 @@
       // install something than nothing.
       console.warn("pre-install recheck failed, using cached target", e);
     }
+    // #179 — `install_start` fires once per install attempt, BEFORE
+    // downloadAndInstall. The progress + done + error events follow.
+    logEvent("info", "updater::install_start", "downloadAndInstall begin", {
+      target_version: target.version,
+    });
     updateState = "downloading";
     updateError = "";
+    // #179 — throttle `install_progress` to ≥10% delta OR ≥2s
+    // interval, whichever comes first. A slow Windows download could
+    // otherwise emit dozens of events per second and burn the 200-row
+    // batch budget.
+    let lastEmittedPercent = -1;
+    let lastEmittedAt = 0;
     try {
       await target.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
@@ -771,16 +958,65 @@
           updateDownloaded = 0;
         } else if (ev.event === "Progress") {
           updateDownloaded += ev.data.chunkLength;
+          if (updateTotal > 0) {
+            const percent = Math.min(
+              100,
+              Math.round((updateDownloaded / updateTotal) * 100),
+            );
+            const now = Date.now();
+            if (
+              percent - lastEmittedPercent >= 10 ||
+              now - lastEmittedAt >= 2000
+            ) {
+              lastEmittedPercent = percent;
+              lastEmittedAt = now;
+              logEvent(
+                "info",
+                "updater::install_progress",
+                "downloadAndInstall progress",
+                {
+                  percent,
+                  downloaded_bytes: updateDownloaded,
+                  total_bytes: updateTotal,
+                },
+              );
+            }
+          }
         } else if (ev.event === "Finished") {
           updateState = "ready";
         }
       });
       // downloadAndInstall returns once the new version is applied. Tell the
       // user explicitly before we relaunch so the app doesn't just vanish.
+      // #179 — `install_done` fires AFTER downloadAndInstall returns
+      // and BEFORE relaunch, so the event lands in the buffer + has a
+      // shot at being flushed before the process exits. (relaunch is
+      // best-effort flushed via the post-relaunch process; this event
+      // is the one we'll see if relaunch itself races the flush.)
+      logEvent("info", "updater::install_done", "downloadAndInstall ok", {
+        target_version: target.version,
+        total_bytes: updateTotal,
+      });
       await relaunch();
     } catch (e) {
+      // #179 — capture the phase from `updateState` BEFORE we overwrite
+      // it with "error" (otherwise every install_error would map to
+      // "apply"). "downloading" → download (the in-flight path),
+      // "ready" → relaunch (post-Finished, before relaunch resolves),
+      // anything else → apply.
+      const phase: "download" | "verify" | "apply" | "relaunch" =
+        updateState === "downloading"
+          ? "download"
+          : updateState === "ready"
+            ? "relaunch"
+            : "apply";
       updateError = portalErrorToText(e);
       updateState = "error";
+      logEvent("error", "updater::install_error", "downloadAndInstall threw", {
+        phase,
+        target_version: target.version,
+        error: String((e as any)?.message ?? e),
+      });
     }
   }
 
@@ -1064,7 +1300,14 @@
     closeUserMenu();
     // #79: explicit user action bypasses the processing gate. If
     // they asked, surface the answer even mid-call.
-    await pollForUpdate({ userInitiated: true });
+    // #177 — refresh the stale-version nudge alongside; same URL,
+    // same trigger semantics.
+    // #179 — trigger="user" so the menu-driven poll is distinguishable
+    // from the hourly interval in agent_logs queries.
+    await Promise.all([
+      pollForUpdate({ trigger: "user", userInitiated: true }),
+      refreshStaleNudge(),
+    ]);
   }
   async function signOut() {
     closeUserMenu();
@@ -1342,7 +1585,30 @@
             >{orphanReview ? "Hide" : "Review…"}</button>
           </div>
         {/if}
-        {#if updateAvailable}
+        {#if staleNudge}
+          <!-- #177 — stale-version nudge. Fires when the running
+               binary is ≥ 2 minor versions behind the manifest. Owns
+               its own manifest fetch, so it surfaces even when the
+               Tauri updater plugin's check() is silently broken (the
+               failure mode that put two real customers months
+               behind). Non-dismissible by design — pure information,
+               renders during recording, takes precedence over the
+               regular install pill below. -->
+          <div class="update nudge" data-tauri-drag-region>
+            <span class="pip nudge-pip" data-tauri-drag-region></span>
+            <span
+              class="update-label"
+              data-tauri-drag-region
+              title={`Update available — v${staleNudge.manifestVersion}. You're running v${version}.`}
+            >
+              Update available — v{staleNudge.manifestVersion}.
+              You're running v{version}.
+            </span>
+            <button class="update-install" onclick={openDownloadsPage}>
+              Get it ↗
+            </button>
+          </div>
+        {:else if updateAvailable}
           <div class="update" data-tauri-drag-region>
             {#if updateState === "downloading"}
               <span class="pip working" data-tauri-drag-region></span>
@@ -2133,6 +2399,22 @@
   .update-dismiss:hover {
     color: var(--bone-0);
     border-color: var(--hairline-hi);
+  }
+
+  /* ── Stale-version nudge (#177) ───────────────────────────────────
+     Reuses the .update pill shape (border, padding, font, gap) so
+     visual mass matches the existing chrome. Distinct from the
+     install pill via a warm `--sig` border + a slightly emphasized
+     pip — reads as "you really should act on this" without shouting
+     in red. Non-dismissible (no .update-dismiss button rendered),
+     so the rule set is intentionally minimal. */
+  .update.nudge {
+    border-color: var(--sig);
+    background: color-mix(in srgb, var(--sig) 8%, var(--ink-1));
+  }
+  .pip.nudge-pip {
+    background: var(--sig);
+    box-shadow: 0 0 6px rgba(201, 162, 74, 0.7);
   }
 
   /* ── Orphan recovery (#63) ─────────────────────────────────────────

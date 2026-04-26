@@ -164,6 +164,11 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         .backend
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no backend configured in config.toml"))?;
+    // Held for telemetry session_id stamping on the new
+    // `pipeline::decode_error` event (#179). Same string `run` derives
+    // for `pipeline::start` / `pipeline::done` / `pipeline::failed` so
+    // the four events tie back to one session_dir in agent_logs.
+    let session_str = session_dir.to_string_lossy().into_owned();
 
     // Steps 1–2: mix + compress. Both are best-effort; the pipeline can
     // still upload + transcribe with whichever tracks landed.
@@ -187,9 +192,28 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
 
     // Step 5: backend transcribe (AssemblyAI with the org's key).
     emit(app, PipelineEvent::Transcribing);
-    let transcript_json = portal::transcribe(backend, &created.call_id).await?;
-    let transcript: MergedTranscript = serde_json::from_value(transcript_json)
-        .context("decode transcript from backend")?;
+    let (transcript_json, transcribe_api_version) =
+        portal::transcribe(backend, &created.call_id).await?;
+    let transcript: MergedTranscript = match serde_json::from_value(transcript_json.clone()) {
+        Ok(t) => t,
+        Err(e) => {
+            // #179 — split decode failures out as a structured event so
+            // a "client is stuck" report can distinguish "backend
+            // returned 5xx" (existing pipeline::failed shape) from
+            // "backend returned a 200 the agent can't deserialize" (a
+            // schema-skew between agent + backend builds — much rarer
+            // but invisible without this discriminator). Fire BEFORE
+            // bubbling so the existing pipeline::failed parent still
+            // emits via the outer `match` in `run`.
+            emit_decode_error(
+                &session_str,
+                &format!("/v1/calls/{}/transcribe", created.call_id),
+                &transcript_json,
+                transcribe_api_version.as_deref(),
+            );
+            return Err(anyhow::Error::new(e).context("decode transcript from backend"));
+        }
+    };
     // Signal to the UI that the transcript is in and the call is
     // now openable — the call-detail route polls for summary /
     // action-items while the rest of the pipeline continues.
@@ -215,11 +239,24 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         }),
         None => Vec::new(),
     };
-    let summary_json =
+    let (summary_json, summarize_api_version) =
         portal::summarize(backend, &created.call_id, &serde_json::to_value(&transcript)?, &candidates)
             .await?;
-    let summary: Summary =
-        serde_json::from_value(summary_json).context("decode summary from backend")?;
+    let summary: Summary = match serde_json::from_value(summary_json.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            // #179 — twin of the transcript decode_error path. Summary
+            // is the most likely place a future schema bump on the
+            // backend trips an out-of-date agent.
+            emit_decode_error(
+                &session_str,
+                &format!("/v1/calls/{}/summarize", created.call_id),
+                &summary_json,
+                summarize_api_version.as_deref(),
+            );
+            return Err(anyhow::Error::new(e).context("decode summary from backend"));
+        }
+    };
 
     // Step 7: write the vault note. Skipped when vault isn't
     // configured — everything else already landed in the DB. The
@@ -275,6 +312,58 @@ fn emit(app: &AppHandle, event: PipelineEvent) {
     if let Err(e) = app.emit("pipeline", event) {
         eprintln!("aftercalls: emit failed: {e}");
     }
+}
+
+/// #179 — structured decode-failure event that fires alongside the
+/// existing `pipeline::failed` catch-all. The parent event stays as the
+/// generic outer signal staff dashboards already query; this event adds
+/// the discriminator (endpoint, expected shape version, the actual
+/// response body) so a "client is stuck" report can be triaged from
+/// agent_logs alone instead of needing the user to reproduce.
+///
+/// `received_type` + `received_keys` capture the STRUCTURAL shape of
+/// the response — variant name plus the top-level object keys when
+/// applicable. Keys-only, never values: the security review of #179
+/// flagged that `MergedTranscript.timeline[].text` and
+/// `Summary.{title, matched_client, summary}` are the leading fields
+/// in real responses, so logging the body bytes would leak transcript
+/// / summary / client-name content on a schema-skew incident — the
+/// exact case this telemetry exists to catch. Keys + variant name
+/// preserve diagnostic value (object vs scalar, renamed field, etc.)
+/// without that risk. `server_version_header` is the backend's
+/// `x-aftercalls-api-version` — `None` when the agent is talking to a
+/// pre-#179 backend.
+fn emit_decode_error(
+    session_str: &str,
+    endpoint: &str,
+    received: &serde_json::Value,
+    server_version_header: Option<&str>,
+) {
+    let received_type = match received {
+        serde_json::Value::Object(_) => "object",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Null => "null",
+    };
+    let received_keys: Vec<&String> = match received {
+        serde_json::Value::Object(map) => map.keys().collect(),
+        _ => Vec::new(),
+    };
+    crate::telemetry::log(
+        "error",
+        "pipeline::decode_error",
+        format!("decode failure on {endpoint}"),
+        Some(serde_json::json!({
+            "endpoint": endpoint,
+            "expected_shape_version": "v2",
+            "received_type": received_type,
+            "received_keys": received_keys,
+            "server_version_header": server_version_header,
+        })),
+        Some(session_str.to_string()),
+    );
 }
 
 /// Locate the ffmpeg binary. Prefers the sidecar bundled with the app

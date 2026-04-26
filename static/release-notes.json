@@ -1,418 +1,411 @@
 {
+  "0.8.2": {
+    "headline": "macOS auto-updater, fall-behind nudge banner, real product screenshots in onboarding",
+    "changes": [
+      "macOS auto-updater channel. macOS (Apple Silicon) is now on the same auto-updater channel as Linux and Windows. Closed-beta install still requires the one-time Terminal command shown on the Downloads page to clear the macOS Gatekeeper warning, until full notarization ships.",
+      "Fall-behind nudge banner. If the app falls two or more minor versions behind the current release, a persistent banner now appears at the top of the window with a direct link to download the latest installer. It surfaces even when the in-app updater check hasn't fired.",
+      "Real product screenshots in the welcome flow. First-run signups now see real screenshots of the app — the Downloads page, a sample call detail, and the Team invite UI — instead of the placeholder mockups."
+    ]
+  },
   "0.8.1": {
     "headline": "Highlight to correct, mobile-friendly portal, smarter CRM push, integrations menu",
     "changes": [
-      "Highlight to correct. Highlight any word or phrase in a call's transcript or summary, type the replacement, and choose the scope — just this occurrence, or everywhere in this call. Fixes name and term mistakes in seconds.",
-      "Mobile-friendly portal. Calls list, call detail, action items, share viewer, settings, and admin pages are all designed to work on phones — sidebar collapses to a hamburger, tap targets sized for fingers, audio waveform fills the width and works under touch.",
-      "Smarter CRM push. Pushed Zoho calls now arrive with the audio attached as a Voice Recording, action items list each item's owner inline, and the description is a clean back-link to aftercalls instead of a wall of transcript text. Name chips render as plain text.",
-      "Integrations menu. The admin sidebar's CRM entry is now Integrations with Zoho CRM as the first child — sets up a clean home for the next round (Zoho Meeting and Zoho Cliq are wired in this release; ingest pipeline lands next).",
-      "Customer email inbox unified. Emails to hello@aftercalls.io and in-app issue reports show in one staff inbox with a Source filter, instead of two separate pages.",
-      "Action item errors stay visible. Save / delete / check-off failures now surface as a toast instead of an inline message that vanished mid-action."
+      "Highlight to correct. Highlight any word in a transcript or summary → type a replacement → choose scope (this occurrence, or everywhere in this call). Fixes name and term mistakes inline.",
+      "Mobile-friendly portal. Calls list, call detail, action items, share viewer, settings, and admin pages all redesigned for phones. Sidebar collapses to a hamburger; tap targets sized for fingers; audio waveform fills the width and works under touch.",
+      "Smarter CRM push. Pushed Zoho calls now include the audio as a Voice Recording, action items list each owner inline, and the description carries a clean back-link to aftercalls instead of a wall of transcript text. Name chips strip cleanly to plain text.",
+      "Integrations menu. The admin sidebar's \"CRM\" became \"Integrations\" with \"Zoho CRM\" as the first child. Zoho Meeting and Zoho Cliq scaffolding is also wired (admin can connect and trigger a manual import; the ingest pipeline lands next release).",
+      "Customer email inbox unified. Emails to hello@aftercalls.io and in-app issue reports show in one inbox with a Source filter chip, instead of two separate pages."
     ]
   },
   "0.8.0": {
     "headline": "Due dates on action items, richer call sharing, and team-specific AI prompts",
     "changes": [
-      "Due dates on action items. The AI infers a due date when a call mentions one (\"by Friday\", \"end of month\", \"ASAP\") and the date appears as a chip on the item. Edit any item to change or clear it, mark it ASAP, or pick a date. Filter the Action items page by Overdue / Today / This week / No date.",
-      "Share-call upgrades. Pick exactly what each link exposes — manual notes off by default, summary / action items / transcript / audio individually toggleable, with an opt-in download button. The public viewer now uses the same waveform player as the rest of the app.",
-      "Customize the AI for your team. Admins can now add an additions block to the summary and action-items prompts under Settings → AI prompts — teach the model your naming conventions or what to emphasize. Append-only and length-capped; the core formatting guarantees stay intact.",
-      "Send to CRM and Share now live on the desktop app too — not just the portal. The action bar groups Share, Send to CRM, and Delete together for fast access.",
-      "Smoother numeric searches in CRM record pickers. Looking up a Deal by a number string (e.g. \"122\") works again without the upstream complaint."
+      "Due dates on action items. The AI infers a due date when the call mentions one (\"by Friday\", \"end of month\", \"ASAP\") — edit, change, or clear from the row. Filter the Action items page by Overdue / Today / This week / No date.",
+      "Share-call upgrades. Pick exactly what each link exposes — manual notes off by default, summary / action items / transcript / audio individually toggleable, with an opt-in Download button. The public viewer now uses the same waveform player as the rest of the app.",
+      "Customize the AI for your team. Admins can append guidance to the summary and action-items prompts under Settings → AI prompts. Teach the model your naming conventions or what to emphasize. Append-only and length-capped; format guarantees stay intact.",
+      "Share and Send to CRM on the desktop app. Both actions now appear on the desktop call-detail page alongside Delete, not just the portal.",
+      "Admin Terms / Privacy improvements. Admins can preview Terms and Privacy drafts on the live page with a banner before publishing, and clone a draft from the current live version in one click."
     ]
   },
   "0.7.2": {
     "headline": "Share calls publicly, smoother screen recording, sign in once from the desktop app",
     "changes": [
-      "Share a call with anyone via a public link. The new Share button on any call generates a secure URL — recipients see the transcript, summary, audio, and action items in a read-only view, no aftercalls account needed. Set an expiry, revoke any time, see view counts.",
-      "Record page learns Call vs Note tabs. Switch between recording a call and dictating a note to self right from the record page — no menu hunt. The keyboard shortcut shows on the button as a tooltip.",
-      "Screen recording for support reports stays out of your way. Start a recording, the dialog tucks into the corner with a duration + size readout and a Stop button — keep using the app to demonstrate the issue, then come back to send. Optional microphone capture so you can narrate.",
-      "Open the web app from the desktop and stay signed in. The user-menu \"Open web app\" link now hands off your session — no re-login on the browser side.",
-      "Smoother CRM experience. Custom modules sit alongside the standards in the record-type picker with a filter input; clicking anywhere on a record-type row selects it; standard-module search (Contact, Deal, Account, Lead, Quote) works correctly again.",
-      "Configurable max recording length in Settings (default 2 hours). For 3-hour-plus calls, bump it; the cap protects against runaway recordings filling your disk."
+      "Share a call with anyone via a public link. The new Share button on any call generates a secure URL — recipients see the transcript, summary, audio, and action items in a read-only view, no aftercalls account needed. Set an expiry (7 days, 30 days, or never), revoke any time, see view counts.",
+      "Record page learns Call vs Note tabs. Switch between recording a call and dictating a note to self right from the record page. The keyboard shortcut shows on the button as a tooltip.",
+      "Screen recording stays out of your way. Start a recording from a support report; the dialog tucks into the corner with a duration + size readout and a Stop button — keep using the app to demonstrate the issue. Optional microphone capture for narration.",
+      "Single sign-in from desktop to web. Click \"Open web app\" in the desktop user-menu and the browser tab opens already signed in.",
+      "Smoother CRM experience. Custom modules in the record-type picker, with a filter input. Click anywhere on a record-type row to select it. Standard-module search works correctly again.",
+      "Configurable maximum recording length. New setting (default 2 hours) caps runaway recordings; bump it for marathon calls."
     ]
   },
   "0.7.1": {
     "headline": "Screen recording for support, a client-name allowlist, and Zoho custom modules",
     "changes": [
-      "Record your screen when reporting an issue. The report dialog gets a Record screen button next to the existing screenshot option — capture what you're doing, stop whenever, review before you send. Video only; system audio and mic stay off.",
-      "Client-name allowlist. Teach the app which names in your calls are customers rather than teammates; the summary will stop wrapping those names. Populates automatically when you click 'Leave as text' on a name chip, or manage by hand under Settings → Organization → Clients.",
-      "Custom Zoho modules in the record-type picker. If your Zoho has Properties, Projects, or any other custom module, they now show up alongside Contact, Deal, Account, Lead, and Quote. Refresh from the Zoho admin page.",
-      "Support-report attachments tidy up automatically after six months. Older screenshots and recordings age out with a clear 'expired' state rather than a broken-link view.",
-      "Extra confirm on changes during a support session. When our team is signed in as you to help, destructive or irreversible changes now ask for a deliberate confirm before they run."
+      "Record your screen when reporting an issue. The report dialog gets a Record screen button next to the existing screenshot option. Video only; system audio and mic stay off.",
+      "Client-name allowlist. Teach the app which names in your calls are customers rather than teammates; the summary stops wrapping them. Auto-populates from the \"Leave as text\" chip action, or manage by hand in Settings → Organization → Clients.",
+      "Custom Zoho modules in the record-type picker. Properties, Projects, Shipments — any custom module in your Zoho now shows alongside the five standard ones. Refresh from the Zoho admin page.",
+      "Attachment retention on support reports. Screenshots and recordings age out after six months with a clear \"expired\" state.",
+      "Extra confirm on changes during support sessions. Destructive changes during a support session now prompt for a deliberate confirm."
     ]
   },
   "0.7.0": {
     "headline": "Zoho CRM, guided onboarding, and in-app issue reporting",
     "changes": [
-      "Send calls to Zoho CRM. An admin connects the org once; anyone can then push a call as a Call activity linked to a Contact, Deal, Account, Lead, or Quote, with tags reflecting the choice.",
-      "New-user onboarding. A short guided tour greets first-time sign-ins with the key things to know plus the desktop-app download.",
-      "Report an issue from inside the app. Attach screenshots; we include a diagnostic bundle so we can help faster.",
-      "Multi-select rename on transcripts. Pick two or more lines and rename only those — the missing granularity between single-line and every-occurrence.",
-      "Consistent date picker in Calls. Same behavior on every platform — no more stuck dropdowns or unexpected defaults.",
-      "Quieter auto-detect on Linux. Keep call detection running without the app stealing focus mid-task.",
-      "Stronger support workflow. When our team acts on your behalf to investigate an issue, you'll see a clear banner and every action gets logged to a tamper-resistant audit trail."
+      "Send calls to Zoho CRM. An admin connects the org once; anyone can then push a call as a Call activity linked to a Contact, Deal, Account, Lead, or Quote. Pushed calls are tagged locally so you can find them again in seconds.",
+      "New-user onboarding. First-time sign-ins get a short guided tour of the essentials plus the desktop-app download — re-runnable for testing.",
+      "Report an issue from inside the app. Attach screenshots; a diagnostic bundle travels with the report so the team can help faster.",
+      "Multi-select rename on transcripts. Select two or more speaker lines and rename only those — the middle granularity between single-line and every-occurrence.",
+      "Consistent date picker in Calls. Built-in picker everywhere. Same behavior on every platform.",
+      "Quieter auto-detect on Linux. A new setting keeps detection running while preventing the app from stealing focus on tiling desktops.",
+      "Support session banner + audit trail. Support sessions display a clear banner while active, and every action lands in a tamper-resistant audit trail."
     ]
   },
   "0.6.0": {
     "headline": "Bulk transcript renaming, external speakers in the picker, cleaner sidebar",
     "changes": [
-      "Replace every instance of a name in a transcript in one action. Open the speaker picker on any line and use the new \"Replace every [name] in this transcript with…\" option — no more clicking each row individually.",
-      "External speakers you've added in a call now show up as picker options for later entries in the same call. Name someone once, reuse across the rest of the transcript.",
-      "Sidebar grouped by role: Workspace for everyday items, a separate Admin section for org management, and a new Staff section for platform-level tools. Cleaner separation between what's yours and what you manage."
+      "Replace every instance of a name in a transcript.",
+      "External speakers reusable within a call.",
+      "Sidebar grouped by role."
     ]
   },
   "0.5.2": {
     "headline": "Scannable summaries, trash date filter, configurable recording shortcut, more /actions chip controls",
     "changes": [
-      "Meeting summaries now render in scannable sections: a one-sentence gist on the first line, then Summary / Decisions / Next steps paragraphs. Easier to skim at a glance than one dense block of prose.",
-      "Note-to-self summaries use a tighter shape — one-sentence gist followed by bullets. No meeting scaffold for solo dictations.",
-      "Filter the Calls trash by date range — same From / To picker as the main Calls page. URL retains the filter for back/forward.",
-      "Start / Stop Recording shortcut is now configurable in Settings (default Super+Shift+R). Collision checks against the Note-to-self shortcut both directions.",
-      "Click an italic name in an action item on the /actions page to link it to a teammate — same chip menu as the call detail page. Previously only worked from within a summary.",
-      "External name chips in summaries now share the speaker-colour convention (italic stays as the 'external' tell; colour matches across all mentions of the same person). Inline avatars in summary prose are gone — avatars live in Participants and Mentioned only, cleaner inline flow.",
-      "Auto-detected recordings now mount the notes panel immediately — previously it stayed hidden until you opened the call detail page.",
-      "Distinct tray icon while a note-to-self is recording — separate visual cue from a regular call recording.",
-      "Unified brand waveform across the marketing site pages and portal rail — matches the desktop tray icon."
-    ]
-  },
-  "0.5.1": {
-    "headline": "Hotfix: v0.5.0 backend startup",
-    "changes": [
-      "Internal-only hotfix. v0.5.0 introduced a backend route-registration conflict that prevented the admin Terms of Service endpoints from starting. Routes consolidated; everything else in v0.5.0 unchanged."
+      "Sectioned meeting summaries.",
+      "Note-to-self summaries get a tighter shape.",
+      "Filter the Calls trash by date range.",
+      "Configurable Start / Stop Recording shortcut.",
+      "Chip linking on the Action items page.",
+      "External name chips now share the speaker-colour convention.",
+      "Auto-detected recordings mount the notes panel immediately.",
+      "Distinct tray icon while a note-to-self is recording.",
+      "Unified brand waveform across site and portal rail."
     ]
   },
   "0.5.0": {
-    "headline": "Date filter on Calls, external-name chip linking, configurable self-note shortcut, /actions chip editing",
+    "headline": "Date filter on Calls, external-name chip linking, configurable shortcut, draft-able T&C publisher",
     "changes": [
-      "Optional date filter on the Calls page — pick From / To and the list narrows live. URL keeps the filter so back/forward restores state. Clear link resets to all dates.",
-      "Click an italic name in a summary (or action item) to link it to a teammate. Previously only teammate-resolved chips could be edited or unlinked; now the reverse direction works too — tag a name the AI missed.",
-      "Self-note dictation shortcut is now configurable in Settings. Default stays Super+Shift+N; rebind to anything that doesn't collide with your other shortcuts.",
-      "Clickable name chips now work on the Action items page too. Same Rename / Unlink / Link menu as the call detail page.",
-      "Filter popover on the Calls page now sits above the top strip. Was hidden underneath in some layouts.",
-      "Admins publishing Terms of Service or Privacy Policy now have editable drafts — save a draft with a future effective date, come back later to edit or delete before it goes live. Every publish, edit, and delete writes an audit log row."
+      "Optional date filter on the Calls page.",
+      "Click an italic name chip to link it to a teammate.",
+      "Self-note dictation shortcut is configurable.",
+      "Click-to-edit action-item chips works on the Action items page.",
+      "Admins: draft-able T&C publisher."
     ]
   },
   "0.4.5": {
-    "headline": "Note to self quick dictation + clickable name chips to edit or unlink + notes save reliably",
+    "headline": "Note to self dictation + clickable name chips + reliable notes save",
     "changes": [
-      "Note to self — quick dictation. Click the new button on the calls page, use the tray menu entry, or hit Super+Shift+N from anywhere. The recording runs through the same transcribe + summarize pipeline as a regular call. Stop anytime — auto-caps at 5 minutes by default (configurable in Settings).",
-      "Click a teammate name chip in a summary to edit or unlink it. If the AI tagged someone incorrectly (the call said 'Mike' but it meant a different Mike), you can rename the chip to the right teammate or unlink it entirely to leave it as plain text. Works on action-item descriptions too.",
-      "New Mentioned section under Participants. Shows teammates the AI named in the summary or action items but who weren't speakers on the call — so you can see who was talked about versus who was there.",
-      "Notes on a call now save reliably across tab closes and fast typing. Previously, the Saved indicator could lie about what actually persisted if you closed the page mid-save or kept typing during one; the indicator now reflects real state and a pending save is committed on tab close."
+      "Note to self — quick dictation.",
+      "Clickable name chips in summaries.",
+      "New Mentioned section.",
+      "Notes on a call save reliably now."
     ]
   },
   "0.4.4": {
-    "headline": "Action items filter fixed + row polish + new System requirements page",
+    "headline": "Action items polish, filter bug fix, new System requirements page",
     "changes": [
-      "Action items filter works correctly end-to-end: the active pill (Open / Done / All) updates on click, counts show accurate totals, and the list refreshes every time.",
-      "Action item rows line up properly. Checkbox + number align with the description + owner chip, and the checkmark renders without clipping in both light and dark modes.",
-      "Editing a multi-line action item shows the full text on entry. Textarea autosizes as you type, up to 5 visible lines before scrolling.",
-      "Actions page layout now matches the rest of the list pages: cleaner spacing, consistent empty state.",
-      "New System requirements page at aftercalls.io/help/system-requirements/. Reachable from Settings → footer on both agent and portal."
+      "Action items filter works correctly.",
+      "Action item rows line up properly.",
+      "Multi-line action item edits show fully.",
+      "Actions page layout aligned with other list pages.",
+      "New System requirements page."
     ]
   },
   "0.4.3": {
-    "headline": "Action items filter fixed, waveform loads reliably mid-processing, better screen-reader support",
+    "headline": "Action items filter fixed, waveform reliable mid-processing, screen-reader support",
     "changes": [
-      "The Open / Done / All filter on the Action items page now actually switches — the active pill updates and the counts next to each filter stay accurate across toggles.",
-      "The waveform on a call opened mid-processing now loads automatically as soon as the audio is ready. Previously you had to exit and reopen the call to see it.",
-      "Screen readers now announce when you start editing an action item and when it saves."
+      "Action items page: filter works correctly.",
+      "Waveform loads reliably for in-flight calls.",
+      "Better screen-reader support for action items."
     ]
   },
   "0.4.2": {
-    "headline": "Click-to-edit action items — tap to edit, tap the owner chip to reassign; Windows drag fix",
+    "headline": "Click-to-edit action items + Windows drag fix",
     "changes": [
-      "Click anywhere on an action item's description to edit it in place. No pencil icon, no Save button — blur, Enter, or Tab commits; Escape cancels. Shift+Enter inserts a newline.",
-      "Click the owner chip to reassign. The chip becomes a picker inline; pick a teammate and it commits on the spot. An × inside the chip clears the owner.",
-      "Add item appends a new row inline — cursor lands in the description, your name is the default owner, blur saves. No separate composer block.",
-      "Windows: dragging the top bar to move the window works again. This broke a few releases ago when the update pill gained wrap support; the drag surface is now restored across the whole bar."
+      "Click-to-edit action items.",
+      "Click the owner chip to reassign.",
+      "Add item is now inline."
     ]
   },
   "0.4.1": {
-    "headline": "Action-items polish — name chips after rename, click-outside to cancel, regenerate runs in the background",
+    "headline": "Action-items polish — chips after rename, editor close, background regenerate",
     "changes": [
-      "Copying a summary or action item no longer leaves stray tags in the clipboard — text pastes clean.",
-      "After you rename a speaker to a teammate, their chips show up across the summary and every action item, not just where you renamed them.",
-      "Editing an action item closes with Escape or by clicking outside the row. Picking an assignee collapses the dropdown.",
-      "Clicking Add item while editing another row now closes the open edit first.",
-      "Fresh recordings load your team's roster on open so the assignee picker is populated and AI-detected assignees resolve correctly.",
-      "Regenerating summary + action items no longer blocks the UI — the confirmation closes as soon as you start and regeneration runs in the background while you keep working."
+      "Copy summaries and action items cleanly.",
+      "Name chips render everywhere after a speaker rename.",
+      "Better action-item editor controls.",
+      "Team roster loads on call open.",
+      "Regenerate runs in the background."
     ]
   },
   "0.4.0": {
     "headline": "Assign, edit, and complete action items — one page for every task across every call",
     "changes": [
-      "Action items now carry an assignee and a status. The AI reads who owns a task and tags your teammate to it with an avatar chip. Items track as Open until someone checks them off; checked items stay on the record so you can see what was done.",
-      "New Action items page in the sidebar (portal) and in the desktop agent's rail. Lists every item assigned to you across all your team's calls. Filter Open / Done / All. Check an item off from there and it reflects on the origin call. Click a row to jump to the call.",
-      "Regenerate summary and AI action items. On the call detail page, click Regenerate to re-run the AI against the transcript if the first pass missed the mark. Items you've added manually and items you've already checked off are preserved.",
-      "Edit anything inline. Click the pencil on the summary to rewrite it, or on any action item to change the description or the assignee. Saves are immediate; no regeneration needed.",
-      "Add or delete action items by hand. An Add item button in the action-items block lets you capture a task that didn't come out of the transcript. Pick an assignee from your team, or leave it unassigned. Hover a row to delete with an inline confirm."
+      "Action items now carry an assignee and a status.",
+      "New Action items page.",
+      "Regenerate summary and AI action items.",
+      "Edit anything inline.",
+      "Add or delete action items by hand."
     ]
   },
   "0.3.32": {
-    "headline": "Clickable name chips in summaries + polish on the speaker rename picker",
+    "headline": "Clickable name chips in summaries + speaker rename picker polish",
     "changes": [
-      "Summaries and action items now show your teammates as colored clickable name chips (with avatars) instead of plain text. Click a chip to see that teammate. External people in a call render as styled text so you can tell them apart from your team. Legacy calls keep their existing summaries unchanged.",
-      "Speaker rename picker: avatars now show for every teammate in the dropdown. Cleaner visual polish — softer shadow, nicer hover state, the teammate/email stack sits next to the avatar. Long speaker names in the transcript no longer wrap to two lines — they truncate with a tooltip."
+      "Clickable name chips in summaries and action items.",
+      "Speaker rename picker polish."
     ]
   },
   "0.3.31": {
     "headline": "First + last names, smarter speaker rename, mic picker, quieter while recording",
     "changes": [
-      "First + last names. Profile settings now have separate inputs for first and last name. Summaries and action items render teammates as 'First L.' (e.g., 'Clayton M.') so people with the same first name don't read as the same person. Existing accounts are pre-filled from your old display name — adjust on your profile if the split looks wrong.",
-      "Speaker rename picker lists your teammates. Typing in the transcript speaker-rename field opens a searchable dropdown of people in your team with small avatars. Pick a teammate and the call remembers who they are across the app; free-form names for external folks still work.",
-      "Audio input device picker. Settings → Behavior now lets you choose which microphone to record from. If your saved mic isn't plugged in, the app quietly falls back to the system default and surfaces a one-time notice on the Record page.",
-      "Global shortcut on Linux (Wayland). Super+Shift+R still works on X11, Windows, and macOS. On Wayland, bind 'aftercalls --toggle-recording' in your desktop environment's keyboard-shortcut settings to trigger the recorder from anywhere — see the help page for instructions.",
-      "Notification chimes stay silent while a call is recording or its transcript is still processing. The recording-start tone still plays because it's a compliance cue.",
-      "The update notice no longer surfaces during a call or mid-processing — it waits until the pipeline finishes, then pops up right away.",
-      "Admin user edit. When an admin renames a teammate from the admin console, the first + last name fields come along, keeping the structured names in sync with the display name."
+      "First + last names.",
+      "Speaker rename picker lists your teammates.",
+      "Audio input device picker.",
+      "Global shortcut on Linux (Wayland).",
+      "Notification chimes silent while a call is recording or still processing.",
+      "Update notice waits for your pipeline to finish.",
+      "Admin user edit."
     ]
   },
   "0.3.30": {
-    "headline": "Launch aftercalls with your computer; every speaker gets an avatar",
+    "headline": "Launch at sign-in, speaker initials in the transcript",
     "changes": [
-      "Launch at sign-in. New toggle at the top of Settings → Behavior — flip it on and aftercalls starts automatically when you sign in to your computer (Linux and Windows). Off by default; your choice sticks across updates and auto-reflects the real OS state each time you open Settings.",
-      "Participant initials in the transcript and the rail footer. Every speaker row now leads with a small circular initial in the same order-based palette the transcript colours already use, so you can scan long calls without re-reading names. Your own chip in the bottom-left uses the brand accent."
+      "Launch at sign-in.",
+      "Participant initials in the transcript and the rail footer."
     ]
   },
   "0.3.28": {
-    "headline": "WYSIWYG notes editor, team-aware calls list, edit notes after the call, cleaner start cue",
+    "headline": "WYSIWYG notes editor, team-aware calls list for admins, edit notes after the call",
     "changes": [
-      "Notes editor is now true WYSIWYG — type bold, see bold; no more markdown stars or dashes cluttering the page. Headings, lists, quotes, code, and links all render inline, exactly as they'll look when saved. Toolbar + keyboard shortcuts (Ctrl/Cmd+B, I, E, K) for the common formatting moves.",
-      "Notes on the call detail page. You can now edit your notes any time after a call is recorded, not just during — open the call, edit inline, autosaves to the cloud.",
-      "All team view in the calls list (admins). Toggle between My calls and All team; every row shows who recorded it, and a new By person filter narrows to one teammate.",
-      "Start-recording tone no longer ends up in the recording. We now play the cue before the recorder engages, so the beep doesn't get captured into the call audio.",
-      "Max-recording-length setting label no longer wraps character-by-character on narrower windows."
+      "WYSIWYG notes editor.",
+      "Edit notes on the call detail page.",
+      "All team view for admins.",
+      "Settings → Legal links footer."
     ]
   },
   "0.3.27": {
     "headline": "Formatting toolbar on notes, owner-aware team views for admins",
     "changes": [
-      "Notes editor now has a formatting toolbar: bold, italic, code, headings, bullet and numbered lists, quote, link. Keyboard shortcuts too — Ctrl/Cmd+B, I, E, K. Markdown syntax stays visible and styled inline so what you see is what gets saved. Notes stay private to you — they never feed the AI summary.",
-      "Admins viewing All team calls now see an owner chip on every row showing whose call it is, plus a new By person filter to scope the list to one teammate."
+      "Notes editor formatting toolbar.",
+      "Notes are private.",
+      "All-team owner chips.",
+      "Filter calls by person."
     ]
   },
   "0.3.26": {
-    "headline": "Take notes during a call, cap runaway recordings, tune the playback volume",
+    "headline": "Manual notes during a call, playback volume, hard ceiling on runaway recordings",
     "changes": [
-      "Manual notes panel. Turn it on in Settings and you'll get a markdown editor on the record screen during an active call. Notes save with the call and are editable from the call detail page afterwards.",
-      "Playback volume slider. The audio player on call detail now has a volume control next to the speed toggle. Your chosen level persists across calls and across the web portal.",
-      "Max recording length. New Settings field caps any single recording at a configurable ceiling (default 2 hours, range 5 minutes to 24 hours). If a softphone holds the mic open long after a call ends, the agent auto-stops at the limit so you don't discover a runaway multi-hour file."
+      "Manual notes panel.",
+      "Playback volume slider.",
+      "Max recording length."
     ]
   },
   "0.3.24": {
-    "headline": "Jumped a few versions? You'll see the full changelog in one place.",
+    "headline": "Full changelog when you jump versions, tag overflow, self-hosted fonts, licenses page",
     "changes": [
-      "The post-update welcome now aggregates every version you skipped since your last launch into one modal. No more catching only the latest headline and missing what happened in the gap.",
-      "Calls list: rows with more than two tags now show a \"+N\" overflow chip instead of silently hiding the extras. Hover to see which tags are folded away; open the call to see them all.",
-      "Fonts are now served from our own servers instead of a third-party CDN, so the app doesn't phone out to a font vendor on launch.",
-      "New \"Licenses\" link in the user menu — opens the third-party notices for ffmpeg (LGPL), Tauri, Svelte, and everything else we bundle."
+      "Aggregated release-notes modal.",
+      "Tag overflow on the Calls list.",
+      "Self-hosted Geist.",
+      "Licenses page.",
+      "Privacy Policy v1.3."
     ]
   },
   "0.3.23": {
     "headline": "Recovery from crashes, Windows call-detect, tag inline, smarter rename, polish",
     "changes": [
-      "Crash recovery on launch. If the app crashed or was force-quit while a call was still being transcribed or summarized, the next time you sign in you'll see a small pill offering to resume the unfinished calls. Review, Resume all, or Discard — nothing stays buried in a folder.",
-      "Windows mic-use detection. Starting Zoom, Teams, or a phone-call app on Windows now surfaces the same \"Call detected\" slide-out Linux users have always gotten. No more missed auto-records on Windows.",
-      "Tags now live inline with the title, right next to the source app chip — no whole separate section for them. Remove with ×, click to filter, + Add tag still works.",
-      "Rename a participant and you'll now get an autocomplete of your team alongside the free-form name field. Recently-used teammates float to the top, type to search the full list, Enter still saves whatever you type for external folks not in your org.",
-      "Auto-detect slide-out now suppresses itself when you're already on the Record page — the page's own banner handles it, no duplicate UI.",
-      "Quitting aftercalls while a call is still processing now asks first. Close-to-tray still works the same — only a deliberate Quit triggers the confirm."
+      "Crash recovery on launch.",
+      "Windows mic-use detection.",
+      "Tags inline with the title metadata.",
+      "Smarter participant rename.",
+      "Auto-detect slide-out polish.",
+      "Confirm before quitting mid-pipeline."
     ]
   },
   "0.3.22": {
-    "headline": "Call-detected now slides in without pulling you off the page",
+    "headline": "Call-detected slides in without pulling you off the page",
     "changes": [
-      "When the app detects a call starting from another app (Zoom, Teams, softphones, etc.), it used to switch you to the Record tab. Now it slides a small \"Call detected\" panel out from the Record tab in the left rail — you can choose Record this call or Not now without leaving whatever you were reading. All the consent and notification-mode behaviour is the same; just the way it greets you changed.",
-      "The Install pill in the top bar now always points at the newest available version. If a version or two came out between when you saw the pill and when you clicked Install, we pick up the most recent one so you don't install an intermediate version and restart twice."
+      "Auto-detect slide-out.",
+      "Compliance behaviour unchanged.",
+      "Updater jumps to latest."
     ]
   },
   "0.3.21": {
     "headline": "Auto-tag your calls, then filter the list by tag",
     "changes": [
-      "Every call now gets a small set of structured tags generated automatically as part of the summary step — typically a client or counterparty, a meeting type (sales review, support, planning, 1:1, etc.), and one or two specific topics. No extra processing cost; tags ride along with the summary.",
-      "Open a call and you can add or remove tags as chips below Participants. Pick a kind (client / purpose / topic / custom), type a value, autocomplete from what's already in use across the team. Click a tag chip to jump to the Calls list pre-filtered to that tag.",
-      "The Calls list filter bar now has a tag-based filter alongside the title search. Stack multiple filters (every selected tag must be present) and the URL keeps them so the filtered view survives a refresh or a shared link."
+      "Auto-tags on every call.",
+      "Edit tags on a call.",
+      "Filter the Calls list by tag.",
+      "Custom tags."
     ]
   },
   "0.3.20": {
     "headline": "Recording consent tools + optional start-of-call cue",
     "changes": [
-      "Before your first recording, the app confirms you understand it's your job to notify participants and get consent. Done once per user — you won't see it again after you accept.",
-      "New \"Copy notice\" button on the Record page drops a customizable heads-up message into your clipboard, ready to paste into the meeting chat. Admins set the purpose wording once in Org settings; everyone on the team uses it.",
-      "Admins: new Org settings under \"Recording\" — a Purpose textarea with live preview of the copied notice, and a Notification Mode toggle (Off / User choice / Enforced). Enforced mode always plays an audio cue when any user starts a recording, which is useful for teams in two-party-consent jurisdictions.",
-      "Admins also get two new audit views: a Recording Acknowledgments roster on the Terms tab (who accepted the consent prompt and when), and a Call Access log on the Logs tab (who opened or listened to a call they didn't record)."
+      "First-recording consent prompt.",
+      "Copy notice button.",
+      "Admins: Recording settings.",
+      "Admins: two new audit views.",
+      "Privacy Policy v1.2."
     ]
   },
   "0.3.19": {
     "headline": "Recording reliability: mixing + compression now work everywhere",
     "changes": [
-      "The app bundles its own audio toolkit on Windows and Linux, so mixing your mic and the other side's audio into a single playable track no longer depends on you having a separate install of an audio tool. Previously, if that tool wasn't on your machine, the call still transcribed but the waveform and playback on the call detail page didn't show up.",
-      "Upload size on every call is smaller too — we compress each track locally before sending, so slow or spotty networks finish \"Syncing to cloud\" faster."
+      "Bundled audio toolkit.",
+      "Smaller per-call upload size."
     ]
   },
   "0.3.18": {
     "headline": "Release notes are one click away from the user menu",
     "changes": [
-      "New \"Release notes\" entry in the user-menu dropdown (rail foot) — opens the full version history at aftercalls.io/releases in your browser. Same item is in the web portal's user menu."
+      "Release notes in user menu."
     ]
   },
   "0.3.17": {
     "headline": "Notification sounds for every moment — and you can turn them off",
     "changes": [
-      "The app now plays short audio cues so you don't need to stare at it: two ascending notes when recording starts, two descending when it stops, three ascending when the summary is ready, a descending pair on failure, and a double-ping when the auto-detect prompt appears.",
-      "The sounds are synthesized in the app — no files to download — and they're all off if you flip Settings → Behavior → Notification sounds to Off."
+      "Audio cues throughout the app.",
+      "Synthesized in-app sounds."
     ]
   },
   "0.3.16": {
     "headline": "Open a call while it's still processing and watch it fill in",
     "changes": [
-      "Open a call before the summary is ready and the title, Summary, and Action items sections now show an animated \"Generating…\" shimmer with a caption instead of looking blank. They fill in live as the pipeline finishes — no need to refresh.",
-      "Superadmins: new \"Create user directly\" form on the Team page (web portal) for bot accounts or seed users where email invites don't fit — skips the invite email and creates an active user with the password you choose."
+      "Live-fill on in-flight calls.",
+      "Superadmins: Create user directly."
     ]
   },
   "0.3.15": {
     "headline": "Live call updates, public help site, and an action-items toggle for admins",
     "changes": [
-      "Opening a call while processing is still underway now actually streams in updates — title, summary, and action items pop in as each step finishes. No more hard refresh.",
-      "The Help link in the user menu now opens aftercalls.io/help — a public, no-login knowledge base you can share with anyone.",
-      "Admins: Org settings (portal → Org tab) now has an \"Auto-generate action items\" toggle, default off. When off, every call saves processing cost — click the new Generate button on the call's Action items section to run them on demand."
+      "Live transcript + summary streaming.",
+      "Public help site.",
+      "Admins: Auto-generate action items toggle."
     ]
   },
   "0.3.14": {
     "headline": "Recycle bin for deleted calls, and a Help link in the user menu",
     "changes": [
-      "Deleting a call now sends it to Trash instead of removing it right away. You have 30 days to Restore it or Delete forever from the new Trash page (reachable from the Calls list). After 30 days it's auto-purged — audio and metadata both.",
-      "The user menu adds a Help link that opens the knowledge base — a full walkthrough of every feature on desktop and web.",
-      "The user menu also gets \"Open web app\" as a direct link to app.aftercalls.io in your default browser."
+      "Trash with 30-day restore.",
+      "Help link in user menu.",
+      "Open web app shortcut."
     ]
   },
   "0.3.13": {
     "headline": "Open a call the moment the transcript's ready — summary fills in live",
     "changes": [
-      "After a call finishes recording you don't have to wait for the full pipeline to finish before you can start reading. The moment transcription completes, \"Open in app\" and \"Open on web\" buttons appear in the progress card — tap either and the call opens immediately, transcript and audio ready.",
-      "Summary and action items pop into view on their own as the rest finishes. You can rename speakers and listen while it generates.",
-      "The Record page's progress indicator still walks through the stages (Transcribing → Drafting summary → Writing vault note → Saved) so you can see what's still in flight."
+      "Open in app / Open on web mid-pipeline.",
+      "Summary + action items pop in live.",
+      "Pipeline progress indicator."
     ]
   },
   "0.3.12": {
     "headline": "Diagnostic telemetry, distinct speaker colors, and an updated privacy policy",
     "changes": [
-      "Diagnostic telemetry. The app now sends a buffered log of errors and pipeline events to the aftercalls team so we can diagnose issues without needing remote access to your computer. No call audio, transcripts, or summaries are included — only app-level events and error messages. Turn it off any time in Settings → Behavior → Diagnostic telemetry.",
-      "Speaker colors are now assigned in encounter order, so the first few distinct speakers always get distinct colors, and later ones pick the least-used slot.",
-      "On your next sign-in to the web portal you'll be asked to accept an updated privacy policy (v1.1). The only change is a new paragraph describing the telemetry above."
+      "Diagnostic telemetry.",
+      "Speaker colors in encounter order.",
+      "Privacy Policy v1.1."
     ]
   },
   "0.3.11": {
     "headline": "Settings moves into a user menu, and the web portal adds a Terms of Service flow",
     "changes": [
-      "Rail footer: clicking your name opens a dropdown with Settings and Sign out — plus Team, Org vocab, and Terms for admins and superadmins (those open the web portal in your browser). Settings is no longer a primary nav entry; the main rail now has only Record and Calls.",
-      "The web portal now has a Terms of Service and Privacy Policy acceptance flow. On next sign-in you'll be asked to accept both before using the app. Superadmins get a Terms tab that lists every published version, accept counts, and an audit roster."
+      "User-menu dropdown.",
+      "Portal Terms / Privacy acceptance flow."
     ]
   },
   "0.3.10": {
-    "headline": "Two new behavior toggles in Settings",
+    "headline": "Audio download actually saves the file, and Settings gets two behavior toggles",
     "changes": [
-      "Settings → Behavior → Close button: choose whether clicking ✕ minimizes to tray (default) or exits the app. Saves instantly.",
-      "Settings → Behavior → Auto-detect calls: toggle the call-detection watcher on or off. When off, no auto-prompts — you'll only record via the button or Super+Shift+R."
+      "Settings → Behavior → Close button.",
+      "Settings → Behavior → Auto-detect calls."
     ]
   },
   "0.3.9": {
-    "headline": "One-click Linux updates, now end-to-end",
+    "headline": "Windows titlebar works properly, and the Linux app installs cleanly everywhere",
     "changes": [
-      "One-click in-place auto-update on Linux now works start to finish. Install once, and from then on new versions arrive as a pill in the top bar just like on Windows — click Install, the app swaps itself and relaunches.",
-      "The Linux app now runs cleanly on Arch, Fedora, NixOS, Ubuntu, and Debian without special handling."
-    ],
-    "footer": "If your v0.3.8 Linux install stopped working, grab the v0.3.9 one from app.aftercalls.io/downloads. Going forward, updates land via the Install pill automatically."
+      "Linux one-click in-place auto-update."
+    ]
   },
   "0.3.8": {
     "headline": "One-click Linux updates and an audio download button",
     "changes": [
-      "Linux: one-click in-place auto-update for the portable app. Updates arrive as a pill in the top bar just like on Windows.",
-      "Linux on .deb / .rpm / tarball installs: you'll see a \"Get it ↗\" notification pill that opens the downloads page when a new version is available.",
-      "Call detail: new Download button next to the playback-rate control on both the app and the web portal. Downloads whichever track is selected (Everyone / You / Others) as a single audio file named after the call, playable in any modern media player or browser."
+      "Linux: AppImage one-click auto-update.",
+      "Linux: deb / rpm / tarball update notifications.",
+      "Call detail: Download button."
     ]
   },
   "0.3.7": {
     "headline": "Linux update notifications and a less-naggy vault toggle",
     "changes": [
-      "Linux: the app now checks for new releases in the background and shows a \"v0.x.y available — Get it ↗\" pill in the top bar when one is out. Clicking it opens the downloads page.",
-      "Settings → Obsidian vault: flipping the switch off saves immediately — no Save button required. The Save button also hides itself when the feature is off, instead of sitting there looking like unfinished work."
+      "Linux: background update check + pill.",
+      "Vault: instant-save toggle."
     ]
   },
   "0.3.6": {
-    "headline": "A handful of polish improvements you'll notice immediately",
+    "headline": "A handful of polish fixes you'll notice immediately",
     "changes": [
-      "Calls list groups calls by your local day instead of UTC. Calls recorded late evening no longer drift to the next day (or the previous one) depending on your timezone. Now Today is actually today.",
-      "The \"Saved\" card after a call finishes is cleaner — one tap opens the call on the web portal, regardless of whether you use the Obsidian vault.",
-      "Settings → Obsidian vault: the enable/disable checkbox is now an obvious on/off slider, so it's clear at a glance which state you're in."
+      "Cleaner Saved card.",
+      "Vault toggle is an obvious slider."
     ]
   },
   "0.3.5": {
     "headline": "Obsidian is now optional, and Windows has a proper dark titlebar",
     "changes": [
-      "Obsidian vault is opt-in per machine. Settings → Obsidian vault (this machine) has a toggle, folder picker, and clients-subfolder field. Leave it off on machines where your vault isn't available; the pipeline still completes, nothing fails.",
-      "Windows: the native titlebar is replaced with an integrated dark one. Double-click to maximize, drag to move, and min/max/close buttons match the app palette."
-    ]
-  },
-  "0.3.4": {
-    "headline": "Windows finally looks like it belongs in the dark theme",
-    "changes": [
-      "Windows: native titlebar is replaced with an integrated dark one. Double-click the top bar to maximize, drag to move, and the min/max/close buttons match the app palette (close still turns red on hover, as it should).",
-      "Linux and macOS: unchanged — the native window chrome stays intact."
+      "Obsidian vault is opt-in per machine.",
+      "Windows: integrated dark titlebar."
     ]
   },
   "0.3.3": {
     "headline": "Windows finally captures the other side of the call",
     "changes": [
-      "Windows: system audio (the person on the other end of a call) is now captured alongside your mic automatically. No new drivers, no config — the call just records both sides."
+      "Windows: system audio loopback."
     ]
   },
   "0.3.2": {
-    "headline": "Summaries read like something you'd paste into an email",
+    "headline": "Session tokens stay fresh, and summaries read like something you'd paste into an email",
     "changes": [
-      "Summaries and action items now refer to you by your first name in the third person, not \"You.\" So you can copy/paste straight into an email to a customer or teammate without rewriting.",
-      "Transcript lines you spoke also get labeled with your first name instead of \"You.\""
+      "Third-person summaries with your first name.",
+      "First-name labels in the transcript."
     ],
     "footer": "Calls recorded before this update still show the old wording — the new prompt only runs on fresh recordings. Re-summarize (#19) is in the queue so we can apply the new prompt to older calls too."
   },
   "0.3.1": {
-    "headline": "Transcript clicks go where you meant, and a few quality-of-life tweaks",
+    "headline": "The Windows upload actually works this time, and transcript clicks go where you meant",
     "changes": [
-      "Summaries hold a more consistent shape across calls — past tense, third person, action items as short imperative phrases.",
-      "Auto-detect end-of-call timeout dropped from 20 seconds to 5 seconds; the app will prompt to end a recording much sooner when you stop talking.",
-      "The app now checks for updates about once an hour while running, not just on launch.",
-      "Record page says \"Syncing to cloud\" instead of the more technical \"Syncing to backend.\"",
-      "Small UI: title chips are now the same size, and the Record page stacks \"Recording · Transcribing\" when you start a new call while the previous one is still processing."
+      "Consistent summary shape.",
+      "Faster auto-detect end-of-call.",
+      "Hourly update check.",
+      "Cleaner Record page status copy.",
+      "Title chip + Record page polish."
     ]
   },
   "0.3.0": {
     "headline": "Web portal catches up to the agent, and teams get first-class admin tools",
     "changes": [
-      "Renaming a speaker now rewrites the transcript, summary, action items, and participants in one go — no more \"Speaker A\" stuck in the summary after you've renamed them.",
-      "Participants moved to the top of the call view (above Summary) so you rename before you read. Speaker names in the summary and action items are tinted with each person's chip color so you can scan them at a glance.",
-      "Web portal caught up to the agent: waveform, highlights (create/edit/delete/auto-detect), speaker editing, delete-with-confirm, copy buttons, and a themed downloads page.",
-      "Admin: self-service profile + password from Settings, invite and manage teammates from Team, Org vocab for organization-wide spelling corrections and word boost. Calls are now scoped to you by default, with a My calls / All team toggle for admins.",
-      "Recording status card trimmed — no more on-screen file paths.",
-      "Post-update welcome modal now fires after sign-in so it can greet you by name."
+      "Speaker rename rewrites everywhere.",
+      "Participants moved above Summary.",
+      "Web portal feature parity.",
+      "Admin: profile, Team, Org vocab.",
+      "Recording status card cleanup.",
+      "Welcome modal greets by name."
     ]
   },
   "0.2.1": {
-    "headline": "Fresh-install fixes and a home for vocab settings",
+    "headline": "A few fixes that make the app actually work on fresh installs",
     "changes": [
-      "Vocab settings (spelling corrections + word boost) moved to the web portal under Admin → Vocab. Admins manage them once for the whole team.",
-      "You'll see the welcome popup right after signing in, not just on first launch."
+      "Vocab settings move to portal Admin → Vocab.",
+      "Welcome popup post-login."
     ],
     "footer": "If you missed the v0.2.0 notes, open Settings → About or ask us — we can resurface them."
   },
   "0.2.0": {
-    "headline": "Account controls and a real waveform",
+    "headline": "Account controls, a real waveform, and the bug fix you'll be glad to hear about",
     "changes": [
-      "You can now edit your display name, email, and password from Settings in the web portal. Email changes go through a verification link.",
-      "Admins can edit teammates: rename, change email, change role, or trigger a password reset — all from the Team page.",
-      "Invited users now show up as \"pending\" in Team, so you can see who hasn't accepted yet.",
-      "Call detail now renders a real waveform. No more flat line.",
-      "Deleting a call shows a proper confirm dialog instead of the browser's default."
+      "Self-service account controls.",
+      "Admins can edit teammates.",
+      "Pending invitee state in Team.",
+      "Real waveform on call detail.",
+      "Proper delete-call confirm dialog."
     ],
     "footer": "Heads up: some older recordings may still be blank from a prior bug. We can help recover from local vault notes if you need to — just reach out."
   }
