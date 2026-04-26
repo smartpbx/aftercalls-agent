@@ -326,7 +326,9 @@ jobs:
             echo "no macOS bundles to attach"
             exit 0
           fi
-          gh release upload "$TAG" "${files[@]}" --clobber
+          # Job runs in /tmp/macos-stage with no checkout, so gh can't
+          # infer the repo from .git — pass it explicitly.
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
       # Slim system-webkit AppImage. tauri-bundler's AppImage target
       # unconditionally runs linuxdeploy-plugin-gtk.sh, which bundles a
