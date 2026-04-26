@@ -135,23 +135,28 @@ jobs:
       # the sidecar first, falling back to PATH for dev.
       - name: Fetch ffmpeg sidecar (Linux)
         if: matrix.os == 'ubuntu-24.04'
+        env:
+          # Pinned per #69 — the same exact archive every CI run consumes,
+          # so a customer filing an LGPL §6 source request months from
+          # now gets the binary that actually shipped, not whatever
+          # rolled to "latest" that day. Bump both lines together when
+          # rolling forward (and update THIRD_PARTY_NOTICES.md +
+          # site/licenses/index.html in the same commit).
+          FFMPEG_URL: "https://johnvansickle.com/ffmpeg/releases/ffmpeg-7.0.2-amd64-static.tar.xz"
+          FFMPEG_SHA256: "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
         run: |
           set -eux
           mkdir -p src-tauri/binaries
           # John Van Sickle static build — fully static LGPL build,
           # works on any glibc distro without additional libs.
-          # TODO(#69): pin to a specific release URL (e.g.
-          # ffmpeg-7.1.1-amd64-static.tar.xz) once we've captured a
-          # known-good sha256 for that version. Today we fetch the
-          # upstream "release" alias (always latest stable) and record
-          # the archive sha256 in the CI log for audit. If the sha256
-          # changes between two builds, that's visible in the run log
-          # and in the artifact diff.
-          curl -sSL \
-            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
-            -o /tmp/ffmpeg.tar.xz
+          curl -sSL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz
           echo "ffmpeg archive sha256:"
           sha256sum /tmp/ffmpeg.tar.xz
+          # Fail-loud if upstream changes the bytes under us. The pin
+          # is the contract with anyone filing a corresponding-source
+          # request — if it moves, we want the build to break before
+          # we ship a binary we can't reproduce.
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
           mkdir -p /tmp/ffmpeg-stage
           tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
           cp /tmp/ffmpeg-stage/ffmpeg \
@@ -164,19 +169,30 @@ jobs:
       - name: Fetch ffmpeg sidecar (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          # Pinned per #69. gyan.dev re-tags the "release" alias on
+          # every upstream bump; the dated build lives in GyanD's
+          # GitHub releases. Bump URL + SHA256 together (and the notices
+          # files) when rolling forward.
+          FFMPEG_URL: "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip"
+          FFMPEG_SHA256: "04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4"
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
           $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-stage"
-          # gyan.dev's "essentials" build is the lightweight LGPL one
-          # (~90MB unpacked) — same license posture as the Linux
-          # John Van Sickle build. See TODO(#69) on the Linux step
-          # for the pin-to-specific-version follow-up.
+          # GyanD/codexffmpeg's "essentials" build is the lightweight LGPL
+          # one (~90MB unpacked) — same license posture as the Linux
+          # John Van Sickle build.
           Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -Uri $env:FFMPEG_URL `
             -OutFile $zip
           Write-Host "ffmpeg archive sha256:"
-          Get-FileHash -Algorithm SHA256 $zip | Format-List Algorithm,Hash
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          Write-Host $hash
+          if ($hash -ne $env:FFMPEG_SHA256) {
+            Write-Error "ffmpeg sha256 mismatch — expected $env:FFMPEG_SHA256, got $hash"
+            exit 1
+          }
           Expand-Archive -Path $zip -DestinationPath $stage -Force
           $exe = (Get-ChildItem -Path $stage -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1).FullName
           Copy-Item $exe "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe"
@@ -184,28 +200,45 @@ jobs:
           Get-FileHash -Algorithm SHA256 "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe" | Format-List Algorithm,Hash
           Get-ChildItem src-tauri/binaries/
 
-      # macOS sidecar — evermeet.cx ships LGPL-only static builds for
-      # both Intel and Apple Silicon. Same license posture as the
-      # Linux/Windows sidecars above. The archive layout is a flat
-      # zip containing a single `ffmpeg` binary. The download URLs
-      # are arch-specific:
-      #   - Intel:  https://evermeet.cx/ffmpeg/getrelease/zip
-      #   - AS:     https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip
-      # (evermeet hosts both arches; the path differs.)
-      # TODO(#69): pin to specific version + sha256 once #41 ships.
+      # macOS sidecar — osxexperts.net ships LGPL-only static builds
+      # for Apple Silicon (and Intel; Intel matrix entry currently
+      # disabled, see top-of-file comment). Same license posture as
+      # the Linux/Windows sidecars above. The archive layout is a flat
+      # zip containing a single `ffmpeg` binary.
+      #
+      # The osxexperts URLs are *already* version-pinned in the
+      # filename (`ffmpeg711arm.zip` = 7.1.1 arm). #69 adds the
+      # matching sha256 fail-loud check so a silent re-tag at the
+      # same URL would break CI before shipping.
       - name: Fetch ffmpeg sidecar (macOS)
         if: startsWith(matrix.os, 'macos-')
+        env:
+          # Pinned per #69. Bump URL + SHA256 together (and notices)
+          # when rolling forward.
+          FFMPEG_URL_ARM: "https://www.osxexperts.net/ffmpeg711arm.zip"
+          FFMPEG_SHA256_ARM: "59e39a5cec2e5d2307ed079c53227a9181e64b87454ed4de998349e044bfdc70"
+          FFMPEG_URL_INTEL: "https://www.osxexperts.net/ffmpeg711intel.zip"
+          # Intel matrix entry is currently dropped (macos-13 deprecated).
+          # When re-added, compute + pin its sha256 here too.
+          FFMPEG_SHA256_INTEL: ""
         run: |
           set -eux
           mkdir -p src-tauri/binaries
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            URL="https://www.osxexperts.net/ffmpeg711arm.zip"
+            URL="$FFMPEG_URL_ARM"
+            EXPECTED_SHA="$FFMPEG_SHA256_ARM"
           else
-            URL="https://www.osxexperts.net/ffmpeg711intel.zip"
+            URL="$FFMPEG_URL_INTEL"
+            EXPECTED_SHA="$FFMPEG_SHA256_INTEL"
           fi
           curl -sSL "$URL" -o /tmp/ffmpeg.zip
           echo "ffmpeg archive sha256:"
           shasum -a 256 /tmp/ffmpeg.zip
+          if [ -n "$EXPECTED_SHA" ]; then
+            echo "${EXPECTED_SHA}  /tmp/ffmpeg.zip" | shasum -a 256 -c -
+          else
+            echo "WARN: no pinned sha256 for this macOS arch — recording for later pin"
+          fi
           mkdir -p /tmp/ffmpeg-stage
           unzip -o /tmp/ffmpeg.zip -d /tmp/ffmpeg-stage
           # The zip contains a single top-level `ffmpeg` binary.
