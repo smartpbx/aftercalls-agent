@@ -30,6 +30,15 @@
   let editor: Editor | undefined = $state();
   let lastEmitted = '';
 
+  // #326 — platform-aware modifier symbol so Mac users see ⌘ and others
+  // see Ctrl. The bindings work on both via TipTap; the tooltip should
+  // match the user's actual keyboard convention. Detected once at mount
+  // since platform doesn't change mid-session.
+  const isMac =
+    typeof navigator !== 'undefined' &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '');
+  const modSym = isMac ? '⌘' : 'Ctrl+';
+
   function runCmd(fn: (chain: ReturnType<Editor['chain']>) => ReturnType<Editor['chain']>) {
     if (!editor) return;
     fn(editor.chain().focus()).run();
@@ -138,7 +147,7 @@
           class="tb-btn"
           class:active={isBold}
           onclick={() => runCmd((c) => c.toggleBold())}
-          title="Bold (⌘B / Ctrl+B)"
+          title={`Bold (${modSym}B)`}
           aria-label="Bold"
         ><strong>B</strong></button>
         <button
@@ -146,7 +155,7 @@
           class="tb-btn"
           class:active={isItalic}
           onclick={() => runCmd((c) => c.toggleItalic())}
-          title="Italic (⌘I / Ctrl+I)"
+          title={`Italic (${modSym}I)`}
           aria-label="Italic"
         ><em>I</em></button>
         <button
@@ -154,7 +163,7 @@
           class="tb-btn mono"
           class:active={isCode}
           onclick={() => runCmd((c) => c.toggleCode())}
-          title="Inline code (⌘E / Ctrl+E)"
+          title={`Inline code (${modSym}E)`}
           aria-label="Inline code"
         >{"</>"}</button>
         <span class="divider" aria-hidden="true"></span>
@@ -228,7 +237,7 @@
           class="tb-btn"
           class:active={isLink}
           onclick={setLink}
-          title="Link (⌘K / Ctrl+K)"
+          title={`Link (${modSym}K)`}
           aria-label="Link"
         >
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">

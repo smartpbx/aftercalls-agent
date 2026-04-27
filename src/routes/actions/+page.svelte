@@ -34,7 +34,7 @@
     type ActionsOwnerSave,
     type ActionsDueSave,
   } from "$lib/ActionsList.svelte";
-  import type { ActionItemUser } from "$lib/ActionItem.svelte";
+  import ActionItem, { type ActionItemUser } from "$lib/ActionItem.svelte";
   import {
     rewriteChipOccurrence,
     firstLastInitial,
@@ -65,9 +65,28 @@
 
   const PAGE_SIZE = 50;
 
+  // #390 — assignee scope (Mine / All). In-memory filter on the
+  // already-fetched items; no backend changes. The backend endpoint is
+  // `me`-scoped so "All" shows every item (unfiltered); "Mine" narrows
+  // to items where assignee_user_id === current user's id. Persisted
+  // in localStorage so it survives navigation.
+  const ASSIGNEE_FILTER_KEY = "aftercalls.actions.assigneeFilter";
+  type AssigneeFilter = "mine" | "all";
+  let assigneeFilter = $state<AssigneeFilter>("mine");
+  // The current user's id — resolved on mount from current_user to
+  // drive the "Mine" filter. Null until resolved; "Mine" renders all
+  // items as a safe fallback when the id isn't known yet.
+  let myUserId = $state<string | null>(null);
+
+  // #390 — group-by-call toggle. When on, items are rendered in
+  // per-call sections instead of a flat list. Persisted in localStorage.
+  const GROUP_BY_CALL_KEY = "aftercalls.actions.groupByCall";
+  let groupByCall = $state(false);
+
   let status = $state<ActionsStatusFilter>("open");
-  // #173 — Due filter, persisted in `?due=...`. Defaults to "all".
-  let dueFilter = $state<ActionsDueFilter>("all");
+  // #173 — Due filter, persisted in `?due=...`. Defaults to "week"
+  // (#390 changes the default from "all" to "Due soon" = this week).
+  let dueFilter = $state<ActionsDueFilter>("week");
   let items = $state<MeActionItem[]>([]);
   let nextCursor = $state<string | null>(null);
   // #130b — three filter-stable counts sourced from the backend
@@ -91,17 +110,19 @@
   }
 
   function readDueFromUrl(): ActionsDueFilter {
-    if (typeof window === "undefined") return "all";
+    if (typeof window === "undefined") return "week";
     const raw = new URL(window.location.href).searchParams.get("due");
     if (
       raw === "overdue" ||
       raw === "today" ||
       raw === "week" ||
-      raw === "none"
+      raw === "none" ||
+      raw === "all"
     ) {
       return raw;
     }
-    return "all";
+    // #390 — default is "week" (Due soon) when no URL param is set.
+    return "week";
   }
 
   function writeStatusToUrl(next: ActionsStatusFilter) {
@@ -125,7 +146,10 @@
   function writeDueToUrl(next: ActionsDueFilter) {
     if (typeof window === "undefined") return;
     const u = new URL(window.location.href);
-    if (next === "all") {
+    // #390 — "week" is the new default; elide the param so URLs stay
+    // clean on the common path. Explicit "all" gets a param so back/
+    // forward navigation can distinguish "week default" from "all".
+    if (next === "week") {
       u.searchParams.delete("due");
     } else {
       u.searchParams.set("due", next);
@@ -188,9 +212,31 @@
     }
   }
 
+  // #390 — load current user id for the "Mine" assignee filter.
+  // LoginResult exposes `user_id` (not `id`).
+  async function loadMyUserId() {
+    try {
+      type Me = { user_id: string; email: string };
+      const me = await invoke<Me | null>("current_user");
+      if (me) myUserId = me.user_id;
+    } catch {
+      // Non-fatal — "Mine" falls back to showing all items.
+    }
+  }
+
   onMount(() => {
     status = readStatusFromUrl();
     dueFilter = readDueFromUrl();
+    // #390 — restore assignee filter + group-by-call from localStorage.
+    try {
+      const saved = localStorage.getItem(ASSIGNEE_FILTER_KEY);
+      if (saved === "mine" || saved === "all") assigneeFilter = saved;
+    } catch {}
+    try {
+      const saved = localStorage.getItem(GROUP_BY_CALL_KEY);
+      if (saved === "true") groupByCall = true;
+    } catch {}
+    void loadMyUserId();
     void loadOrgMembers();
     void loadFirst();
   });
@@ -202,6 +248,20 @@
     nextCursor = null;
     items = [];
     await loadFirst();
+  }
+
+  // #390 — in-memory assignee filter handler. No backend roundtrip —
+  // filters the already-loaded items array on the client.
+  function onAssigneeFilterChange(next: AssigneeFilter) {
+    if (next === assigneeFilter) return;
+    assigneeFilter = next;
+    try { localStorage.setItem(ASSIGNEE_FILTER_KEY, next); } catch {}
+  }
+
+  // #390 — group-by-call toggle.
+  function toggleGroupByCall() {
+    groupByCall = !groupByCall;
+    try { localStorage.setItem(GROUP_BY_CALL_KEY, String(groupByCall)); } catch {}
   }
 
   async function onDueFilterChange(next: ActionsDueFilter) {
@@ -291,6 +351,48 @@
     open: totalOpen,
     done: totalDone,
     all: totalAll,
+  });
+
+  // #390 — in-memory assignee filter. "Mine" narrows to items where
+  // assignee_user_id matches the current user's id. Falls back to
+  // showing all items if myUserId is not yet resolved (avoids a flash
+  // of empty state on first load). "All" passes items through unchanged.
+  const visibleItems = $derived.by(() => {
+    if (assigneeFilter === "all" || !myUserId) return items;
+    return items.filter(
+      (it) => it.assignee_user_id === myUserId,
+    );
+  });
+
+  // #390 — group items by parent call. Each entry is a call header +
+  // its action items, sorted by the call's recorded_at desc so the
+  // most recent call is first.
+  type CallGroup = {
+    callId: string;
+    callTitle: string | null;
+    callRecordedAt: string;
+    items: MeActionItem[];
+  };
+  const callGroups = $derived.by((): CallGroup[] => {
+    const map = new Map<string, CallGroup>();
+    for (const it of visibleItems) {
+      let g = map.get(it.call_id);
+      if (!g) {
+        g = {
+          callId: it.call_id,
+          callTitle: it.call_title,
+          callRecordedAt: it.call_recorded_at,
+          items: [],
+        };
+        map.set(it.call_id, g);
+      }
+      g.items.push(it);
+    }
+    return [...map.values()].sort(
+      (a, b) =>
+        new Date(b.callRecordedAt).getTime() -
+        new Date(a.callRecordedAt).getTime(),
+    );
   });
 
   // Back/forward navigation: SvelteKit's actual navigation flow
@@ -695,28 +797,28 @@
   let highlightedItemId = $state<string | null>(null);
 
   $effect(() => {
-    if (items.length === 0) {
+    if (visibleItems.length === 0) {
       highlightedItemId = null;
       return;
     }
     if (
       !highlightedItemId ||
-      !items.some((it) => it.id === highlightedItemId)
+      !visibleItems.some((it) => it.id === highlightedItemId)
     ) {
-      highlightedItemId = items[0].id;
+      highlightedItemId = visibleItems[0].id;
     }
   });
 
   function moveHighlight(delta: 1 | -1) {
-    if (items.length === 0) return;
+    if (visibleItems.length === 0) return;
     const cur = highlightedItemId
-      ? items.findIndex((it) => it.id === highlightedItemId)
+      ? visibleItems.findIndex((it) => it.id === highlightedItemId)
       : -1;
     const next = Math.max(
       0,
-      Math.min(items.length - 1, (cur < 0 ? 0 : cur) + delta),
+      Math.min(visibleItems.length - 1, (cur < 0 ? 0 : cur) + delta),
     );
-    highlightedItemId = items[next].id;
+    highlightedItemId = visibleItems[next].id;
     requestAnimationFrame(() => {
       const el = document.querySelector<HTMLElement>(
         '[data-shortcut-row="active"]',
@@ -726,7 +828,7 @@
   }
 
   function toggleHighlighted() {
-    const it = items.find((x) => x.id === highlightedItemId);
+    const it = visibleItems.find((x) => x.id === highlightedItemId);
     if (!it) return;
     const nextStatus: "open" | "done" =
       it.status === "done" ? "open" : "done";
@@ -734,7 +836,7 @@
   }
 
   function editHighlighted() {
-    const it = items.find((x) => x.id === highlightedItemId);
+    const it = visibleItems.find((x) => x.id === highlightedItemId);
     if (!it) return;
     onDescriptionEditRequest({ item: { id: it.id, call_id: it.call_id } });
   }
@@ -767,40 +869,192 @@
   <title>Action items · aftercalls</title>
 </svelte:head>
 
-<ActionsList
-  {items}
-  {status}
-  {loading}
-  {loadingMore}
-  {error}
-  {loadMoreError}
-  {nextCursor}
-  {totals}
-  {orgMembers}
-  {togglingIds}
-  canEdit={true}
-  {activeRowEdit}
-  {patchingItemIds}
-  due={dueFilter}
-  onfilterchange={onFilterChange}
-  onduefilterchange={onDueFilterChange}
-  ontoggle={onToggle}
-  onloadmore={loadMore}
-  onretry={onRetry}
-  onDescriptionEditRequest={onDescriptionEditRequest}
-  onOwnerEditRequest={onOwnerEditRequest}
-  onDueEditRequest={onDueEditRequest}
-  onDescriptionSave={onDescriptionSave}
-  onOwnerSave={onOwnerSave}
-  onDueSave={onDueSave}
-  onDescriptionCancel={onDescriptionCancel}
-  onOwnerCancel={onOwnerCancel}
-  onDueCancel={onDueCancel}
-  onactionitemchipaction={openActionItemChip}
-  activeChipItemId={activeChip?.itemId ?? null}
-  activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}
-  {highlightedItemId}
-/>
+<!-- #390 — Mine / All assignee filter + Group-by-call toggle.
+     Rendered above the ActionsList flat view; also shown in the grouped
+     view header. These are agent-specific controls (portal handles scope
+     backend-side via a separate endpoint); kept outside ActionsList so
+     the mirror-pair invariant is preserved. -->
+<div class="actions-extra-bar">
+  <div class="assignee-toggle" role="group" aria-label="Assignee scope">
+    <button
+      type="button"
+      class="scope-opt"
+      class:active={assigneeFilter === "mine"}
+      onclick={() => onAssigneeFilterChange("mine")}
+    >Mine</button>
+    <button
+      type="button"
+      class="scope-opt"
+      class:active={assigneeFilter === "all"}
+      onclick={() => onAssigneeFilterChange("all")}
+    >All</button>
+  </div>
+  <button
+    type="button"
+    class="group-toggle"
+    class:active={groupByCall}
+    onclick={toggleGroupByCall}
+    title={groupByCall ? "Show flat list" : "Group by call"}
+    aria-pressed={groupByCall}
+  >
+    {groupByCall ? "Grouped" : "Flat"}
+  </button>
+</div>
+
+{#if groupByCall}
+  <!-- #390 — Per-call grouped view. Replaces the flat ActionsList so
+       we can insert call-header rows without touching the mirror-pair
+       component. Inherits all edit/toggle/save handlers from the page. -->
+  <main class="actions-grouped-page">
+    <header class="actions-head">
+      <div class="actions-head-main">
+        <h1>Action items</h1>
+        <p class="actions-subhead">
+          {assigneeFilter === "mine"
+            ? "Your items across all calls, grouped by call."
+            : "All items across all calls, grouped by call."}
+        </p>
+      </div>
+    </header>
+
+    {#if loading}
+      <p class="actions-state">Loading…</p>
+    {:else if error}
+      <p class="actions-state actions-state-err" role="alert">
+        Couldn't load your action items.
+        <button type="button" class="actions-retry" onclick={onRetry}>Retry</button>
+      </p>
+    {:else if callGroups.length === 0}
+      <div class="actions-empty">
+        <p class="actions-empty-title">All caught up.</p>
+        <p class="actions-empty-sub">No items match the current filters.</p>
+      </div>
+    {:else}
+      {#each callGroups as group (group.callId)}
+        <section class="call-group">
+          <a
+            href="/calls/{group.callId}"
+            class="call-group-head"
+            aria-label="Go to call: {group.callTitle ?? '(untitled)'}"
+          >
+            <span class="call-group-title">{group.callTitle ?? "(untitled)"}</span>
+            <span class="call-group-meta">
+              {new Date(group.callRecordedAt).toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+                year: "numeric",
+              })}
+              · {group.items.length} item{group.items.length === 1 ? "" : "s"}
+            </span>
+          </a>
+          <ul class="actions-list call-group-list">
+            {#each group.items as item, i (item.id)}
+              <ActionItem
+                {item}
+                users={orgMembers}
+                callId={item.call_id}
+                index={i}
+                totalInList={group.items.length}
+                variant="actions-page"
+                callContext={{
+                  id: item.call_id,
+                  title: item.call_title,
+                  recordedAt: item.call_recorded_at,
+                }}
+                canEdit={true}
+                editingDescription={activeRowEdit.kind === "description" &&
+                  activeRowEdit.itemId === item.id}
+                editingOwner={activeRowEdit.kind === "owner" &&
+                  activeRowEdit.itemId === item.id}
+                editingDue={activeRowEdit.kind === "due" &&
+                  activeRowEdit.itemId === item.id}
+                saving={patchingItemIds.has(item.id)}
+                onDescriptionEditRequest={(p) =>
+                  onDescriptionEditRequest({ item: p.item })}
+                onOwnerEditRequest={(p) =>
+                  onOwnerEditRequest({ item: p.item })}
+                onDueEditRequest={(p) =>
+                  onDueEditRequest({ item: p.item })}
+                onDescriptionSave={(p) =>
+                  onDescriptionSave({
+                    itemId: p.itemId,
+                    callId: item.call_id,
+                    description: p.description,
+                  })}
+                onOwnerSave={(p) =>
+                  onOwnerSave({
+                    itemId: p.itemId,
+                    callId: item.call_id,
+                    assigneeUserId: p.assigneeUserId,
+                  })}
+                onDueSave={(p) => {
+                  if (p.kind === "dated") {
+                    onDueSave({ itemId: p.itemId, callId: item.call_id, kind: "dated", dueAt: p.dueAt });
+                  } else {
+                    onDueSave({ itemId: p.itemId, callId: item.call_id, kind: p.kind });
+                  }
+                }}
+                onDescriptionCancel={(p) =>
+                  onDescriptionCancel({ item: p.item })}
+                onOwnerCancel={(p) =>
+                  onOwnerCancel({ item: p.item })}
+                onDueCancel={(p) =>
+                  onDueCancel({ item: p.item })}
+                ontoggle={(payload) =>
+                  !togglingIds.has(item.id) &&
+                  onToggle({
+                    itemId: payload.item.id,
+                    callId: payload.item.call_id,
+                    nextStatus: payload.nextStatus,
+                  })}
+                onchipaction={openActionItemChip}
+                activeChipOccurrenceIndex={activeChip?.itemId === item.id
+                  ? activeChip.occurrenceIndex
+                  : null}
+                highlighted={highlightedItemId === item.id}
+              />
+            {/each}
+          </ul>
+        </section>
+      {/each}
+    {/if}
+  </main>
+{:else}
+  <ActionsList
+    items={visibleItems}
+    {status}
+    {loading}
+    {loadingMore}
+    {error}
+    {loadMoreError}
+    {nextCursor}
+    {totals}
+    {orgMembers}
+    {togglingIds}
+    canEdit={true}
+    {activeRowEdit}
+    {patchingItemIds}
+    due={dueFilter}
+    onfilterchange={onFilterChange}
+    onduefilterchange={onDueFilterChange}
+    ontoggle={onToggle}
+    onloadmore={loadMore}
+    onretry={onRetry}
+    onDescriptionEditRequest={onDescriptionEditRequest}
+    onOwnerEditRequest={onOwnerEditRequest}
+    onDueEditRequest={onDueEditRequest}
+    onDescriptionSave={onDescriptionSave}
+    onOwnerSave={onOwnerSave}
+    onDueSave={onDueSave}
+    onDescriptionCancel={onDescriptionCancel}
+    onOwnerCancel={onOwnerCancel}
+    onDueCancel={onDueCancel}
+    onactionitemchipaction={openActionItemChip}
+    activeChipItemId={activeChip?.itemId ?? null}
+    activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}
+    {highlightedItemId}
+  />
+{/if}
 
 {#if activeChip}
   <ChipMenu
@@ -814,3 +1068,179 @@
     onclose={closeChipMenu}
   />
 {/if}
+
+<style>
+  /* #390 — Mine/All assignee filter + Group-by-call toggle bar.
+     Floats above the ActionsList so it doesn't interfere with the
+     mirror-pair component's own filter row. Aligns flush with the
+     ActionsList's max-width so the two rows form one visual unit. */
+  .actions-extra-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 0.75rem 2rem 0;
+  }
+  .assignee-toggle {
+    display: inline-flex;
+    gap: 0.2rem;
+    padding: 0.2rem;
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    border-radius: 8px;
+  }
+  .scope-opt {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--bone-2);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .scope-opt:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
+  }
+  .scope-opt.active {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    box-shadow: inset 0 0 0 1px var(--hairline-hi);
+  }
+  .group-toggle {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--bone-2);
+    background: var(--ink-1);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .group-toggle:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+  }
+  .group-toggle.active {
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+
+  /* #390 — grouped view. Reuses the ActionsList page shape. */
+  .actions-grouped-page {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 1rem 2rem 2rem;
+    position: relative;
+    z-index: 2;
+  }
+  .actions-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-bottom: 1.2rem;
+  }
+  .actions-head-main {
+    min-width: 0;
+  }
+  .actions-head h1 {
+    margin: 0 0 0.2rem;
+    font-weight: 600;
+    color: var(--bone-0);
+  }
+  .actions-subhead {
+    margin: 0;
+    font-size: 0.82rem;
+    color: var(--bone-3);
+  }
+  .actions-state {
+    color: var(--bone-3);
+  }
+  .actions-state-err {
+    color: var(--live);
+  }
+  .actions-retry {
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    font-size: inherit;
+    font-family: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .actions-empty {
+    padding: 2.5rem 2rem;
+    text-align: center;
+    border: 1px dashed var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-1);
+  }
+  .actions-empty-title {
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--bone-1);
+    margin: 0 0 0.3rem;
+  }
+  .actions-empty-sub {
+    color: var(--bone-3);
+    font-size: 0.85rem;
+    margin: 0;
+  }
+  .call-group {
+    margin-bottom: 1.5rem;
+  }
+  .call-group-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.45rem 0;
+    margin-bottom: 0.2rem;
+    border-bottom: 1px solid var(--hairline);
+    text-decoration: none;
+    color: inherit;
+  }
+  .call-group-head:hover .call-group-title {
+    color: var(--accent-hi);
+  }
+  .call-group-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--bone-0);
+    transition: color 0.12s;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .call-group-meta {
+    font-size: 0.75rem;
+    color: var(--bone-3);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .call-group-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-1);
+  }
+  .actions-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-1);
+  }
+</style>

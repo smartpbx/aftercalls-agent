@@ -1,4 +1,13 @@
 {
+  "0.10.1": {
+    "headline": "Polish + onboarding copy + agent UX waiting state + backend HTTP timeouts + tighter password policy",
+    "changes": [
+      "Action items on the desktop app — Mine/All toggle, default Due soon, per-call grouping. The desktop app's Action items view now matches the web's range of controls: Mine vs Anyone toggle, default to 'Due soon', and an option to group by parent call so you can see everything from a single meeting at once. Preferences persist locally across sessions.",
+      "Web portal: shared TagAutocomplete + cleaner filter cluster + Send-to-CRM remembers prior push. On the web portal: the tag-add popover on a call detail page and the Add filter popover on the calls list now share the same component, so they look and behave the same. The calls list filter and date pickers are now visually grouped as one cluster instead of two stacked rows. And on a call you've already pushed to your CRM, the Send-to-CRM dialog now shows what record it landed on last time and asks Update or Create instead of silently creating a duplicate.",
+      "Web portal: Notifications card preview, integrations catalog, redirect-only directory cleanup. Smaller portal polish: a new Notifications card on /settings (preview-only for now while we wire up the per-user prefs backend), the /admin/integrations page is now a proper catalog with status indicators for each integration instead of a redirect, and the duplicate Action items section on call-detail pages is gone (was rendering twice).",
+      "Agent ack modal: 'Read full guide' link with intent preserved. The recording-consent ack modal on the desktop app now has a clearly-labelled 'Read full guide ↗' link that opens the help page in your browser without clearing your checkbox state — when you come back to the modal, you don't have to re-check the consent box."
+    ]
+  },
   "0.10.0": {
     "headline": "Mine vs all-team toggles, share-modal presets, more keyboard + Linux + Zoho-region polish",
     "changes": [

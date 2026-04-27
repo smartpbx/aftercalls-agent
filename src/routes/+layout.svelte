@@ -2123,11 +2123,14 @@
         {/if}
       </div>
       <div class="rn-actions">
+        <!-- #409 — "Read full guide" opens in the system browser via
+             openUrl so the modal stays open with the checkbox state
+             intact; the user returns and confirms without re-checking. -->
         <button
           type="button"
           class="rn-link"
           onclick={openConsentGuide}
-        >See our recording-consent guide <span aria-hidden="true">↗</span></button>
+        >Read full guide <span aria-hidden="true">↗</span></button>
         <div class="auto-ack-buttons">
           <button
             type="button"

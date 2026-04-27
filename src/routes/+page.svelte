@@ -1332,8 +1332,12 @@
         <span>I'll get consent from everyone on this call.</span>
       </label>
 
+      <!-- #409 — "Read full guide" opens the help page in the system
+           browser via openUrl; the modal stays open with the checkbox
+           state intact so the user can return and confirm without
+           re-reading or re-checking. -->
       <button type="button" class="ack-guide" onclick={openConsentGuide}>
-        See our recording-consent guide <span aria-hidden="true">↗</span>
+        Read full guide <span aria-hidden="true">↗</span>
       </button>
 
       {#if ackError}

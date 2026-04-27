@@ -4,6 +4,7 @@
   import { replaceState, afterNavigate } from "$app/navigation";
   import { page } from "$app/state";
   import DateInput from "$lib/DateInput.svelte";
+  import TosConfirmModal from "$lib/TosConfirmModal.svelte";
   import { portalErrorToText } from "$lib/portalError";
 
   // Mirrors the portal's trash view. Deleted calls live here for
@@ -37,6 +38,10 @@
   let error = $state("");
   let scope = $state<"mine" | "all">("mine");
   let busy = $state<Record<string, boolean>>({});
+  // #397 — styled confirm modal replaces window.confirm() on the
+  // permanent-delete path. `confirmRow` holds the row pending
+  // confirmation; null = modal is closed.
+  let confirmRow = $state<Call | null>(null);
 
   // #176 — only admin + owner see the All-team pill. Non-admins stay
   // on the implicit `mine` scope (and the backend enforces this
@@ -142,11 +147,13 @@
     }
   }
 
-  async function permadelete(row: Call) {
-    const ok = window.confirm(
-      `Permanently delete "${row.title ?? "(untitled)"}"? The audio is removed from storage and cannot be undone.`,
-    );
-    if (!ok) return;
+  // #397 — open the styled confirm modal (was a native window.confirm).
+  function askPermadelete(row: Call) {
+    confirmRow = row;
+  }
+
+  async function confirmPermadelete(row: Call) {
+    confirmRow = null;
     busy[row.id] = true;
     try {
       await invoke("permadelete_call", {
@@ -302,7 +309,7 @@
             <button
               class="row-btn row-btn-danger"
               disabled={busy[r.id]}
-              onclick={() => permadelete(r)}
+              onclick={() => askPermadelete(r)}
             >
               Delete forever
             </button>
@@ -312,6 +319,29 @@
     </ul>
   {/if}
 </main>
+
+{#if confirmRow}
+  {@const target = confirmRow}
+  <!-- #397 — Permanent-delete confirm. Reuses TosConfirmModal so the
+       confirm follows the shared `.rn-*` shell + danger-variant
+       button vocabulary used elsewhere for destructive intent. -->
+  <TosConfirmModal
+    title="Permanently delete this call?"
+    primaryLabel={busy[target.id] ? "Deleting…" : "Delete forever"}
+    primaryVariant="danger"
+    busy={!!busy[target.id]}
+    onConfirm={() => confirmPermadelete(target)}
+    onCancel={() => (confirmRow = null)}
+  >
+    {#snippet body()}
+      <p>
+        <strong>{target.title ?? "(untitled)"}</strong> will be
+        permanently removed. The audio is deleted from storage and
+        this cannot be undone.
+      </p>
+    {/snippet}
+  </TosConfirmModal>
+{/if}
 
 <style>
   .page {
