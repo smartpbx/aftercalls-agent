@@ -1067,9 +1067,15 @@
             <button class="open-app" onclick={openCallInApp}>
               Open in app
             </button>
-            <button class="open-web" onclick={openCallInBrowser}>
-              Open on web ↗
-            </button>
+            <!-- Demoted to icon-only external link; tooltip carries the
+                 full label so keyboard + pointer users can discover it
+                 without the button competing visually with the primary. -->
+            <button
+              class="open-web"
+              onclick={openCallInBrowser}
+              aria-label="Open on web"
+              title="Open on web"
+            >↗</button>
           </div>
         {/if}
       </div>
@@ -1595,31 +1601,38 @@
     gap: 0.4rem;
     flex-shrink: 0;
   }
-  .open-web,
   .open-app {
     padding: 0.35rem 0.75rem;
     border: 1px solid var(--accent);
     border-radius: 6px;
-    background: transparent;
-    color: var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
     font-size: 0.78rem;
     font-weight: 500;
     cursor: pointer;
     transition: all 0.15s;
   }
-  .open-app {
-    /* Primary action lives in-app — filled accent, external link
-       gets the lighter outlined treatment. */
-    background: var(--accent);
-    color: var(--ink-0);
-  }
-  .open-web:hover {
-    background: var(--accent);
-    color: var(--ink-0);
-  }
   .open-app:hover {
     background: var(--accent-hi);
     border-color: var(--accent-hi);
+  }
+  /* Demoted external-link: icon-only square pill. Tooltip carries the
+     full "Open on web" label; visually it just shows ↗ so it doesn't
+     compete with the filled primary button. */
+  .open-web {
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--bone-3);
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .open-web:hover {
+    color: var(--bone-0);
+    border-color: var(--bone-2);
   }
 
   .inline-error {

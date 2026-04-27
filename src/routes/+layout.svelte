@@ -65,8 +65,13 @@
   // is_recording (so a reopened webview picks up an in-flight
   // session) and ticked every 500ms while the overlay is visible.
   let noteElapsedLabel = $state("0:00");
+  // #495 — hidden sr-only live region text. Updated every 60 s so
+  // screen readers get a periodic "still recording, N min elapsed" cue
+  // without spamming the 500 ms visual tick.
+  let noteSrAnnounce = $state("");
   let noteStartedAtMs = $state<number | null>(null);
   let noteTimerHandle: ReturnType<typeof setInterval> | null = null;
+  let noteSrHandle: ReturnType<typeof setInterval> | null = null;
   let stoppingNote = $state(false);
   let noteError = $state<string | null>(null);
   let unlistenState: UnlistenFn | null = null;
@@ -94,12 +99,23 @@
       if (!noteStartedAtMs) return;
       noteElapsedLabel = fmtElapsed(Date.now() - noteStartedAtMs);
     }, 500);
+    // #495 — announce elapsed time to screen readers every 60 s.
+    noteSrHandle = setInterval(() => {
+      if (!noteStartedAtMs) return;
+      const mins = Math.floor((Date.now() - noteStartedAtMs) / 60_000);
+      noteSrAnnounce = `Still recording — ${mins} minute${mins === 1 ? "" : "s"} elapsed.`;
+    }, 60_000);
   }
   function stopNoteTimer() {
     if (noteTimerHandle) {
       clearInterval(noteTimerHandle);
       noteTimerHandle = null;
     }
+    if (noteSrHandle) {
+      clearInterval(noteSrHandle);
+      noteSrHandle = null;
+    }
+    noteSrAnnounce = "";
   }
   async function primeNoteOverlay() {
     try {
@@ -356,6 +372,16 @@
     try {
       const u = await checkForUpdate();
       if (u) {
+        // #428 — skip re-surfacing if the user clicked "Later" on this
+        // version within the snooze window (4 h). A newer version on
+        // the manifest always surfaces because its key is unset.
+        if (!opts.userInitiated && isUpdateSnoozed(u.version)) {
+          logEvent("info", "updater::check_result", "checkForUpdate -> snoozed", {
+            outcome: "snoozed",
+            manifest_version: u.version,
+          });
+          return;
+        }
         // Replace the cached object only if the manifest has moved
         // forward. Keeps the pill steady when nothing changed; flips
         // it to the newer version when 0.3.19 → 0.3.20 happens while
@@ -402,9 +428,12 @@
       const manifestVersion = await pollManifestVersion();
       if (!manifestVersion || !version) return;
       if (semverGt(manifestVersion, version)) {
-        // Same refresh logic: only replace when newer.
-        if (!linuxUpdateAvailable || semverGt(manifestVersion, linuxUpdateAvailable)) {
-          linuxUpdateAvailable = manifestVersion;
+        // #428 — same snooze gate as the AppImage path.
+        if (opts.userInitiated || !isUpdateSnoozed(manifestVersion)) {
+          // Same refresh logic: only replace when newer.
+          if (!linuxUpdateAvailable || semverGt(manifestVersion, linuxUpdateAvailable)) {
+            linuxUpdateAvailable = manifestVersion;
+          }
         }
       } else {
         linuxUpdateAvailable = null;
@@ -421,6 +450,7 @@
   }
 
   function dismissLinuxUpdate() {
+    if (linuxUpdateAvailable) snoozeUpdate(linuxUpdateAvailable);
     linuxUpdateAvailable = null;
   }
 
@@ -493,6 +523,9 @@
   // the scroll container itself and the footer link — neither is the
   // obvious "commit" target.
   let rnDismissBtn = $state<HTMLButtonElement | null>(null);
+  // #492 — focus trap: ref for the secondary action so Tab wraps
+  // between the two buttons inside the modal.
+  let rnLinkBtn = $state<HTMLButtonElement | null>(null);
   let autoAckDismissBtn = $state<HTMLButtonElement | null>(null);
   $effect(() => {
     if (releaseNotes && rnDismissBtn) {
@@ -1080,7 +1113,34 @@
     }
   }
 
+  // #428 — per-version snooze. "Later" hides the pill for 4 hours so
+  // the hourly poll doesn't resurface the exact same version on the
+  // very next tick.  The key includes the version string so a newer
+  // release on the manifest always surfaces fresh (its key is unset).
+  const UPDATE_SNOOZE_MS = 4 * 60 * 60 * 1000; // 4 hours
+  function updateSnoozeKey(ver: string) {
+    return `aftercalls:update-snooze:${ver}`;
+  }
+  function isUpdateSnoozed(ver: string): boolean {
+    try {
+      const raw = localStorage.getItem(updateSnoozeKey(ver));
+      if (!raw) return false;
+      return Date.now() < parseInt(raw, 10);
+    } catch {
+      return false;
+    }
+  }
+  function snoozeUpdate(ver: string) {
+    try {
+      localStorage.setItem(
+        updateSnoozeKey(ver),
+        String(Date.now() + UPDATE_SNOOZE_MS),
+      );
+    } catch {}
+  }
+
   function dismissUpdate() {
+    if (updateAvailable) snoozeUpdate(updateAvailable.version);
     updateAvailable = null;
     updateState = "idle";
   }
@@ -1621,10 +1681,11 @@
              agent's `backend_health` Tauri command is happy. -->
         <OfflineBanner />
         {#if orphans.length > 0}
-          <!-- Orphan recovery pill (#63). Same shape as the update
-               pill: a thin rounded chip with status pip + label +
-               primary + dismiss action. Sig-yellow pip so it reads
-               as an interrupt without the warning-red weight. -->
+          <!-- Orphan recovery pill (#63). Collapsed to a short label +
+               single Review button — bulk actions (Resume all / Discard
+               all) live in the orphan review pane that Review toggles.
+               Full description in tooltip so it still appears in the
+               narrower topstrip cluster. (#432) -->
           <div class="update" data-tauri-drag-region>
             <span class="pip sig" data-tauri-drag-region></span>
             <span
@@ -1632,26 +1693,13 @@
               data-tauri-drag-region
               title={`${orphans.length} unfinished call${orphans.length === 1 ? "" : "s"} from before the last restart`}
             >
-              {orphans.length} unfinished call{orphans.length === 1 ? "" : "s"}
-              from before the last restart
+              {orphans.length} unfinished
             </span>
             <button
               class="update-install"
-              onclick={resumeAllOrphans}
-              disabled={orphanBulkBusy}
-            >
-              {orphanBulkBusy ? "Working…" : "Resume all"}
-            </button>
-            <button
-              class="update-dismiss"
-              onclick={discardAllOrphans}
-              disabled={orphanBulkBusy}
-            >Discard all</button>
-            <button
-              class="update-dismiss"
               onclick={() => (orphanReview = !orphanReview)}
               disabled={orphanBulkBusy}
-            >{orphanReview ? "Hide" : "Review…"}</button>
+            >{orphanReview ? "Hide" : "Review"}</button>
           </div>
         {/if}
         {#if staleNudge}
@@ -1858,6 +1906,12 @@
     aria-live="polite"
     aria-label="Recording note to self"
   >
+    <!-- #495 — screen-reader live region. Ticks every 60 s so
+         assistive tech hears a periodic "still recording, N min"
+         cue. Visually hidden; the visible elapsed span is aria-hidden. -->
+    <span class="sr-only" aria-live="polite" aria-atomic="true"
+      >{noteSrAnnounce}</span
+    >
     <div class="note-overlay-head">
       <span class="note-pip" aria-hidden="true"></span>
       <span class="note-title">Recording note</span>
@@ -1927,6 +1981,25 @@
         // swallowed it. All other keys stay contained so they don't
         // reach the rail's route-switch / shortcut handlers underneath.
         if (e.key === "Escape") { dismissReleaseNotes(); return; }
+        // #492 — hand-rolled focus trap. Cycle Tab between the two
+        // action buttons (rnLinkBtn ↔ rnDismissBtn) so the body's
+        // scroll region doesn't bleed keyboard focus out of the modal.
+        if (e.key === "Tab") {
+          const first = rnLinkBtn;
+          const last = rnDismissBtn;
+          if (!first || !last) return;
+          if (e.shiftKey) {
+            if (document.activeElement === first) {
+              e.preventDefault();
+              last.focus();
+            }
+          } else {
+            if (document.activeElement === last) {
+              e.preventDefault();
+              first.focus();
+            }
+          }
+        }
         e.stopPropagation();
       }}
       tabindex="-1"
@@ -1971,6 +2044,7 @@
         <button
           type="button"
           class="rn-link"
+          bind:this={rnLinkBtn}
           onclick={async () => {
             try { await openUrl("https://aftercalls.io/releases"); } catch {}
           }}

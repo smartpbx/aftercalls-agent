@@ -1,25 +1,33 @@
 {
-  "0.9.5": {
-    "headline": "Polish + portal toasts + agent recording UX + prompt-injection hardening + invite security",
+  "0.9.6": {
+    "headline": "Canadian privacy on the homepage, clearer single sign-on help, quieter desktop update prompt, behind-the-scenes hardening",
     "changes": [
-      "Toasts replace inline ok/err messages across the portal. Saving a password change, toggling a teammate's status, doing a bulk speaker rename — these now show a tidy toast that auto-dismisses, instead of inline 'Saved' or error text crowding the form. Failed-call list rows already had this treatment in v0.9.4; v0.9.5 sweeps it across Settings, Admin Users, and the bulk-rename surface.",
-      "Notes editor stays mounted through pipeline upload + agent UX polish. Notes you wrote during a call no longer disappear at the moment the agent finishes uploading. The Call / Note mode toggle on the Record screen now has a one-line subtitle explaining the difference, the filter popover shows a spinner instead of bare 'Loading…' text, and the 'Set in Settings' tooltip on null shortcuts now links you straight to the right setting."
+      "Homepage now leads with our Canadian privacy posture. The features grid on aftercalls.io now leads with a Canadian-privacy section: recordings are stored in Toronto, we publish full PIPEDA and Quebec Law 25 disclosures, and your audio is never used to train AI — ours or anyone else's. The big button at the top of the page now says Request access (and opens an email to us) — most first-time visitors don't have an invite yet, so bouncing them to a sign-in page didn't make sense. Sign in is still right next to it for people who already have accounts.",
+      "Clearer help instructions for signing in with single sign-on. If your team uses single sign-on, the help page now has a short paragraph that walks you through it: open the login page, click Sign in with single sign-on, pick your provider, done. The longer setup instructions for whoever's running aftercalls (registering provider apps, setting environment variables) are now clearly separated below, so you don't have to scroll past them. The help sidebar also picks up an Integrations group with links to the Zoho CRM and Zoho Meeting setup pages.",
+      "Desktop app: quieter update prompt, tidier post-recording buttons, screen-reader friendly notes. On the desktop app: clicking Later on the update prompt now keeps it quiet for 4 hours instead of an hour, so it doesn't keep nagging you about the same release. After you stop a recording, Open in app stays as the obvious next button and Open on web shrinks to a small icon next to it — one clear primary action instead of two competing ones. Screen-reader users now hear the elapsed time of an in-progress note announced once a minute, and you can keyboard-tab through the release-notes pop-up without the focus jumping out. The Form button on the report-issue screen now reads Open report."
+    ]
+  },
+  "0.9.5": {
+    "headline": "Cleaner confirmation messages, kept-while-uploading notes, mobile site fixes, behind-the-scenes hardening",
+    "changes": [
+      "Confirmation messages now appear as brief pop-up notices across the portal. Saving a password change, toggling a teammate's status, doing a bulk speaker rename — these now show a brief notice at the bottom of the screen that dismisses itself, instead of inline 'Saved' or error text crowding the form. The calls list already worked this way; this release extends it to Settings, the Users page, and bulk speaker rename.",
+      "Notes stay visible after uploading, plus small improvements to the desktop app. Notes you wrote during a call no longer disappear the moment the desktop app finishes uploading. The Call / Note mode toggle on the Record screen now has a one-line subtitle explaining the difference, the filter panel shows a loading indicator instead of bare 'Loading…' text, and the 'Set in Settings' hint on unassigned shortcuts now links you straight to the right setting."
     ]
   },
   "0.9.4": {
-    "headline": "Login + invites + recording pipeline reliability + a11y polish",
+    "headline": "Login improvements, invites, recording reliability, and accessibility",
     "changes": [
-      "Failed-pipeline calls show a clear status, retry from the call list. Calls whose processing failed (rare — usually a transient transcription / summarization service issue) now show a 'Failed' badge on the calls list. Behind the scenes, every transcribe + summarize error now writes a terminal status so a stuck call doesn't sit in 'Processing' forever, and on backend restart any in-flight call from the previous process is reaped + flagged so you can retry instead of waiting indefinitely.",
-      "Login form input borders + page titles + delete-confirm modals. A polish sweep across the portal: login + sign-up input borders now meet WCAG AA contrast against the dark background; every page sets its own browser-tab title; native browser confirm pop-ups on destructive actions (delete a call, deactivate a user) replaced by in-app modals. The mobile drawer keyboard-tab-cycles inside itself, and the empty calls list gains a download-the-desktop-app CTA for fresh users."
+      "Failed calls show a clear status on the calls list. Calls whose processing failed (rare — usually a short-lived issue with the transcription or summarization service) now show a 'Failed' badge on the calls list. A stuck call no longer sits in 'Processing' forever; it gets marked so you know to retry instead of waiting indefinitely.",
+      "Visible login fields, page titles, and better delete confirmations. A round of small improvements across the portal: login and sign-up input fields now have clearly visible borders against the dark background; every page sets its own browser-tab title so you can tell tabs apart; native browser confirmation pop-ups on destructive actions (delete a call, deactivate a user) are replaced by in-app confirmation dialogs. On phones, the navigation drawer keeps keyboard focus inside itself, and an empty calls list now shows a button to download the desktop app for new users."
     ]
   },
   "0.9.3": {
-    "headline": "Browse-and-import for external recordings, single SSO sign-in CTA, integrations sidebar",
+    "headline": "Browse and import external recordings, single button for sign-in providers, integrations sidebar",
     "changes": [
       "Browse and import external recordings on demand. Connecting an external recording source (Zoho Meeting today; more coming) no longer eagerly downloads every recording it finds. Recordings now appear on your /calls list as placeholder rows with an Import button — tap it on the recordings you actually want, skip the rest. First-time connections complete instantly even if your account has hundreds of historical recordings.",
-      "Single 'Sign in with single sign-on' CTA on the login page. The three SSO provider buttons on the login page (Google, Microsoft, Zoho) collapsed into a single 'Sign in with single sign-on' button that expands to show your provider when you click it. Less visual noise on the password sign-in path, and only the providers your aftercalls deploy has configured will show up in the expanded panel.",
+      "Single 'Sign in with single sign-on' button on the login page. The three single sign-on provider buttons on the login page (Google, Microsoft, Zoho) collapsed into a single 'Sign in with single sign-on' button that expands to show your provider when you click it. Less visual clutter on the password sign-in path, and only the providers your aftercalls deploy has configured will show up in the expanded panel.",
       "Source chip distinguishes externally-imported calls. Calls imported from Zoho Meeting, SmartPBX, or other external sources now carry a small chip on the calls list showing where they came from. Agent-recorded calls remain unbadged as the implicit default.",
-      "Integrations sidebar lists every connected service. The Integrations group in the sidebar now expands to show Zoho CRM, Zoho Meeting, Zoho Cliq, SmartPBX, and SSO sign-in entries (whichever your org has enabled). Previously only Zoho CRM showed up; Zoho Meeting + Cliq were reachable only by typing the URL. Zoho Meeting + Cliq pages also moved under /admin/integrations/ to match the rest of the group; old paths still resolve via redirect so existing bookmarks don't break."
+      "Integrations sidebar lists every connected service. The Integrations group in the sidebar now expands to show Zoho CRM, Zoho Meeting, Zoho Cliq, SmartPBX, and single sign-on entries (whichever your org has enabled). Previously only Zoho CRM showed up; Zoho Meeting and Cliq were reachable only by typing the URL. Zoho Meeting and Cliq pages also moved under /admin/integrations/ to match the rest of the group; old paths still resolve via redirect so existing bookmarks don't break."
     ]
   },
   "0.9.2": {
@@ -31,15 +39,15 @@
   "0.9.1": {
     "headline": "Keyboard shortcuts and a less-intrusive call-detect notification",
     "changes": [
-      "Keyboard shortcuts across the app. Common keys now work in the portal and desktop app — Space plays/pauses audio, ←/→ seek, j/k move between calls or action items, Space toggles an item done, ? opens a shortcut overlay any time. Full list at aftercalls.io/help#keyboard-shortcuts; the agent's Settings page has a link too.",
+      "Keyboard shortcuts across the app. Common keys now work in the portal and desktop app — Space plays/pauses audio, ←/→ seek, j/k move between calls or action items, Space toggles an item done, ? opens a shortcut reference panel any time. Full list at aftercalls.io/help#keyboard-shortcuts; the desktop app's Settings page has a link too.",
       "Less-intrusive call-detect notification. When the desktop app detects a call but its window isn't focused, it now shows a system notification with 'Record' and 'Not now' buttons instead of slamming the full window to the foreground. Click Record to start; ignore it for 30 seconds and it dismisses on its own. The in-app slide-out (when the window is already open) is unchanged."
     ]
   },
   "0.9.0": {
-    "headline": "Reliability release: offline-resilient saves, processing-delay UX, and onboarding polish",
+    "headline": "Reliability release: offline-resilient saves, clearer processing-delay messages, and onboarding refinements",
     "changes": [
-      "Offline indicator + automatic save retry. A discreet pill at the top of the window shows when your connection drops. While you're offline, in-progress edits to notes and action items queue locally and save automatically when you're back. Recordings continue to disk regardless.",
-      "'Still working' state for delayed calls. Calls that take longer than usual now switch from a neutral 'Processing' pill to a 'Still working' pill plus a one-line reassurance under the title. When the call's ready, a toast (and a system notification on the desktop app) confirms — no need to keep checking.",
+      "Offline indicator + automatic save retry. A small indicator at the top of the window shows when your connection drops. While you're offline, in-progress edits to notes and action items are saved locally and synced automatically when you're back. Recordings continue to your device regardless.",
+      "'Still working' state for delayed calls. Calls that take longer than usual now switch from a neutral 'Processing' status to a 'Still working' status with a one-line reassurance under the title. When the call's ready, a brief notice (and a system notification on the desktop app) confirms — no need to keep checking.",
       "Download the desktop app right from onboarding. The 'Download the app' button on the welcome flow now triggers the right installer for your operating system in-place. No new tab, no manual picking from the downloads page.",
       "Onboarding slide 4 welcomes everyone. Members no longer skip the team slide. They get an intro to how teammates' calls and notes show up alongside theirs. Admins and owners get an inline invite form right on the slide — no need to navigate away to invite their first teammate.",
       "Tidier sidebar when not in an integration. The Integrations section in the sidebar now collapses when you're not in it — only the 'Integrations' label shows. Open it to see the connected services."
@@ -125,7 +133,7 @@
       "External name chips now share the speaker-colour convention.",
       "Auto-detected recordings mount the notes panel immediately.",
       "Distinct tray icon while a note-to-self is recording.",
-      "Unified brand waveform across site and portal rail."
+      "Unified brand waveform across the site and app sidebar."
     ]
   },
   "0.5.0": {
@@ -148,7 +156,7 @@
     ]
   },
   "0.4.4": {
-    "headline": "Action items polish, filter bug fix, new System requirements page",
+    "headline": "Action items refinements, filter bug fix, new System requirements page",
     "changes": [
       "Action items filter works correctly.",
       "Action item rows line up properly.",
@@ -174,7 +182,7 @@
     ]
   },
   "0.4.1": {
-    "headline": "Action-items polish — chips after rename, editor close, background regenerate",
+    "headline": "Action items: chips refresh after rename, edit panel can close, background regenerate",
     "changes": [
       "Copy summaries and action items cleanly.",
       "Name chips render everywhere after a speaker rename.",
@@ -194,10 +202,10 @@
     ]
   },
   "0.3.32": {
-    "headline": "Clickable name chips in summaries + speaker rename picker polish",
+    "headline": "Clickable name chips in summaries plus a smoother speaker-rename picker",
     "changes": [
       "Clickable name chips in summaries and action items.",
-      "Speaker rename picker polish."
+      "Speaker rename picker improvements."
     ]
   },
   "0.3.31": {
@@ -216,7 +224,7 @@
     "headline": "Launch at sign-in, speaker initials in the transcript",
     "changes": [
       "Launch at sign-in.",
-      "Participant initials in the transcript and the rail footer."
+      "Participant initials in the transcript and the bottom of the sidebar."
     ]
   },
   "0.3.28": {
@@ -248,7 +256,7 @@
   "0.3.24": {
     "headline": "Full changelog when you jump versions, tag overflow, self-hosted fonts, licenses page",
     "changes": [
-      "Aggregated release-notes modal.",
+      "What's new shows everything you missed since your last update.",
       "Tag overflow on the Calls list.",
       "Self-hosted Geist.",
       "Licenses page.",
@@ -256,13 +264,13 @@
     ]
   },
   "0.3.23": {
-    "headline": "Recovery from crashes, Windows call-detect, tag inline, smarter rename, polish",
+    "headline": "Recovery from crashes, Windows call detection, tag inline, smarter rename, refinements",
     "changes": [
       "Crash recovery on launch.",
       "Windows mic-use detection.",
       "Tags inline with the title metadata.",
       "Smarter participant rename.",
-      "Auto-detect slide-out polish.",
+      "No duplicate call-detected prompt when you're already on the Record page.",
       "Confirm before quitting mid-pipeline."
     ]
   },
@@ -383,12 +391,12 @@
   "0.3.7": {
     "headline": "Linux update notifications and a less-naggy vault toggle",
     "changes": [
-      "Linux: background update check + pill.",
+      "Linux: background update check with in-app notification.",
       "Vault: instant-save toggle."
     ]
   },
   "0.3.6": {
-    "headline": "A handful of polish fixes you'll notice immediately",
+    "headline": "A handful of small fixes you'll notice immediately",
     "changes": [
       "Cleaner Saved card.",
       "Vault toggle is an obvious slider."
@@ -422,7 +430,7 @@
       "Faster auto-detect end-of-call.",
       "Hourly update check.",
       "Cleaner Record page status copy.",
-      "Title chip + Record page polish."
+      "Small visual improvements to the Record page."
     ]
   },
   "0.3.0": {
@@ -433,7 +441,7 @@
       "Web portal feature parity.",
       "Admin: profile, Team, Org vocab.",
       "Recording status card cleanup.",
-      "Welcome modal greets by name."
+      "What's new notice greets you by name."
     ]
   },
   "0.2.1": {

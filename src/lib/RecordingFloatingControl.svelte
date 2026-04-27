@@ -8,7 +8,7 @@
   //   - red recording dot (pulsing)
   //   - mm:ss elapsed counter
   //   - running size estimate (XX MB / 100 MB)
-  //   - "Form" affordance to bring the report dialog back without
+  //   - "Open report" affordance to bring the report dialog back without
   //     stopping
   //   - Stop button (primary action)
   //
@@ -64,7 +64,7 @@
       aria-label="Open report form"
       title="Open report form"
     >
-      Form
+      Open report
     </button>
     <button
       type="button"

@@ -585,3 +585,18 @@ select {
   color: var(--bone-0);
   background: var(--ink-2);
 }
+
+/* Accessibility utility — visually hidden but readable by screen readers.
+ * Standard clip-path technique (no clip: rect() deprecated path).
+ * Used for aria-live announcement regions, etc. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
