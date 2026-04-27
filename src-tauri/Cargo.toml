@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.9.8"
+version = "0.9.9"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
