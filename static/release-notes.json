@@ -1,4 +1,10 @@
 {
+  "0.11.0": {
+    "headline": "Per-user Zoho Meeting connections — each member sees only their own meetings",
+    "changes": [
+      "Zoho Meeting integration is now per-user — you connect your own account, you see your own meetings. Previously the Zoho Meeting integration was a single org-wide connection — only the connecting admin saw the recordings, and they saw every meeting in the org. v0.11.0 reworks it: an admin enables Zoho Meeting per team member from /admin/integrations/zoho-meeting (an allowlist), and each member then connects their own Zoho account from /settings/integrations. Each member's recording list is filtered by Zoho to only meetings they have access to. The legacy 25 admin-attributed recordings stay where they are; new imports go through the per-user path forward."
+    ]
+  },
   "0.10.1": {
     "headline": "Polish + onboarding copy + agent UX waiting state + backend HTTP timeouts + tighter password policy",
     "changes": [
