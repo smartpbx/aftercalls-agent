@@ -160,6 +160,15 @@
   // via the save_notes Tauri command. The pipeline picks that up at
   // create_call time so the backend gets the notes + include flag.
   let manualNotesEnabled = $state(false);
+  // #346 — per-session notes toggle. Lets the user open the notes
+  // panel directly from the Record page without visiting Settings.
+  // Resets when the session changes so a new recording always starts
+  // at the Settings-driven default. If the Settings pref is already
+  // on, the inline toggle is redundant but stays consistent.
+  let sessionNotesOpen = $state(false);
+  let showNotes = $derived(
+    manualNotesEnabled || sessionNotesOpen,
+  );
 
   // Linux-only in-app note that explains why Super+Shift+R doesn't
   // fire when the app is unfocused on most desktop environments (the
@@ -278,12 +287,15 @@
   // Whenever the active session changes, reset the seed and try to
   // rehydrate from disk. Empty/missing notes.md → empty string, so
   // a fresh recording starts blank without a special branch.
+  // Also reset the per-session notes toggle (#346) so a new recording
+  // starts from the Settings-driven default state.
   $effect(() => {
     const sid = currentSessionId;
     if (!sid) {
       notesInitial = "";
       notesInitialFor = "";
       notesUserTyped = false;
+      sessionNotesOpen = false;
       return;
     }
     if (notesInitialFor === sid) return;
@@ -1156,18 +1168,13 @@
     {/if}
   </section>
 
-  <!-- Manual notes panel (#73). Opt-in via Settings; visible during
-       an active recording AND through the post-stop pipeline window
-       (#344) so a final-second thought typed while the chime is
-       still ringing isn't lost. Keyed on session_id so a new
-       recording gets a fresh editor state (the TipTap instance is
-       destroyed + re-created rather than carrying stale text
-       between calls). #194: value={notesInitial} seeds the editor
-       from notes.md when the user navigates away and back mid-
-       recording. The panel unmounts once the pipeline reaches done
-       (or failed) — at that point the call-detail page owns notes
-       editing. -->
-  {#if manualNotesEnabled && currentSessionId && (recording || (pipelineStage && pipelineStage !== "done" && pipelineStage !== "failed"))}
+  <!-- Manual notes panel (#73 #346). Visible during an active
+       recording AND through the post-stop pipeline window (#344).
+       Shown when manualNotesEnabled (Settings pref) OR sessionNotesOpen
+       (inline toggle, #346). Keyed on session_id so a new recording
+       gets a fresh editor state. #194: value={notesInitial} seeds the
+       editor from notes.md on re-entry. Unmounts on done/failed. -->
+  {#if showNotes && currentSessionId && (recording || (pipelineStage && pipelineStage !== "done" && pipelineStage !== "failed"))}
     <section class="notes" style="--i: 3">
       {#key currentSessionId}
         <NotesPanel value={notesInitial} onchange={scheduleNotesSave} />
@@ -1182,6 +1189,30 @@
       <div class="row row-live">
         <span class="row-dot live"></span>
         <span class="row-title">Recording mic + system audio</span>
+        <!-- #346 — inline notes toggle. Surfaces the panel without
+             requiring a trip to Settings. Disabled once the session is
+             off (the button becomes irrelevant after stop). -->
+        <button
+          class="notes-toggle"
+          class:notes-toggle-on={showNotes}
+          onclick={() => {
+            sessionNotesOpen = !showNotes;
+            // If the Settings pref is already on, turning the toggle
+            // "off" here only kills the session flag; the Settings
+            // pref wins on the next recording. That's the correct
+            // behaviour — we don't mutate Settings from this button.
+            if (manualNotesEnabled) {
+              sessionNotesOpen = !manualNotesEnabled;
+            }
+          }}
+          title={showNotes ? "Hide notes" : "Open notes"}
+          aria-pressed={showNotes}
+        >
+          <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 2h10v10H2zM2 5h10M5 5v7"/>
+          </svg>
+          {showNotes ? "Notes on" : "Notes"}
+        </button>
       </div>
     {/if}
     {#if pipelineStage}
@@ -1196,12 +1227,13 @@
             {pipelineLabels[pipelineStage] ?? pipelineStage}
           </p>
         </div>
-        <!-- Open buttons appear the moment the transcript lands
-             (openableCallId set by `transcribed`), NOT only on done.
-             The row continues to show Drafting summary / Writing
-             note / Saved beneath; the call-detail page polls for
-             the rest to fill in live. -->
-        {#if openableCallId && pipelineStage !== "failed"}
+        <!-- #351 — Open buttons held until the pipeline reaches done.
+             Early intermediate stages (transcribed, summarizing, etc.)
+             produce an incomplete call record; surfacing the link too
+             early can confuse users who land on a call with no summary
+             yet. We wait for pipelineStage === "done" so the full
+             record is ready. -->
+        {#if openableCallId && pipelineStage === "done"}
           <div class="row-actions">
             <button class="open-app" onclick={openCallInApp}>
               Open in app
@@ -1283,13 +1315,12 @@
       tabindex="-1"
     >
       <div class="rn-head">
-        <h2 id="ack-title">Before you record</h2>
+        <h2 id="ack-title">Get consent before recording</h2>
       </div>
       <p class="ack-body">
-        You're responsible for telling everyone on the call that
-        you're recording, getting their consent, and only using the
-        recording for the purpose you disclosed. aftercalls doesn't
-        automate that — you do.
+        By recording you confirm that you'll tell everyone on the call
+        that it's being recorded, get their consent, and use the
+        recording only for the purpose you disclosed.
       </p>
 
       <label class="ack-check">
@@ -1298,7 +1329,7 @@
           bind:checked={ackChecked}
           disabled={ackSubmitting}
         />
-        <span>I understand and will get consent from everyone I record.</span>
+        <span>I'll get consent from everyone on this call.</span>
       </label>
 
       <button type="button" class="ack-guide" onclick={openConsentGuide}>
@@ -1865,6 +1896,36 @@
     display: flex;
     gap: 0.4rem;
     flex-shrink: 0;
+  }
+
+  /* #346 — inline notes toggle on the live-recording row. */
+  .notes-toggle {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.6rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: 6px;
+    background: var(--ink-2);
+    color: var(--bone-2);
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .notes-toggle:hover {
+    color: var(--bone-0);
+    border-color: var(--accent);
+  }
+  .notes-toggle-on {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .notes-toggle-on:hover {
+    color: var(--accent-hi);
   }
   .open-app {
     padding: 0.35rem 0.75rem;

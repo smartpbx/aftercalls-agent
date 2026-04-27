@@ -1571,19 +1571,33 @@
           </span>
         </button>
       {/if}
-      {#if version}
-        <!-- Version doubles as the release-notes entry point — clicking
-             opens the public per-version page in the default browser.
-             Replaces the equivalent user-menu item (redundant). -->
+      <!-- Rail foot meta row: version + shortcuts hint (#416) side-by-side. -->
+      <div class="rail-foot-meta">
+        {#if version}
+          <!-- Version doubles as the release-notes entry point — clicking
+               opens the public per-version page in the default browser.
+               Replaces the equivalent user-menu item (redundant). -->
+          <button
+            type="button"
+            class="version"
+            title="See release notes"
+            onclick={async () => {
+              try { await openUrl("https://aftercalls.io/releases"); } catch {}
+            }}
+          >v{version}</button>
+        {/if}
+        <!-- #416 — shortcuts-panel discovery affordance. Small "?" button
+             in the rail foot so users can discover the keyboard-shortcut
+             panel without already knowing the ? hotkey. Tooltip reinforces
+             the hotkey so users learn it. -->
         <button
           type="button"
-          class="version"
-          title="See release notes"
-          onclick={async () => {
-            try { await openUrl("https://aftercalls.io/releases"); } catch {}
-          }}
-        >v{version}</button>
-      {/if}
+          class="shortcuts-hint"
+          title="Keyboard shortcuts (press ?)"
+          aria-label="Show keyboard shortcuts"
+          onclick={toggleHelp}
+        >?</button>
+      </div>
 
       {#if userMenuOpen}
         <!-- Backdrop absorbs outside clicks to dismiss the menu.
@@ -2356,6 +2370,35 @@
     color: var(--bone-1);
   }
 
+  /* #416 — rail-foot meta row: version + shortcuts hint side-by-side. */
+  .rail-foot-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  /* Shortcuts hint "?" button — minimal chrome, matches the version
+     button's visual weight so neither competes with the who-btn. */
+  .shortcuts-hint {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-4);
+    cursor: pointer;
+    padding: 0.1rem 0.45rem;
+    line-height: 1.4;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+    margin-right: 0.4rem;
+  }
+  .shortcuts-hint:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+    background: var(--ink-2);
+  }
+
   nav {
     display: flex;
     flex-direction: column;
@@ -3033,6 +3076,34 @@
       right: 1rem;
       bottom: 1rem;
       width: auto;
+    }
+  }
+
+  /* #370 — collapse pill cluster on narrow windows. Below 480 px the
+     combined widths of an update pill + orphan pill + indicator can
+     overflow the topstrip even with flex-wrap. Collapse each .update
+     pill to pip-only (hide the label + action buttons) so the strip
+     stays in a single row. The tooltip/title on the wrapping element
+     still carries the full text for pointer users; screen readers
+     never see the span text anyway (they traverse the DOM). The
+     indicator drops its ind-label too, keeping just the pip + the
+     separator dot. */
+  @media (max-width: 480px) {
+    .update-label,
+    .update-install,
+    .update-dismiss {
+      display: none;
+    }
+    .update {
+      padding: 0.28rem 0.55rem;
+      gap: 0;
+    }
+    .ind-label,
+    .ind-sep {
+      display: none;
+    }
+    .indicator {
+      gap: 0.4rem;
     }
   }
 

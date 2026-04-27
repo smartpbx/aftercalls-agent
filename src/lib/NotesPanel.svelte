@@ -29,23 +29,6 @@
   let host: HTMLDivElement | undefined = $state();
   let editor: Editor | undefined = $state();
   let lastEmitted = '';
-  // #505 — fullscreen/maximize toggle. When expanded, the panel renders as
-  // a fixed overlay so the user has maximum writing space without leaving
-  // the Record screen. Escape or the toggle button collapses it.
-  let expanded = $state(false);
-
-  function toggleExpanded() {
-    expanded = !expanded;
-    // Re-focus the editor after layout shift so the cursor stays active.
-    requestAnimationFrame(() => editor?.commands.focus());
-  }
-
-  function onKeydownExpanded(e: KeyboardEvent) {
-    if (e.key === 'Escape' && expanded) {
-      e.stopPropagation();
-      expanded = false;
-    }
-  }
 
   function runCmd(fn: (chain: ReturnType<Editor['chain']>) => ReturnType<Editor['chain']>) {
     if (!editor) return;
@@ -138,37 +121,13 @@
   });
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
 <section
   class="notes-panel"
   class:no-header={!showHeader}
-  class:expanded
-  onkeydown={onKeydownExpanded}
 >
   {#if showHeader}
     <header class="notes-header">
       <strong>Notes</strong>
-      <!-- #505 — fullscreen/maximize toggle -->
-      <button
-        type="button"
-        class="expand-btn"
-        onclick={toggleExpanded}
-        title={expanded ? 'Collapse notes (Escape)' : 'Expand notes'}
-        aria-label={expanded ? 'Collapse notes' : 'Expand notes'}
-        aria-pressed={expanded}
-      >
-        {#if expanded}
-          <!-- Compress icon -->
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-            <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4"/>
-          </svg>
-        {:else}
-          <!-- Expand icon -->
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-            <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/>
-          </svg>
-        {/if}
-      </button>
     </header>
   {/if}
   <div class="notes-wrap" class:readonly>
@@ -293,50 +252,11 @@
   .notes-panel.no-header {
     margin-top: 0;
   }
-  /* #505 — expanded / fullscreen mode */
-  .notes-panel.expanded {
-    position: fixed;
-    inset: 0;
-    z-index: 120;
-    margin: 0;
-    padding: 1.2rem;
-    background: var(--ink-0);
-    gap: 0.6rem;
-  }
-  .notes-panel.expanded .notes-wrap {
-    flex: 1;
-    min-height: 0;
-    height: auto;
-    resize: none;
-  }
   .notes-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
-  }
-  /* #505 — expand/collapse toggle button */
-  .expand-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    background: transparent;
-    color: var(--bone-3);
-    cursor: pointer;
-    transition: color 0.12s, background 0.12s, border-color 0.12s;
-  }
-  .expand-btn:hover {
-    color: var(--bone-0);
-    background: var(--ink-2);
-    border-color: var(--hairline-hi);
-  }
-  .expand-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
   }
   .notes-wrap {
     border: 1px solid var(--hairline);

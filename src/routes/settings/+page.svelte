@@ -783,12 +783,14 @@
       <div>
         <h2>Behavior</h2>
         <p class="hint">
-          How the app handles window close and automatic call detection.
-          Stored per computer.
+          App preferences stored per computer.
         </p>
       </div>
       {#if prefsSavedRecently}<span class="saved">Saved</span>{/if}
     </div>
+
+    <!-- #353 — subdivide behavior card into labelled sections -->
+    <h3 class="pref-section">Startup &amp; window</h3>
 
     <div class="pref-row">
       <div class="pref-label">
@@ -853,6 +855,8 @@
         </span>
       </label>
     </div>
+
+    <h3 class="pref-section">Call detection</h3>
 
     <div class="pref-row">
       <div class="pref-label">
@@ -993,6 +997,8 @@
       </p>
     {/if}
 
+    <h3 class="pref-section">Recording</h3>
+
     <div class="pref-row">
       <div class="pref-label">
         <span class="pref-title">Max recording length (minutes)</span>
@@ -1033,6 +1039,8 @@
         onchange={saveAppPrefs}
       />
     </div>
+
+    <h3 class="pref-section">Shortcuts</h3>
 
     <div class="pref-row" id="shortcuts">
       <div class="pref-label">
@@ -1191,6 +1199,8 @@
       </label>
     </div>
 
+    <h3 class="pref-section">Notifications</h3>
+
     <div class="pref-row">
       <div class="pref-label">
         <span class="pref-title">Notification sounds</span>
@@ -1271,6 +1281,8 @@
         </span>
       </div>
     {/if}
+
+    <h3 class="pref-section">Privacy</h3>
 
     <div class="pref-row">
       <div class="pref-label">
@@ -1561,6 +1573,21 @@
     color: var(--bone-3);
     line-height: 1.45;
     max-width: 52ch;
+  }
+
+  /* #353 — behavior card section dividers */
+  .pref-section {
+    margin: 1.1rem 0 0;
+    padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--hairline);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--bone-3);
+  }
+  .pref-section:first-of-type {
+    margin-top: 0.2rem;
   }
 
   /* ── Vault section ──────────────────────────────────────────────── */

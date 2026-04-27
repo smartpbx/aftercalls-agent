@@ -1,4 +1,14 @@
 {
+  "0.10.0": {
+    "headline": "Mine vs all-team toggles, share-modal presets, more keyboard + Linux + Zoho-region polish",
+    "changes": [
+      "Action items now show Mine and All team like the Calls page. The Action items page gains the same Mine / All team toggle the Calls page already has — admins and owners can flip between their own to-dos and the whole team's. The choice rides in the URL, so a bookmark stays where you left it.",
+      "Share-modal presets: one click for Public summary or Internal full. When you share a call, a new preset row above the section toggles lets you pick Public summary only (just the summary visible to the recipient) or Internal full (every section). Manual toggles still work — flipping any toggle clears the preset highlight so you know you're in custom mode.",
+      "Connect-CRM signpost when the integration is enabled but not yet linked. If your org has the Send-to-CRM feature turned on but no integration linked yet, admins and owners now see a muted Connect CRM hint on a finished call's action bar — direct path to /admin/integrations/zoho instead of wondering where it went.",
+      "Bulk-rename inside summary text + Undo toast on delete. Two improvements on the call detail page. Renaming a name chip in the summary now updates every occurrence at once — same shape as the transcript flow, was previously per-occurrence. And deleting a call now shows an Undo toast for 8 seconds after redirecting back to the calls list, so a misclick is recoverable.",
+      "Desktop app: less-naggy consent prompt, Notes panel toggle, post-pipeline button gate, calmer narrow-window strip. On the desktop app: the consent prompt before recording leads with the action ('Get consent before recording') instead of a wall of legal language; you can show or hide the Notes panel with a toggle on the live-recording row; the Open in app and Open on web buttons now wait until the call is fully ready instead of appearing during transcription; the top status strip collapses to colored pips on narrow windows so the cluster doesn't wrap. Plus: a ? help button in the rail's bottom corner opens the keyboard shortcuts overlay, and your Mine vs All team filter on /calls now sticks between sessions."
+    ]
+  },
   "0.9.7": {
     "headline": "Zoho Meeting recordings scoped to participants, password-strength meters, more keyboard + screen-reader polish, behind-the-scenes hardening",
     "changes": [

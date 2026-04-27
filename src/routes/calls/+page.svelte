@@ -130,7 +130,23 @@
   let loading = $state(true);
   let query = $state("");
   let me = $state<Me | null>(null);
-  let scope = $state<"mine" | "all">("mine");
+  // #403 — persist scope between sessions via localStorage. The key is
+  // namespaced so a future multi-surface storage clear doesn't
+  // accidentally wipe unrelated prefs. We read the value synchronously
+  // at module evaluation (before onMount) so the first `load()` uses
+  // the restored scope instead of always defaulting to "mine".
+  const SCOPE_KEY = "aftercalls:calls_scope";
+  function readPersistedScope(): "mine" | "all" {
+    try {
+      const raw = typeof localStorage !== "undefined"
+        ? localStorage.getItem(SCOPE_KEY)
+        : null;
+      return raw === "all" ? "all" : "mine";
+    } catch {
+      return "mine";
+    }
+  }
+  let scope = $state<"mine" | "all">(readPersistedScope());
 
   let canSeeAll = $derived(
     !!me && (me.role === "admin" || me.role === "owner"),
@@ -278,6 +294,12 @@
   async function setScope(next: "mine" | "all") {
     if (scope === next) return;
     scope = next;
+    // #403 — persist selection so the next session opens the same scope.
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(SCOPE_KEY, scope);
+      }
+    } catch {}
     if (scope !== "all") userFilter = null;
     if (scope === "all") void ensureMemberRoster();
     await load();
