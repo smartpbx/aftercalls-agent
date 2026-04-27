@@ -47,7 +47,8 @@ pub async fn create_call(
         session_id: session_id.clone(),
         recorded_at,
         duration_ms: duration_ms_hint as i64,
-        title: None,
+        // #531 — use user-provided title from title.txt when present.
+        title: crate::notes::read_title_from_dir(session_dir),
         matched_client: None,
         summary_text: None,
         action_items: Vec::new(),

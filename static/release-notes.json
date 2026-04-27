@@ -1,4 +1,12 @@
 {
+  "0.9.7": {
+    "headline": "Zoho Meeting recordings scoped to participants, password-strength meters, more keyboard + screen-reader polish, behind-the-scenes hardening",
+    "changes": [
+      "Strength meter on password change and reset. When you change your password in Settings or set a new one via a reset link, you'll now see a strength meter as you type — color-coded from weak to strong. We don't enforce a strength minimum (you choose), but a five-bar visual is hard to argue with.",
+      "Web portal: discoverable vocabulary, keyboard-friendly call player, share-link insights, accessible filter menus. The Org Vocab admin page now opens with a clearer summary of how custom vocabulary works and gains a per-user vocab tab (placeholder for now, rolling out properly soon). The call-detail audio player surfaces a time readout, full keyboard shortcuts (space to play/pause, arrow keys to seek, J/L for ±5s, comma/period for ±1s) and proper labels. The share-call modal now shows view counts and last-accessed for each existing link, so you can see which shares are getting attention. The filter and tag-add menus across the portal are now keyboard-loop-able with focus traps. And the staff Cross-org index gains search + sort, so jumping to a specific org is faster.",
+      "Desktop app: Notes panel fullscreen, Recently recorded strip, optional Note titles. On the desktop app: the Notes panel now has a fullscreen toggle for when you want the editor at full viewport; the Record screen shows a Recently recorded strip with the last three calls from this session when you're idle; and Note mode (the dictation-without-a-call mode) gains an optional title input so the note shows up with the right name on your calls list instead of '(untitled)'. Plus: a character counter on the first-name input in Settings (kicks in near the limit), a preview popover on Copy notice before it copies the recording-disclosure text to your clipboard, and a discoverability tip about tags on the calls list for new users."
+    ]
+  },
   "0.9.6": {
     "headline": "Canadian privacy on the homepage, clearer single sign-on help, quieter desktop update prompt, behind-the-scenes hardening",
     "changes": [

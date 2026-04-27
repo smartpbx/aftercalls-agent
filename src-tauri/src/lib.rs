@@ -2222,6 +2222,7 @@ pub fn run() {
             zoho_push_call,
             notes::save_notes,
             notes::load_notes,
+            notes::save_title,
             notes::update_call_notes,
             // #183 — in-agent support reports.
             // #203 — stage_support_video lands webview-produced webm

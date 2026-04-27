@@ -504,6 +504,31 @@
     return calls.filter((c) => (c.title ?? "").toLowerCase().includes(q));
   });
 
+  // #527 — tags discoverability tip. True when the user has calls loaded
+  // but none of them carry any tags, and no filters are active. The tip
+  // is shown in the chip-row so the "+ Add filter" button is adjacent.
+  // Dismissed via localStorage so it only appears once. Defer the check
+  // until the first load completes so we don't flash during loading.
+  const TAG_TIP_KEY = "aftercalls:tags-tip-dismissed";
+  let tagTipDismissed = $state(
+    typeof localStorage !== "undefined" && !!localStorage.getItem(TAG_TIP_KEY),
+  );
+  let anyCallHasTags = $derived(calls.some((c) => c.tags && c.tags.length > 0));
+  let showTagTip = $derived(
+    !loading &&
+      !tagTipDismissed &&
+      !anyCallHasTags &&
+      calls.length > 0 &&
+      tagFilters.length === 0 &&
+      !userFilter,
+  );
+  function dismissTagTip() {
+    tagTipDismissed = true;
+    try {
+      localStorage.setItem(TAG_TIP_KEY, "1");
+    } catch {}
+  }
+
   // Group by LOCAL yyyy-mm-dd. Using toISOString here would bucket a call
   // recorded at 11pm local on Monday under Tuesday (UTC).
   function localDayKey(iso: string): string {
@@ -817,6 +842,27 @@
       </div>
     </div>
   </div>
+
+  <!-- #527 — Tags discoverability tip. Shown once (localStorage-dismissed)
+       when the user has calls but hasn't tagged any of them. Sits between
+       the filter-bar and the date-bar so the "Add filter" button is nearby
+       and contextually adjacent. -->
+  {#if showTagTip}
+    <div class="tag-tip" role="note">
+      <p class="tag-tip-text">
+        <span class="tag-tip-icon" aria-hidden="true">🏷</span>
+        Add tags to calls to filter and find them faster — client names,
+        topics, or custom labels. Open a call and tap "Add tag" to start.
+      </p>
+      <button
+        type="button"
+        class="tag-tip-dismiss"
+        onclick={dismissTagTip}
+        aria-label="Dismiss tags tip"
+        title="Dismiss"
+      >×</button>
+    </div>
+  {/if}
 
   <!-- #146 · Date range. Sits in its own row so the filter-bar above
        stays legible at narrow agent widths. #189 swapped the native
@@ -1455,6 +1501,53 @@
   }
 
   /* ── #146 · Date range bar ───────────────────────────────────────── */
+  /* #527 — tags discoverability tip */
+  .tag-tip {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.55rem 0.75rem;
+    margin-bottom: 0.8rem;
+    border: 1px dashed var(--hairline-hi);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+  }
+  .tag-tip-text {
+    flex: 1;
+    margin: 0;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--bone-2);
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+  }
+  .tag-tip-icon {
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  .tag-tip-dismiss {
+    flex-shrink: 0;
+    width: 1.4rem;
+    height: 1.4rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--bone-3);
+    font-size: 1.1rem;
+    line-height: 1;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+  }
+  .tag-tip-dismiss:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
+  }
+
   .date-bar {
     display: flex;
     align-items: center;

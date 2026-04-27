@@ -51,6 +51,8 @@
   let { rect, selection, anchor, onreplace, onclose }: Props = $props();
 
   let cardEl = $state<HTMLDivElement | null>(null);
+  // #541 — first-item-focus: focus the Replace button on mount.
+  let replaceBtnEl = $state<HTMLButtonElement | null>(null);
   // Position state — fixed-position overlay. `placeBelow` flips when
   // the selection sits within `cardHeightGuess` of the viewport top
   // (so the popover doesn't get clipped above the selection).
@@ -120,6 +122,21 @@
     document.removeEventListener("pointerdown", onDocPointerDown, true);
   });
 
+  // #541 — focus trap: Escape dismisses; only one focusable item so
+  // Tab does not need trapping (single-item toolbar).
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      onclose();
+    }
+  }
+
+  // #541 — focus the Replace button after mount so keyboard users
+  // can immediately act without a Tab press.
+  $effect(() => {
+    replaceBtnEl?.focus();
+  });
+
   function onReplaceClick() {
     onreplace({ selection, anchor });
   }
@@ -131,9 +148,12 @@
   class:place-below={pos.placeBelow}
   style="top: {pos.top}px; left: {pos.left}px;"
   role="toolbar"
+  tabindex="-1"
   aria-label="Selection actions"
+  onkeydown={onKeydown}
 >
   <button
+    bind:this={replaceBtnEl}
     type="button"
     class="hc-btn"
     onclick={onReplaceClick}

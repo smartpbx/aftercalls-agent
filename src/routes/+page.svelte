@@ -18,6 +18,7 @@
     loadRecordingPrefs,
     playStartCueIfEnabled,
   } from "$lib/compliance";
+  import { confirmAutoStart } from "$lib/autoStart";
   import NotesPanel from "$lib/NotesPanel.svelte";
   import { portalErrorToText } from "$lib/portalError";
 
@@ -88,6 +89,14 @@
   let elapsedMs = $state(0);
   let importing = $state(false);
 
+  // #523 — "Recently recorded" strip: in-memory list of calls completed
+  // during the current app session. Capped at 3 entries (newest first).
+  // No backend fetch — populated only from pipeline `done` events fired
+  // while this webview is open. Shown at the bottom of the idle Record
+  // screen so the user has a quick way back to the last few calls.
+  type RecentCall = { id: string; completedAt: number };
+  let recentCalls = $state<RecentCall[]>([]);
+
   // PIPEDA recording-ack modal (#44). We show it at most once per
   // user per device; after the POST resolves the backend + auth.json
   // both mark the user acknowledged and this short-circuits every
@@ -114,6 +123,36 @@
   let copiedNotice = $state(false);
   let copyingNotice = $state(false);
   let copyError = $state("");
+  // #479 — preview the notice text before copying. Null = closed;
+  // string = the rendered notice text ready to copy. The user sees the
+  // full message first, then clicks "Copy" inside the preview panel to
+  // push it to the clipboard.
+  let noticePreview = $state<string | null>(null);
+
+  // #531 — optional title for Note-to-self recordings. Shown when
+  // recordMode === "note" and not yet recording. Persisted via save_title
+  // Tauri command when the user types and starting recording flushes it.
+  // Resets to "" after stop so the next note starts blank.
+  let noteTitle = $state("");
+  let noteTitleSaved = $state(false); // optimistic "saved" feedback
+  let noteTitleTimer = 0;
+
+  function scheduleNoteTitleSave(title: string) {
+    if (!currentSessionId) return;
+    clearTimeout(noteTitleTimer);
+    noteTitleTimer = window.setTimeout(async () => {
+      try {
+        await invoke("save_title", {
+          sessionId: currentSessionId,
+          title,
+        });
+        noteTitleSaved = true;
+        setTimeout(() => { noteTitleSaved = false; }, 1500);
+      } catch (e) {
+        console.warn("save_title failed", e);
+      }
+    }, 400);
+  }
 
   // Manual notes panel (#73). Opt-in per user via Settings. When on,
   // the record page shows a CodeMirror editor during an active
@@ -313,6 +352,8 @@
       if (p.stage === "done") {
         openableCallId = p.call_id;
         notifyPipelineDone();
+        // #523 — record to in-memory recent list (newest-first, capped at 3).
+        recentCalls = [{ id: p.call_id, completedAt: Date.now() }, ...recentCalls].slice(0, 3);
       }
       // #344 — the notes panel stays mounted through pipeline
       // upload, then unmounts on done/failed. Flush any pending
@@ -362,6 +403,9 @@
         } else {
           clearInterval(timer);
           elapsedMs = 0;
+          // #531 — clear the note title so the next recording starts blank.
+          noteTitle = "";
+          noteTitleSaved = false;
         }
       },
     );
@@ -562,6 +606,14 @@
       console.warn("start cue failed", e);
     }
     sessionDir = await invoke<string>("start_self_note");
+    // #531 — flush the user-provided title now that we have a session_dir.
+    // session_id is the last path component of session_dir.
+    const sessionId = sessionDir.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    if (noteTitle.trim() && sessionId) {
+      invoke("save_title", { sessionId, title: noteTitle.trim() }).catch(
+        (e) => console.warn("save_title (start flush) failed", e),
+      );
+    }
   }
 
   // Returns true when the caller may proceed with recording
@@ -611,12 +663,8 @@
       if (resume === "manual") {
         await actuallyStartRecording();
       } else if (resume === "auto") {
-        try {
-          await playStartCueIfEnabled();
-        } catch (e) {
-          console.warn("start cue failed", e);
-        }
-        await invoke("confirm_auto_start");
+        // Shared helper: play start cue then confirm_auto_start (#465).
+        await confirmAutoStart();
       }
     } catch (e) {
       ackError = portalErrorToText(e).replace(/^Error:\s*/, "");
@@ -641,7 +689,14 @@
     }
   }
 
-  async function copyNotice() {
+  // #479 — open the preview panel so the user can inspect the notice
+  // text before it hits the clipboard.
+  async function openNoticePreview() {
+    if (noticePreview !== null) {
+      // Second click closes the panel (toggle behaviour).
+      noticePreview = null;
+      return;
+    }
     copyError = "";
     copyingNotice = true;
     try {
@@ -650,20 +705,31 @@
         copyError = "Couldn't load your org's recording preferences.";
         return;
       }
-      const notice =
+      noticePreview =
         `Heads up — I'm using aftercalls to record and transcribe this ` +
         `call for the purpose of ${prefs.recording_purpose}. The recording ` +
         `is stored on Canadian cloud infrastructure and used only for that ` +
         `purpose. If you'd prefer I didn't, let me know and I'll stop.`;
-      await writeText(notice);
+    } catch (e) {
+      copyError = portalErrorToText(e).replace(/^Error:\s*/, "");
+    } finally {
+      copyingNotice = false;
+    }
+  }
+
+  // Called from inside the preview panel — actually copies to clipboard.
+  async function copyNotice() {
+    if (!noticePreview) return;
+    copyError = "";
+    try {
+      await writeText(noticePreview);
       copiedNotice = true;
+      noticePreview = null;
       setTimeout(() => {
         copiedNotice = false;
       }, 2000);
     } catch (e) {
       copyError = portalErrorToText(e).replace(/^Error:\s*/, "");
-    } finally {
-      copyingNotice = false;
     }
   }
 
@@ -700,12 +766,8 @@
   async function confirmStart() {
     const ok = await ensureRecordingAcknowledged("auto");
     if (!ok) return;
-    try {
-      await playStartCueIfEnabled();
-    } catch (e) {
-      console.warn("start cue failed", e);
-    }
-    await invoke("confirm_auto_start");
+    // Shared helper: play start cue then confirm_auto_start (#465).
+    await confirmAutoStart();
   }
   async function dismissStart() {
     await invoke("dismiss_auto_start");
@@ -759,6 +821,17 @@
     const r = s % 60;
     const pad = (n: number) => String(n).padStart(2, "0");
     return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${pad(m)}:${pad(r)}`;
+  }
+
+  // #523 — format a timestamp as a short relative label ("just now",
+  // "2 min ago", "1 hr ago") for the recently-recorded strip.
+  function fmtRelative(ms: number): string {
+    const diff = Date.now() - ms;
+    const mins = Math.floor(diff / 60_000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.floor(mins / 60);
+    return `${hrs} hr ago`;
   }
 
   const pipelineLabels: Record<string, string> = {
@@ -893,6 +966,34 @@
       {/if}
     </p>
 
+    <!-- #531 — optional note title. Shown in Note mode when idle so the
+         user can name the note before hitting record. Flushed to title.txt
+         in the session_dir via save_title when recording actually starts.
+         Hidden while recording so the UI doesn't shift mid-capture. -->
+    {#if recordMode === "note" && !recording}
+      <div class="note-title-row">
+        <label class="note-title-label" for="note-title">
+          Title
+          <span class="note-title-opt">(optional)</span>
+        </label>
+        <input
+          id="note-title"
+          type="text"
+          class="note-title-input"
+          placeholder="e.g. Meeting recap, Idea dump…"
+          bind:value={noteTitle}
+          maxlength="200"
+          autocomplete="off"
+          oninput={() => {
+            if (currentSessionId) scheduleNoteTitleSave(noteTitle);
+          }}
+        />
+        {#if noteTitleSaved}
+          <span class="note-title-saved" aria-live="polite">Saved</span>
+        {/if}
+      </div>
+    {/if}
+
     <div class="cta-row">
       <!-- Primary action — button flips to live state with inline timer.
            In Note mode the verb + aria-label change to "note to self"
@@ -944,17 +1045,55 @@
            (#45) so the user can paste it into meeting chat as the
            "I'm recording, here's why, here's the retention posture"
            heads-up to other participants. Hidden in Note mode — no
-           other participant on a self-note. -->
+           other participant on a self-note.
+           #479 — clicking opens a preview panel first so the user can
+           read the full message before it goes to the clipboard. -->
       {#if recordMode === "call"}
-        <button
-          type="button"
-          class="copy-notice-btn"
-          onclick={copyNotice}
-          disabled={copyingNotice}
-          aria-live="polite"
-        >
-          {copiedNotice ? "Copied ✓" : copyingNotice ? "Copying…" : "Copy notice"}
-        </button>
+        <div class="notice-wrap">
+          <button
+            type="button"
+            class="copy-notice-btn"
+            class:active={noticePreview !== null}
+            onclick={openNoticePreview}
+            disabled={copyingNotice}
+            aria-expanded={noticePreview !== null}
+            aria-haspopup="true"
+            aria-live="polite"
+          >
+            {copiedNotice ? "Copied ✓" : copyingNotice ? "Loading…" : "Copy notice"}
+          </button>
+          {#if noticePreview !== null}
+            <!-- Dismiss on outside click -->
+            <div
+              class="notice-backdrop"
+              role="button"
+              tabindex="-1"
+              aria-label="Close preview"
+              onclick={() => (noticePreview = null)}
+              onkeydown={(e) => e.key === "Escape" && (noticePreview = null)}
+            ></div>
+            <div class="notice-preview" role="dialog" aria-label="Recording notice preview" aria-modal="false">
+              <p class="notice-preview-label">Notice text</p>
+              <p class="notice-preview-text">{noticePreview}</p>
+              <div class="notice-preview-actions">
+                <button
+                  type="button"
+                  class="btn primary"
+                  onclick={copyNotice}
+                >
+                  Copy to clipboard
+                </button>
+                <button
+                  type="button"
+                  class="btn ghost"
+                  onclick={() => (noticePreview = null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          {/if}
+        </div>
       {/if}
     </div>
 
@@ -1091,6 +1230,33 @@
       <p class="inline-error">{error}</p>
     {/if}
   </section>
+
+  <!-- #523 — Recently recorded strip. Shown when idle (not recording,
+       no active pipeline) and at least one call completed this session.
+       In-memory only — no backend fetch; populated from pipeline `done`
+       events fired while the webview is open. -->
+  {#if !recording && !pipelineStage && recentCalls.length > 0}
+    <section class="recent" style="--i: 5">
+      <p class="recent-label">Recently recorded</p>
+      <ul class="recent-list">
+        {#each recentCalls as rc (rc.id)}
+          <li>
+            <a href="/calls/{rc.id}" class="recent-entry">
+              <span class="recent-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 2a3 3 0 0 0-3 3v3a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" fill="currentColor" stroke="none"/>
+                  <path d="M5 7v1a5 5 0 0 0 10 0V7M10 13v2M7.5 15h5" />
+                </svg>
+              </span>
+              <span class="recent-name">Recorded call</span>
+              <span class="recent-time">{fmtRelative(rc.completedAt)}</span>
+              <span class="recent-arrow" aria-hidden="true">→</span>
+            </a>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
 </main>
 
 <!-- Recording-ack modal (#44). Blocking — the user can only proceed
@@ -1284,6 +1450,50 @@
     color: var(--bone-3);
   }
 
+  /* #531 — optional note title row */
+  .note-title-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    width: 100%;
+    max-width: 360px;
+  }
+  .note-title-label {
+    font-size: 0.78rem;
+    color: var(--bone-3);
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .note-title-opt {
+    color: var(--bone-4);
+    font-size: 0.7rem;
+  }
+  .note-title-input {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: 7px;
+    background: var(--ink-1);
+    color: var(--bone-0);
+    font-size: 0.88rem;
+    font-family: var(--font-sans);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    box-sizing: border-box;
+  }
+  .note-title-input::placeholder {
+    color: var(--bone-4);
+  }
+  .note-title-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  .note-title-saved {
+    font-size: 0.72rem;
+    color: var(--olive);
+  }
+
   /* Primary + Copy notice share a row; Copy notice is the ghost
      counterpart to the filled record button. Wraps to stack on very
      narrow widths so the timer-expanded pill doesn't squeeze Copy
@@ -1293,6 +1503,12 @@
     align-items: center;
     gap: 0.6rem;
     flex-wrap: wrap;
+  }
+
+  /* #479 — notice wrapper provides positioning context for the preview
+     popover. */
+  .notice-wrap {
+    position: relative;
   }
 
   .copy-notice-btn {
@@ -1312,9 +1528,58 @@
     border-color: var(--accent);
     color: var(--bone-0);
   }
+  .copy-notice-btn.active {
+    border-color: var(--accent);
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+  }
   .copy-notice-btn:disabled {
     opacity: 0.6;
     cursor: default;
+  }
+
+  /* #479 — notice preview popover */
+  .notice-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+  }
+  .notice-preview {
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    left: 0;
+    z-index: 10;
+    width: 320px;
+    max-width: calc(100vw - 2rem);
+    padding: 1rem;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .notice-preview-label {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+  }
+  .notice-preview-text {
+    margin: 0;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: var(--bone-1);
+    white-space: pre-wrap;
+  }
+  .notice-preview-actions {
+    display: flex;
+    gap: 0.4rem;
+    justify-content: flex-end;
+    padding-top: 0.2rem;
   }
 
   .record-btn {
@@ -1658,6 +1923,69 @@
     50% {
       opacity: 0.5;
     }
+  }
+
+  /* ── Recently recorded strip (#523) ───────────────────────────────── */
+  .recent {
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .recent-label {
+    margin: 0 0 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--bone-4);
+  }
+  .recent-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .recent-entry {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    background: var(--ink-1);
+    color: var(--bone-1);
+    font-size: 0.84rem;
+    text-decoration: none;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .recent-entry:hover {
+    background: var(--ink-2);
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
+  }
+  .recent-icon {
+    color: var(--bone-3);
+    flex-shrink: 0;
+    display: inline-flex;
+  }
+  .recent-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .recent-time {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--bone-3);
+    flex-shrink: 0;
+  }
+  .recent-arrow {
+    color: var(--bone-4);
+    font-size: 0.8rem;
+    flex-shrink: 0;
   }
 
   /* ── PIPEDA ack modal (#44) ──────────────────────────────────────

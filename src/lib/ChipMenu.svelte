@@ -66,6 +66,8 @@
   let mode = $state<Mode>("menu");
   let focusIdx = $state(0);
   let pickerValue = $state("");
+  // #541 — first-item-focus + focus trap for the menu items.
+  let menuItemEls = $state<HTMLButtonElement[]>([]);
 
   // Anchor positioning — fixed-position card, bottom-left of the
   // anchor, with a 6px gap. Flips above if the chip sits within
@@ -135,14 +137,28 @@
       return;
     }
     if (mode !== "menu") return;
+    const itemCount = menuItemEls.filter(Boolean).length || 2;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      focusIdx = (focusIdx + 1) % 2;
+      focusIdx = (focusIdx + 1) % itemCount;
+      menuItemEls[focusIdx]?.focus();
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
-      focusIdx = (focusIdx + 1) % 2; // only 2 items; wraps either way
+      focusIdx = (focusIdx - 1 + itemCount) % itemCount;
+      menuItemEls[focusIdx]?.focus();
+      return;
+    }
+    // #541 — Tab / Shift+Tab traps focus within the menu items.
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        focusIdx = (focusIdx - 1 + itemCount) % itemCount;
+      } else {
+        focusIdx = (focusIdx + 1) % itemCount;
+      }
+      menuItemEls[focusIdx]?.focus();
       return;
     }
     if (e.key === "Enter" || e.key === " ") {
@@ -162,9 +178,14 @@
     }
   }
 
-  // Focus the card on mount so keyboard flow lands here.
+  // #541 — Focus the first menu item (not just the card) on mount and
+  // whenever we return from "picker" mode back to "menu".
   $effect(() => {
-    cardEl?.focus();
+    if (mode === "menu") {
+      // After the reactive update, buttons are rendered; index into
+      // menuItemEls[0] which is bound via `bind:this` on each item.
+      menuItemEls[0]?.focus();
+    }
   });
 
   function openRename() {
@@ -215,6 +236,7 @@
 >
   {#if mode === "menu"}
     <button
+      bind:this={menuItemEls[0]}
       type="button"
       role="menuitem"
       class="chip-menu-item"
@@ -241,6 +263,7 @@
            text, but the action still strips the `<name>` wrapper
            so the chip stays plain text on subsequent reloads. -->
       <button
+        bind:this={menuItemEls[1]}
         type="button"
         role="menuitem"
         class="chip-menu-item"
@@ -262,6 +285,7 @@
       </button>
     {:else}
       <button
+        bind:this={menuItemEls[1]}
         type="button"
         role="menuitem"
         class="chip-menu-item"

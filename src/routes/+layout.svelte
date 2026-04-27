@@ -11,6 +11,7 @@
   import { onDestroy, onMount } from "svelte";
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
+  import { confirmAutoStart } from "$lib/autoStart";
   import Avatar from "$lib/Avatar.svelte";
   import OfflineBanner from "$lib/OfflineBanner.svelte";
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
@@ -1187,17 +1188,10 @@
 
   async function triggerAutoStart() {
     try {
-      // Play the start cue BEFORE invoking the recorder so the
-      // system loopback doesn't capture the beep. Await blocks for
-      // ~350ms when sounds are enabled; no-op when off. Failure
-      // here is swallowed — we'd rather start the recording than
-      // miss it because of a flaky audio subsystem.
-      try {
-        await playStartCueIfEnabled();
-      } catch (e) {
-        console.warn("start cue failed", e);
-      }
-      await invoke("confirm_auto_start");
+      // Shared helper plays the start cue then calls confirm_auto_start.
+      // See $lib/autoStart.ts — same mechanics used by the inline banner
+      // on +page.svelte (#465).
+      await confirmAutoStart();
       autoPrompt = null;
     } catch (e) {
       console.warn("confirm_auto_start failed", e);

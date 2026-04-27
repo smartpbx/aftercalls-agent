@@ -43,6 +43,13 @@
   let nameMsg = $state("");
   let nameErr = $state("");
   let firstBlurErr = $state(false);
+  // #484 — character counter for the first-name input. maxlength is 120;
+  // counter appears once the user gets within 20 chars of the limit so the
+  // field doesn't feel cluttered at typical name lengths.
+  const FIRST_NAME_MAX = 120;
+  const FIRST_NAME_COUNTER_THRESHOLD = 20;
+  let firstCharCount = $derived(firstDraft.length);
+  let showFirstCounter = $derived(firstCharCount >= FIRST_NAME_MAX - FIRST_NAME_COUNTER_THRESHOLD);
 
   let canSaveName = $derived(
     !!me &&
@@ -685,6 +692,11 @@
           {#if firstBlurErr}
             <p class="error-inline name-err" role="alert">
               First name is required.
+            </p>
+          {:else if showFirstCounter}
+            <!-- #484 — char counter appears when nearing maxlength -->
+            <p class="char-counter" class:char-counter-near={firstCharCount >= FIRST_NAME_MAX - 5} aria-live="polite">
+              {firstCharCount}/{FIRST_NAME_MAX}
             </p>
           {/if}
         </label>
@@ -1501,6 +1513,16 @@
   }
   .name-err {
     margin: 0.2rem 0 0;
+  }
+  /* #484 — character counter for the first-name input */
+  .char-counter {
+    margin: 0.2rem 0 0;
+    font-size: 0.72rem;
+    color: var(--bone-4);
+    text-align: right;
+  }
+  .char-counter.char-counter-near {
+    color: var(--live);
   }
   .name-actions {
     display: flex;
