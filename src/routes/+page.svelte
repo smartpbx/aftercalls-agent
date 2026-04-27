@@ -62,6 +62,23 @@
   let selfNoteShortcut = $state<string | null>("Super+Shift+N");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
+
+  /** #498 — strip internal vendor names from a free-form error
+   *  string so the user-facing surface stays vendor-opaque (per
+   *  CLAUDE.md hard rule #2). Replaces the names with "the
+   *  transcription provider" / "the summarization provider" /
+   *  generic fallbacks so the underlying cause stays readable
+   *  ("rate-limit hit", "504 from upstream") even when the vendor
+   *  name is redacted. */
+  function redactVendorNames(s: string): string {
+    if (!s) return s;
+    return s
+      .replace(/\bAssemblyAI\b/gi, "the transcription provider")
+      .replace(/\bOpenAI\b/gi, "the summarization provider")
+      .replace(/\bPostmark\b/gi, "the email provider")
+      .replace(/\bDigitalOcean\b/gi, "the storage provider")
+      .replace(/\bSpaces\b/g, "object storage");
+  }
   // Latest known call id for the in-flight pipeline. Populated on
   // `transcribed` — before summary/action-items finish — so the
   // user can pop the call open while the rest of the pipeline
@@ -282,7 +299,14 @@
       pipelineError = "";
       pipelineStage = p.stage;
       if (p.stage === "failed") {
-        pipelineError = p.error;
+        // #498 — backend pipeline errors can name internal vendors
+        // (AssemblyAI / OpenAI / Postmark / DigitalOcean) when an
+        // upstream call fails. Per CLAUDE.md hard rule #2, public-
+        // facing copy stays vendor-opaque. Redact vendor names from
+        // the pass-through string before showing it to the user;
+        // the staff `/staff/agent-logs` view still has the raw
+        // unredacted error for debugging.
+        pipelineError = redactVendorNames(p.error);
         notifyPipelineFailed();
       }
       if (p.stage === "transcribed") openableCallId = p.call_id;
@@ -1053,13 +1077,11 @@
         <h2 id="ack-title">Before you record</h2>
       </div>
       <p class="ack-body">
-        Under Canadian PIPEDA — and equivalent privacy laws in most
-        jurisdictions — you are responsible for notifying every
-        participant that the call is being recorded, obtaining their
-        consent, and using the recording only for the purpose you
-        disclosed.
+        You're responsible for telling everyone on the call that
+        you're recording, getting their consent, and only using the
+        recording for the purpose you disclosed. aftercalls doesn't
+        automate that — you do.
       </p>
-      <p class="ack-body ack-emph">aftercalls doesn't automate consent. You do.</p>
 
       <label class="ack-check">
         <input

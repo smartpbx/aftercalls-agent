@@ -37,6 +37,11 @@
     status: string;
     source_app: string | null;
     source_kind: string | null;
+    /** External-source classification (#303): 'agent' (default),
+     *  'zoho_meeting', 'zoho_cliq', 'smartpbx', 'imported_file'.
+     *  Older backends that don't emit this field land as undefined;
+     *  treat undefined as 'agent'. */
+    ingest_source?: string;
     tags?: Tag[];
     // Owner metadata (populated when scope=all). Optional so legacy
     // responses don't break the type.
@@ -109,6 +114,12 @@
         return "Manual";
       case "self_note":
         return "Note to self";
+      case "zoho_meeting":
+        return "Zoho Meeting";
+      case "zoho_cliq":
+        return "Zoho Cliq";
+      case "smartpbx":
+        return "SmartPBX";
       default:
         return "";
     }
@@ -555,6 +566,28 @@
     e.stopPropagation();
     await addTagFilter(t.kind, t.value);
   }
+
+  // #303 — placeholder external recordings. Mirror of the portal's
+  // importPlaceholder; uses the new Tauri `hydrate_call` command
+  // which proxies to POST /v1/calls/{id}/hydrate. Optimistic
+  // local-state flip so the row reacts immediately.
+  let hydrating = $state<Record<string, boolean>>({});
+  async function importPlaceholder(e: MouseEvent, callId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (hydrating[callId]) return;
+    hydrating = { ...hydrating, [callId]: true };
+    try {
+      await invoke("hydrate_call", { id: callId });
+      calls = calls.map(c =>
+        c.id === callId ? { ...c, status: "transcribing" } : c
+      );
+    } catch (e: any) {
+      console.warn("hydrate failed", portalErrorToText(e));
+    } finally {
+      hydrating = { ...hydrating, [callId]: false };
+    }
+  }
 </script>
 
 <main class="page">
@@ -963,10 +996,35 @@
                         <span class="chip" title={sourceKindLabel(call.source_kind)}>
                           {prettyApp(call.source_app)}
                         </span>
+                      {:else if call.ingest_source && call.ingest_source !== "agent"}
+                        <!-- #303 — external-source chip drives off
+                             ingest_source (the wire-side external
+                             classification), NOT source_kind which is
+                             the agent-side label. Keeps Zoho Meeting
+                             / SmartPBX / etc. recognizable in the
+                             list rather than rendering as the
+                             generic "Imported" source_kind would. -->
+                        <span class="chip">{sourceKindLabel(call.ingest_source)}</span>
                       {:else if call.source_kind}
                         <span class="chip">{sourceKindLabel(call.source_kind)}</span>
                       {/if}
-                      {#if isProcessing(call.status)}
+                      {#if call.status === "available"}
+                        <!-- #303 — placeholder external recording.
+                             Inline Import button hydrates the row on
+                             demand. Stops event propagation so the
+                             row's <a> doesn't navigate; optimistic
+                             local-state flip to 'transcribing' so the
+                             UI reacts before the server roundtrip
+                             completes. -->
+                        <button
+                          type="button"
+                          class="import-btn"
+                          disabled={hydrating[call.id]}
+                          onclick={(e) => importPlaceholder(e, call.id)}
+                        >
+                          {hydrating[call.id] ? "Importing…" : "Import"}
+                        </button>
+                      {:else if isProcessing(call.status)}
                         {#if isDelayed(call.status, call.recorded_at, nowMs)}
                           <span class="chip chip-still" title="Taking a little longer than usual">
                             {PILL_STILL_WORKING}
@@ -974,6 +1032,14 @@
                         {:else}
                           <span class="chip chip-sig">{PILL_PROCESSING}</span>
                         {/if}
+                      {:else if call.status === "failed"}
+                        <!-- #482 — explicit Failed chip rather than the
+                             generic chip-sig fallback so users notice on
+                             the list. Detail-page retry surface tracked
+                             as #488. -->
+                        <span class="chip chip-failed" title="Processing failed — open the call to retry">
+                          Failed
+                        </span>
                       {:else if call.status !== "complete"}
                         <span class="chip chip-sig">{call.status}</span>
                       {/if}
@@ -1574,12 +1640,48 @@
     border: 1px solid var(--hairline);
   }
 
+  /* #303 — Import button on placeholder external rows. Same chip
+     family but accent-fill so the call to action reads as actionable
+     rather than informational. */
+  .import-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--ink-0);
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 120ms, border-color 120ms;
+  }
+  .import-btn:hover:not(:disabled),
+  .import-btn:focus-visible {
+    background: var(--accent-hi, #56b8ae);
+    border-color: var(--accent-hi, #56b8ae);
+    outline: none;
+  }
+  .import-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
   .chip-sig {
     border-color: rgba(201, 162, 74, 0.3);
     color: var(--sig);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     font-size: 0.64rem;
+  }
+  /* #482 — Failed-pipeline chip. Live-red tint so it stands out from
+     the chip family without competing with the accent-fill Import
+     button. Mirror of portal styling. */
+  .chip.chip-failed {
+    color: var(--live, #d94a4a);
+    background: var(--live-soft, rgba(217, 74, 74, 0.12));
+    border: 1px solid var(--live, #d94a4a);
   }
   /* #286 · Post-threshold "Still working" pill. Slightly warmer
      (soft tint of --sig) + bolder weight so it reads as "we

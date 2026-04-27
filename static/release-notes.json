@@ -1,19 +1,28 @@
 {
+  "0.9.3": {
+    "headline": "Browse-and-import for external recordings, single SSO sign-in CTA, integrations sidebar",
+    "changes": [
+      "Browse and import external recordings on demand. Connecting an external recording source (Zoho Meeting today; more coming) no longer eagerly downloads every recording it finds. Recordings now appear on your /calls list as placeholder rows with an Import button — tap it on the recordings you actually want, skip the rest. First-time connections complete instantly even if your account has hundreds of historical recordings.",
+      "Single 'Sign in with single sign-on' CTA on the login page. The three SSO provider buttons on the login page (Google, Microsoft, Zoho) collapsed into a single 'Sign in with single sign-on' button that expands to show your provider when you click it. Less visual noise on the password sign-in path, and only the providers your aftercalls deploy has configured will show up in the expanded panel.",
+      "Source chip distinguishes externally-imported calls. Calls imported from Zoho Meeting, SmartPBX, or other external sources now carry a small chip on the calls list showing where they came from. Agent-recorded calls remain unbadged as the implicit default.",
+      "Integrations sidebar lists every connected service. The Integrations group in the sidebar now expands to show Zoho CRM, Zoho Meeting, Zoho Cliq, SmartPBX, and SSO sign-in entries (whichever your org has enabled). Previously only Zoho CRM showed up; Zoho Meeting + Cliq were reachable only by typing the URL. Zoho Meeting + Cliq pages also moved under /admin/integrations/ to match the rest of the group; old paths still resolve via redirect so existing bookmarks don't break."
+    ]
+  },
   "0.9.2": {
-    "headline": "Sign in with Google, Microsoft, or Zoho + SmartPBX recording-import scaffolding",
+    "headline": "Sign in with Google, Microsoft, or Zoho",
     "changes": [
       "Sign in with Google, Microsoft, or Zoho. You can now sign in to the portal with Google, Microsoft, or Zoho instead of email-and-password. Use the buttons under the login form on app.aftercalls.io. New accounts are created on first sign-in; existing accounts are linked when the email matches (you'll be asked to confirm with your password the first time). Manage which providers are linked to your account from Settings → Account → Linked sign-in methods. Email-and-password sign-in continues to work side-by-side."
     ]
   },
   "0.9.1": {
-    "headline": "Keyboard shortcuts, less-intrusive call-detect notification, Zoho Meeting ingest",
+    "headline": "Keyboard shortcuts and a less-intrusive call-detect notification",
     "changes": [
       "Keyboard shortcuts across the app. Common keys now work in the portal and desktop app — Space plays/pauses audio, ←/→ seek, j/k move between calls or action items, Space toggles an item done, ? opens a shortcut overlay any time. Full list at aftercalls.io/help#keyboard-shortcuts; the agent's Settings page has a link too.",
       "Less-intrusive call-detect notification. When the desktop app detects a call but its window isn't focused, it now shows a system notification with 'Record' and 'Not now' buttons instead of slamming the full window to the foreground. Click Record to start; ignore it for 30 seconds and it dismisses on its own. The in-app slide-out (when the window is already open) is unchanged."
     ]
   },
   "0.9.0": {
-    "headline": "Reliability release: offline-resilient saves, processing-delay UX, onboarding polish, and ops hardening",
+    "headline": "Reliability release: offline-resilient saves, processing-delay UX, and onboarding polish",
     "changes": [
       "Offline indicator + automatic save retry. A discreet pill at the top of the window shows when your connection drops. While you're offline, in-progress edits to notes and action items queue locally and save automatically when you're back. Recordings continue to disk regardless.",
       "'Still working' state for delayed calls. Calls that take longer than usual now switch from a neutral 'Processing' pill to a 'Still working' pill plus a one-line reassurance under the title. When the call's ready, a toast (and a system notification on the desktop app) confirms — no need to keep checking.",

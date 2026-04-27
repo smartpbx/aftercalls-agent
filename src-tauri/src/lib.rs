@@ -505,6 +505,15 @@ async fn restore_call(id: String) -> Result<(), error::PortalError> {
 }
 
 #[tauri::command]
+async fn hydrate_call(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::hydrate_call(backend, &id).await
+}
+
+#[tauri::command]
 async fn permadelete_call(
     app: AppHandle,
     id: String,
@@ -2159,6 +2168,7 @@ pub fn run() {
             list_trashed,
             restore_call,
             permadelete_call,
+            hydrate_call,
             get_call,
             get_session_audio_path,
             get_audio_urls,

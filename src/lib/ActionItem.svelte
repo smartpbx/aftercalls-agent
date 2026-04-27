@@ -1422,7 +1422,16 @@
      flexbox on edge cases not visited here). */
   .ai-meta {
     display: grid;
-    grid-template-columns: auto minmax(80px, auto);
+    /* Badge column was minmax(80px, auto) — fits "Due May 1" /
+       "ASAP" but the wider "Overdue Apr 24" badge auto-grows past
+       80px and pushes the assignee column left, so rows with
+       overdue badges no longer align with rows that have shorter
+       badges. Pin the column to a fixed 112px (just over the
+       widest "Overdue Mon Day" rendering) so every row's assignee
+       chip lands at the same x-coordinate regardless of badge
+       length. The per-chip `margin-left: auto` rules still apply
+       on the mobile reset where this grid is unset. */
+    grid-template-columns: auto 112px;
     align-items: baseline;
     gap: 0.4rem;
     margin-left: auto;

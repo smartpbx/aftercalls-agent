@@ -372,6 +372,32 @@ pub async fn restore_call(backend: &Backend, id: &str) -> std::result::Result<()
     post_nop_typed(backend, &format!("/v1/calls/{id}/restore"), serde_json::json!({})).await
 }
 
+/// #303 — hydrate a placeholder external recording on demand. Returns
+/// the new call_id + a was_new flag (idempotent on already-hydrated
+/// rows). Same shape as the portal endpoint; the Tauri command just
+/// proxies through `post_nop_typed`-shaped POST → JSON.
+pub async fn hydrate_call(backend: &Backend, id: &str) -> std::result::Result<Value, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/calls/{}/hydrate",
+        backend.url.trim_end_matches('/'),
+        id,
+    );
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return resp.json::<Value>().await.map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
 pub async fn permadelete_call(backend: &Backend, id: &str) -> std::result::Result<(), PortalError> {
     // Matches the same auth-header wiring delete_call uses.
     let auth = build_auth_header(backend).await?;
