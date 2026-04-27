@@ -1,4 +1,11 @@
 {
+  "0.9.4": {
+    "headline": "Login + invites + recording pipeline reliability + a11y polish",
+    "changes": [
+      "Failed-pipeline calls show a clear status, retry from the call list. Calls whose processing failed (rare — usually a transient transcription / summarization service issue) now show a 'Failed' badge on the calls list. Behind the scenes, every transcribe + summarize error now writes a terminal status so a stuck call doesn't sit in 'Processing' forever, and on backend restart any in-flight call from the previous process is reaped + flagged so you can retry instead of waiting indefinitely.",
+      "Login form input borders + page titles + delete-confirm modals. A polish sweep across the portal: login + sign-up input borders now meet WCAG AA contrast against the dark background; every page sets its own browser-tab title; native browser confirm pop-ups on destructive actions (delete a call, deactivate a user) replaced by in-app modals. The mobile drawer keyboard-tab-cycles inside itself, and the empty calls list gains a download-the-desktop-app CTA for fresh users."
+    ]
+  },
   "0.9.3": {
     "headline": "Browse-and-import for external recordings, single SSO sign-in CTA, integrations sidebar",
     "changes": [

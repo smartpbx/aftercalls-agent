@@ -21,7 +21,7 @@
   let {
     value = '',
     readonly = false,
-    placeholder = 'Take notes during the call…',
+    placeholder = 'Take notes during or after the call…',
     showHeader = true,
     onchange,
   }: Props = $props();
@@ -135,7 +135,7 @@
           class="tb-btn"
           class:active={isBold}
           onclick={() => runCmd((c) => c.toggleBold())}
-          title="Bold (Ctrl+B)"
+          title="Bold (⌘B / Ctrl+B)"
           aria-label="Bold"
         ><strong>B</strong></button>
         <button
@@ -143,7 +143,7 @@
           class="tb-btn"
           class:active={isItalic}
           onclick={() => runCmd((c) => c.toggleItalic())}
-          title="Italic (Ctrl+I)"
+          title="Italic (⌘I / Ctrl+I)"
           aria-label="Italic"
         ><em>I</em></button>
         <button
@@ -151,7 +151,7 @@
           class="tb-btn mono"
           class:active={isCode}
           onclick={() => runCmd((c) => c.toggleCode())}
-          title="Inline code (Ctrl+E)"
+          title="Inline code (⌘E / Ctrl+E)"
           aria-label="Inline code"
         >{"</>"}</button>
         <span class="divider" aria-hidden="true"></span>
@@ -225,7 +225,7 @@
           class="tb-btn"
           class:active={isLink}
           onclick={setLink}
-          title="Link (Ctrl+K)"
+          title="Link (⌘K / Ctrl+K)"
           aria-label="Link"
         >
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">

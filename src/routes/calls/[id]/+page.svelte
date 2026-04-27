@@ -110,6 +110,10 @@
     status: string;
     source_app: string | null;
     source_kind: string | null;
+    /** External-source classification (#303): 'agent' (default),
+     *  'zoho_meeting', 'zoho_cliq', 'smartpbx', 'imported_file'.
+     *  Older backends without this field land as undefined. */
+    ingest_source?: string;
     utterances: Utterance[];
     tags: Tag[];
     // Manual notes markdown (#73). Server always returns a string
@@ -194,6 +198,11 @@
   let highlights = $state<Highlight[]>([]);
   let error = $state("");
   let loading = $state(true);
+  // #303 follow-up — placeholder hydrate state. Mirror of the portal
+  // call-detail path. After a successful hydrate the call is
+  // re-fetched and status flips to 'transcribing'.
+  let hydrating = $state(false);
+  let hydrateError = $state("");
 
   // ── Manual notes on call detail (#73) ────────────────────────────
   // Local buffer + debounced save via the update_call_notes Tauri
@@ -2259,6 +2268,24 @@
     return before;
   }
 
+  // #303 follow-up — Import this placeholder via the Tauri hydrate
+  // command. Mirror of the portal call-detail flow. Re-fetch on
+  // success so status flips from 'available' to 'transcribing' and
+  // the rest of the page renders the normal pipeline-in-progress UI.
+  async function hydrateAvailable() {
+    if (!call || hydrating) return;
+    hydrating = true;
+    hydrateError = "";
+    try {
+      await invoke("hydrate_call", { id: call.id });
+      call = await invoke<Call>("get_call", { id: call.id });
+    } catch (e: any) {
+      hydrateError = portalErrorToText(e);
+    } finally {
+      hydrating = false;
+    }
+  }
+
   async function onBulkPick(pick: {
     from: string;
     user: { id: string; display_name: string; email: string } | null;
@@ -3263,6 +3290,57 @@
     <p class="state" style="--i: 0">Loading call…</p>
   {:else if error}
     <p class="state err" style="--i: 0">{error}</p>
+  {:else if call && call.status === "available"}
+    <!-- #303 follow-up — placeholder external recording (Zoho Meeting /
+         SmartPBX / etc). Render a focused import card instead of the
+         normal call body so the page doesn't appear blank. After
+         hydrate the call status flips to 'transcribing' and the
+         normal UI takes over. -->
+    <header class="head" style="--i: 0">
+      <a class="back" href="/calls">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M10 3 L5 8 L10 13" stroke="currentColor" stroke-width="1.75" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span>Calls</span>
+      </a>
+    </header>
+    <section class="placeholder-card">
+      <p class="placeholder-eyebrow">
+        Available from {call.ingest_source === "zoho_meeting"
+          ? "Zoho Meeting"
+          : call.ingest_source === "smartpbx"
+            ? "SmartPBX"
+            : call.ingest_source ?? "an external source"}
+      </p>
+      <h1 class="placeholder-title">{call.title ?? "(untitled)"}</h1>
+      <p class="placeholder-meta">
+        {fmtDateTitle(call.recorded_at)}
+        {#if call.duration_ms}
+          · {Math.floor(call.duration_ms / 60000)} min {Math.floor((call.duration_ms / 1000) % 60)}s
+        {/if}
+      </p>
+      <p class="placeholder-body">
+        This recording isn't imported yet. We saw it on the connected
+        account but haven't downloaded the audio or run transcription /
+        summary on it. Click <strong>Import</strong> to pull it in —
+        you'll see the call's audio, transcript, and summary on this
+        page within a few minutes.
+      </p>
+      <div class="placeholder-actions">
+        <button
+          type="button"
+          class="placeholder-cta"
+          onclick={hydrateAvailable}
+          disabled={hydrating}
+        >
+          {hydrating ? "Importing…" : "Import recording"}
+        </button>
+        <a class="placeholder-cancel" href="/calls">Back to calls</a>
+      </div>
+      {#if hydrateError}
+        <p class="placeholder-err" role="alert">{hydrateError}</p>
+      {/if}
+    </section>
   {:else if call}
     <header class="head" style="--i: 0">
       <a class="back" href="/calls">
@@ -6326,5 +6404,93 @@
     .bulk-toast-body {
       flex-basis: 100%;
     }
+  }
+
+  /* #303 follow-up — placeholder import card. Mirror of the portal
+     call-detail styles. Same surface tokens; sized for desktop +
+     mobile baseline. */
+  .placeholder-card {
+    max-width: 600px;
+    margin: 1.5rem auto;
+    padding: 2rem 2rem 1.75rem;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 24px 50px -32px rgba(0, 0, 0, 0.6);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .placeholder-eyebrow {
+    margin: 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .placeholder-title {
+    margin: 0;
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: var(--bone-0);
+    letter-spacing: -0.01em;
+    line-height: 1.25;
+  }
+  .placeholder-meta {
+    margin: 0;
+    color: var(--bone-3);
+    font-size: 0.85rem;
+  }
+  .placeholder-body {
+    margin: 0.5rem 0 0;
+    color: var(--bone-2);
+    font-size: 0.9rem;
+    line-height: 1.6;
+    max-width: 56ch;
+  }
+  .placeholder-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 0.75rem;
+  }
+  .placeholder-cta {
+    padding: 0.65rem 1.25rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    font-weight: 600;
+    font-size: 0.92rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 150ms, border-color 150ms;
+  }
+  .placeholder-cta:hover:not(:disabled),
+  .placeholder-cta:focus-visible {
+    background: var(--accent-hi, #56b8ae);
+    border-color: var(--accent-hi, #56b8ae);
+    outline: none;
+  }
+  .placeholder-cta:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .placeholder-cancel {
+    color: var(--bone-3);
+    font-size: 0.85rem;
+    text-decoration: none;
+  }
+  .placeholder-cancel:hover {
+    color: var(--bone-1);
+  }
+  .placeholder-err {
+    margin: 0.5rem 0 0;
+    padding: 0.55rem 0.75rem;
+    background: var(--live-soft, rgba(217, 74, 74, 0.12));
+    border: 1px solid var(--live, #d94a4a);
+    border-radius: 6px;
+    color: var(--live, #d94a4a);
+    font-size: 0.85rem;
   }
 </style>
