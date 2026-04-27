@@ -1259,8 +1259,8 @@
           onclick={handleDeleteRequest}
         >
           <svg
-            width="12"
-            height="12"
+            width="16"
+            height="16"
             viewBox="0 0 16 16"
             fill="none"
             stroke="currentColor"
@@ -1310,7 +1310,7 @@
        on the same line. Replaces the hand-tuned per-cell margin /
        padding offsets that compensated for `align-items: start`. */
     align-items: first baseline;
-    padding: 0.6rem 0;
+    padding: 0.6rem 0 0.6rem 0.6rem;
     border-bottom: 1px solid var(--hairline);
     color: var(--bone-1);
     font-size: 0.9rem;
@@ -1321,7 +1321,9 @@
   }
   /* #282 — keyboard-driven highlight (j/k on /actions). Mirrors the
      calls-list active-row styling: subtle accent rail, faint tint.
-     Component-scoped — does not bleed into app.css. */
+     Component-scoped — does not bleed into app.css. The 0.6rem
+     left padding on .ai-row above is what keeps the 2px rail from
+     visually intersecting the leftmost checkbox column. */
   .ai-row[data-shortcut-row="active"] {
     background: var(--ink-1);
     box-shadow: inset 2px 0 0 var(--accent);
@@ -1698,7 +1700,7 @@
   }
 
   .ai-del {
-    padding: 0.22rem 0.35rem;
+    padding: 0.4rem 0.5rem;
     /* #132.1 — drop the hand-tuned margin-top: 0.1rem; the
        parent's align-self: center handles vertical alignment. */
     border: none;
@@ -1707,7 +1709,7 @@
     cursor: pointer;
     border-radius: 4px;
     line-height: 0;
-    opacity: 0.4;
+    opacity: 0.55;
     transition: opacity 150ms linear, color 150ms linear,
       background 150ms linear;
   }
