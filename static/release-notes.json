@@ -1,4 +1,10 @@
 {
+  "0.9.2": {
+    "headline": "Sign in with Google, Microsoft, or Zoho + SmartPBX recording-import scaffolding",
+    "changes": [
+      "Sign in with Google, Microsoft, or Zoho. You can now sign in to the portal with Google, Microsoft, or Zoho instead of email-and-password. Use the buttons under the login form on app.aftercalls.io. New accounts are created on first sign-in; existing accounts are linked when the email matches (you'll be asked to confirm with your password the first time). Manage which providers are linked to your account from Settings → Account → Linked sign-in methods. Email-and-password sign-in continues to work side-by-side."
+    ]
+  },
   "0.9.1": {
     "headline": "Keyboard shortcuts, less-intrusive call-detect notification, Zoho Meeting ingest",
     "changes": [
