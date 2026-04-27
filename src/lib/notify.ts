@@ -16,6 +16,7 @@
 // effect immediately without reloading.
 
 import { invoke } from "@tauri-apps/api/core";
+import { getAppPrefs } from "./stores/appPrefs.svelte";
 
 let ctx: AudioContext | null = null;
 function getCtx(): AudioContext | null {
@@ -34,12 +35,12 @@ function getCtx(): AudioContext | null {
 }
 
 async function soundsEnabled(): Promise<boolean> {
-  try {
-    const p = await invoke<{ sounds_enabled: boolean }>("get_app_prefs");
-    return p.sounds_enabled ?? true;
-  } catch {
-    return true;
-  }
+  // #501 — reads via the shared appPrefs cache so a chime-heavy flow
+  // (start cue → stop cue → pipeline-done cue) doesn't fan into
+  // three IPC calls. Cache miss → default-on, matching the prior
+  // catch-and-default behaviour.
+  const p = await getAppPrefs();
+  return p?.sounds_enabled ?? true;
 }
 
 // #92: gate "normal" chimes on busy-state as well as the user pref.

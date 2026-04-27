@@ -777,7 +777,10 @@
             />
             <ul class="pop-list">
               {#if suggestLoading}
-                <li class="pop-empty">Loading…</li>
+                <li class="pop-empty">
+                  <span class="pop-empty-spinner" aria-hidden="true"></span>
+                  Loading…
+                </li>
               {:else if suggestions.length === 0}
                 {#if popoverQuery.trim() && popoverKind}
                   <li>
@@ -1426,6 +1429,29 @@
     padding: 0.4rem;
     text-align: center;
     list-style: none;
+  }
+  /* #508 — small spinner glyph next to "Loading…" so the affordance is
+     consistent with other in-flight states in the agent. */
+  .pop-empty-spinner {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    margin-right: 0.4rem;
+    vertical-align: -1px;
+    border: 1.5px solid var(--hairline-hi);
+    border-top-color: var(--bone-3);
+    border-radius: 50%;
+    animation: pop-empty-spin 0.7s linear infinite;
+  }
+  @keyframes pop-empty-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pop-empty-spinner {
+      animation: none;
+    }
   }
 
   /* ── #146 · Date range bar ───────────────────────────────────────── */

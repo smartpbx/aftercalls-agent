@@ -1,4 +1,11 @@
 {
+  "0.9.5": {
+    "headline": "Polish + portal toasts + agent recording UX + prompt-injection hardening + invite security",
+    "changes": [
+      "Toasts replace inline ok/err messages across the portal. Saving a password change, toggling a teammate's status, doing a bulk speaker rename — these now show a tidy toast that auto-dismisses, instead of inline 'Saved' or error text crowding the form. Failed-call list rows already had this treatment in v0.9.4; v0.9.5 sweeps it across Settings, Admin Users, and the bulk-rename surface.",
+      "Notes editor stays mounted through pipeline upload + agent UX polish. Notes you wrote during a call no longer disappear at the moment the agent finishes uploading. The Call / Note mode toggle on the Record screen now has a one-line subtitle explaining the difference, the filter popover shows a spinner instead of bare 'Loading…' text, and the 'Set in Settings' tooltip on null shortcuts now links you straight to the right setting."
+    ]
+  },
   "0.9.4": {
     "headline": "Login + invites + recording pipeline reliability + a11y polish",
     "changes": [

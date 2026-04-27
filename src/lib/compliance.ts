@@ -6,6 +6,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { notifyConsentAnnouncement, notifyRecordStart } from "./notify";
+import { getAppPrefs } from "./stores/appPrefs.svelte";
 
 export type RecordingNotificationMode = "off" | "user" | "enforced";
 export type RecordingPrefs = {
@@ -46,20 +47,15 @@ export async function loadRecordingPrefs(): Promise<RecordingPrefs | null> {
 // announcement plays alongside the chime. Default OFF for `user` mode
 // (chime alone is enough for most users); always-on for `enforced`
 // mode regardless of this pref so an admin's compliance posture isn't
-// silenceable from local Settings. Read fresh per call so toggling in
-// Settings takes effect without an app restart — the read is cheap
-// (in-process Tauri command, hits a TOML file).
+// silenceable from local Settings. #501 — reads route through the
+// shared appPrefs cache so a series of recordings within one session
+// only pays the round-trip once; Settings invalidates on save so a
+// toggled pref takes effect immediately.
 async function consentAnnouncementEnabled(): Promise<boolean> {
-  try {
-    const p = await invoke<{ consent_announcement_enabled: boolean }>(
-      "get_app_prefs",
-    );
-    return !!p.consent_announcement_enabled;
-  } catch {
-    // Fail-closed on IPC error: better to skip the speech than to
-    // surprise users with audio they didn't opt into.
-    return false;
-  }
+  const p = await getAppPrefs();
+  // Fail-closed on cache miss: better to skip the speech than to
+  // surprise users with audio they didn't opt into.
+  return !!p?.consent_announcement_enabled;
 }
 
 export type StartCueOpts = {

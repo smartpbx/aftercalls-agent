@@ -6,6 +6,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
+  import { invalidateAppPrefs } from "$lib/stores/appPrefs.svelte";
   import { portalErrorToText } from "$lib/portalError";
 
   // #69 — About card surfaces the running version + the LGPL ffmpeg
@@ -367,6 +368,10 @@
         recordToggleShortcut,
         consentAnnouncementEnabled,
       });
+      // #501 — drop the shared cache so the next consumer
+      // (compliance.ts / notify.ts) sees the freshly-saved values
+      // instead of stale module-level state.
+      invalidateAppPrefs();
       prefsSavedAt = Date.now();
     } catch (e) {
       error = portalErrorToText(e);
@@ -1017,7 +1022,7 @@
       />
     </div>
 
-    <div class="pref-row">
+    <div class="pref-row" id="shortcuts">
       <div class="pref-label">
         <span class="pref-title">Note-to-self shortcut</span>
         <span class="pref-hint">

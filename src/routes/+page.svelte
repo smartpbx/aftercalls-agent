@@ -314,6 +314,19 @@
         openableCallId = p.call_id;
         notifyPipelineDone();
       }
+      // #344 — the notes panel stays mounted through pipeline
+      // upload, then unmounts on done/failed. Flush any pending
+      // debounced save before that unmount so the last keystrokes
+      // landed during the post-stop window are persisted.
+      if ((p.stage === "done" || p.stage === "failed") && notesPending !== null && currentSessionId) {
+        const payload = notesPending;
+        const sid = currentSessionId;
+        notesPending = null;
+        clearTimeout(notesSaveTimer);
+        invoke("save_notes", { sessionId: sid, notes: payload }).catch(
+          (e) => console.warn("save_notes (pipeline-end flush) failed", e),
+        );
+      }
     });
     unlistenState = await listen<{
       recording: boolean;
@@ -866,6 +879,19 @@
         Note
       </button>
     </div>
+    <!-- #443 — subtitle clarifies what each mode captures and which
+         path triggers consent. Helps a user who misclicks Note when
+         they meant Call (or vice versa) realise the consent flow
+         differs. -->
+    <p class="record-tabs-sub" aria-live="polite">
+      {#if recordMode === "call"}
+        Call: records your mic + system audio for transcription.
+        Requires participant consent acknowledgement.
+      {:else}
+        Note: records your mic only — for personal dictation. No
+        consent prompt; only you are captured.
+      {/if}
+    </p>
 
     <div class="cta-row">
       <!-- Primary action — button flips to live state with inline timer.
@@ -940,6 +966,13 @@
           {/each}
         </span>
         <span class="sep">·</span>
+      {:else}
+        <!-- #512 — when no shortcut is bound, give users a one-click
+             path to Settings instead of a dead-end tooltip. -->
+        <a class="link set-shortcut" href="/settings#shortcuts">
+          Set shortcut →
+        </a>
+        <span class="sep">·</span>
       {/if}
       <button class="link" disabled={importing} onclick={importRecording}>
         {importing ? "Importing…" : "Import a file"}
@@ -984,14 +1017,18 @@
     {/if}
   </section>
 
-  <!-- Manual notes panel (#73). Opt-in via Settings; only visible
-       during an active recording so there's no empty editor on the
-       page when idle. Keyed on session_id so a new recording gets a
-       fresh editor state (the TipTap instance is destroyed + re-
-       created rather than carrying stale text between calls). #194:
-       value={notesInitial} seeds the editor from notes.md when the
-       user navigates away and back mid-recording. -->
-  {#if manualNotesEnabled && recording && currentSessionId}
+  <!-- Manual notes panel (#73). Opt-in via Settings; visible during
+       an active recording AND through the post-stop pipeline window
+       (#344) so a final-second thought typed while the chime is
+       still ringing isn't lost. Keyed on session_id so a new
+       recording gets a fresh editor state (the TipTap instance is
+       destroyed + re-created rather than carrying stale text
+       between calls). #194: value={notesInitial} seeds the editor
+       from notes.md when the user navigates away and back mid-
+       recording. The panel unmounts once the pipeline reaches done
+       (or failed) — at that point the call-detail page owns notes
+       editing. -->
+  {#if manualNotesEnabled && currentSessionId && (recording || (pipelineStage && pipelineStage !== "done" && pipelineStage !== "failed"))}
     <section class="notes" style="--i: 3">
       {#key currentSessionId}
         <NotesPanel value={notesInitial} onchange={scheduleNotesSave} />
@@ -1229,6 +1266,17 @@
     opacity: 0.55;
     cursor: not-allowed;
   }
+  /* #443 — subtitle row beneath the Call/Note pills. Sits above the
+     CTA row, shares the .cta-secondary text weight so it reads as
+     hint copy, not chrome. Max-width keeps it from outrunning the
+     pills on a wide-enough viewport. */
+  .record-tabs-sub {
+    margin: 0.45rem 0 0;
+    max-width: 38ch;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    color: var(--bone-3);
+  }
 
   /* Primary + Copy notice share a row; Copy notice is the ghost
      counterpart to the filled record button. Wraps to stack on very
@@ -1371,6 +1419,12 @@
   }
   .link:hover:not(:disabled) {
     color: var(--accent);
+  }
+  /* #512 — actionable "Set shortcut →" link surfaced next to the
+     record button when no shortcut is bound. Anchor styling so it
+     matches the kbd-row visual weight. */
+  a.set-shortcut {
+    text-decoration: none;
   }
   .link:disabled {
     opacity: 0.6;
