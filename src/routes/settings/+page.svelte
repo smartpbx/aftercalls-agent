@@ -1342,6 +1342,42 @@
     </div>
   </section>
 
+  <!-- #317 — recording-policy explainer. Relocated from the auto-detect
+       ack modal so the slim variant of that modal can stay scoped to a
+       single sentence + checkbox (auto-detect's 30s OS-toast deadline
+       wouldn't accommodate a wall of legal text). The copy below is
+       the verbatim text that shipped in the modal — legal review
+       attaches to the wording, not the surface. The slim modal links
+       to this section via the `#recording-policy` anchor. -->
+  <section class="card" style="--i: 1.75" id="recording-policy">
+    <div class="card-head">
+      <div>
+        <h2>Recording policy</h2>
+        <p class="hint">
+          What you confirm every time you start recording a call.
+        </p>
+      </div>
+    </div>
+    <div class="recording-policy">
+      <p>
+        Under Canadian PIPEDA — and equivalent privacy laws in most
+        jurisdictions — you are responsible for notifying every
+        participant that the call is being recorded, obtaining their
+        consent, and using the recording only for the purpose you
+        disclosed.
+      </p>
+      <p>aftercalls doesn't automate consent. You do.</p>
+      <p>
+        When you do record, your audio is transcribed and summarized
+        by automated services to generate transcripts, summaries, and
+        suggested action items. These outputs are advisory — you can
+        edit or delete any of them, or delete the entire call, at any
+        time. See the Privacy Policy for the full disclosure under
+        GDPR Article 22.
+      </p>
+    </div>
+  </section>
+
   <section class="card" style="--i: 2">
     <div class="card-head">
       <div>
@@ -2156,5 +2192,19 @@
   }
   .legal-footer .sep {
     color: var(--bone-4);
+  }
+
+  /* #317 — recording-policy explainer block. Plain prose; the card
+     shell gives it the same chrome as every other settings section
+     so it doesn't read as an alert. */
+  .recording-policy p {
+    margin: 0 0 0.7rem;
+    color: var(--bone-2);
+    font-size: 0.88rem;
+    line-height: 1.55;
+    max-width: 64ch;
+  }
+  .recording-policy p:last-child {
+    margin-bottom: 0;
   }
 </style>

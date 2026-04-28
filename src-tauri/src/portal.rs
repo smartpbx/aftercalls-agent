@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
-use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags};
+use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags, PendingTos};
 use crate::error::{from_status, parse_retry_after, PortalError};
 
 /// #179 — explicit User-Agent so backend logs can attribute requests to
@@ -79,6 +79,15 @@ struct MeResponse {
     /// matching the absent-row default.
     #[serde(default)]
     features: FeatureFlags,
+    /// #320 — outstanding ToS / privacy versions the user has yet to
+    /// accept. Mirrors the portal's `PendingTos[]`. The agent's layout
+    /// gates on `len() > 0` and routes the user to `/accept-terms`,
+    /// matching the portal flow. Serde-defaulted to an empty Vec so a
+    /// backend response from before this field landed (or one that
+    /// inadvertently omits it) decodes cleanly with the empty/no-gate
+    /// semantics.
+    #[serde(default)]
+    pending_tos: Vec<PendingTos>,
 }
 
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
@@ -152,6 +161,7 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         org_display_name: p.user.org_display_name,
         recording_acknowledged: p.user.recording_acknowledged,
         features: p.user.features,
+        pending_tos: p.user.pending_tos,
     }
 }
 
@@ -225,6 +235,7 @@ pub async fn update_me(
         org_display_name: me.org_display_name,
         recording_acknowledged: me.recording_acknowledged,
         features: me.features,
+        pending_tos: me.pending_tos,
     };
     write_auth_file(&merged).map_err(PortalError::from)?;
     Ok(merged)
@@ -1146,6 +1157,100 @@ pub async fn post_recording_ack(
 
 pub async fn get_recording_prefs(backend: &Backend) -> std::result::Result<Value, PortalError> {
     get_json_typed(backend, "/v1/org/recording-prefs").await
+}
+
+// ── Terms of Service / Privacy gate (#320) ───────────────────────────
+
+/// Public endpoint — no auth required. Returns the latest published
+/// `terms` + `privacy` document bodies so the accept-terms page can
+/// render them. The auth header is built best-effort: when the user is
+/// signed in we send it (the backend doesn't require it but doesn't
+/// reject it either); when there's no auth.json on disk we send the
+/// request unauthenticated rather than erroring out, since the route is
+/// public-facing on the backend.
+pub async fn tos_current(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/tos/current",
+        backend.url.trim_end_matches('/')
+    );
+    let mut req = c.get(&url);
+    if let Ok(auth) = build_auth_header(backend).await {
+        req = req.header("authorization", auth);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        let text = resp.text().await.map_err(PortalError::from)?;
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&text).map_err(PortalError::from);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
+/// Authed. Records acceptance(s) against the current user. Mirrors
+/// the portal's `api.tos.accept(ids)` — the wire shape is
+/// `{ tos_version_ids: [...] }`.
+pub async fn tos_accept(
+    backend: &Backend,
+    ids: Vec<String>,
+) -> std::result::Result<(), PortalError> {
+    post_nop_typed(
+        backend,
+        "/v1/tos/accept",
+        serde_json::json!({ "tos_version_ids": ids }),
+    )
+    .await
+}
+
+/// #320 — refetch `/v1/auth/me` and persist the fresh `pending_tos`
+/// (and the rest of the profile bundle) into `auth.json` so the next
+/// `current_user` read reflects the post-acceptance state without a
+/// re-login. Used by the `tos_accept` Tauri command after a successful
+/// POST so the layout's gate clears on the same tick.
+pub async fn refresh_me(backend: &Backend) -> std::result::Result<AuthFile, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/auth/me",
+        backend.url.trim_end_matches('/')
+    );
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
+    }
+    let me: MeResponse = resp.json().await.map_err(PortalError::from)?;
+    let existing = read_auth_file()
+        .map_err(PortalError::from)?
+        .ok_or(PortalError::Unauthorized)?;
+    let merged = AuthFile {
+        access_token: existing.access_token,
+        access_expires_at: existing.access_expires_at,
+        refresh_token: existing.refresh_token,
+        refresh_expires_at: existing.refresh_expires_at,
+        user_id: me.id,
+        email: me.email,
+        first_name: me.first_name,
+        last_name: me.last_name,
+        display_name: me.display_name,
+        role: me.role,
+        is_platform_staff: me.is_platform_staff,
+        org_id: me.org_id,
+        org_slug: me.org_slug,
+        org_display_name: me.org_display_name,
+        recording_acknowledged: me.recording_acknowledged,
+        features: me.features,
+        pending_tos: me.pending_tos,
+    };
+    write_auth_file(&merged).map_err(PortalError::from)?;
+    Ok(merged)
 }
 
 // ── Org member roster (#65) ──────────────────────────────────────────

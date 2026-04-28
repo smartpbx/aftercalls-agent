@@ -1320,7 +1320,9 @@
       <p class="ack-body">
         By recording you confirm that you'll tell everyone on the call
         that it's being recorded, get their consent, and use the
-        recording only for the purpose you disclosed.
+        recording only for the purpose you disclosed. Your audio will
+        be transcribed and summarized by automated services to
+        generate notes for you.
       </p>
 
       <label class="ack-check">

@@ -301,6 +301,34 @@ pub struct AuthFile {
     /// security boundary; this is purely UX.
     #[serde(default)]
     pub features: FeatureFlags,
+    /// #320 — outstanding ToS / privacy versions the user must accept
+    /// before any recording surface is reachable. Cached so a relaunch
+    /// without network still gates correctly; the next `current_user`
+    /// fetch re-syncs against `/v1/auth/me` whenever the agent is
+    /// online. Serde default = empty Vec so older auth.json files
+    /// (written before this field existed) decode cleanly with
+    /// "no gate" semantics — a user who needs to accept a freshly
+    /// published version will hit the gate as soon as the next
+    /// `current_user` call lands the live `pending_tos`.
+    #[serde(default)]
+    pub pending_tos: Vec<PendingTos>,
+}
+
+/// Mirror of the backend's per-version row in
+/// `MeResponse.pending_tos` (and the portal's `PendingTos` type).
+/// Shape is intentionally narrow — the layout only needs `kind` to
+/// know whether the user has terms vs privacy outstanding; the full
+/// `body_md` lands separately via `tos_current`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PendingTos {
+    pub id: String,
+    /// Either `"terms"` or `"privacy"`. Stored as `String` (not an enum)
+    /// so the agent layout's gate stays decoupled from the backend's
+    /// variant churn — if a third kind is ever introduced we treat it
+    /// as a generic pending row rather than panicking on decode.
+    pub kind: String,
+    pub slug: String,
+    pub effective_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Mirror of the backend's `FeaturesSnapshot` shape (see

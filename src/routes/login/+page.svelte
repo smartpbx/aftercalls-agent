@@ -21,11 +21,23 @@
   let ssoRefreshing = $state(false);
   let ssoRefreshError = $state("");
 
+  type PendingTos = {
+    id: string;
+    kind: string;
+    slug: string;
+    effective_at: string;
+  };
+
   type Me = {
     email: string;
     display_name: string;
     role: string;
     org_display_name: string;
+    /// #320 — outstanding ToS / privacy versions. The login flow
+    /// routes the user to /accept-terms first when this is non-empty
+    /// so they don't briefly mount the recording surface before the
+    /// layout-level gate redirects.
+    pending_tos?: PendingTos[];
   };
 
   onMount(async () => {
@@ -39,7 +51,15 @@
 
     try {
       const me = await invoke<Me | null>("current_user");
-      if (me) goto("/");
+      if (me) {
+        // #320 — if the cached profile has pending ToS / privacy
+        // rows, route past the recording surface and straight to the
+        // gate so the layout doesn't have to bounce a half-mounted
+        // /calls page.
+        const pending = me.pending_tos ?? [];
+        if (pending.length > 0) goto("/accept-terms");
+        else goto("/");
+      }
     } catch (e) {
       console.warn("current_user check failed", e);
     }
@@ -90,7 +110,10 @@
       const me = await invoke<Me | null>("current_user");
       if (me) {
         window.dispatchEvent(new Event("aftercalls-login"));
-        goto("/");
+        // #320 — same ToS-aware route-out as the password flow.
+        const pending = me.pending_tos ?? [];
+        if (pending.length > 0) goto("/accept-terms");
+        else goto("/");
       } else {
         ssoRefreshError = "Sign-in not detected yet. Complete the sign-in in your browser, then try again.";
       }
@@ -113,13 +136,20 @@
     submitting = true;
     try {
       const trimmed = email.trim();
-      await invoke<Me>("login", { email: trimmed, password });
+      const result = await invoke<Me>("login", { email: trimmed, password });
       try {
         if (rememberEmail) localStorage.setItem(REMEMBERED_EMAIL_KEY, trimmed);
         else localStorage.removeItem(REMEMBERED_EMAIL_KEY);
       } catch {}
       window.dispatchEvent(new Event("aftercalls-login"));
-      goto("/");
+      // #320 — route past the recording surface when the user has
+      // outstanding ToS / privacy versions so the gate page renders
+      // cleanly rather than the layout having to bounce a half-
+      // mounted /calls. The layout still owns the post-mount
+      // re-evaluation in case the cached state lags.
+      const pending = result.pending_tos ?? [];
+      if (pending.length > 0) goto("/accept-terms");
+      else goto("/");
     } catch (e: unknown) {
       error = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {

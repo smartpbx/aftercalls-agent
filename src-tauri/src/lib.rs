@@ -597,6 +597,11 @@ struct LoginResult {
     /// `FeaturesSnapshot` shape; the SvelteKit layout + call-detail
     /// page gate the Send-to-CRM affordances on `features.zoho`.
     features: config::FeatureFlags,
+    /// #320 — outstanding ToS / privacy versions. The SvelteKit layout
+    /// gates on `length > 0` and routes the user to `/accept-terms`
+    /// before any recording surface is reachable. Mirror of the
+    /// portal's `Me.pending_tos` shape.
+    pending_tos: Vec<config::PendingTos>,
 }
 
 #[tauri::command]
@@ -617,6 +622,7 @@ async fn login(email: String, password: String) -> Result<LoginResult, error::Po
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
         features: auth.features,
+        pending_tos: auth.pending_tos,
     })
 }
 
@@ -661,6 +667,7 @@ fn current_user() -> Result<Option<LoginResult>, error::PortalError> {
         org_display_name: a.org_display_name,
         recording_acknowledged: a.recording_acknowledged,
         features: a.features,
+        pending_tos: a.pending_tos,
     }))
 }
 
@@ -689,6 +696,7 @@ async fn update_me(
         org_display_name: auth.org_display_name,
         recording_acknowledged: auth.recording_acknowledged,
         features: auth.features,
+        pending_tos: auth.pending_tos,
     })
 }
 
@@ -840,6 +848,54 @@ async fn get_recording_prefs() -> Result<serde_json::Value, error::PortalError> 
         message: "no backend configured".into(),
     })?;
     portal::get_recording_prefs(backend).await
+}
+
+// ── ToS / privacy gate (#320) ────────────────────────────────────────
+
+/// Wrap `GET /v1/tos/current`. Public endpoint — the wrapper sends an
+/// auth header when one is available but doesn't require it. The
+/// SvelteKit `/accept-terms` page calls this on mount to fetch the
+/// `body_md` for each pending kind.
+#[tauri::command]
+async fn tos_current() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::tos_current(backend).await
+}
+
+/// Wrap `POST /v1/tos/accept`. After a successful POST, refetches
+/// `/v1/auth/me` and persists the resulting bundle into `auth.json` so
+/// the next `current_user` read sees the cleared `pending_tos` —
+/// matching the portal's "POST then re-fetch /me" flow without
+/// requiring a second roundtrip from the SvelteKit layer.
+#[tauri::command]
+async fn tos_accept(ids: Vec<String>) -> Result<LoginResult, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::tos_accept(backend, ids).await?;
+    // Best-effort: a refetch failure leaves the cached pending_tos in
+    // place but the acceptance itself succeeded server-side. We surface
+    // the refresh error so the front-end can ask the user to reload —
+    // matching the portal's "Acceptance recorded but the server still
+    // reports pending items" branch.
+    let auth = portal::refresh_me(backend).await?;
+    Ok(LoginResult {
+        user_id: auth.user_id,
+        email: auth.email,
+        first_name: auth.first_name,
+        last_name: auth.last_name,
+        display_name: auth.display_name,
+        role: auth.role,
+        is_platform_staff: auth.is_platform_staff,
+        org_display_name: auth.org_display_name,
+        recording_acknowledged: auth.recording_acknowledged,
+        features: auth.features,
+        pending_tos: auth.pending_tos,
+    })
 }
 
 #[tauri::command]
@@ -1699,6 +1755,20 @@ fn toggle_recording(app: &AppHandle) {
     }
 }
 
+/// #313 — single source of truth for "is the agent doing work that
+/// blocks a quit / close." Reused by `quit_with_confirm` (tray Quit)
+/// and the X-button window-event handler so both paths funnel
+/// through the same confirmation dialog rather than each rolling
+/// their own busy-check.
+fn is_busy(app: &AppHandle) -> bool {
+    let pipeline_busy = pipeline::is_pipeline_active();
+    let recorder_busy = app
+        .try_state::<recorder::Recorder>()
+        .map(|r| r.is_active())
+        .unwrap_or(false);
+    pipeline_busy || recorder_busy
+}
+
 /// Tray Quit handler with a confirm dialog when work is in flight
 /// (#62). Close-to-tray path (X button) is separate — that one
 /// intentionally never quits. Only reached from the tray "Quit"
@@ -2223,6 +2293,12 @@ pub fn run() {
             get_recording_ack,
             post_recording_ack,
             get_recording_prefs,
+            // #320 — ToS / privacy gate parity with the portal. Layout
+            // routes to /accept-terms when current_user surfaces a
+            // non-empty pending_tos; the page hits these two commands
+            // to render + accept.
+            tos_current,
+            tos_accept,
             list_orphan_sessions,
             resume_orphan_session,
             discard_orphan_session,
@@ -2288,6 +2364,21 @@ pub fn run() {
         .on_window_event(|win, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if win.label() == "main" {
+                    let app = win.app_handle().clone();
+                    // #313 — busy-state takes precedence over the
+                    // close-to-tray preference. A user who clicks X
+                    // mid-recording (or while the post-call pipeline
+                    // is still running) hits the same confirmation
+                    // dialog the tray Quit path uses, regardless of
+                    // their close_to_tray pref. quit_with_confirm
+                    // routes through the dialog and exits on confirm
+                    // / no-ops on cancel; we just need to prevent the
+                    // close from running synchronously.
+                    if is_busy(&app) {
+                        api.prevent_close();
+                        quit_with_confirm(app);
+                        return;
+                    }
                     // Per-user preference: default true (hide to tray),
                     // false means the X button really quits. Fallback to
                     // hide-on-close if config can't be read so users
@@ -2299,6 +2390,24 @@ pub fn run() {
                     if close_to_tray {
                         api.prevent_close();
                         let _ = win.hide();
+                    } else {
+                        // #313 — close-to-tray = false AND not busy →
+                        // honour the user's pref and let the close run,
+                        // but emit a one-time advisory event so the
+                        // SvelteKit layout can render a dismissible
+                        // ".hotkey-note" on the next launch reading
+                        // "X closes the window — aftercalls keeps
+                        // running in the tray". The webview listener
+                        // gates on a localStorage flag so the note
+                        // only ever appears once per machine.
+                        //
+                        // Emitted before the close completes so the
+                        // event queue lands the payload while the
+                        // webview is still alive; the layout listener
+                        // immediately writes its localStorage flag,
+                        // and the next process startup picks the note
+                        // up from there.
+                        let _ = app.emit("close-advisory", ());
                     }
                 }
             }
