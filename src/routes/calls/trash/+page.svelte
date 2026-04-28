@@ -38,6 +38,21 @@
   let error = $state("");
   let scope = $state<"mine" | "all">("mine");
   let busy = $state<Record<string, boolean>>({});
+
+  // #386 — keyset pagination, mirror of the portal trash page.
+  const PAGE_SIZE = 50;
+  let nextCursor = $state<string | null>(null);
+  let loadingMore = $state(false);
+  let loadMoreError = $state<string | null>(null);
+
+  type CallsListResponse = { calls: Call[]; next_cursor: string | null };
+  function parseListResponse(raw: unknown): CallsListResponse {
+    const r = raw as { calls?: Call[]; next_cursor?: string | null } | null;
+    return {
+      calls: r?.calls ?? [],
+      next_cursor: r?.next_cursor ?? null,
+    };
+  }
   // #397 — styled confirm modal replaces window.confirm() on the
   // permanent-delete path. `confirmRow` holds the row pending
   // confirmation; null = modal is closed.
@@ -78,16 +93,47 @@
   async function load() {
     loading = true;
     error = "";
+    loadMoreError = null;
     try {
-      rows = await invoke<Call[]>("list_trashed", {
+      const raw = await invoke<unknown>("list_trashed", {
         scope,
         fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
         toDate: toDate ? `${toDate}T23:59:59Z` : null,
+        cursor: null,
+        limit: PAGE_SIZE,
       });
+      const resp = parseListResponse(raw);
+      rows = resp.calls;
+      nextCursor = resp.next_cursor;
     } catch (e) {
       error = portalErrorToText(e);
     } finally {
       loading = false;
+    }
+  }
+
+  // #386 — fetch the next page using `next_cursor`. Appends to `rows`
+  // so single-row mutations (restore / permadelete) keep operating on
+  // a coherent list.
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return;
+    loadingMore = true;
+    loadMoreError = null;
+    try {
+      const raw = await invoke<unknown>("list_trashed", {
+        scope,
+        fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
+        toDate: toDate ? `${toDate}T23:59:59Z` : null,
+        cursor: nextCursor,
+        limit: PAGE_SIZE,
+      });
+      const resp = parseListResponse(raw);
+      rows = [...rows, ...resp.calls];
+      nextCursor = resp.next_cursor;
+    } catch (e) {
+      loadMoreError = portalErrorToText(e);
+    } finally {
+      loadingMore = false;
     }
   }
 
@@ -317,6 +363,22 @@
         </li>
       {/each}
     </ul>
+    {#if nextCursor}
+      <!-- #386 — keyset Load-more for the trash list. -->
+      <div class="load-more-wrap">
+        {#if loadMoreError}
+          <p class="error">{loadMoreError}</p>
+        {/if}
+        <button
+          type="button"
+          class="cta-btn load-more"
+          disabled={loadingMore}
+          onclick={loadMore}
+        >
+          {loadingMore ? "Loading…" : "Load more"}
+        </button>
+      </div>
+    {/if}
   {/if}
 </main>
 
@@ -437,6 +499,39 @@
   }
   .empty-clear:hover {
     color: var(--accent-hi);
+  }
+  /* #386 — Load-more affordance, mirror of the portal trash page. */
+  .load-more-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 1.2rem;
+    padding-top: 0.6rem;
+  }
+  .cta-btn {
+    appearance: none;
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: var(--ink-0);
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 0.55rem 1.1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .cta-btn:hover:not(:disabled) {
+    background: var(--accent-hi);
+  }
+  .cta-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .load-more {
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.48rem 1.1rem;
   }
   .list {
     list-style: none;

@@ -749,6 +749,34 @@
     </section>
   {/if}
 
+  <!-- #572 v2 follow-up — Integrations live on the web portal because
+       the OAuth callback flow needs a browser anyway. Surface the link
+       here so a user looking for "where do I connect my Zoho account"
+       finds it in the same Settings page they're already on. -->
+  <section class="card" style="--i: 0.85">
+    <div class="card-head">
+      <div>
+        <h2>Integrations</h2>
+        <p class="hint">
+          Connect your own accounts (Zoho Meeting, etc.) on the web
+          portal — your administrator must first enable each integration
+          for you.
+        </p>
+      </div>
+    </div>
+    <button
+      type="button"
+      class="primary"
+      onclick={() => {
+        openUrl("https://app.aftercalls.io/settings/integrations").catch((e) =>
+          console.warn("openUrl failed", e),
+        );
+      }}
+    >
+      Open integrations on the web portal
+    </button>
+  </section>
+
   <section class="card" style="--i: 1">
     <div class="card-head">
       <div>

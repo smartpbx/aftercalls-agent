@@ -126,6 +126,18 @@
     // #188 · emitted when subset mode commits. Parent handles the
     // save using the selected idxs it already tracks.
     onsubsetpick?: (pick: SpeakerSubsetPick) => void;
+    // #332 · filter-mode toggle. When `true` the picker behaves as a
+    // pure roster picker for the calls-list "By person" filter:
+    //   • Save / Cancel chrome hides — clicking a row commits, no
+    //     trailing buttons.
+    //   • The "+ Save … as external speaker" CTA row is suppressed —
+    //     filters can't target a free-form string.
+    //   • Enter on empty / non-matching input closes via `oncancel`
+    //     instead of firing a free-form `onpick`.
+    // Bulk + subset surfaces remain off in this mode by construction
+    // (the calls-list call-site doesn't pass `onbulkpick`,
+    // `contextCount`, or `selectionCount`).
+    filterMode?: boolean;
   };
 
   let {
@@ -148,6 +160,7 @@
     onbulkpick,
     selectionCount = 0,
     onsubsetpick,
+    filterMode = false,
   }: Props = $props();
 
   // #188 · sticky "is this a subset-rename picker" flag. Derived once
@@ -277,8 +290,11 @@
     // match any row above (case-insensitive). In secondary mode the
     // CTA is still valid: picking an external-by-free-form is a
     // legitimate bulk target (a new external participant).
+    // #332 · suppressed in filter mode — the calls-list "By person"
+    // filter cannot target a free-form string, only roster members.
     const trimmed = value.trim();
     const showCta =
+      !filterMode &&
       trimmed.length > 0 &&
       !base.some(
         (r) =>
@@ -482,6 +498,14 @@
       oncancel();
       return;
     }
+    // #332 · in filter mode, typed text that doesn't match a roster
+    // member is a no-op — the filter target must be a roster member.
+    // Dismiss instead of firing a free-form pick the parent can't
+    // honour.
+    if (filterMode) {
+      oncancel();
+      return;
+    }
     emitPrimary(null, trimmed);
     dropdownOpen = false;
   }
@@ -597,17 +621,19 @@
       onclick={() => (dropdownOpen = true)}
       oninput={() => (dropdownOpen = true)}
     />
-    <button
-      type="button"
-      class="srp-save"
-      disabled={saving}
-      onclick={commit}
-    >
-      {saveLabel}
-    </button>
-    <button type="button" class="srp-cancel" onclick={oncancel}>
-      Cancel
-    </button>
+    {#if !filterMode}
+      <button
+        type="button"
+        class="srp-save"
+        disabled={saving}
+        onclick={commit}
+      >
+        {saveLabel}
+      </button>
+      <button type="button" class="srp-cancel" onclick={oncancel}>
+        Cancel
+      </button>
+    {/if}
   </div>
   {#if dropdownOpen}
     <div class="srp-list" role="listbox" id={listboxId}>

@@ -281,6 +281,12 @@ pub async fn list_calls(
     // backend's `serde(default) = None` default.
     from_date: Option<&str>,
     to_date: Option<&str>,
+    // #386 — keyset pagination. `cursor` is whatever opaque RFC-3339
+    // string the previous response returned in `next_cursor`; `limit`
+    // is 1..=200 with backend default 50 when None. Empty / None on
+    // either falls through to the backend default.
+    cursor: Option<&str>,
+    limit: Option<i64>,
 ) -> std::result::Result<Value, PortalError> {
     // Tag filters are passed as repeated ?tag= params; missing = no
     // filter. scope=all restricts to admin/superadmin; user= narrows
@@ -311,6 +317,14 @@ pub async fn list_calls(
             params.push(("to_date".into(), t.into()));
         }
     }
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            params.push(("cursor".into(), c.into()));
+        }
+    }
+    if let Some(n) = limit {
+        params.push(("limit".into(), n.to_string()));
+    }
     if !params.is_empty() {
         path.push('?');
         let mut first = true;
@@ -334,6 +348,11 @@ pub async fn list_trashed(
     // passed through to the backend which narrows by `recorded_at`.
     from_date: Option<&str>,
     to_date: Option<&str>,
+    // #386 — keyset pagination, mirror of list_calls. Trash cursors
+    // anchor on `deleted_at` server-side; the agent layer just passes
+    // the opaque token along.
+    cursor: Option<&str>,
+    limit: Option<i64>,
 ) -> std::result::Result<Value, PortalError> {
     let mut path = String::from("/v1/calls/trashed");
     let mut params: Vec<(String, String)> = Vec::new();
@@ -351,6 +370,14 @@ pub async fn list_trashed(
         if !t.is_empty() {
             params.push(("to_date".into(), t.into()));
         }
+    }
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            params.push(("cursor".into(), c.into()));
+        }
+    }
+    if let Some(n) = limit {
+        params.push(("limit".into(), n.to_string()));
     }
     if !params.is_empty() {
         path.push('?');

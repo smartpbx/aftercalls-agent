@@ -440,6 +440,11 @@ async fn list_calls(
     // backend, which parses with `chrono::DateTime<Utc>`.
     from_date: Option<String>,
     to_date: Option<String>,
+    // #386 — keyset pagination. `cursor` is the opaque RFC-3339 token
+    // returned in the previous response's `next_cursor`; `limit`
+    // defaults to the backend's 50 when None.
+    cursor: Option<String>,
+    limit: Option<i64>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -453,6 +458,8 @@ async fn list_calls(
         &tags,
         from_date.as_deref(),
         to_date.as_deref(),
+        cursor.as_deref(),
+        limit,
     )
     .await
 }
@@ -480,6 +487,10 @@ async fn list_trashed(
     // on the JS side; backend narrows by `recorded_at`.
     from_date: Option<String>,
     to_date: Option<String>,
+    // #386 — keyset pagination. Trash cursors anchor on `deleted_at`
+    // server-side; the wire shape is the same opaque RFC-3339 token.
+    cursor: Option<String>,
+    limit: Option<i64>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -491,6 +502,8 @@ async fn list_trashed(
         Some(scope),
         from_date.as_deref(),
         to_date.as_deref(),
+        cursor.as_deref(),
+        limit,
     )
     .await
 }

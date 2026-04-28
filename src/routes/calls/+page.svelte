@@ -4,6 +4,7 @@
   import { page } from "$app/state";
   import { goto, replaceState, afterNavigate } from "$app/navigation";
   import DateInput from "$lib/DateInput.svelte";
+  import SpeakerRenamePicker from "$lib/SpeakerRenamePicker.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import {
     isProcessing,
@@ -130,6 +131,29 @@
   let loading = $state(true);
   let query = $state("");
   let me = $state<Me | null>(null);
+
+  // #386 — keyset pagination. `nextCursor` mirrors the backend
+  // envelope; `null` on the final page hides the Load-more button.
+  // PAGE_SIZE matches the portal so both surfaces request the same
+  // chunk size and feel consistent end-to-end.
+  const PAGE_SIZE = 50;
+  let nextCursor = $state<string | null>(null);
+  let loadingMore = $state(false);
+  let loadMoreError = $state<string | null>(null);
+
+  // #386 — backend now returns `{ calls, next_cursor }`. Older agents
+  // talking to a backend that still returns a bare array would break,
+  // but the two ship together — see issue #386 / context-map for the
+  // hybrid PR rule. Helper centralises the shape parse so both
+  // load + loadMore reuse it.
+  type CallsListResponse = { calls: Call[]; next_cursor: string | null };
+  function parseListResponse(raw: unknown): CallsListResponse {
+    const r = raw as { calls?: Call[]; next_cursor?: string | null } | null;
+    return {
+      calls: r?.calls ?? [],
+      next_cursor: r?.next_cursor ?? null,
+    };
+  }
   // #403 — persist scope between sessions via localStorage. The key is
   // namespaced so a future multi-surface storage clear doesn't
   // accidentally wipe unrelated prefs. We read the value synchronously
@@ -167,8 +191,13 @@
   let userFilter = $state<{ id: string; name: string } | null>(null);
   let memberRoster = $state<OrgMember[]>([]);
   let memberRosterLoaded = $state(false);
+  // #332 · person-filter popover state. Roster + filter picking is
+  // now driven by `SpeakerRenamePicker` (filterMode) so the picker's
+  // internal `value` state replaces the old `userPopoverQuery`. We
+  // keep the typed-value mirror here only because the picker accepts
+  // a `bind:value` and we want to reset on close.
   let userPopoverOpen = $state(false);
-  let userPopoverQuery = $state("");
+  let userPopoverValue = $state("");
 
   async function ensureMemberRoster() {
     if (memberRosterLoaded) return;
@@ -179,16 +208,6 @@
       memberRoster = [];
     }
   }
-
-  let filteredMembers = $derived.by(() => {
-    const q = userPopoverQuery.trim().toLowerCase();
-    if (!q) return memberRoster;
-    return memberRoster.filter(
-      (m) =>
-        m.display_name.toLowerCase().includes(q) ||
-        m.email.toLowerCase().includes(q),
-    );
-  });
 
   // Add-filter popover state.
   let popoverOpen = $state(false);
@@ -251,8 +270,9 @@
   async function load() {
     loading = true;
     error = "";
+    loadMoreError = null;
     try {
-      calls = await invoke<Call[]>("list_calls", {
+      const raw = await invoke<unknown>("list_calls", {
         scope,
         user: scope === "all" ? (userFilter?.id ?? null) : null,
         tags: tagFilters,
@@ -260,11 +280,43 @@
         // the Tauri command + backend only ever see parsed timestamps.
         fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
         toDate: toDate ? `${toDate}T23:59:59Z` : null,
+        // #386 — first page → no cursor; PAGE_SIZE is the chunk size.
+        cursor: null,
+        limit: PAGE_SIZE,
       });
+      const resp = parseListResponse(raw);
+      calls = resp.calls;
+      nextCursor = resp.next_cursor;
     } catch (e) {
       error = portalErrorToText(e);
     } finally {
       loading = false;
+    }
+  }
+
+  // #386 — keyset Load-more, mirror of the portal page. Appends rather
+  // than replacing so the day-grouped list accumulates.
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return;
+    loadingMore = true;
+    loadMoreError = null;
+    try {
+      const raw = await invoke<unknown>("list_calls", {
+        scope,
+        user: scope === "all" ? (userFilter?.id ?? null) : null,
+        tags: tagFilters,
+        fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
+        toDate: toDate ? `${toDate}T23:59:59Z` : null,
+        cursor: nextCursor,
+        limit: PAGE_SIZE,
+      });
+      const resp = parseListResponse(raw);
+      calls = [...calls, ...resp.calls];
+      nextCursor = resp.next_cursor;
+    } catch (e) {
+      loadMoreError = portalErrorToText(e);
+    } finally {
+      loadingMore = false;
     }
   }
 
@@ -305,11 +357,22 @@
     await load();
   }
 
-  async function setUserFilter(m: OrgMember | null) {
+  async function setUserFilter(
+    m: { id: string; display_name: string } | null,
+  ) {
     userFilter = m ? { id: m.id, name: m.display_name } : null;
     userPopoverOpen = false;
-    userPopoverQuery = "";
+    userPopoverValue = "";
     await load();
+  }
+
+  // #332 · open the person-filter picker. Always seeds an empty
+  // input so the user starts a fresh search; matches the prior
+  // popover behaviour where opening cleared the typed query.
+  async function openUserPicker() {
+    await ensureMemberRoster();
+    userPopoverValue = "";
+    userPopoverOpen = true;
   }
 
   async function addTagFilter(kind: string, value: string) {
@@ -710,69 +773,44 @@
         </span>
       {/if}
       {#if scope === "all" && canSeeAll}
-        <div class="add-wrap">
-          <button
-            type="button"
-            class="add-filter"
-            onclick={async () => {
-              if (userPopoverOpen) {
-                userPopoverOpen = false;
-              } else {
-                await ensureMemberRoster();
-                userPopoverQuery = "";
-                userPopoverOpen = true;
-              }
-            }}
-            aria-haspopup="dialog"
-            aria-expanded={userPopoverOpen}
-          >
-            + By person
-          </button>
+        <div class="add-wrap by-person-wrap">
           {#if userPopoverOpen}
-            <div
-              class="pop-backdrop"
-              role="button"
-              tabindex="-1"
-              aria-label="Close person picker"
-              onclick={() => (userPopoverOpen = false)}
-              onkeydown={(e) => e.key === "Escape" && (userPopoverOpen = false)}
-            ></div>
-            <div class="pop" role="dialog" aria-label="Filter by person">
-              <input
-                class="pop-search"
-                type="text"
+            <!-- #332 · person-filter is the SpeakerRenamePicker
+                 primitive in filterMode. The picker self-handles
+                 outside-click + Escape dismissal, so the trigger
+                 button hides while it's mounted (matches the
+                 call-detail Participants chip swap pattern at
+                 calls/[id]/+page.svelte L3543–3580). -->
+            <div class="by-person-picker" role="dialog" aria-label="Filter by person">
+              <SpeakerRenamePicker
+                bind:value={userPopoverValue}
+                roster={memberRoster}
+                rosterLoaded={memberRosterLoaded}
                 placeholder="Search team…"
-                bind:value={userPopoverQuery}
-                use:focusOnMount
-                onkeydown={(e) => {
-                  if (e.key === "Escape") userPopoverOpen = false;
-                  else if (e.key === "Enter" && filteredMembers.length > 0) {
-                    e.preventDefault();
-                    void setUserFilter(filteredMembers[0]);
-                  }
+                noMatchHint="No matching teammates"
+                filterMode
+                onpick={(p) => {
+                  // Free-form picks are suppressed by `filterMode`,
+                  // so `p.user` is always present here. Guard anyway
+                  // to keep the type narrowing clean.
+                  if (p.user) void setUserFilter(p.user);
+                }}
+                oncancel={() => {
+                  userPopoverOpen = false;
+                  userPopoverValue = "";
                 }}
               />
-              <ul class="pop-list">
-                {#if filteredMembers.length === 0}
-                  <li class="pop-empty">
-                    {memberRoster.length === 0 ? "Loading…" : "No matching teammates"}
-                  </li>
-                {:else}
-                  {#each filteredMembers as m (m.id)}
-                    <li>
-                      <button
-                        type="button"
-                        class="pop-item"
-                        onclick={() => setUserFilter(m)}
-                      >
-                        <span class="person-name">{m.display_name}</span>
-                        <span class="person-email">{m.email}</span>
-                      </button>
-                    </li>
-                  {/each}
-                {/if}
-              </ul>
             </div>
+          {:else}
+            <button
+              type="button"
+              class="add-filter"
+              onclick={() => void openUserPicker()}
+              aria-haspopup="dialog"
+              aria-expanded={userPopoverOpen}
+            >
+              + By person
+            </button>
           {/if}
         </div>
       {/if}
@@ -1063,21 +1101,21 @@
                           <span class="tag-chip-label">client: {call.matched_client}</span>
                         </span>
                       {/if}
-                      {#if prettyApp(call.source_app)}
-                        <span class="chip" title={sourceKindLabel(call.source_kind)}>
-                          {prettyApp(call.source_app)}
-                        </span>
-                      {:else if call.ingest_source && call.ingest_source !== "agent"}
+                      {#if call.ingest_source && call.ingest_source !== "agent"}
                         <!-- #303 — external-source chip drives off
                              ingest_source (the wire-side external
                              classification), NOT source_kind which is
                              the agent-side label. Keeps Zoho Meeting
                              / SmartPBX / etc. recognizable in the
                              list rather than rendering as the
-                             generic "Imported" source_kind would. -->
-                        <span class="chip">{sourceKindLabel(call.ingest_source)}</span>
+                             generic "Imported" source_kind would.
+                             #412 — the redundant `source_app` chip
+                             that previously preceded this branch was
+                             dropped; ingest_source already conveys
+                             the same provenance signal. -->
+                        <span class="status-chip">{sourceKindLabel(call.ingest_source)}</span>
                       {:else if call.source_kind}
-                        <span class="chip">{sourceKindLabel(call.source_kind)}</span>
+                        <span class="status-chip">{sourceKindLabel(call.source_kind)}</span>
                       {/if}
                       {#if call.status === "available"}
                         <!-- #303 — placeholder external recording.
@@ -1097,22 +1135,22 @@
                         </button>
                       {:else if isProcessing(call.status)}
                         {#if isDelayed(call.status, call.recorded_at, nowMs)}
-                          <span class="chip chip-still" title="Taking a little longer than usual">
+                          <span class="status-chip status-chip-still" title="Taking a little longer than usual">
                             {PILL_STILL_WORKING}
                           </span>
                         {:else}
-                          <span class="chip chip-sig">{PILL_PROCESSING}</span>
+                          <span class="status-chip status-chip-sig">{PILL_PROCESSING}</span>
                         {/if}
                       {:else if call.status === "failed"}
                         <!-- #482 — explicit Failed chip rather than the
-                             generic chip-sig fallback so users notice on
-                             the list. Detail-page retry surface tracked
-                             as #488. -->
-                        <span class="chip chip-failed" title="Processing failed — open the call to retry">
+                             generic status-chip-sig fallback so users
+                             notice on the list. Detail-page retry
+                             surface tracked as #488. -->
+                        <span class="status-chip status-chip-failed" title="Processing failed — open the call to retry">
                           Failed
                         </span>
                       {:else if call.status !== "complete"}
-                        <span class="chip chip-sig">{call.status}</span>
+                        <span class="status-chip status-chip-sig">{call.status}</span>
                       {/if}
                     </div>
                   </div>
@@ -1123,6 +1161,24 @@
           </ul>
         </section>
       {/each}
+      {#if nextCursor}
+        <!-- #386 — keyset Load-more. Hidden on the final page. Retry
+             on error stays on the same cursor so a click replays the
+             previous request. -->
+        <div class="load-more-wrap">
+          {#if loadMoreError}
+            <p class="state err">{loadMoreError}</p>
+          {/if}
+          <button
+            type="button"
+            class="cta-btn load-more"
+            disabled={loadingMore}
+            onclick={loadMore}
+          >
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </main>
@@ -1323,16 +1379,18 @@
   }
   .owner-chip svg { color: var(--bone-3); }
 
-  .person-name {
-    display: block;
-    font-size: 0.9rem;
-    color: var(--bone-1);
+  /* #332 · person-filter picker surface. The picker swaps in
+     where the "By person" trigger sat, so it lays out inline in
+     the chip row. SpeakerRenamePicker owns its own input chrome
+     and absolutely-positioned dropdown list; this wrapper just
+     fixes a stable width so the trigger ↔ picker swap doesn't
+     reflow the row. Chrome inside is component-scoped — no row
+     paint duplicates here. */
+  .by-person-wrap {
+    position: relative;
   }
-  .person-email {
-    display: block;
-    font-size: 0.72rem;
-    color: var(--bone-3);
-    margin-top: 0.1rem;
+  .by-person-picker {
+    width: 240px;
   }
 
   .tag-chip-x {
@@ -1674,6 +1732,42 @@
     color: var(--accent-hi);
   }
 
+  /* #386 — Load-more affordance, sits at the bottom of the day-grouped
+     list when the backend returns a `next_cursor`. Mirror of the
+     portal page so the two surfaces feel consistent. */
+  .load-more-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 1.2rem;
+    padding-top: 0.6rem;
+  }
+  .cta-btn {
+    appearance: none;
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: var(--ink-0);
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 0.55rem 1.1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .cta-btn:hover:not(:disabled) {
+    background: var(--accent-hi);
+  }
+  .cta-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .load-more {
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.48rem 1.1rem;
+  }
+
   /* ── Groups ──────────────────────────────────────────────────────── */
   .groups {
     display: flex;
@@ -1768,7 +1862,14 @@
     flex-wrap: wrap;
   }
 
-  .chip {
+  /* #412 — `.status-chip` is the small (4px-radius) state pill family
+     used on the calls-list row: Processing / Still working / Failed /
+     other-status fallback. Renamed from the generic `.chip` to break
+     a class-name collision with `calls/[id]/+page.svelte`'s larger
+     8px-radius `.chip` (see design.md §Pattern library — chip
+     families on the calls-list row). Tracked for app.css promotion
+     in #412b. Mirrors the portal calls-list rule. */
+  .status-chip {
     display: inline-flex;
     align-items: center;
     padding: 0.1rem 0.5rem;
@@ -1809,7 +1910,7 @@
     cursor: not-allowed;
   }
 
-  .chip-sig {
+  .status-chip-sig {
     border-color: rgba(201, 162, 74, 0.3);
     color: var(--sig);
     text-transform: uppercase;
@@ -1819,7 +1920,7 @@
   /* #482 — Failed-pipeline chip. Live-red tint so it stands out from
      the chip family without competing with the accent-fill Import
      button. Mirror of portal styling. */
-  .chip.chip-failed {
+  .status-chip.status-chip-failed {
     color: var(--live, #d94a4a);
     background: var(--live-soft, rgba(217, 74, 74, 0.12));
     border: 1px solid var(--live, #d94a4a);
@@ -1828,7 +1929,7 @@
      (soft tint of --sig) + bolder weight so it reads as "we
      noticed and we're on it" rather than as an error. Mirrors the
      portal calls-list treatment. */
-  .chip-still {
+  .status-chip-still {
     background: rgba(201, 162, 74, 0.14);
     border-color: rgba(201, 162, 74, 0.45);
     color: var(--sig);
