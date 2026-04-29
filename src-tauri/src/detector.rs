@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::mpsc;
 
 use crate::mic_consumers::{is_blacklisted, raw_mic_consumers};
@@ -41,6 +41,48 @@ pub struct Detector {
 impl Detector {
     pub fn spawn(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+
+        // #606 — Rust-side `notify-action` listener as a redundant
+        // path for the OS-toast confirm. The webview's listener at
+        // +layout.svelte:851 still routes clicks through the
+        // confirm_auto_start IPC, but on Windows the toast click can
+        // arrive BEFORE the webview's listener mounts (agent launched
+        // by AUMID activation, agent waking from tray, etc.). When the
+        // webview misses the event, the toast click was a no-op:
+        // user clicks "Record this call" → app opens → no recording
+        // starts → user has to click Record manually. That's the user
+        // report on #606. Routing the decision through `decide()`
+        // here as well makes the action robust to webview-mount race;
+        // the second decision arriving from the webview later is a
+        // phase-transition no-op (Detector::run drains both via the
+        // same `rx` and already handles re-emit guards).
+        let tx_for_listener = tx.clone();
+        app.listen("notify-action", move |event| {
+            #[derive(serde::Deserialize)]
+            struct Payload {
+                action_id: String,
+                #[serde(default)]
+                auto_dismissed: bool,
+            }
+            let Ok(p) = serde_json::from_str::<Payload>(event.payload()) else {
+                return;
+            };
+            // Only the start-prompt toast routes through this event
+            // (end-prompts use the in-app banner only — see
+            // maybe_show_window). action_id values come from
+            // detector.rs's PromptKind::Start: "record" / "dismiss".
+            // The auto-dismiss case (timeout) is treated as Dismiss
+            // so the detector's Suppressed phase fires consistently.
+            let decision = match (p.action_id.as_str(), p.auto_dismissed) {
+                ("record", false) => Some(UserDecision::ConfirmStart),
+                ("dismiss", _) | (_, true) => Some(UserDecision::DismissStart),
+                _ => None,
+            };
+            if let Some(d) = decision {
+                let _ = tx_for_listener.send(d);
+            }
+        });
+
         tauri::async_runtime::spawn(run(app, rx));
         Self { tx }
     }

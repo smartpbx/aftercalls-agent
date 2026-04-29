@@ -4322,17 +4322,23 @@
     <section class="block" style="--i: 5">
       <div class="block-head">
         <h2>Transcript</h2>
-        <button class="copy-btn" onclick={copyTranscript}>
-          {copiedLabel === "transcript" ? "Copied" : "Copy"}
-        </button>
-        <button
-          class="copy-btn"
-          onclick={downloadTranscript}
-          disabled={!call?.utterances || call.utterances.length === 0}
-          title="Download the transcript as a text file"
-        >
-          Download
-        </button>
+        <div class="block-head-actions">
+          <button class="copy-btn" onclick={copyTranscript}>
+            {copiedLabel === "transcript" ? "Copied" : "Copy"}
+          </button>
+          <button
+            class="copy-btn copy-btn-icon"
+            onclick={downloadTranscript}
+            disabled={!call?.utterances || call.utterances.length === 0}
+            title="Download the transcript as a text file"
+            aria-label="Download transcript"
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M8 2 v8 M5 7 L8 10 L11 7" />
+              <path d="M3 13 L13 13" />
+            </svg>
+          </button>
+        </div>
       </div>
       {#if bulkStatus}
         {#if bulkStatus.kind === "success"}
@@ -5432,6 +5438,17 @@
   .copy-btn:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  /* #608 — icon-only variant for the transcript-download button next
+     to Copy. Square footprint so the two buttons read as a paired
+     cluster rather than competing for label width. */
+  .copy-btn-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.3rem;
+    width: 26px;
+    height: 26px;
   }
   /* #186 Send-to-CRM button — same .copy-btn shape but slightly
      stronger text (the action is outbound, not a quick utility). */
