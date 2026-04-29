@@ -164,12 +164,15 @@
     }
   });
 
-  // Auto-detect slide-out state (#59). Only the `prompt_start` kind
-  // surfaces here; `prompt_end` (mid-recording idle-mic prompt) stays
-  // on the Record page since the user is almost always on /record
-  // while a recording is live. This slide-out anchors to the rail's
-  // Record item so it's visible regardless of current route.
+  // Auto-detect slide-out state (#59). Both `prompt_start` and
+  // `prompt_end` surface here so the prompt is reachable from any
+  // route, not just /record — a user who started a call from /record
+  // and then navigated to /calls used to miss the idle-mic prompt
+  // entirely (the +page banner only renders while /record is mounted).
+  // The slide-out anchors to the rail's Record item; the Record page
+  // suppresses both copies via `isRecordPage` to avoid duplicate UI.
   let autoPrompt = $state<{ app: string } | null>(null);
+  let autoEndPrompt = $state<{ app: string } | null>(null);
 
   // Orphan-session recovery (#63). One-shot check at startup for
   // session_dirs left behind by a crashed / force-quit previous
@@ -809,10 +812,13 @@
       if (evt.payload === "settings") goto("/settings");
     });
 
-    // Auto-detect → slide-out (#59). We only handle `prompt_start`
-    // here; mid-recording `prompt_end` prompts stay with the Record
-    // page since the user is almost always on /record while live.
-    // `cleared` drops both the slide-out and any open ack modal.
+    // Auto-detect → slide-out (#59). Both `prompt_start` (call
+    // detected, prompt to record) and `prompt_end` (mic idle mid-
+    // recording, prompt to stop) surface here so the user can answer
+    // the prompt from any route — the Record page suppresses both
+    // copies via `isRecordPage` so its own inline banner remains the
+    // single source of truth when the user is on /record.
+    // `cleared` drops both slide-outs and any open ack modal.
     unlistenAutoDetect = await listen<
       | { kind: "prompt_start"; app: string }
       | { kind: "prompt_end"; app: string }
@@ -835,8 +841,20 @@
         // repeat the sound.
         if (!autoPrompt) notifyAutoDetect();
         autoPrompt = { app: evt.payload.app };
+      } else if (evt.payload.kind === "prompt_end") {
+        // Same record-page guard as prompt_start: the inline banner
+        // on /record already handles this case. Off-route, surface
+        // a slide-out anchored to the rail so the user can save +
+        // transcribe (or keep recording) without route-changing.
+        if (isRecordPage) {
+          autoEndPrompt = null;
+          return;
+        }
+        if (!autoEndPrompt) notifyAutoDetect();
+        autoEndPrompt = { app: evt.payload.app };
       } else if (evt.payload.kind === "cleared") {
         autoPrompt = null;
+        autoEndPrompt = null;
         autoAckOpen = false;
       }
     });
@@ -1486,6 +1504,31 @@
     autoPrompt = null;
   }
 
+  // Mid-recording idle-mic slide-out handlers. Mirrors the inline
+  // banner on +page.svelte (#60) so the user gets the same two
+  // affordances regardless of route: confirm_auto_end stops the
+  // recording and runs the post-call pipeline; keep_auto_recording
+  // tells the detector to stop nagging until the consumer comes
+  // back. Both clear the slide-out optimistically — the detector's
+  // own `cleared` event arrives shortly after either decision.
+  async function confirmAutoEnd() {
+    try {
+      await invoke("confirm_auto_end");
+    } catch (e) {
+      console.warn("confirm_auto_end failed", e);
+    }
+    autoEndPrompt = null;
+  }
+
+  async function keepAutoRecording() {
+    try {
+      await invoke("keep_auto_recording");
+    } catch (e) {
+      console.warn("keep_auto_recording failed", e);
+    }
+    autoEndPrompt = null;
+  }
+
   async function submitAutoAck() {
     if (!autoAckChecked || autoAckSubmitting) return;
     autoAckSubmitting = true;
@@ -1782,7 +1825,7 @@
           <nav aria-labelledby={`nav-sec-${sec.id}`}>
             {#each sec.items as it (it.href)}
               {@const active = it.match(page.url.pathname)}
-              <div class="nav-row" class:has-slideout={it.href === "/" && autoPrompt}>
+              <div class="nav-row" class:has-slideout={it.href === "/" && (autoPrompt || autoEndPrompt)}>
                 {#if it.external}
                   <button
                     type="button"
@@ -1839,6 +1882,35 @@
                 Change auto-detect in
                 <a href="/settings" onclick={() => (autoPrompt = null)}>Settings</a>.
               </p>
+            </div>
+          {:else if it.href === "/" && autoEndPrompt && !isRecordPage}
+            <!-- Mid-recording idle-mic slide-out. The detector fires
+                 `prompt_end` after the chosen consumer has been gone
+                 for CONSUMER_GONE_BEFORE_END_PROMPT seconds. Off-route
+                 users used to miss this entirely — the Record page's
+                 inline banner only renders while /record is mounted.
+                 Reuses the `auto-slideout` shell from the start
+                 prompt for visual consistency. -->
+            <div class="auto-slideout" role="dialog" aria-label="Idle microphone">
+              <div class="auto-head">
+                <span class="auto-pip" aria-hidden="true"></span>
+                <span class="auto-title">Idle mic</span>
+              </div>
+              <p class="auto-body">
+                The microphone has been quiet for a while. End the recording?
+              </p>
+              <div class="auto-actions">
+                <button
+                  type="button"
+                  class="auto-primary"
+                  onclick={confirmAutoEnd}
+                >Save + transcribe</button>
+                <button
+                  type="button"
+                  class="auto-secondary"
+                  onclick={keepAutoRecording}
+                >Keep recording</button>
+              </div>
             </div>
           {/if}
               </div>

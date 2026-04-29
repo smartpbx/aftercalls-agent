@@ -24,7 +24,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::mic_consumers::{raw_mic_consumers, RawMicConsumer};
 
@@ -58,15 +57,22 @@ pub fn is_supported() -> bool {
 /// good enough for the 1s "user perception" target the spec asks for.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Spawn the platform-specific observer. Returns a JoinHandle the
-/// caller may await on shutdown; in practice the observer is
-/// long-lived for the agent's lifetime so the handle is dropped.
+/// Spawn the platform-specific observer. Long-lived for the agent's
+/// lifetime; the JoinHandle is intentionally not surfaced (callers
+/// have nothing to await on shutdown).
 ///
 /// Events flow over `tx`. The receiver end belongs to
 /// `auto_recorder::run` which fans them out to its decision loop.
+///
+/// Uses `tauri::async_runtime::spawn` — the `setup` callback runs
+/// before any Tokio runtime is in scope on the calling thread, so a
+/// raw `tokio::spawn` here panics with "no reactor running" the moment
+/// the function is called. Every other long-lived task in the agent
+/// (detector, auto_recorder, updater poll) goes through the same
+/// helper for the same reason.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
+    tauri::async_runtime::spawn(async move {
         let mut active: HashSet<RawMicConsumer> = HashSet::new();
         loop {
             let next: HashSet<RawMicConsumer> = raw_mic_consumers().into_iter().collect();
@@ -78,19 +84,19 @@ pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) -> JoinHandle<()> {
             active = next;
             tokio::time::sleep(POLL_INTERVAL).await;
         }
-    })
+    });
 }
 
 /// macOS + other unsupported targets compile to a no-op spawner — the
-/// caller still gets a JoinHandle so its setup() code stays uniform,
-/// but the task immediately drops the channel and exits.
+/// caller's setup() code stays uniform, but the spawned task
+/// immediately drops the channel and exits.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
+    tauri::async_runtime::spawn(async move {
         // Drop tx to release the receiver immediately; the auto-recorder's
         // `recv()` loop turns into a no-op without any further work.
         drop(tx);
-    })
+    });
 }
 
 /// Pure transition-diff. Public so the unit tests in `tests` (and the

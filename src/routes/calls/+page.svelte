@@ -821,7 +821,7 @@
   async function importPlaceholder(e: MouseEvent, callId: string) {
     e.preventDefault();
     e.stopPropagation();
-    if (hydrating[callId]) return;
+    if (hydrating[callId] || dismissingPlaceholder[callId]) return;
     hydrating = { ...hydrating, [callId]: true };
     try {
       await invoke("hydrate_call", { id: callId });
@@ -832,6 +832,31 @@
       console.warn("hydrate failed", portalErrorToText(e));
     } finally {
       hydrating = { ...hydrating, [callId]: false };
+    }
+  }
+
+  // Mirror of the portal's dismissPlaceholder. Soft-deletes a
+  // `status='available'` placeholder so legacy `auto_import = TRUE`
+  // integrations (Zoho Meeting today, SmartPBX next) get the same
+  // Import + Dismiss pair the new #595 candidate flow ships with.
+  // Routes through the existing `delete_call` Tauri command (calls
+  // DELETE /v1/calls/{id}) — placeholders carry no audio yet, and
+  // the nightly purge sweeps soft-deleted rows after 30 days.
+  let dismissingPlaceholder = $state<Record<string, boolean>>({});
+  async function dismissPlaceholder(e: MouseEvent, callId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (hydrating[callId] || dismissingPlaceholder[callId]) return;
+    dismissingPlaceholder = { ...dismissingPlaceholder, [callId]: true };
+    const prev = calls;
+    calls = calls.filter((c) => c.id !== callId);
+    try {
+      await invoke("delete_call", { id: callId });
+    } catch (err: any) {
+      calls = prev;
+      toast.error(`Couldn't dismiss: ${portalErrorToText(err)}`);
+    } finally {
+      dismissingPlaceholder = { ...dismissingPlaceholder, [callId]: false };
     }
   }
 
@@ -1407,18 +1432,27 @@
                       {#if call.status === "available"}
                         <!-- #303 — placeholder external recording.
                              Inline Import button hydrates the row on
-                             demand. Stops event propagation so the
-                             row's <a> doesn't navigate; optimistic
-                             local-state flip to 'transcribing' so the
-                             UI reacts before the server roundtrip
-                             completes. -->
+                             demand. Dismiss soft-deletes the row so
+                             legacy `auto_import = TRUE` integrations
+                             (Zoho Meeting, SmartPBX) match the new
+                             #595 candidate flow's Import + Dismiss
+                             pair. Both stop event propagation so the
+                             row's <a> doesn't navigate. -->
                         <button
                           type="button"
                           class="import-btn"
-                          disabled={hydrating[call.id]}
+                          disabled={hydrating[call.id] || dismissingPlaceholder[call.id]}
                           onclick={(e) => importPlaceholder(e, call.id)}
                         >
                           {hydrating[call.id] ? "Importing…" : "Import"}
+                        </button>
+                        <button
+                          type="button"
+                          class="dismiss-btn"
+                          disabled={hydrating[call.id] || dismissingPlaceholder[call.id]}
+                          onclick={(e) => dismissPlaceholder(e, call.id)}
+                        >
+                          {dismissingPlaceholder[call.id] ? "Dismissing…" : "Dismiss"}
                         </button>
                       {:else if isProcessing(call.status)}
                         {#if isDelayed(call.status, call.recorded_at, nowMs)}
@@ -2245,6 +2279,38 @@
     outline: none;
   }
   .import-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  /* Dismiss companion to .import-btn for placeholder rows. Same chip-
+     family geometry (4px radius) as Import so they line up; ghost
+     palette so it reads as the secondary action. Mirrors
+     candidate-btn-dismiss in app.css for the new #595 candidate flow,
+     so the two import surfaces feel like one control family. */
+  .dismiss-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 0.35rem;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--bone-2);
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 120ms, border-color 120ms, color 120ms;
+  }
+  .dismiss-btn:hover:not(:disabled),
+  .dismiss-btn:focus-visible {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    border-color: var(--bone-3);
+    outline: none;
+  }
+  .dismiss-btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
