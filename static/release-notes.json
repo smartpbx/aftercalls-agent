@@ -1,4 +1,11 @@
 {
+  "0.14.5": {
+    "headline": "Multi-speaker transcripts on imported recordings, audio works on every imported-recording detail page, waveforms on imports, transcript download, plus several smaller fixes.",
+    "changes": [
+      "Call summaries are now denser and surface more concrete facts. When you click Regenerate on a call's summary, the rewritten summary captures more specific detail — dollar amounts, dates, vendor names, and attributions like '<recorder> confirmed the January payment was the last one received' — instead of generic phrasing like 'the team discussed billing'. The summary may also include extra topic paragraphs picked from the call (Billing, Hardware, Risks, Open questions, and so on) when the call's content warrants them. Existing summaries keep their original shape until you click Regenerate.",
+      "Download a call's transcript as a text file. On every call page (web portal and desktop app), the Transcript section now has a Download button next to Copy. It saves a plain-text file with the call title, date, duration, and every line of the transcript stamped with its time and speaker — useful for filing, attaching to an email, or feeding into another tool."
+    ]
+  },
   "0.14.0": {
     "headline": "Per-user opt-in for phone-system and Zoho Meeting imports, on-Linux auto-record by app, and exports of any size now work.",
     "changes": [

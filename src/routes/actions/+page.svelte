@@ -841,6 +841,46 @@
     onDescriptionEditRequest({ item: { id: it.id, call_id: it.call_id } });
   }
 
+  // #608 — Phase-3 row-level delete on /actions. Mirror of the
+  // call-detail page's pattern (calls/[id]/+page.svelte:1155). Without
+  // this wiring the trash button on every row was a silent no-op.
+  let confirmingDeleteId = $state<string | null>(null);
+  let deletingId = $state<string | null>(null);
+
+  function onActionItemDeleteRequest(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (deletingId) return;
+    confirmingDeleteId = payload.item.id;
+  }
+  function onActionItemDeleteCancel(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (deletingId === payload.item.id) return;
+    if (confirmingDeleteId === payload.item.id) confirmingDeleteId = null;
+  }
+  async function onActionItemDeleteConfirm(payload: {
+    item: { id: string; call_id: string };
+  }) {
+    if (deletingId) return;
+    deletingId = payload.item.id;
+    const prevItems = items;
+    items = items.filter((it) => it.id !== payload.item.id);
+    try {
+      await invoke("delete_action_item", {
+        callId: payload.item.call_id,
+        itemId: payload.item.id,
+      });
+      confirmingDeleteId = null;
+    } catch (e: any) {
+      items = prevItems;
+      toast.error("Delete failed. Try again.");
+      console.warn("action item delete failed", e);
+    } finally {
+      deletingId = null;
+    }
+  }
+
   let teardownActionShortcuts: (() => void) | null = null;
   onMount(() => {
     teardownActionShortcuts = registerShortcuts(
@@ -1053,6 +1093,11 @@
     activeChipItemId={activeChip?.itemId ?? null}
     activeChipOccurrenceIndex={activeChip?.occurrenceIndex ?? null}
     {highlightedItemId}
+    {confirmingDeleteId}
+    {deletingId}
+    onDeleteRequest={onActionItemDeleteRequest}
+    onDeleteConfirm={onActionItemDeleteConfirm}
+    onDeleteCancel={onActionItemDeleteCancel}
   />
 {/if}
 

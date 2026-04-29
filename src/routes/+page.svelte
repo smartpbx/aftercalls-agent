@@ -1543,7 +1543,8 @@
   }
 
   /* #479 — notice wrapper provides positioning context for the preview
-     popover. */
+     popover. (#608: stacking-context bits live with the popover rules
+     a few blocks below.) */
   .notice-wrap {
     position: relative;
   }
@@ -1575,17 +1576,27 @@
     cursor: default;
   }
 
-  /* #479 — notice preview popover */
+  /* #479 — notice preview popover.
+     #608 — bumped z-index (and lifted notice-wrap to a dedicated
+     stacking context) so the popover paints above the Notes panel
+     rendered below it on the Record screen. The previous values
+     (10/9) lost to the Notes editor's own paint order on Linux
+     WebKitGTK, leaving the bottom of the notice card (Cancel button)
+     hidden behind the toolbar. */
+  .notice-wrap {
+    isolation: isolate;
+    z-index: 50;
+  }
   .notice-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 9;
+    z-index: 99;
   }
   .notice-preview {
     position: absolute;
     top: calc(100% + 0.5rem);
     left: 0;
-    z-index: 10;
+    z-index: 100;
     width: 320px;
     max-width: calc(100vw - 2rem);
     padding: 1rem;

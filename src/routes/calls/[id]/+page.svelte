@@ -1915,7 +1915,17 @@
     // seek operations are sample-accurate. The old path ran the whole
     // file through fetch + blob, which froze the UI on big recordings
     // (#13) and left click-to-seek jumping to random timestamps (#18).
-    const remote = audioUrls && audioUrls.mixed;
+    //
+    // #608 — fall through to mic / system when mixed isn't populated.
+    // External imports (Zoho Meeting / SmartPBX) only ever land on
+    // the mic slot — `mixed_audio_key` stays NULL on those rows by
+    // design. The share viewer already had this fallback; the call
+    // detail surfaces (portal + agent) used to render
+    // "Audio unavailable" for those same calls.
+    const remote =
+      (audioUrls && audioUrls.mixed) ||
+      (audioUrls && audioUrls.mic) ||
+      (audioUrls && audioUrls.system);
     if (remote) {
       audioSrc = remote;
       return;
@@ -2142,6 +2152,51 @@
       )
       .join("");
     copyRich(html, plain, "transcript");
+  }
+
+  // #608 — download the transcript as a plain-text file. Mirror of
+  // the portal's downloadTranscript: header (title + recorded + duration)
+  // followed by `[mm:ss] Speaker: text` lines, generated from the
+  // already-loaded `call` payload.
+  function downloadTranscript() {
+    if (!call || !call.utterances || call.utterances.length === 0) return;
+    const titleStr = call.title?.trim() ? call.title.trim() : "Untitled call";
+    const dateStr = (() => {
+      try {
+        return new Date(call.recorded_at).toLocaleString();
+      } catch {
+        return call.recorded_at;
+      }
+    })();
+    const totalSec = Math.max(0, Math.floor((call.duration_ms ?? 0) / 1000));
+    const durStr = `${Math.floor(totalSec / 60)
+      .toString()
+      .padStart(2, "0")}:${(totalSec % 60).toString().padStart(2, "0")}`;
+    const lines: string[] = [];
+    lines.push(titleStr);
+    lines.push(`Recorded: ${dateStr}`);
+    lines.push(`Duration: ${durStr}`);
+    lines.push("");
+    for (const u of call.utterances) {
+      const startSec = Math.max(0, Math.floor(u.start_ms / 1000));
+      const tsM = Math.floor(startSec / 60)
+        .toString()
+        .padStart(2, "0");
+      const tsS = (startSec % 60).toString().padStart(2, "0");
+      lines.push(`[${tsM}:${tsS}] ${u.speaker}: ${u.text}`);
+    }
+    const blob = new Blob([lines.join("\n") + "\n"], {
+      type: "text/plain;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const safeStem = titleStr.replace(/[^\w\s.-]+/g, "_").slice(0, 80);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${safeStem}-transcript.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   function startEdit(u: Utterance) {
@@ -3237,22 +3292,32 @@
     return result;
   }
 
+  // #603 + #606 — guarded wrapper around `onSelectionChange`. We
+  // listen on the document for mouseup + keyup (see #603) so the
+  // popover only renders once the gesture completes. But a mouseup
+  // INSIDE the popover or replace modal must NOT re-evaluate the
+  // selection — when the user clicks "Replace…" in the popover,
+  // mouseup fires on the button BEFORE the click handler runs;
+  // Linux WebKitGTK collapses the selection at that moment, so
+  // re-running onSelectionChange would null `correctMenu` and
+  // unmount the popover before its click handler ever fired (#606).
+  // Skipping when the event target sits inside the popover or modal
+  // shell preserves their state across their own internal events.
+  function handleSelectionTrigger(e?: Event) {
+    if (e && e.target instanceof Element) {
+      if (e.target.closest(".hc-card") || e.target.closest(".replace-modal")) {
+        return;
+      }
+    }
+    onSelectionChange();
+  }
   onMount(() => {
-    // #603 — trigger on mouseup (drag-select end) + keyup (keyboard
-    // selection) instead of `selectionchange`. Linux WebKitGTK fires
-    // `selectionchange` aggressively mid-drag — every pixel of motion
-    // can fire it, and rendering the popover during the drag reflows
-    // under the cursor and collapses the selection on the same tick,
-    // so the user can never finish a drag-select. mouseup + keyup
-    // fire only when the gesture completes, so the popover renders
-    // once the selection is final. The web portal (Blink/Gecko) didn't
-    // trip this and the swap is a no-op there.
-    document.addEventListener("mouseup", onSelectionChange);
-    document.addEventListener("keyup", onSelectionChange);
+    document.addEventListener("mouseup", handleSelectionTrigger);
+    document.addEventListener("keyup", handleSelectionTrigger);
   });
   onDestroy(() => {
-    document.removeEventListener("mouseup", onSelectionChange);
-    document.removeEventListener("keyup", onSelectionChange);
+    document.removeEventListener("mouseup", handleSelectionTrigger);
+    document.removeEventListener("keyup", handleSelectionTrigger);
   });
 
   // ── #282 · Keyboard shortcuts for the call-detail player ──────────
@@ -4259,6 +4324,14 @@
         <h2>Transcript</h2>
         <button class="copy-btn" onclick={copyTranscript}>
           {copiedLabel === "transcript" ? "Copied" : "Copy"}
+        </button>
+        <button
+          class="copy-btn"
+          onclick={downloadTranscript}
+          disabled={!call?.utterances || call.utterances.length === 0}
+          title="Download the transcript as a text file"
+        >
+          Download
         </button>
       </div>
       {#if bulkStatus}

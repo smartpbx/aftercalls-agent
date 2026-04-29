@@ -225,6 +225,23 @@
     // /actions page wrapper). The page owns the highlight state;
     // ActionsList just forwards it down to the matching ActionItem.
     highlightedItemId?: string | null;
+
+    // #608 — Phase-3 row-level delete forwarding. The /actions page
+    // mounts ActionsList; without these props the trash button on
+    // any row would be a silent no-op (no confirm, no API call).
+    // Mirror of the portal/src/lib/ActionsList.svelte shape so the
+    // pages on both sides wire delete the same way.
+    confirmingDeleteId?: string | null;
+    deletingId?: string | null;
+    onDeleteRequest?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onDeleteConfirm?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
+    onDeleteCancel?: (payload: {
+      item: { id: string; call_id: string };
+    }) => void;
   };
 
   let {
@@ -261,6 +278,11 @@
     activeChipItemId = null,
     activeChipOccurrenceIndex = null,
     highlightedItemId = null,
+    confirmingDeleteId = null,
+    deletingId = null,
+    onDeleteRequest,
+    onDeleteConfirm,
+    onDeleteCancel,
   }: Props = $props();
 
   // Adapters: ActionItem fires with {itemId, description} /
@@ -566,6 +588,20 @@
             ? activeChipOccurrenceIndex
             : null}
           highlighted={highlightedItemId === item.id}
+          confirmingDelete={confirmingDeleteId === item.id}
+          deleting={deletingId === item.id}
+          ondeleterequest={(p) =>
+            onDeleteRequest?.({
+              item: { id: p.item.id, call_id: item.call_id },
+            })}
+          ondeleteconfirm={(p) =>
+            onDeleteConfirm?.({
+              item: { id: p.item.id, call_id: item.call_id },
+            })}
+          ondeletecancel={(p) =>
+            onDeleteCancel?.({
+              item: { id: p.item.id, call_id: item.call_id },
+            })}
         />
       {/each}
     </ul>
