@@ -100,6 +100,20 @@ impl AutoRecorder {
     pub fn open() -> anyhow::Result<Self> {
         let path = crate::app_observations::agent_db_path()?;
         let store = AppObservations::open(path)?;
+        // Sweep stale blacklisted rows on every startup. Users who
+        // upgraded from v0.14.0–v0.14.2 carried `aftercalls` / `parec` /
+        // `Chromium input` rows in their store from before the source-
+        // side filter landed (#604). Forgetting them via the UI used
+        // to require an OS-native confirm that doesn't fire on
+        // wlroots-based Wayland (#605); auto-purging at boot lets the
+        // user open Settings and see a clean list without manual
+        // intervention. Cheap (single SELECT + tiny DELETE loop) and
+        // idempotent — harmless on a fresh install.
+        match store.purge_blacklisted_rows() {
+            Ok(0) => {}
+            Ok(n) => eprintln!("aftercalls: purged {n} stale blacklisted observed_apps row(s)"),
+            Err(e) => eprintln!("aftercalls: purge_blacklisted_rows failed: {e}"),
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 store,

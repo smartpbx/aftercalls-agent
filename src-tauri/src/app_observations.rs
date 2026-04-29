@@ -255,6 +255,59 @@ impl AppObservations {
         )?;
         Ok(())
     }
+
+    /// Sweep stale rows whose `bundle_id` or `friendly_name` is now
+    /// blacklisted. Called once at agent startup so users upgrading
+    /// from v0.14.0–v0.14.2 (when the source-side blacklist wasn't
+    /// applied — see #604) don't have to manually click Forget on
+    /// every leaked `aftercalls` / `parec` / `Chromium input` row
+    /// (#605). Returns the number of rows deleted so the caller can
+    /// log the cleanup.
+    pub fn purge_blacklisted_rows(&self) -> Result<usize> {
+        // Pull every (bundle, friendly) pair out under the lock, then
+        // drop the lock before running the blacklist predicate +
+        // delete loop. Avoids the borrow-checker friction of holding
+        // both `stmt` (borrows `conn`) and the predicate iterator
+        // alive in one expression, and keeps the mutex held for as
+        // little time as possible.
+        let rows: Vec<(String, String)> = {
+            let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT bundle_id, friendly_name FROM observed_apps",
+            )?;
+            let collected: Vec<(String, String)> = stmt
+                .query_map([], |row| {
+                    let b: String = row.get(0)?;
+                    let f: String = row.get(1)?;
+                    Ok((b, f))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            collected
+        };
+
+        let to_delete: Vec<String> = rows
+            .into_iter()
+            .filter(|(b, f)| {
+                crate::mic_consumers::is_blacklisted(b)
+                    || crate::mic_consumers::is_blacklisted(f)
+            })
+            .map(|(b, _)| b)
+            .collect();
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut deleted = 0;
+        for bundle_id in &to_delete {
+            deleted += conn.execute(
+                "DELETE FROM observed_apps WHERE bundle_id = ?1",
+                params![bundle_id],
+            )?;
+        }
+        Ok(deleted)
+    }
 }
 
 /// Resolve the canonical on-disk path for the agent's local sqlite
@@ -335,6 +388,50 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 0);
         // idempotent — second forget is a no-op
         store.forget("slack").unwrap();
+    }
+
+    #[test]
+    fn purge_blacklisted_rows_drops_stale_pre_v0_14_3_rows() {
+        // Users upgrading from v0.14.0–v0.14.2 carried these in their
+        // store from before the source-side blacklist landed (#604).
+        // Auto-purge at startup means they don't have to hunt for the
+        // Forget button (which was itself broken on wlroots Wayland —
+        // see #605, this same release).
+        let store = AppObservations::open_in_memory().unwrap();
+        store.upsert("aftercalls", "PipeWire ALSA [aftercalls]", now()).unwrap();
+        store.upsert("parec", "parec", now()).unwrap();
+        store.upsert("Chromium input", "Chromium input", now()).unwrap();
+        store.upsert("cliq", "Zoho Cliq", now()).unwrap();
+        store.upsert("zoom", "Zoom", now()).unwrap();
+
+        let deleted = store.purge_blacklisted_rows().unwrap();
+        assert_eq!(deleted, 3);
+
+        let remaining: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.bundle_id)
+            .collect();
+        assert!(remaining.contains(&"cliq".to_string()));
+        assert!(remaining.contains(&"zoom".to_string()));
+        assert_eq!(remaining.len(), 2);
+
+        // Idempotent — calling again is a no-op.
+        let deleted = store.purge_blacklisted_rows().unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn purge_catches_friendly_name_only_matches() {
+        // friendly_name might match the blacklist when bundle_id
+        // doesn't (e.g. a row stored before the friendly_name fallback
+        // landed). Either field tripping the blacklist deletes the row.
+        let store = AppObservations::open_in_memory().unwrap();
+        store.upsert("some-bundle", "PipeWire ALSA [aftercalls]", now()).unwrap();
+        let deleted = store.purge_blacklisted_rows().unwrap();
+        assert_eq!(deleted, 1);
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

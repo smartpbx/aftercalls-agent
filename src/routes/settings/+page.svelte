@@ -3,7 +3,7 @@
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
   import { invalidateAppPrefs } from "$lib/stores/appPrefs.svelte";
@@ -427,18 +427,16 @@
     return `${years} year${years === 1 ? "" : "s"} ago`;
   }
 
-  // Confirm-then-forget handler for the per-row "Forget" button. Public
-  // copy mirrors the architect's spec: opaque about WHAT the app was —
-  // it'll reappear next time it grabs the mic, so the user isn't
-  // committing to a permanent suppression.
-  async function onForgetApp(app: { bundle_id: string; friendly_name: string }) {
-    const ok = await confirmDialog(
-      `Forget ${app.friendly_name}? It will reappear here the next time it uses the microphone.`,
-      { title: "Forget app", kind: "warning" },
-    );
-    if (ok) {
-      void autoRecordStore.forget(app.bundle_id);
-    }
+  // Per-row "Forget" handler. Originally guarded by an OS-native
+  // confirm via @tauri-apps/plugin-dialog; that dialog never appeared
+  // for users on Linux Wayland under wlroots-derived compositors
+  // (Hyprland), making the button look broken (#605). Removed because
+  // Forget is non-destructive — the row reappears the next time the
+  // app uses the mic, so a misclick costs nothing. The store's
+  // optimistic mutation already gives the user immediate feedback
+  // (the row disappears on click).
+  async function onForgetApp(app: { bundle_id: string }) {
+    void autoRecordStore.forget(app.bundle_id);
   }
 
   // #149 (v0.4.7) + #161 (v0.5.2) — capture-widget handlers. The row
