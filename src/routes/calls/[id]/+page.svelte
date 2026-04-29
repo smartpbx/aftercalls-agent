@@ -3238,10 +3238,21 @@
   }
 
   onMount(() => {
-    document.addEventListener("selectionchange", onSelectionChange);
+    // #603 — trigger on mouseup (drag-select end) + keyup (keyboard
+    // selection) instead of `selectionchange`. Linux WebKitGTK fires
+    // `selectionchange` aggressively mid-drag — every pixel of motion
+    // can fire it, and rendering the popover during the drag reflows
+    // under the cursor and collapses the selection on the same tick,
+    // so the user can never finish a drag-select. mouseup + keyup
+    // fire only when the gesture completes, so the popover renders
+    // once the selection is final. The web portal (Blink/Gecko) didn't
+    // trip this and the swap is a no-op there.
+    document.addEventListener("mouseup", onSelectionChange);
+    document.addEventListener("keyup", onSelectionChange);
   });
   onDestroy(() => {
-    document.removeEventListener("selectionchange", onSelectionChange);
+    document.removeEventListener("mouseup", onSelectionChange);
+    document.removeEventListener("keyup", onSelectionChange);
   });
 
   // ── #282 · Keyboard shortcuts for the call-detail player ──────────
