@@ -1,6 +1,10 @@
+mod app_observations;
+mod audio_observer;
+mod auto_recorder;
 mod config;
 mod detector;
 mod error;
+mod mic_consumers;
 mod notes;
 mod notify_actions;
 mod pipeline;
@@ -14,6 +18,7 @@ mod transcription;
 mod upload;
 mod vault;
 
+use auto_recorder::AutoRecorder;
 use detector::{Detector, UserDecision};
 use recorder::Recorder;
 use serde::Serialize;
@@ -407,6 +412,107 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
         pipeline::run(session_dir, app_clone).await;
     });
     Ok(base.to_string_lossy().into_owned())
+}
+
+// ── #596 — auto-record IPC surface ─────────────────────────────────────
+//
+// Five commands + four events drive the per-app whitelist UX:
+//   - `auto_record_settings_get` returns the bundle the Settings page
+//     paints (master toggles + per-app rows + platform_supported).
+//   - `auto_record_settings_set_master` flips the two booleans that
+//     gate the auto-start / auto-stop paths.
+//   - `auto_record_settings_toggle_app` updates one row's `enabled`
+//     flag — the per-row checkbox in the apps list.
+//   - `auto_record_settings_forget_app` removes a row; it'll reappear
+//     the next time that app captures the mic, by design.
+//   - `confirm_auto_record_cancel` clears the in-flight pending-start
+//     when the user clicks Cancel on the 5s toast.
+//
+// Events emitted from `auto_recorder` and listened to by +layout.svelte:
+//   `auto-record-pending`, `auto-record-fired`, `auto-record-cancelled`,
+//   `observed-apps-updated`. See `auto_recorder::on_event`.
+
+#[derive(serde::Serialize)]
+struct AutoRecordAppRow {
+    bundle_id: String,
+    friendly_name: String,
+    first_seen_at: chrono::DateTime<chrono::Utc>,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    enabled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AutoRecordSettings {
+    start_enabled: bool,
+    stop_enabled: bool,
+    /// False on macOS (and any other future OS without an observer impl).
+    /// The Settings UI uses this to show the "App detection isn't
+    /// supported on this OS yet" banner instead of the empty list.
+    platform_supported: bool,
+    apps: Vec<AutoRecordAppRow>,
+}
+
+#[tauri::command]
+fn auto_record_settings_get(
+    auto: State<AutoRecorder>,
+) -> Result<AutoRecordSettings, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    let rows = auto.store().list().map_err(|e| e.to_string())?;
+    Ok(AutoRecordSettings {
+        start_enabled: cfg.auto_record_start_enabled,
+        stop_enabled: cfg.auto_record_stop_enabled,
+        platform_supported: audio_observer::is_supported(),
+        apps: rows
+            .into_iter()
+            .map(|r| AutoRecordAppRow {
+                bundle_id: r.bundle_id,
+                friendly_name: r.friendly_name,
+                first_seen_at: r.first_seen_at,
+                last_seen_at: r.last_seen_at,
+                enabled: r.enabled,
+            })
+            .collect(),
+    })
+}
+
+#[tauri::command]
+fn auto_record_settings_set_master(
+    start: bool,
+    stop: bool,
+) -> Result<(), String> {
+    let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
+    cfg.auto_record_start_enabled = start;
+    cfg.auto_record_stop_enabled = stop;
+    cfg.save().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn auto_record_settings_toggle_app(
+    auto: State<AutoRecorder>,
+    bundle_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    auto.store()
+        .set_enabled(&bundle_id, enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn auto_record_settings_forget_app(
+    auto: State<AutoRecorder>,
+    bundle_id: String,
+) -> Result<(), String> {
+    auto.store().forget(&bundle_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn confirm_auto_record_cancel(
+    auto: State<AutoRecorder>,
+    app: AppHandle,
+    pending_id: String,
+) -> Result<(), String> {
+    auto.cancel_pending(&app, &pending_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -898,6 +1004,126 @@ async fn tos_accept(ids: Vec<String>) -> Result<LoginResult, error::PortalError>
     })
 }
 
+/// #592 — agent surface parity with the portal's `/settings/privacy`.
+/// Wraps `GET /v1/auth/me/privacy`; returns the bundle that backs the
+/// page paint (joined_at, TOS acceptances, calls count, first page of
+/// the access log).
+#[tauri::command]
+async fn me_privacy_bundle() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_privacy_bundle(backend).await
+}
+
+/// #592 — cursor-paginated access log feeding the privacy page's "Load
+/// more" CTA. `cursor` is the previous page's `next_cursor` (RFC-3339);
+/// `limit` defaults to 25 to match the portal's TS client.
+#[tauri::command]
+async fn me_privacy_access_log(
+    cursor: Option<String>,
+    limit: Option<i64>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let resolved_limit = limit.unwrap_or(25);
+    portal::me_privacy_access_log(backend, cursor.as_deref(), resolved_limit).await
+}
+
+/// #592 — POST `/v1/auth/me/export`. Kicks the data-export worker;
+/// 24h cooldown enforced server-side surfaces as a 400 with a
+/// `retry_after_seconds=N` token in the body so the frontend can show
+/// a precise hint.
+#[tauri::command]
+async fn data_export_request() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::data_exports_request(backend).await
+}
+
+/// #592 — GET `/v1/auth/me/exports`. Newest-first list of the caller's
+/// exports. Shape: `{ exports: DataExportRow[] }`. No download URLs in
+/// this payload — call `data_export_get_status` for those.
+#[tauri::command]
+async fn data_export_list() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::data_exports_list(backend).await
+}
+
+/// #592 — GET `/v1/auth/me/exports/{id}`. Single row plus a freshly-
+/// presigned `download_url` when the row is `ready` and the archive
+/// hasn't expired. The frontend uses this to refresh the URL on every
+/// click rather than caching whatever the list endpoint last reported.
+#[tauri::command]
+async fn data_export_get_status(
+    id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::data_exports_get_status(backend, &id).await
+}
+
+/// #595 — GET `/v1/import-candidates`. Caller's own open candidates
+/// (per-user, not org-wide). `source` narrows by `ingest_source` —
+/// `smartpbx` or `zoho_meeting`; pass `None` for both. `include_dismissed`
+/// flips the default open-only filter so dismissed rows surface too.
+/// Mirrors the portal's `api.importCandidates.list()` wrapper.
+#[tauri::command]
+async fn import_candidates_list(
+    source: Option<String>,
+    include_dismissed: Option<bool>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::import_candidates_list(
+        backend,
+        source.as_deref(),
+        include_dismissed.unwrap_or(false),
+    )
+    .await
+}
+
+/// #595 — POST `/v1/import-candidates/{id}/import`. Promote a candidate
+/// to a real `calls` row; the backend kicks the deferred download +
+/// pipeline and returns `{ candidate_id, call_id, was_new }`. The
+/// agent's `/calls` page uses `call_id` for the optimistic row
+/// replacement.
+#[tauri::command]
+async fn import_candidate_import(
+    id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::import_candidate_import(backend, &id).await
+}
+
+/// #595 — POST `/v1/import-candidates/{id}/dismiss`. Soft-delete the
+/// candidate so it stops appearing in the user's `/calls` candidate
+/// list. Idempotent server-side; cross-org / unknown ids surface as a
+/// 404 → `PortalError::NotFound`.
+#[tauri::command]
+async fn import_candidate_dismiss(id: String) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::import_candidate_dismiss(backend, &id).await
+}
+
 #[tauri::command]
 async fn get_org_vocab() -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
@@ -1061,6 +1287,13 @@ struct AppPrefs {
     /// the toggle is hidden. Default false so existing installs
     /// don't suddenly start speaking.
     consent_announcement_enabled: bool,
+    /// #596 — auto-record master switches. Default false; the
+    /// Settings page renders both as switches in the new "Auto-record"
+    /// section. Round-tripped through this AppPrefs blob alongside
+    /// every other per-machine pref so a single save() call covers
+    /// any combination of changes.
+    auto_record_start_enabled: bool,
+    auto_record_stop_enabled: bool,
 }
 
 #[tauri::command]
@@ -1080,6 +1313,8 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         self_note_shortcut: cfg.self_note_shortcut,
         record_toggle_shortcut: cfg.record_toggle_shortcut,
         consent_announcement_enabled: cfg.consent_announcement_enabled,
+        auto_record_start_enabled: cfg.auto_record_start_enabled,
+        auto_record_stop_enabled: cfg.auto_record_stop_enabled,
     })
 }
 
@@ -1099,6 +1334,8 @@ fn set_app_prefs(
     self_note_shortcut: Option<String>,
     record_toggle_shortcut: Option<String>,
     consent_announcement_enabled: bool,
+    auto_record_start_enabled: bool,
+    auto_record_stop_enabled: bool,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
@@ -1155,6 +1392,8 @@ fn set_app_prefs(
     cfg.self_note_shortcut = self_note_shortcut.clone();
     cfg.record_toggle_shortcut = record_toggle_shortcut.clone();
     cfg.consent_announcement_enabled = consent_announcement_enabled;
+    cfg.auto_record_start_enabled = auto_record_start_enabled;
+    cfg.auto_record_stop_enabled = auto_record_stop_enabled;
     cfg.save().map_err(|e| e.to_string())?;
     // #149 — re-register the self-note hotkey in place if it changed.
     // Best-effort: a failure to bind (portal denied, combo in use)
@@ -2236,6 +2475,14 @@ pub fn run() {
             dismiss_auto_start,
             confirm_auto_end,
             keep_auto_recording,
+            // #596 — auto-record per-app whitelist surface. Five
+            // commands + four events drive the Settings page + cancel
+            // toast; see the AutoRecord module group above.
+            auto_record_settings_get,
+            auto_record_settings_set_master,
+            auto_record_settings_toggle_app,
+            auto_record_settings_forget_app,
+            confirm_auto_record_cancel,
             login,
             logout,
             current_user,
@@ -2299,6 +2546,22 @@ pub fn run() {
             // to render + accept.
             tos_current,
             tos_accept,
+            // #592 — `/settings/privacy` parity with the portal. Bundle
+            // + paginated access log back the read-only page paint;
+            // the three data-export commands drive the "Export my
+            // data" action card.
+            me_privacy_bundle,
+            me_privacy_access_log,
+            data_export_request,
+            data_export_list,
+            data_export_get_status,
+            // #595 — per-user import-candidate flow. Mirror of the
+            // portal's `api.importCandidates.*` client; the agent's
+            // `/calls` page renders these alongside real call rows
+            // and uses the same Import / Dismiss button cluster.
+            import_candidates_list,
+            import_candidate_import,
+            import_candidate_dismiss,
             list_orphan_sessions,
             resume_orphan_session,
             discard_orphan_session,
@@ -2359,6 +2622,31 @@ pub fn run() {
             }
             let detector = Detector::spawn(app.handle().clone());
             app.manage(detector);
+
+            // #596 — auto-record observer + state machine. Open the
+            // local sqlite store; if it fails (disk full, perm
+            // denied), log + continue without auto-record so the rest
+            // of the agent stays functional. The Settings UI will see
+            // an empty observed_apps list and the master toggles flip
+            // configs but never trigger a start.
+            match AutoRecorder::open() {
+                Ok(auto) => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    audio_observer::spawn(tx);
+                    auto.run(app.handle().clone(), rx);
+                    app.manage(auto);
+                }
+                Err(e) => {
+                    eprintln!("aftercalls: auto-record disabled — store open failed: {e}");
+                    telemetry::log(
+                        "warn",
+                        "auto_record::disabled",
+                        format!("auto_record store open failed: {e}"),
+                        None,
+                        None,
+                    );
+                }
+            }
             Ok(())
         })
         .on_window_event(|win, event| {

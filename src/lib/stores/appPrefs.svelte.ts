@@ -35,6 +35,11 @@ export type AppPrefs = {
   self_note_shortcut: string | null;
   record_toggle_shortcut: string | null;
   consent_announcement_enabled: boolean;
+  /** #596 — auto-record master toggles. Default false on a fresh
+   *  install; the Settings → Auto-record section is the only UI that
+   *  reads these directly. */
+  auto_record_start_enabled: boolean;
+  auto_record_stop_enabled: boolean;
 };
 
 let cached: AppPrefs | null = null;

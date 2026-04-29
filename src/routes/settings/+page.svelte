@@ -3,10 +3,11 @@
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
   import { invalidateAppPrefs } from "$lib/stores/appPrefs.svelte";
+  import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { portalErrorToText } from "$lib/portalError";
 
   // #69 — About card surfaces the running version + the LGPL ffmpeg
@@ -174,6 +175,15 @@
   // 'enforced' (compliance posture is mandatory; no toggle to flip)
   // or 'off' (chime suppressed → speech makes no sense).
   let consentAnnouncementEnabled = $state(false);
+  // #596 — auto-record master toggles. Both default OFF so an existing
+  // upgrade-installed user is never surprised by an automatic
+  // recording. The new "Auto-record" section in the markup binds to
+  // these and persists them through the existing saveAppPrefs path.
+  // The per-app whitelist (which apps trigger an auto-start when this
+  // is on) lives in the autoRecordStore (sqlite-backed); these two are
+  // the gates that cover that list.
+  let autoRecordStartEnabled = $state(false);
+  let autoRecordStopEnabled = $state(false);
   // Org-level recording notification mode, fetched once on mount so
   // the row can decide whether to render itself. Null while loading;
   // treated as 'user' on error so the toggle stays visible (a
@@ -328,6 +338,8 @@
         self_note_shortcut: string | null;
         record_toggle_shortcut: string | null;
         consent_announcement_enabled: boolean;
+        auto_record_start_enabled: boolean;
+        auto_record_stop_enabled: boolean;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -342,6 +354,12 @@
       selfNoteShortcut = p.self_note_shortcut ?? null;
       recordToggleShortcut = p.record_toggle_shortcut ?? null;
       consentAnnouncementEnabled = p.consent_announcement_enabled ?? false;
+      // #596 master toggles ride along with the rest of the prefs blob;
+      // they're displayed in their own section below but persist through
+      // the same set_app_prefs round-trip so a single Save covers any
+      // combination of pref edits.
+      autoRecordStartEnabled = p.auto_record_start_enabled ?? false;
+      autoRecordStopEnabled = p.auto_record_stop_enabled ?? false;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -374,6 +392,8 @@
         selfNoteShortcut,
         recordToggleShortcut,
         consentAnnouncementEnabled,
+        autoRecordStartEnabled,
+        autoRecordStopEnabled,
       });
       // #501 — drop the shared cache so the next consumer
       // (compliance.ts / notify.ts) sees the freshly-saved values
@@ -382,6 +402,42 @@
       prefsSavedAt = Date.now();
     } catch (e) {
       error = portalErrorToText(e);
+    }
+  }
+
+  // #596 — auto-record helpers. The Settings → Auto-record section
+  // surfaces relative timestamps ("Last used: 2 hours ago"), so this
+  // tiny formatter keeps the markup clean. Coarse buckets are good
+  // enough — the user is making a "do I trust this app?" decision,
+  // not auditing call history.
+  function fmtRelative(iso: string): string {
+    const t = new Date(iso).getTime();
+    if (!Number.isFinite(t)) return "—";
+    const diffMs = Date.now() - t;
+    if (diffMs < 60_000) return "just now";
+    const mins = Math.floor(diffMs / 60_000);
+    if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
+    const months = Math.floor(days / 30);
+    if (months < 12) return `${months} month${months === 1 ? "" : "s"} ago`;
+    const years = Math.floor(days / 365);
+    return `${years} year${years === 1 ? "" : "s"} ago`;
+  }
+
+  // Confirm-then-forget handler for the per-row "Forget" button. Public
+  // copy mirrors the architect's spec: opaque about WHAT the app was —
+  // it'll reappear next time it grabs the mic, so the user isn't
+  // committing to a permanent suppression.
+  async function onForgetApp(app: { bundle_id: string; friendly_name: string }) {
+    const ok = await confirmDialog(
+      `Forget ${app.friendly_name}? It will reappear here the next time it uses the microphone.`,
+      { title: "Forget app", kind: "warning" },
+    );
+    if (ok) {
+      void autoRecordStore.forget(app.bundle_id);
     }
   }
 
@@ -566,6 +622,10 @@
     await loadAppPrefs();
     await loadAutostart();
     await loadInputDevices();
+    // #596 — auto-record bundle (master toggles + observed_apps list).
+    // Errors here are non-fatal: the section renders an inline retry
+    // hint and the rest of the page stays usable.
+    void autoRecordStore.refresh();
     // #56 — fetch the org's recording-notification mode so the
     // consent-announcement toggle can decide whether to render.
     // Cache lives in $lib/compliance, so the Record page and the
@@ -948,6 +1008,168 @@
         </span>
       </label>
     </div>
+
+    <!-- #596 — Auto-record. Sits between Call detection (its
+         spiritual sibling — both watch for mic activity) and the
+         capture concerns (Input microphone, max length, etc.) below.
+         Master toggles + observed-apps list. The per-app checkboxes
+         are the gate: master "Auto-record when an allowed app starts
+         a call" is meaningless without at least one ticked row, so
+         the empty-state copy points users at the list. -->
+    <h3 class="pref-section">Auto-record</h3>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">
+          Auto-record when an allowed app starts a call
+        </span>
+        <span class="pref-hint">
+          Apps you've allowed below will start a recording automatically
+          when they begin using the microphone. You'll have 5 seconds to
+          cancel from the in-app toast before the recording fires.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={autoRecordStartEnabled}
+          disabled={!autoRecordStore.platformSupported}
+          onchange={(e) => {
+            autoRecordStartEnabled = (e.currentTarget as HTMLInputElement)
+              .checked;
+            // Persist via the existing AppPrefs round-trip AND mirror
+            // into the runed store so the next paint of this page (or
+            // any other consumer) sees the new value without a fresh
+            // get_app_prefs.
+            void saveAppPrefs();
+            void autoRecordStore.setMaster(
+              autoRecordStartEnabled,
+              autoRecordStopEnabled,
+            );
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {autoRecordStartEnabled ? "On" : "Off"}
+        </span>
+      </label>
+    </div>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Auto-stop when the call ends</span>
+        <span class="pref-hint">
+          When an allowed app releases the microphone, the recording
+          stops automatically. Manual recordings are never auto-stopped
+          — only ones the agent started for you.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={autoRecordStopEnabled}
+          disabled={!autoRecordStore.platformSupported}
+          onchange={(e) => {
+            autoRecordStopEnabled = (e.currentTarget as HTMLInputElement)
+              .checked;
+            void saveAppPrefs();
+            void autoRecordStore.setMaster(
+              autoRecordStartEnabled,
+              autoRecordStopEnabled,
+            );
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">
+          {autoRecordStopEnabled ? "On" : "Off"}
+        </span>
+      </label>
+    </div>
+
+    {#if !autoRecordStore.platformSupported}
+      <!-- macOS / other unsupported targets (Linux + Windows ship a
+           working observer in v1). Banner copy stays vendor-opaque —
+           never names CoreAudio / WASAPI / PipeWire. -->
+      <p class="pref-hint auto-record-banner" role="status">
+        App detection isn't supported on this OS yet — manual record
+        still works.
+      </p>
+    {:else}
+      <div class="auto-record-apps">
+        <div class="auto-record-apps-header">
+          <span class="pref-title">Apps that have used the microphone</span>
+          <span class="pref-hint">
+            Tick the apps you want to auto-record. Apps you don't tick
+            stay observed only — they appear here so you can decide,
+            but they never trigger a recording on their own.
+            Browser-based call apps appear as the browser itself;
+            ticking your browser will auto-record any tab that uses
+            the microphone.
+          </span>
+        </div>
+
+        {#if autoRecordStore.loading && !autoRecordStore.loaded}
+          <p class="pref-hint auto-record-empty">Loading…</p>
+        {:else if autoRecordStore.error}
+          <p class="error-inline" role="alert">
+            Couldn't load the apps list.
+            <button
+              type="button"
+              class="add"
+              onclick={() => autoRecordStore.refresh()}
+            >
+              Try again
+            </button>
+          </p>
+        {:else if autoRecordStore.apps.length === 0}
+          <p class="pref-hint auto-record-empty">
+            Open the apps you want to record from. They'll appear here
+            once they use the microphone, and you can pick which ones
+            should auto-record.
+          </p>
+        {:else}
+          <ul class="auto-record-list">
+            {#each autoRecordStore.apps as app (app.bundle_id)}
+              <li class="auto-record-row">
+                <label class="switch switch--compact">
+                  <input
+                    type="checkbox"
+                    checked={app.enabled}
+                    aria-label={`Auto-record ${app.friendly_name}`}
+                    onchange={(e) =>
+                      autoRecordStore.toggleApp(
+                        app.bundle_id,
+                        (e.currentTarget as HTMLInputElement).checked,
+                      )}
+                  />
+                  <span class="track" aria-hidden="true">
+                    <span class="knob"></span>
+                  </span>
+                </label>
+                <div class="auto-record-row-meta">
+                  <span class="auto-record-row-name">{app.friendly_name}</span>
+                  <span class="auto-record-row-times">
+                    Last used {fmtRelative(app.last_seen_at)} • First seen
+                    {fmtRelative(app.first_seen_at)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="add auto-record-forget"
+                  onclick={() => onForgetApp(app)}
+                >
+                  Forget
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
 
     <!-- Input microphone (#3). Capture concern, sits next to auto-
          detect so multi-mic users can pin recordings to the device
@@ -1342,6 +1564,26 @@
     </div>
   </section>
 
+  <!-- #592 — Privacy summary entry point. Mirrors the portal's
+       `/settings → /settings/privacy` card so a user on the agent can
+       reach the same read-only posture surface (TOS history, calls
+       count, access log) and the "Export my data" action without
+       round-tripping through the web portal. The deeper page renders
+       at `/settings/privacy`. -->
+  <section class="card" style="--i: 1.7">
+    <div class="card-head">
+      <div>
+        <h2>Privacy</h2>
+        <p class="hint">
+          See what your account holds, what terms you've accepted, who
+          has opened the calls you've recorded, and download a copy of
+          your data.
+        </p>
+      </div>
+      <a class="add" href="/settings/privacy">View privacy summary →</a>
+    </div>
+  </section>
+
   <!-- #317 — recording-policy explainer. Relocated from the auto-detect
        ack modal so the slim variant of that modal can stay scoped to a
        single sentence + checkbox (auto-detect's 30s OS-toast deadline
@@ -1701,6 +1943,21 @@
   .switch input:focus-visible + .track {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+  /* #596 — compact switch for the per-app auto-record rows.
+     Smaller knob/track so the row stays light next to the app name +
+     timestamps. Mirrored in the design-system app.css so the portal
+     stays in lockstep. */
+  .switch--compact .track {
+    width: 28px;
+    height: 16px;
+  }
+  .switch--compact .knob {
+    width: 10px;
+    height: 10px;
+  }
+  .switch--compact input:checked + .track .knob {
+    transform: translateX(12px);
   }
   .switch-label {
     font-family: var(--font-mono);
@@ -2206,5 +2463,68 @@
   }
   .recording-policy p:last-child {
     margin-bottom: 0;
+  }
+
+  /* #596 — Auto-record section. Reuses .pref-row / .pref-section /
+     .switch primitives; the only new chrome is the per-app list +
+     the smaller `switch--compact` modifier (which lives in the
+     design-system app.css so the portal stays in lockstep). */
+  .auto-record-banner {
+    margin: 0.5rem 0 0.2rem;
+  }
+  .auto-record-apps {
+    margin-top: 0.6rem;
+    padding: 0.7rem 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .auto-record-apps-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    margin-bottom: 0.7rem;
+  }
+  .auto-record-empty {
+    margin: 0;
+  }
+  .auto-record-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  .auto-record-row {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.55rem 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .auto-record-row:first-child {
+    border-top: none;
+  }
+  .auto-record-row-meta {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 0.1rem;
+  }
+  .auto-record-row-name {
+    font-size: 0.88rem;
+    color: var(--bone-0);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .auto-record-row-times {
+    font-size: 0.75rem;
+    color: var(--bone-3);
+    font-family: var(--font-mono);
+  }
+  .auto-record-forget {
+    flex-shrink: 0;
   }
 </style>

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
   import { portalErrorToText } from "$lib/portalError";
@@ -12,14 +11,6 @@
   let rememberEmail = $state(false);
   let submitting = $state(false);
   let error = $state("");
-
-  // #335 / #381 — SSO waiting-state. Set when the user clicks an SSO
-  // button and the browser is launched. Shows a "Return to aftercalls"
-  // hint plus a manual "Refresh sign-in state" button so the user has
-  // a clear recovery path if auto-detection doesn't fire.
-  let ssoWaiting = $state(false);
-  let ssoRefreshing = $state(false);
-  let ssoRefreshError = $state("");
 
   type PendingTos = {
     id: string;
@@ -65,71 +56,6 @@
     }
   });
 
-  // #32 — agent SSO entry point. Commit 1 ships a thin "sign in with
-  // browser" experience: clicking opens the portal's /login page in
-  // the system browser (which carries the same three SSO buttons +
-  // password form). Once the user has signed in there, the existing
-  // /handoff flow brings the session back into the agent on the
-  // user's next "Open desktop app" click. The localhost-listener
-  // PKCE flow described in the architect plan lands in a follow-up.
-  //
-  // #335 — after openUrl returns, flip into the waiting state so the
-  // agent's login card shows a "Return to aftercalls" hint. The user
-  // sees this while their browser handles SSO and knows to switch back.
-  //
-  // #381 — the waiting state also surfaces a "Refresh sign-in state"
-  // button (ssoRefreshCheck) as a manual recovery path if the
-  // auto-detection doesn't trigger (e.g. user completed SSO in the
-  // browser but the agent didn't pick it up automatically).
-  async function ssoSignIn(provider: string) {
-    ssoRefreshError = "";
-    try {
-      // Hardcoded portal URL — same shape as other "go to portal"
-      // links elsewhere in the agent (see settings/+page.svelte).
-      // The portal's /login renders the SSO buttons; the user picks
-      // their provider there. Provider param is hint-only — the
-      // portal renders all three regardless.
-      const url = `https://app.aftercalls.io/login?sso_hint=${encodeURIComponent(provider)}`;
-      await openUrl(url);
-      // Browser launched successfully — show the waiting/hint state.
-      ssoWaiting = true;
-    } catch (e) {
-      console.warn("openUrl failed", e);
-    }
-  }
-
-  // #381 — manual "Refresh sign-in state" handler. Re-checks whether
-  // the backend session exists (the user may have signed in via browser
-  // and the agent didn't auto-detect). On success: navigate to /. On
-  // failure: show an inline error so the user can try again or cancel.
-  async function ssoRefreshCheck() {
-    if (ssoRefreshing) return;
-    ssoRefreshing = true;
-    ssoRefreshError = "";
-    try {
-      const me = await invoke<Me | null>("current_user");
-      if (me) {
-        window.dispatchEvent(new Event("aftercalls-login"));
-        // #320 — same ToS-aware route-out as the password flow.
-        const pending = me.pending_tos ?? [];
-        if (pending.length > 0) goto("/accept-terms");
-        else goto("/");
-      } else {
-        ssoRefreshError = "Sign-in not detected yet. Complete the sign-in in your browser, then try again.";
-      }
-    } catch (e) {
-      ssoRefreshError = "Couldn't check sign-in status. Check your connection and try again.";
-      console.warn("ssoRefreshCheck current_user failed", e);
-    } finally {
-      ssoRefreshing = false;
-    }
-  }
-
-  function cancelSsoWaiting() {
-    ssoWaiting = false;
-    ssoRefreshError = "";
-  }
-
   async function submit(e: Event) {
     e.preventDefault();
     error = "";
@@ -165,61 +91,9 @@
       <h1 class="wordmark">aftercalls</h1>
     </div>
 
-    {#if ssoWaiting}
-      <!-- #335 / #381 — SSO waiting state. Shown after the user clicks
-           an SSO button and the browser is launched. The "Return to
-           aftercalls" hint tells them to switch back once done. The
-           "Refresh sign-in state" button is the manual recovery path
-           (#381) when auto-detection hasn't fired. -->
-      <div class="sso-waiting">
-        <p class="sso-waiting-label">
-          Sign in via your browser, then switch back to aftercalls.
-        </p>
-        {#if ssoRefreshError}
-          <p class="sso-waiting-err">{ssoRefreshError}</p>
-        {/if}
-        <button
-          type="button"
-          class="primary sso-refresh-btn"
-          onclick={ssoRefreshCheck}
-          disabled={ssoRefreshing}
-        >
-          {ssoRefreshing ? "Checking…" : "Refresh sign-in state"}
-        </button>
-        <button
-          type="button"
-          class="sso-cancel"
-          onclick={cancelSsoWaiting}
-          disabled={ssoRefreshing}
-        >
-          Use email &amp; password instead
-        </button>
-      </div>
-    {:else}
-      <p class="sub">Sign in to your workspace.</p>
+    <p class="sub">Sign in to your workspace.</p>
 
-      <!-- #32 — SSO buttons that bounce out to the system browser.
-           The agent-native PKCE + localhost-listener flow lands as a
-           follow-up; this thin variant keeps SSO usable from day one
-           without the IPC/listener complexity. -->
-      <div class="sso">
-        <button type="button" class="sso-btn" onclick={() => ssoSignIn("google")}>
-          <span class="sso-glyph">G</span>
-          Continue with Google
-        </button>
-        <button type="button" class="sso-btn" onclick={() => ssoSignIn("microsoft")}>
-          <span class="sso-glyph">M</span>
-          Continue with Microsoft
-        </button>
-        <button type="button" class="sso-btn" onclick={() => ssoSignIn("zoho")}>
-          <span class="sso-glyph">Z</span>
-          Continue with Zoho
-        </button>
-      </div>
-
-      <div class="divider"><span>or</span></div>
-
-      <form onsubmit={submit}>
+    <form onsubmit={submit}>
       <label>
         <span>Email</span>
         <input
@@ -265,7 +139,6 @@
         </a>
       </p>
     </form>
-    {/if}
   </div>
 </main>
 
@@ -313,61 +186,6 @@
     margin: 0 0 1.3rem;
     color: var(--bone-3);
     font-size: 0.88rem;
-  }
-
-  .sso {
-    display: flex;
-    flex-direction: column;
-    gap: 0.55rem;
-    margin-bottom: 1.1rem;
-  }
-  .sso-btn {
-    display: flex;
-    align-items: center;
-    gap: 0.65rem;
-    padding: 0.55rem 0.85rem;
-    border-radius: 8px;
-    border: 1px solid var(--hairline);
-    background: var(--ink-0);
-    color: var(--bone-0);
-    font-size: 0.9rem;
-    text-decoration: none;
-    cursor: pointer;
-    font-family: inherit;
-    text-align: left;
-    transition: border-color 0.15s, background 0.15s;
-  }
-  .sso-btn:hover {
-    border-color: var(--accent);
-    background: var(--ink-1);
-  }
-  .sso-glyph {
-    width: 22px;
-    height: 22px;
-    border-radius: 4px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-family: "Geist Mono", monospace;
-    font-size: 0.78rem;
-    color: var(--bone-3);
-    border: 1px solid var(--hairline);
-    background: var(--ink-1);
-  }
-
-  .divider {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    margin: 0 0 1.1rem;
-    color: var(--bone-3);
-    font-size: 0.78rem;
-  }
-  .divider::before, .divider::after {
-    content: "";
-    flex: 1;
-    height: 1px;
-    background: var(--hairline);
   }
 
   form {
@@ -464,50 +282,5 @@
   }
   .forgot a:hover {
     color: var(--accent);
-  }
-
-  /* #335 / #381 — SSO waiting state. */
-  .sso-waiting {
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
-    padding: 0.5rem 0 0.2rem;
-  }
-  .sso-waiting-label {
-    margin: 0;
-    color: var(--bone-2);
-    font-size: 0.9rem;
-    line-height: 1.45;
-  }
-  .sso-waiting-err {
-    margin: 0;
-    padding: 0.5rem 0.7rem;
-    border-radius: 6px;
-    background: var(--live-soft);
-    color: var(--live);
-    font-size: 0.82rem;
-  }
-  .sso-refresh-btn {
-    margin-top: 0;
-    width: 100%;
-  }
-  .sso-cancel {
-    appearance: none;
-    background: transparent;
-    border: none;
-    color: var(--bone-3);
-    font-family: inherit;
-    font-size: 0.82rem;
-    cursor: pointer;
-    text-align: center;
-    padding: 0.25rem 0;
-    text-decoration: underline;
-  }
-  .sso-cancel:hover {
-    color: var(--bone-1);
-  }
-  .sso-cancel:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
 </style>

@@ -26,6 +26,9 @@
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { callRecording } from "$lib/stores/callRecording.svelte";
+  import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
+  import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
+  import { toast } from "$lib/stores/toast.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import "../app.css";
 
@@ -111,6 +114,24 @@
   // existing auto-detect slide-out so both surfaces drive the same
   // autoRecordClick / autoDismiss handlers — no parallel state.
   let unlistenNotifyAction: UnlistenFn | null = null;
+  // #596 — auto-record event listeners. Three from the agent
+  // (`auto-record-pending`, `auto-record-fired`, `auto-record-cancelled`)
+  // drive the 5s cancel toast; one (`observed-apps-updated`) bumps the
+  // settings store so a freshly-observed app appears in the list
+  // without the user manually navigating away and back.
+  let unlistenAutoRecordPending: UnlistenFn | null = null;
+  let unlistenAutoRecordFired: UnlistenFn | null = null;
+  let unlistenAutoRecordCancelled: UnlistenFn | null = null;
+  let unlistenObservedAppsUpdated: UnlistenFn | null = null;
+  // Map of pending_id → toast id so the matching `auto-record-fired` /
+  // `auto-record-cancelled` event can dismiss the in-flight toast
+  // instead of letting the 5s auto-dismiss tick down on a recording
+  // that's already running.
+  const autoRecordToasts = new Map<string, number>();
+  // Reverse lookup: bundle_id → pending_id, so the `fired` /
+  // `cancelled` payloads (which only carry bundle_id) can find their
+  // matching toast.
+  const autoRecordPendingByBundle = new Map<string, string>();
 
   // #327 — call-recording floater bridge. The floater reads its own
   // `callRecording` store; this layout owns the `recording-state` +
@@ -856,6 +877,102 @@
       }
     });
 
+    // #596 — auto-record cancel toast. The agent fires
+    // `auto-record-pending` when an enabled app's mic transition is
+    // about to land; the user has 5s to click Cancel before the
+    // matching `auto-record-fired` lands and the recording starts.
+    // Inline action on the toast routes to the cancel IPC, which wipes
+    // the pending slot Rust-side and emits `auto-record-cancelled`
+    // (reason="user"). Empty `friendly_name` falls back to bundle_id
+    // for the rare app that didn't surface application.name.
+    unlistenAutoRecordPending = await listen<AutoRecordPendingPayload>(
+      "auto-record-pending",
+      (evt) => {
+        const { pending_id, bundle_id, friendly_name } = evt.payload;
+        const display = friendly_name?.trim() || bundle_id;
+        // Belt-and-braces: if a pending toast is already up for this
+        // bundle (shouldn't happen — Rust drops a second pending
+        // mid-flight), dismiss the old one before pushing a new.
+        const stale = autoRecordPendingByBundle.get(bundle_id);
+        if (stale) {
+          const tid = autoRecordToasts.get(stale);
+          if (tid !== undefined) toast.dismiss(tid);
+          autoRecordToasts.delete(stale);
+          autoRecordPendingByBundle.delete(bundle_id);
+        }
+        const toastId = toast.info(`Auto-recording ${display} in 5s`, {
+          duration: 5000,
+          action: {
+            label: "Cancel",
+            onClick: () => {
+              // Fire-and-forget; the matching `auto-record-cancelled`
+              // event will dismiss the toast for us. We pre-emptively
+              // dismiss here too so a flaky IPC round-trip doesn't
+              // leave the toast hanging.
+              autoRecord.cancelPending(pending_id).catch((e) => {
+                console.warn("confirm_auto_record_cancel failed", e);
+              });
+              const tid = autoRecordToasts.get(pending_id);
+              if (tid !== undefined) toast.dismiss(tid);
+              autoRecordToasts.delete(pending_id);
+              autoRecordPendingByBundle.delete(bundle_id);
+            },
+          },
+        });
+        autoRecordToasts.set(pending_id, toastId);
+        autoRecordPendingByBundle.set(bundle_id, pending_id);
+      },
+    );
+
+    // #596 — auto-record-fired: 5s elapsed, recording is running.
+    // Dismiss the toast cleanly so the user doesn't see "Cancel" on
+    // an action that's no longer cancellable. The `recording-state`
+    // event listener above takes over from here.
+    unlistenAutoRecordFired = await listen<{ bundle_id: string }>(
+      "auto-record-fired",
+      (evt) => {
+        const pending = autoRecordPendingByBundle.get(evt.payload.bundle_id);
+        if (pending) {
+          const tid = autoRecordToasts.get(pending);
+          if (tid !== undefined) toast.dismiss(tid);
+          autoRecordToasts.delete(pending);
+          autoRecordPendingByBundle.delete(evt.payload.bundle_id);
+        }
+      },
+    );
+
+    // #596 — auto-record-cancelled: pending was aborted before firing.
+    // `reason` carries the cause (user / app_stopped / error). Dismiss
+    // the toast unconditionally; only show a follow-up note for
+    // surprising cases (errors). app_stopped is the user opening then
+    // closing the app within 5s — non-noteworthy.
+    unlistenAutoRecordCancelled = await listen<{
+      bundle_id: string;
+      reason: "user" | "app_stopped" | "error";
+    }>("auto-record-cancelled", (evt) => {
+      const pending = autoRecordPendingByBundle.get(evt.payload.bundle_id);
+      if (pending) {
+        const tid = autoRecordToasts.get(pending);
+        if (tid !== undefined) toast.dismiss(tid);
+        autoRecordToasts.delete(pending);
+        autoRecordPendingByBundle.delete(evt.payload.bundle_id);
+      }
+      if (evt.payload.reason === "error") {
+        toast.warning(
+          "Couldn't auto-start the recording. Try the Record button.",
+        );
+      }
+    });
+
+    // #596 — observed-apps-updated: a new row was inserted or an
+    // existing row's last_seen_at advanced. Bump the settings store so
+    // a Settings page mounted right now sees the change without a
+    // route navigation. Throttled server-side (2s) so a chatty
+    // consumer doesn't spam the IPC bus.
+    unlistenObservedAppsUpdated = await listen("observed-apps-updated", () => {
+      void autoRecordStore.refresh();
+    });
+
     // #313 — wire the close-window advisory listener. Rust emits this
     // when `close_to_tray=false` AND the agent isn't busy, i.e. the
     // user clicked X and the window is genuinely closing. Stash a
@@ -1290,6 +1407,10 @@
     unlistenAutoDetect?.();
     unlistenNotifyAction?.();
     unlistenCloseAdvisory?.();
+    unlistenAutoRecordPending?.();
+    unlistenAutoRecordFired?.();
+    unlistenAutoRecordCancelled?.();
+    unlistenObservedAppsUpdated?.();
     if (callFloaterDoneTimer) {
       clearTimeout(callFloaterDoneTimer);
       callFloaterDoneTimer = null;

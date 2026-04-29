@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+use crate::mic_consumers::raw_mic_consumers;
 use crate::notify_actions::{self, ActionSpec, NotifyError};
 use crate::recorder::Recorder;
 
@@ -268,254 +269,35 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
 /// Apps currently holding a source-output on *any* mic source, filtered
 /// against the blacklist. Deduplicated so a multi-stream app (e.g. WebRTC)
 /// only shows up once.
+///
+/// The detector renders the "consumer" string in user-visible prompts,
+/// so we keep the historical behaviour: prefer `application.process.binary`
+/// (RawMicConsumer::bundle_id) and fall back to `application.name`
+/// (`friendly_name`) if the binary lookup ever produced an empty key.
+/// In practice the two are the same for non-empty rows; the wrapper
+/// just keeps the same shape callers expect.
 fn interesting_mic_consumers() -> Vec<String> {
-    let names = raw_mic_consumers();
+    let consumers = raw_mic_consumers();
     let mut seen = HashSet::new();
     let mut result = Vec::new();
-    for name in names {
-        let lower = name.to_lowercase();
+    for c in consumers {
+        let display = if c.bundle_id.is_empty() {
+            c.friendly_name.clone()
+        } else {
+            c.bundle_id.clone()
+        };
+        let lower = display.to_lowercase();
         if MIC_CONSUMER_BLACKLIST
             .iter()
             .any(|b| lower.contains(&b.to_lowercase()))
         {
             continue;
         }
-        if seen.insert(name.clone()) {
-            result.push(name);
+        if seen.insert(display.clone()) {
+            result.push(display);
         }
     }
     result
-}
-
-#[cfg(target_os = "linux")]
-fn raw_mic_consumers() -> Vec<String> {
-    let output = std::process::Command::new("pactl")
-        .arg("list")
-        .arg("source-outputs")
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let own_pid = std::process::id().to_string();
-
-    let mut result = Vec::new();
-    let mut cur_name: Option<String> = None;
-    let mut cur_binary: Option<String> = None;
-    let mut cur_pid: Option<String> = None;
-
-    let flush = |result: &mut Vec<String>,
-                 name: &mut Option<String>,
-                 binary: &mut Option<String>,
-                 pid: &mut Option<String>,
-                 own_pid: &str| {
-        let is_ours = pid.as_deref() == Some(own_pid);
-        if !is_ours {
-            if let Some(app) = binary.take().or_else(|| name.take()) {
-                result.push(app);
-            }
-        }
-        *name = None;
-        *binary = None;
-        *pid = None;
-    };
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Source Output #") {
-            flush(&mut result, &mut cur_name, &mut cur_binary, &mut cur_pid, &own_pid);
-        } else if let Some(rest) = trimmed.strip_prefix("application.name = \"") {
-            if let Some(end) = rest.find('"') {
-                cur_name = Some(rest[..end].to_string());
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("application.process.binary = \"") {
-            if let Some(end) = rest.find('"') {
-                cur_binary = Some(rest[..end].to_string());
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("application.process.id = \"") {
-            if let Some(end) = rest.find('"') {
-                cur_pid = Some(rest[..end].to_string());
-            }
-        }
-    }
-    flush(&mut result, &mut cur_name, &mut cur_binary, &mut cur_pid, &own_pid);
-    result
-}
-
-#[cfg(target_os = "windows")]
-fn raw_mic_consumers() -> Vec<String> {
-    match windows_mic_consumers() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("aftercalls: WASAPI session enumeration failed: {e}");
-            Vec::new()
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_mic_consumers() -> Result<Vec<String>, String> {
-    use windows::core::{Interface, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE};
-    use windows::Win32::Media::Audio::{
-        eCapture, AudioSessionStateInactive, IAudioSessionControl2, IAudioSessionManager2,
-        IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
-    };
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
-    };
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    // Helper hoisted above the main body so the outer function's tail
-    // expression is the `unsafe { ... }` block and its `Result<Vec<…>, …>`
-    // value flows out directly. (Previously the inner `fn` declaration
-    // followed the unsafe block, which made rustc treat the unsafe
-    // block as a statement and the function's implicit return `()` —
-    // Linux ignores this file via cfg but Windows CI caught it.)
-    #[inline]
-    unsafe fn process_exe_basename(pid: u32) -> Result<String, String> {
-        use std::ffi::OsString;
-        use std::os::windows::ffi::OsStringExt;
-
-        let handle: HANDLE =
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-                .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
-
-        let mut buf: [u16; 1024] = [0; 1024];
-        let mut size: u32 = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-
-        let _ = CloseHandle(handle);
-
-        result.map_err(|e| format!("QueryFullProcessImageNameW: {e}"))?;
-
-        let slice = &buf[..size as usize];
-        let full = OsString::from_wide(slice)
-            .to_string_lossy()
-            .into_owned();
-        let base = full
-            .rsplit(|c| c == '\\' || c == '/')
-            .next()
-            .unwrap_or(&full)
-            .to_string();
-        Ok(base)
-    }
-
-    unsafe {
-        // COM init: per-thread. Ignore RPC_E_CHANGED_MODE (already inited
-        // differently) and S_FALSE (already inited same mode).
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if let Err(e) = hr.ok() {
-            if e.code() != RPC_E_CHANGED_MODE {
-                return Err(format!("CoInitializeEx: {e}"));
-            }
-        }
-
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
-
-        let devices = enumerator
-            .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
-            .map_err(|e| format!("EnumAudioEndpoints: {e}"))?;
-
-        let device_count = devices
-            .GetCount()
-            .map_err(|e| format!("IMMDeviceCollection::GetCount: {e}"))?;
-
-        let own_pid = std::process::id();
-        let mut result: Vec<String> = Vec::new();
-        let mut seen_pids: HashSet<u32> = HashSet::new();
-
-        for i in 0..device_count {
-            let device = match devices.Item(i) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("aftercalls: IMMDeviceCollection::Item({i}): {e}");
-                    continue;
-                }
-            };
-
-            let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("aftercalls: IMMDevice::Activate IAudioSessionManager2: {e}");
-                    continue;
-                }
-            };
-
-            let session_enum = match session_manager.GetSessionEnumerator() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("aftercalls: GetSessionEnumerator: {e}");
-                    continue;
-                }
-            };
-
-            let session_count = match session_enum.GetCount() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("aftercalls: IAudioSessionEnumerator::GetCount: {e}");
-                    continue;
-                }
-            };
-
-            for s in 0..session_count {
-                let control = match session_enum.GetSession(s) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let control2: IAudioSessionControl2 = match control.cast() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let pid = match control2.GetProcessId() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                if pid == 0 || pid == own_pid {
-                    continue;
-                }
-
-                // Active use only — skip inactive/expired sessions.
-                if let Ok(state) = control.GetState() {
-                    if state == AudioSessionStateInactive {
-                        continue;
-                    }
-                }
-
-                if !seen_pids.insert(pid) {
-                    continue;
-                }
-
-                match process_exe_basename(pid) {
-                    Ok(name) if !name.is_empty() => result.push(name),
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("aftercalls: process_exe_basename({pid}): {e}");
-                    }
-                }
-            }
-        }
-
-        Ok(result)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn raw_mic_consumers() -> Vec<String> {
-    // macOS + other unsupported platforms: auto-detect is a no-op.
-    Vec::new()
 }
 
 fn emit(app: &AppHandle, event: AutoDetectEvent) {

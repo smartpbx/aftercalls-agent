@@ -1287,6 +1287,142 @@ pub async fn health_check(backend: &Backend) -> bool {
     }
 }
 
+// ── /settings/privacy parity (#592) ──────────────────────────────────
+//
+// Thin wrappers around `/v1/auth/me/privacy*` and `/v1/auth/me/export*`
+// so the agent's `/settings/privacy` Svelte page can mirror the portal's
+// surface byte-for-byte without re-implementing the auth-header refresh
+// dance in the webview. Wire shapes match the portal's `myPrivacy` and
+// `dataExports` clients exactly — see `portal/src/lib/api.ts` for the TS
+// counterpart. All four endpoints route through `effective_user_id()` on
+// the backend, so impersonation Just Works (the data-export endpoints
+// also reject impersonation JWTs explicitly — surfaced as a 403).
+
+/// `GET /v1/auth/me/privacy` — bundle endpoint backing the page paint.
+pub async fn me_privacy_bundle(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/auth/me/privacy").await
+}
+
+/// `GET /v1/auth/me/privacy/access-log?cursor=…&limit=…` — cursor-paginated
+/// access log used by the page's "Load more" CTA.
+pub async fn me_privacy_access_log(
+    backend: &Backend,
+    cursor: Option<&str>,
+    limit: i64,
+) -> std::result::Result<Value, PortalError> {
+    let mut path = String::from("/v1/auth/me/privacy/access-log?limit=");
+    path.push_str(&limit.to_string());
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            path.push_str("&cursor=");
+            path.push_str(&urlencoding_minimal(c));
+        }
+    }
+    get_json_typed(backend, &path).await
+}
+
+/// `POST /v1/auth/me/export` — request a fresh data export. 202 on
+/// success; 400 with `retry_after_seconds=N` when the 24h cooldown is
+/// live; 409 when a previous job is still pending or running. The
+/// frontend reads the body string for the cooldown hint.
+pub async fn data_exports_request(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    post_json_typed(backend, "/v1/auth/me/export", serde_json::json!({})).await
+}
+
+/// `GET /v1/auth/me/exports` — newest-first list. No URLs in the
+/// response; call `data_exports_get_status` for the download URL of
+/// a specific row.
+pub async fn data_exports_list(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/auth/me/exports").await
+}
+
+/// `GET /v1/auth/me/exports/{id}` — single row plus a freshly-presigned
+/// `download_url` when the row is `ready` and inside its retention
+/// window.
+pub async fn data_exports_get_status(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
+    let path = format!("/v1/auth/me/exports/{}", urlencoding_minimal(id));
+    get_json_typed(backend, &path).await
+}
+
+// ── #595 — per-user import-candidate flow ────────────────────────────
+//
+// Mirror of the portal's `importCandidates` TS client. The agent's
+// `/calls` page renders candidates alongside real call rows when the
+// filter pill is "All" or "Importable only". Import promotes a
+// candidate (server downloads the upstream recording, runs the
+// pipeline, stamps `imported_call_id` on the candidate row); Dismiss
+// soft-deletes the candidate so it stops appearing. Both endpoints
+// route through `effective_user_id()` on the backend — impersonation
+// Just Works the same way the privacy + data-export shims do.
+
+/// `GET /v1/import-candidates` — caller's own open candidates. `source`
+/// narrows by `ingest_source` (`smartpbx` / `zoho_meeting`); omitting
+/// it returns both. `include_dismissed` flips the default filter so
+/// dismissed candidates surface alongside open ones (admin-y view; the
+/// page leaves it false by default).
+pub async fn import_candidates_list(
+    backend: &Backend,
+    source: Option<&str>,
+    include_dismissed: bool,
+) -> std::result::Result<Value, PortalError> {
+    let mut path = String::from("/v1/import-candidates");
+    let mut params: Vec<(String, String)> = Vec::new();
+    if let Some(s) = source {
+        if !s.is_empty() {
+            params.push(("source".into(), s.into()));
+        }
+    }
+    if include_dismissed {
+        params.push(("include_dismissed".into(), "true".into()));
+    }
+    if !params.is_empty() {
+        path.push('?');
+        let mut first = true;
+        for (k, v) in &params {
+            if !first {
+                path.push('&');
+            }
+            first = false;
+            path.push_str(k);
+            path.push('=');
+            path.push_str(&urlencoding_minimal(v));
+        }
+    }
+    get_json_typed(backend, &path).await
+}
+
+/// `POST /v1/import-candidates/{id}/import` — promote a candidate into
+/// a real call. Returns `{ candidate_id, call_id, was_new }`; a second
+/// click while the first is mid-flight returns `was_new=false`
+/// referencing the same `call_id` (server-side idempotency).
+pub async fn import_candidate_import(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
+    let path = format!(
+        "/v1/import-candidates/{}/import",
+        urlencoding_minimal(id),
+    );
+    post_json_typed(backend, &path, serde_json::json!({})).await
+}
+
+/// `POST /v1/import-candidates/{id}/dismiss` — soft-delete the
+/// candidate. Idempotent on already-dismissed rows; cross-org or
+/// unknown `id` returns 404 → `PortalError::NotFound`.
+pub async fn import_candidate_dismiss(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<(), PortalError> {
+    let path = format!(
+        "/v1/import-candidates/{}/dismiss",
+        urlencoding_minimal(id),
+    );
+    post_nop_typed(backend, &path, serde_json::json!({})).await
+}
+
 // ── HTTP primitives ──────────────────────────────────────────────────
 
 fn client() -> Result<reqwest::Client> {

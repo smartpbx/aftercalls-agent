@@ -127,6 +127,23 @@ pub struct Config {
     /// config.toml files loading cleanly.
     #[serde(default)]
     pub consent_announcement_enabled: bool,
+    /// #596 — when true, the auto-record observer fires `do_start`
+    /// (with a 5s in-app cancel toast) the moment an app on the
+    /// per-machine allowlist starts using the microphone. Default OFF:
+    /// gating is the user's responsibility, and shipping ON would
+    /// surprise existing users on upgrade. The Settings UI exposes
+    /// this as the "Auto-record when an allowed app starts a call"
+    /// toggle.
+    #[serde(default)]
+    pub auto_record_start_enabled: bool,
+    /// #596 — when true AND a recording is in flight that was started
+    /// by the auto-record path, releasing the mic stops it. Default
+    /// OFF for the same reason as the start toggle. Manual recordings
+    /// are NEVER auto-stopped — the active_auto sentinel inside
+    /// `auto_recorder` only carries forward when auto_record_start
+    /// fired the start.
+    #[serde(default)]
+    pub auto_record_stop_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -195,6 +212,8 @@ impl Config {
                 self_note_shortcut: default_self_note_shortcut(),
                 record_toggle_shortcut: default_record_toggle_shortcut(),
                 consent_announcement_enabled: false,
+                auto_record_start_enabled: false,
+                auto_record_stop_enabled: false,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

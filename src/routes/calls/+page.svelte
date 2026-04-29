@@ -3,6 +3,7 @@
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
   import { goto, replaceState, afterNavigate } from "$app/navigation";
+  import * as api from "$lib/api";
   import DateInput from "$lib/DateInput.svelte";
   import SpeakerRenamePicker from "$lib/SpeakerRenamePicker.svelte";
   import { portalErrorToText } from "$lib/portalError";
@@ -13,6 +14,7 @@
     PILL_STILL_WORKING,
   } from "$lib/processing-thresholds";
   import { registerShortcuts } from "$lib/shortcuts.svelte";
+  import { toast } from "$lib/stores/toast.svelte";
 
   // #57 Tag-aware filter bar.
   //
@@ -141,6 +143,28 @@
   let loadingMore = $state(false);
   let loadMoreError = $state<string | null>(null);
 
+  // #595 — Importable filter pill. The same /calls page renders calls +
+  // candidates either independently or interleaved by date.
+  //   - "all"        → both fetches fire; rows merged by recorded_at
+  //                    / discovered_at.
+  //   - "importable" → only the candidates fetch fires.
+  //   - "hide"       → only the calls fetch fires.
+  // The pill state lives on the URL as `?filter=importable|hide` so
+  // refresh + share-link preserve it. Default ("all") drops the param.
+  // Mirror of the portal `/calls` filter — wire shapes (candidates,
+  // ImportCandidate fields, etc.) match the portal's TS types byte-for-
+  // byte through `agent/src/lib/api.ts`.
+  type ImportableFilter = "all" | "importable" | "hide";
+  let importableFilter = $state<ImportableFilter>("all");
+  let candidates = $state<api.ImportCandidate[]>([]);
+  // Per-candidate busy flag — disables Import/Dismiss buttons while a
+  // request is in flight so a double-click can't fire two competing
+  // promotes. The optimistic-replacement bookkeeping below mirrors the
+  // portal's `promotedCandidateIds` so a stale poll result that briefly
+  // re-includes a just-imported candidate doesn't re-paint the row.
+  let candidateBusy = $state<Record<string, boolean>>({});
+  let promotedCandidateIds = $state<Set<string>>(new Set());
+
   // #386 — backend now returns `{ calls, next_cursor }`. Older agents
   // talking to a backend that still returns a bare array would break,
   // but the two ship together — see issue #386 / context-map for the
@@ -246,6 +270,17 @@
     return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : "";
   }
 
+  // #595 — read the importable-filter pill state from the URL. Only
+  // accepts the two non-default values; anything else (including "all"
+  // explicitly) collapses to "all" so a stray query param can't wedge
+  // the page into a strange mode. Mirror of the portal helper.
+  function readImportableFilterFromUrl(): ImportableFilter {
+    if (typeof window === "undefined") return "all";
+    const raw = new URL(window.location.href).searchParams.get("filter");
+    if (raw === "importable" || raw === "hide") return raw;
+    return "all";
+  }
+
   function syncUrl() {
     if (typeof window === "undefined") return;
     const u = new URL(window.location.href);
@@ -257,6 +292,12 @@
     u.searchParams.delete("to");
     if (fromDate) u.searchParams.set("from", fromDate);
     if (toDate) u.searchParams.set("to", toDate);
+    // #595 — `?filter=importable|hide`. Default ("all") drops the
+    // param so the URL stays clean for users with no candidates.
+    u.searchParams.delete("filter");
+    if (importableFilter !== "all") {
+      u.searchParams.set("filter", importableFilter);
+    }
     // #135 — use SvelteKit's `replaceState` so the browser history
     // stays in sync with the filter pill without a push-navigation.
     // `replaceState` from `$app/navigation` updates `history` +
@@ -271,22 +312,68 @@
     loading = true;
     error = "";
     loadMoreError = null;
+    // #595 — parallel fetch. The pill state determines which side
+    // fires; "all" fires both, "importable" only candidates, "hide"
+    // only calls. Each fetch's failure is isolated so a 500 on the
+    // less-load-bearing side doesn't blank the whole page (mirror of
+    // portal `/calls`).
+    const wantCalls = importableFilter !== "importable";
+    const wantCandidates = importableFilter !== "hide";
+    const callsPromise: Promise<unknown> = wantCalls
+      ? invoke<unknown>("list_calls", {
+          scope,
+          user: scope === "all" ? (userFilter?.id ?? null) : null,
+          tags: tagFilters,
+          // #146 — pack `YYYY-MM-DD` into full RFC3339 on this side so
+          // the Tauri command + backend only ever see parsed timestamps.
+          fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
+          toDate: toDate ? `${toDate}T23:59:59Z` : null,
+          // #386 — first page → no cursor; PAGE_SIZE is the chunk size.
+          cursor: null,
+          limit: PAGE_SIZE,
+        }).catch((e) => ({ _err: e }))
+      : Promise.resolve(null);
+    const candidatesPromise: Promise<api.ImportCandidatesResponse | { _err: unknown } | null> =
+      wantCandidates
+        ? api.importCandidates
+            .list()
+            .catch((e: unknown) => ({ _err: e }))
+        : Promise.resolve(null);
     try {
-      const raw = await invoke<unknown>("list_calls", {
-        scope,
-        user: scope === "all" ? (userFilter?.id ?? null) : null,
-        tags: tagFilters,
-        // #146 — pack `YYYY-MM-DD` into full RFC3339 on this side so
-        // the Tauri command + backend only ever see parsed timestamps.
-        fromDate: fromDate ? `${fromDate}T00:00:00Z` : null,
-        toDate: toDate ? `${toDate}T23:59:59Z` : null,
-        // #386 — first page → no cursor; PAGE_SIZE is the chunk size.
-        cursor: null,
-        limit: PAGE_SIZE,
-      });
-      const resp = parseListResponse(raw);
-      calls = resp.calls;
-      nextCursor = resp.next_cursor;
+      const [callsRaw, candidatesResp] = await Promise.all([
+        callsPromise,
+        candidatesPromise,
+      ]);
+      if (wantCalls) {
+        if (callsRaw && (callsRaw as { _err?: unknown })._err !== undefined) {
+          throw (callsRaw as { _err: unknown })._err;
+        }
+        const resp = parseListResponse(callsRaw);
+        calls = resp.calls;
+        nextCursor = resp.next_cursor;
+      } else {
+        calls = [];
+        nextCursor = null;
+      }
+      if (wantCandidates) {
+        if (
+          candidatesResp &&
+          (candidatesResp as { _err?: unknown })._err !== undefined
+        ) {
+          // Candidates failure is isolated — toast the error rather
+          // than blanking the page. Calls list (the dominant surface)
+          // still paints whatever the calls fetch returned.
+          toast.error("Couldn't load importable recordings — try refreshing.");
+          candidates = [];
+        } else {
+          const r = candidatesResp as api.ImportCandidatesResponse | null;
+          candidates = (r?.items ?? []).filter(
+            (c) => !promotedCandidateIds.has(c.id),
+          );
+        }
+      } else {
+        candidates = [];
+      }
     } catch (e) {
       error = portalErrorToText(e);
     } finally {
@@ -412,6 +499,16 @@
     await load();
   }
 
+  // #595 — flip the importable filter pill. The URL is synced before
+  // the load fires so refresh during the in-flight request still
+  // reflects the user's intent. Mirror of portal `setImportableFilter`.
+  async function setImportableFilter(next: ImportableFilter) {
+    if (importableFilter === next) return;
+    importableFilter = next;
+    syncUrl();
+    await load();
+  }
+
   async function refreshSuggestions() {
     suggestLoading = true;
     try {
@@ -484,9 +581,16 @@
   // calls-list component can lift this verbatim.
   let searchInput: HTMLInputElement | undefined = $state();
   let highlightedCallId = $state<string | null>(null);
+  // #595 — only call rows are navigable via j/k + Enter/o; candidates
+  // sit outside the keyboard-row cycle since their action is the
+  // Import / Dismiss buttons rather than open-detail.
   let visibleIds = $derived.by(() => {
     const ids: string[] = [];
-    for (const [, items] of groups) for (const c of items) ids.push(c.id);
+    for (const [, items] of groups) {
+      for (const row of items) {
+        if (row.kind === "call") ids.push(row.call.id);
+      }
+    }
     return ids;
   });
 
@@ -537,6 +641,7 @@
     tagFilters = readTagsFromUrl();
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
+    importableFilter = readImportableFilterFromUrl();
     if (scope === "all" && canSeeAll) void ensureMemberRoster();
     nowTimer = setInterval(() => {
       nowMs = Date.now();
@@ -579,6 +684,7 @@
     tagFilters = readTagsFromUrl();
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
+    importableFilter = readImportableFilterFromUrl();
     void load();
   });
 
@@ -587,6 +693,16 @@
     const q = query.trim().toLowerCase();
     // Title-only now — client lives in the tag-filter bar above.
     return calls.filter((c) => (c.title ?? "").toLowerCase().includes(q));
+  });
+
+  // #595 — title-search applies to candidates too so the search box
+  // filters across both row kinds.
+  let filteredCandidates = $derived.by(() => {
+    if (!query.trim()) return candidates;
+    const q = query.trim().toLowerCase();
+    return candidates.filter((c) =>
+      candidateTitle(c).toLowerCase().includes(q),
+    );
   });
 
   // #527 — tags discoverability tip. True when the user has calls loaded
@@ -624,13 +740,33 @@
     return `${y}-${m}-${day}`;
   }
 
+  // #595 — unified row shape for the grouped list. Calls and
+  // candidates render side-by-side when the pill is "all"; the
+  // discriminator drives the markup branch in the each-block below.
+  type ListRow =
+    | { kind: "call"; call: Call; recordedAt: string }
+    | { kind: "candidate"; candidate: api.ImportCandidate; recordedAt: string };
+
   let groups = $derived.by(() => {
-    const map = new Map<string, Call[]>();
+    const map = new Map<string, ListRow[]>();
     for (const c of filtered) {
       const key = localDayKey(c.recorded_at);
       const arr = map.get(key) ?? [];
-      arr.push(c);
+      arr.push({ kind: "call", call: c, recordedAt: c.recorded_at });
       map.set(key, arr);
+    }
+    for (const c of filteredCandidates) {
+      const at = candidateRecordedAt(c);
+      const key = localDayKey(at);
+      const arr = map.get(key) ?? [];
+      arr.push({ kind: "candidate", candidate: c, recordedAt: at });
+      map.set(key, arr);
+    }
+    // Within a day, sort newest first by the row's recorded /
+    // discovered timestamp so candidates and calls interleave
+    // naturally.
+    for (const arr of map.values()) {
+      arr.sort((a, b) => (a.recordedAt < b.recordedAt ? 1 : -1));
     }
     return [...map.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
   });
@@ -698,6 +834,115 @@
       hydrating = { ...hydrating, [callId]: false };
     }
   }
+
+  // #595 — candidate metadata + render helpers. Candidates carry
+  // source-specific JSONB so we read defensively — a malformed payload
+  // shouldn't blank the row.
+  function candidateTitle(c: api.ImportCandidate): string {
+    const m = c.metadata ?? {};
+    const title = (m as any).title;
+    if (typeof title === "string" && title.trim()) return title;
+    const topic = (m as any).topic;
+    if (typeof topic === "string" && topic.trim()) return topic;
+    if (c.ingest_source === "smartpbx") {
+      const caller = (m as any).caller_extension;
+      const callee = (m as any).callee_extension;
+      if (caller && callee) return `${caller} → ${callee}`;
+      if (caller) return `From ${caller}`;
+    }
+    return "(untitled)";
+  }
+  function candidateRecordedAt(c: api.ImportCandidate): string {
+    const m = c.metadata ?? {};
+    const start = (m as any).started_at ?? (m as any).start_time;
+    if (typeof start === "string" && start) return start;
+    return c.discovered_at;
+  }
+  function candidateDurationMs(c: api.ImportCandidate): number {
+    const m = c.metadata ?? {};
+    const secs = (m as any).duration_secs;
+    if (typeof secs === "number" && isFinite(secs)) {
+      return Math.max(0, Math.round(secs * 1000));
+    }
+    return 0;
+  }
+
+  // #595 — Source label for the candidate row's small chip. Admin-
+  // context labels — naming the upstream product is fine here per
+  // the vendor-opaque rule (the rule applies to end-user copy on the
+  // public site and in-app marketing surfaces, not to source chips
+  // that signal the integration the candidate came from).
+  function candidateSourceLabel(src: "smartpbx" | "zoho_meeting"): string {
+    return src === "smartpbx" ? "FusionPBX" : "Zoho Meeting";
+  }
+
+  // #595 — Import a candidate. Optimistic shape: replace the candidate
+  // row in place with a synthetic Call that paints as `transcribing`
+  // (same status the legacy hydrate flow uses), so the row stays put
+  // without a layout jump. The server returns the real call_id; we
+  // stamp `promotedCandidateIds` so a stale poll result doesn't
+  // re-paint the candidate after the next refresh.
+  async function importCandidate(e: MouseEvent, c: api.ImportCandidate) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (candidateBusy[c.id]) return;
+    candidateBusy = { ...candidateBusy, [c.id]: true };
+    const prevCandidates = candidates;
+    const prevCalls = calls;
+    try {
+      const resp = await api.importCandidates.import(c.id);
+      const optimistic: Call = {
+        id: resp.call_id,
+        session_id: resp.call_id,
+        recorded_at: candidateRecordedAt(c),
+        duration_ms: candidateDurationMs(c),
+        title: candidateTitle(c),
+        matched_client: null,
+        status: "transcribing",
+        source_app: null,
+        source_kind: null,
+        ingest_source: c.ingest_source,
+        tags: [],
+      };
+      candidates = candidates.filter((x) => x.id !== c.id);
+      promotedCandidateIds = new Set([...promotedCandidateIds, c.id]);
+      // Only insert into the calls list if calls are visible — when
+      // the filter is "importable", the calls array is empty by
+      // design and we shouldn't pollute it.
+      if (importableFilter !== "importable") {
+        calls = [optimistic, ...calls];
+      }
+      if (!resp.was_new) {
+        toast.info("This recording is already importing.");
+      }
+    } catch (err: any) {
+      candidates = prevCandidates;
+      calls = prevCalls;
+      toast.error(`Couldn't import: ${portalErrorToText(err)}`);
+    } finally {
+      candidateBusy = { ...candidateBusy, [c.id]: false };
+    }
+  }
+
+  // #595 — Dismiss a candidate. Optimistic removal — server is
+  // idempotent; cross-org / unknown ids return 404 which surfaces as a
+  // revert + toast.
+  async function dismissCandidate(e: MouseEvent, c: api.ImportCandidate) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (candidateBusy[c.id]) return;
+    candidateBusy = { ...candidateBusy, [c.id]: true };
+    const prev = candidates;
+    candidates = candidates.filter((x) => x.id !== c.id);
+    try {
+      await api.importCandidates.dismiss(c.id);
+    } catch (err: any) {
+      candidates = prev;
+      toast.error(`Couldn't dismiss: ${portalErrorToText(err)}`);
+    } finally {
+      candidateBusy = { ...candidateBusy, [c.id]: false };
+    }
+  }
 </script>
 
 <main class="page">
@@ -707,6 +952,9 @@
       <p class="sub">
         {calls.length} {calls.length === 1 ? "call" : "calls"}
         {scope === "all" ? "across the team" : "in your archive"}
+        {#if candidates.length > 0}
+          · {candidates.length} importable
+        {/if}
       </p>
     </div>
     <div class="head-actions">
@@ -733,6 +981,41 @@
       <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
     </div>
   </header>
+
+  <!-- #595 — Importable filter pills. Hidden when the user has zero
+       candidates AND the filter is in its default state — keeps the
+       /calls UX byte-identical for users without an integration. The
+       pill row also stays visible when the user has switched to
+       "Importable only" so they retain a way to switch back. Mirrors
+       the portal `/calls` page. -->
+  {#if candidates.length > 0 || importableFilter !== "all"}
+    <div class="importable-pills" role="group" aria-label="Importable filter">
+      <button
+        type="button"
+        class="importable-pill"
+        class:active={importableFilter === "all"}
+        onclick={() => setImportableFilter("all")}
+      >
+        All
+      </button>
+      <button
+        type="button"
+        class="importable-pill"
+        class:active={importableFilter === "importable"}
+        onclick={() => setImportableFilter("importable")}
+      >
+        Importable only
+      </button>
+      <button
+        type="button"
+        class="importable-pill"
+        class:active={importableFilter === "hide"}
+        onclick={() => setImportableFilter("hide")}
+      >
+        Hide importable
+      </button>
+    </div>
+  {/if}
 
   <div class="filter-bar">
     <div class="search">
@@ -971,7 +1254,7 @@
     <p class="state">Loading…</p>
   {:else if error}
     <p class="state err">{error}</p>
-  {:else if calls.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate}
+  {:else if calls.length === 0 && candidates.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate && importableFilter === "all"}
     <div class="empty">
       <p class="empty-title">No calls yet</p>
       <p class="empty-sub">
@@ -979,10 +1262,12 @@
       </p>
       <a href="/" class="empty-cta">Go to Record →</a>
     </div>
-  {:else if filtered.length === 0}
+  {:else if filtered.length === 0 && filteredCandidates.length === 0}
     <div class="empty">
       <p class="empty-title">
-        {#if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
+        {#if importableFilter === "importable"}
+          No importable recordings
+        {:else if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
           No calls in the selected range
         {:else}
           No calls match these filters
@@ -1001,12 +1286,14 @@
           <div class="group-head">
             <span class="day">{fmtDay(day)}</span>
             <span class="day-count">
-              {items.length} {items.length === 1 ? "call" : "calls"}
+              {items.length} {items.length === 1 ? "item" : "items"}
             </span>
           </div>
 
           <ul class="entries">
-            {#each items as call (call.id)}
+            {#each items as row (row.kind + ":" + (row.kind === "call" ? row.call.id : row.candidate.id))}
+              {#if row.kind === "call"}
+                {@const call = row.call}
               <li>
                 <a
                   href="/calls/{call.id}"
@@ -1157,6 +1444,58 @@
                   <span class="entry-dur">{fmtDuration(call.duration_ms)}</span>
                 </a>
               </li>
+              {:else}
+                {@const c = row.candidate}
+                {@const recordedAt = candidateRecordedAt(c)}
+                {@const durMs = candidateDurationMs(c)}
+                <!-- #595 — candidate row. Renders alongside real call
+                     rows when the filter is "All" or "Importable
+                     only". The "To import" pip + Import / Dismiss
+                     button cluster lives in app.css (mirrored from
+                     portal/src/app.css) — see design.md
+                     §"Candidate row (#595)". -->
+              <li>
+                <div class="entry candidate-entry">
+                  <span class="entry-time">{fmtTime(recordedAt)}</span>
+                  <div class="entry-body">
+                    <h3 class="entry-title">{candidateTitle(c)}</h3>
+                    <div class="entry-meta">
+                      <span class="candidate-pip" aria-hidden="true"></span>
+                      <span class="candidate-pip-label">To import</span>
+                      <span
+                        class="source-chip source-{c.ingest_source}"
+                        title="From {candidateSourceLabel(c.ingest_source)}"
+                      >
+                        {candidateSourceLabel(c.ingest_source)}
+                      </span>
+                    </div>
+                  </div>
+                  <div class="candidate-actions">
+                    <button
+                      type="button"
+                      class="candidate-btn candidate-btn-import"
+                      disabled={candidateBusy[c.id]}
+                      onclick={(e) => importCandidate(e, c)}
+                    >
+                      {candidateBusy[c.id] ? "Importing…" : "Import"}
+                    </button>
+                    <button
+                      type="button"
+                      class="candidate-btn candidate-btn-dismiss"
+                      disabled={candidateBusy[c.id]}
+                      onclick={(e) => dismissCandidate(e, c)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                  {#if durMs > 0}
+                    <span class="entry-dur">{fmtDuration(durMs)}</span>
+                  {:else}
+                    <span class="entry-dur entry-dur-na">—</span>
+                  {/if}
+                </div>
+              </li>
+              {/if}
             {/each}
           </ul>
         </section>
@@ -1944,5 +2283,110 @@
     font-size: 0.8rem;
     color: var(--bone-2);
     letter-spacing: 0.02em;
+  }
+
+  /* #595 — Importable filter pills. Anchor row above the existing
+     filter bar. Same segmented-control rhythm as the scope-toggle
+     (mine / all) so the page reads as having two parallel filter axes.
+     Hidden when the user has no candidates and no non-default filter
+     selected — see the conditional in the markup. Mirror of the portal
+     /calls treatment. */
+  .importable-pills {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-2);
+    margin-bottom: 0.7rem;
+    width: max-content;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+  .importable-pill {
+    padding: 0.4rem 0.85rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--bone-3);
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, background 0.15s;
+  }
+  .importable-pill:hover {
+    color: var(--bone-0);
+  }
+  .importable-pill.active {
+    background: var(--ink-0);
+    color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--hairline-hi);
+  }
+
+  /* #595 — Candidate row (the import-not-yet-promoted variant of an
+     entry). Re-uses the existing .entry layout so rows align with real
+     call rows in the same list; the only structural addition is
+     `.candidate-actions`, the right-aligned button cluster replacing
+     the absent <a> click target. The pip + button styles themselves
+     live in app.css (mirrored from the portal) — see design.md
+     §"Candidate row (#595)". */
+  .candidate-entry {
+    cursor: default;
+    /* Add a fourth column for the action-button cluster. The layout
+       reads "time | body | actions | duration" so the duration stays
+       right-aligned with real call rows in the same list. */
+    grid-template-columns: 66px 1fr auto auto;
+  }
+  .candidate-entry:hover {
+    background: transparent;
+  }
+  .candidate-entry .entry-title {
+    color: var(--bone-1);
+  }
+  .candidate-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .entry-dur-na {
+    color: var(--bone-3);
+    font-style: italic;
+  }
+  @media (max-width: 540px) {
+    .candidate-entry {
+      grid-template-columns: 1fr;
+    }
+    .candidate-actions {
+      width: 100%;
+      justify-content: flex-start;
+    }
+  }
+
+  /* #595 — Source chip on candidate rows. Mirrors the portal's
+     `.source-chip` shape (rounded pill, accent-tinted) and per-source
+     variants (Zoho Meeting picks up the gold `--sig` family; SmartPBX
+     stays accent). Distinguishes externally-discovered recordings
+     from agent-recorded ones at a glance. */
+  .source-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.1rem 0.5rem;
+    font-size: 0.72rem;
+    color: var(--accent);
+    background: var(--accent-soft, rgba(58, 155, 146, 0.12));
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    font-weight: 500;
+  }
+  .source-chip.source-zoho_meeting {
+    color: var(--sig, #c9a24a);
+    background: rgba(201, 162, 74, 0.12);
+    border-color: rgba(201, 162, 74, 0.55);
+  }
+  .source-chip.source-smartpbx {
+    color: var(--accent);
+    background: var(--accent-soft, rgba(58, 155, 146, 0.12));
+    border-color: var(--accent);
   }
 </style>

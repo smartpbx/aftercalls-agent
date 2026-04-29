@@ -1,4 +1,13 @@
 {
+  "0.14.0": {
+    "headline": "Per-user opt-in for phone-system and Zoho Meeting imports, on-Linux auto-record by app, and exports of any size now work.",
+    "changes": [
+      "Choose which calls to import from your phone system or Zoho Meeting, one by one. Calls picked up from your connected phone system or from Zoho Meeting now show up on your Calls page as candidates first. Each candidate row has Import and Dismiss buttons, and a filter row above the calls list lets you switch between All, Importable only, and Hide importable. Admins get a new page to map phone-system extensions and Zoho Meeting accounts to the right team members, and to choose whether new candidates are auto-imported or held for review. If your admin has connected Zoho Meeting before, your existing setup keeps working unchanged unless they flip a 'Switch to per-user opt-in' toggle on the integration page.",
+      "On Linux, the desktop app can record calls automatically when you start a chosen app. On Linux, Settings → Recording has a new Auto-record section. Turn on the master toggle, then add the apps you want covered (your softphone, your meeting client, and so on). When one of those apps starts a call, recording begins automatically. A small toast appears for five seconds with a Cancel button so you can stop it before anything is captured. The master toggle is off by default — nothing changes until you turn it on. Coming soon on Mac and Windows: those platforms show a 'not yet supported' note in the same settings area for now.",
+      "Export your data from the desktop app, not just the web portal. The desktop app's Settings → Privacy now matches the web portal. You can request a full data export, see its packaging status, and download it from the same page — no need to switch to the web portal to start the export.",
+      "Owners and admins can read the call-access log directly. The log of who has opened each recording inside your organization used to say 'available on request'. Owners and admins can now open it directly from the new Access log page under the admin area. End users still see their own per-call access list on each call's detail page; nothing changes for them."
+    ]
+  },
   "0.13.0": {
     "headline": "Export your data, delete your account, and a refreshed Privacy Policy aligned with GDPR — plus a persistent on-screen indicator any time aftercalls is recording.",
     "changes": [

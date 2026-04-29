@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.13.0"
+version = "0.14.0"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -42,6 +42,16 @@ toml = "0.8"
 dirs = "5"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 thiserror = "1"
+# Local-only sqlite store of "apps that have used your microphone"
+# (#596). `bundled` ships sqlite as part of the build artifact so we
+# don't depend on the host's libsqlite — keeps cross-compiles to
+# Windows + macOS from special-casing system libs. `chrono` enables
+# the rfc3339 date roundtrip helpers we use for observed_apps timestamps.
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+# Pending-id generator for the auto-record cancel toast (#596). Pinned
+# at 0.8 to match what reqwest's deps already drag in transitively, so
+# we don't bloat the dep graph with a parallel 0.9 chain.
+rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
