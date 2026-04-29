@@ -4,25 +4,16 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
-use crate::mic_consumers::raw_mic_consumers;
+use crate::mic_consumers::{is_blacklisted, raw_mic_consumers};
 use crate::notify_actions::{self, ActionSpec, NotifyError};
 use crate::recorder::Recorder;
 
-/// Apps we *don't* want to treat as "a call." Matched case-insensitively as
-/// substrings. Kept tight: WEBRTC VoiceEngine is the generic Chromium/Electron
-/// audio stack, so Discord hits it — we rely on `application.process.binary`
-/// to identify the real app (Discord / teams-for-linux / etc.) and only
-/// blacklist things that are *never* an app-meeting (our own capture and
-/// accessibility noise).
-const MIC_CONSUMER_BLACKLIST: &[&str] = &[
-    "pipewire alsa [client]", // generic ALSA client (our cpal mic path lands here)
-    "pacat",                  // parec's binary
-    "parec",
-    "pw-cat",
-    "pw-record",
-    "speech-dispatcher",
-    "aftercalls",             // our own cpal mic consumer shows up as "pipewire alsa [aftercalls]"
-];
+// Apps we *don't* want to treat as "a call" — vendor helpers we spawn,
+// generic framework labels, accessibility noise. Lives in
+// `mic_consumers::MIC_CONSUMER_BLACKLIST` so the detector AND the
+// auto-record observer share one filter (#604: the observer used to
+// skip this list, leaking `parec` + `Chromium input` into the
+// user-visible auto-record catalog). New entries land there, not here.
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the mic consumer must be gone before we prompt to end.
@@ -277,6 +268,10 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
 /// In practice the two are the same for non-empty rows; the wrapper
 /// just keeps the same shape callers expect.
 fn interesting_mic_consumers() -> Vec<String> {
+    // `raw_mic_consumers` already applies the blacklist + helper-proc
+    // filters at the source (#604), so this wrapper is just dedup +
+    // bundle_id-preferred display. Belt-and-braces re-check via
+    // `is_blacklisted` in case a future refactor lets a row slip past.
     let consumers = raw_mic_consumers();
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -286,11 +281,7 @@ fn interesting_mic_consumers() -> Vec<String> {
         } else {
             c.bundle_id.clone()
         };
-        let lower = display.to_lowercase();
-        if MIC_CONSUMER_BLACKLIST
-            .iter()
-            .any(|b| lower.contains(&b.to_lowercase()))
-        {
+        if is_blacklisted(&display) {
             continue;
         }
         if seen.insert(display.clone()) {

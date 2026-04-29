@@ -42,10 +42,21 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// internally, but capping the emit-rate here is a cheap belt.
 const OBSERVED_UPDATED_THROTTLE: Duration = Duration::from_secs(2);
 
-/// Matches `CARGO_PKG_NAME` — the binary name our recorder shows up as
-/// in `pactl`. Used as the recursion-guard name in `on_event`.
+/// The bundled binary basename, NOT `CARGO_PKG_NAME`. The crate is
+/// named `agent` (codepath neutrality) but the bundled binary on every
+/// supported OS is `aftercalls` — `pactl` (Linux) and `process_exe_basename`
+/// (Windows) report this name. Using `CARGO_PKG_NAME` here silently
+/// disabled the recursion guard for two releases (#604) because every
+/// `bundle_id == "agent"` check missed the real binary `aftercalls`.
+///
+/// If the bundle ever gets renamed — change `productName` in
+/// `tauri.conf.json` — update this const in lockstep AND keep the
+/// blacklist entry in `mic_consumers::MIC_CONSUMER_BLACKLIST` aligned
+/// (the two are belt-and-braces against the same recursion failure).
+const OWN_BUNDLE_ID: &str = "aftercalls";
+
 fn own_bundle_id() -> &'static str {
-    env!("CARGO_PKG_NAME")
+    OWN_BUNDLE_ID
 }
 
 /// In-flight pending start. Lives behind a `Mutex<Option<…>>` on the
@@ -147,6 +158,14 @@ impl AutoRecorder {
             }
         };
         self.maybe_emit_observed_updated(app, inserted);
+
+        // Initial-batch events populate the catalog only — never fire
+        // the trigger. See `audio_observer.rs` §"Initial-tick semantics":
+        // a softphone running since boot must not trigger an auto-
+        // recording the moment the user opens the agent.
+        if ev.initial {
+            return;
+        }
 
         // Check master pref + per-row enable. Default OFF for both, so
         // a fresh install never fires.
@@ -411,10 +430,26 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn own_bundle_id_matches_cargo_pkg_name() {
-        // Defends against an accidental rename of the agent crate that
-        // would silently disable our self-recursion guard.
-        assert_eq!(own_bundle_id(), env!("CARGO_PKG_NAME"));
+    fn own_bundle_id_is_the_bundled_binary_basename() {
+        // Defends against #604 regressing: the prior version of this
+        // test asserted equality with `CARGO_PKG_NAME` ("agent"), but
+        // the bundled binary on every supported OS is "aftercalls" and
+        // pactl / WASAPI report THAT name. The recursion guard checks
+        // `ev.bundle_id == own_bundle_id()`, so getting this wrong
+        // means the agent's own cpal mic capture leaks into the
+        // observed-apps list and (if a user toggled it on) recording
+        // would loop into itself.
+        assert_eq!(own_bundle_id(), "aftercalls");
+        assert_ne!(own_bundle_id(), env!("CARGO_PKG_NAME"));
+    }
+
+    #[test]
+    fn own_bundle_id_is_in_mic_consumer_blacklist() {
+        // Belt-and-braces: even if the recursion guard fails, the
+        // blacklist filter inside `mic_consumers::raw_mic_consumers`
+        // should drop our binary at the source. Keep the two aligned —
+        // a rename touching only one is a #604-class regression.
+        assert!(crate::mic_consumers::is_blacklisted(own_bundle_id()));
     }
 
     #[test]

@@ -11,19 +11,111 @@
 //!   * `bundle_id`: a stable key (process binary on Linux, exe basename
 //!     on Windows, bundle id on macOS once that lands). `auto_recorder`
 //!     and the `observed_apps` sqlite table key off this.
-//!   * `friendly_name`: a human-readable display string (PA's
-//!     `application.name` if present; falls back to `bundle_id`).
-//!
-//! The detector wraps the resulting list with its own
-//! `MIC_CONSUMER_BLACKLIST` substring filter; see `interesting_mic_consumers`
-//! in detector.rs.
+//!   * `friendly_name`: a human-readable display string. Falls back to
+//!     `bundle_id` when the OS-supplied label is empty OR matches a
+//!     generic audio-framework boilerplate pattern (e.g. PipeWire's
+//!     "PipeWire ALSA [<binary>]" placeholder for raw ALSA streams).
 //!
 //! Public-copy posture: the strings the observer surfaces to the
 //! webview come straight from `friendly_name` (or `bundle_id`), so
 //! they're whatever the user's OS named the app — never our own
 //! "PipeWire" / "PulseAudio" label.
+//!
+//! ## Cross-platform contract (read this before adding macOS, or
+//!  before touching the Windows path)
+//!
+//! Every `raw_mic_consumers()` impl MUST:
+//!
+//! 1. **Filter our own process.** Whatever the agent's bundled binary
+//!    is named on the host (`aftercalls` on Linux/macOS, `aftercalls.exe`
+//!    on Windows), the impl skips any source-output / audio-session
+//!    whose owning process is us. Both PID-based filtering (cheap,
+//!    works for the main agent process) AND bundle-id matching against
+//!    the agent's binary name (catches the cpal capture stream that PA
+//!    sometimes attributes to a child PID) are required. Failing to
+//!    do this will let `aftercalls` appear in the observer's catalog,
+//!    and an enabled row would loop a recording onto itself (#604 was
+//!    exactly this on Linux because `own_bundle_id()` returned the
+//!    crate name `agent` instead of the bundled binary `aftercalls`).
+//!
+//! 2. **Apply `MIC_CONSUMER_BLACKLIST`.** Vendor helpers we spawn
+//!    (`parec`, `pacat`, `pw-cat`, `pw-record`, `ffmpeg`) and generic
+//!    framework labels (`PipeWire ALSA [client]`, `Chromium input`)
+//!    must be filtered at the source — NOT only inside
+//!    `detector::interesting_mic_consumers`. The observer used to skip
+//!    this filter and leaked `parec` + `Chromium input` into the
+//!    user-visible catalog (#604).
+//!
+//! 3. **Apply `is_helper_proc()`.** Crashpad handlers, Chromium GPU
+//!    helpers, Electron renderer subprocesses (binaries named
+//!    `*_helper`, `crashpad_*`, `*-renderer`, `*_renderer`,
+//!    `gpu-process`) are filtered. The user's mental model is the
+//!    parent app, never the helper.
+//!
+//! 4. **Surface `friendly_name` only when it's actually friendly.**
+//!    On Linux, PipeWire reports raw ALSA streams as
+//!    "PipeWire ALSA [<binary>]" with no `application.name` set by the
+//!    app itself. Surfacing that string in the observer catalog reads
+//!    as a vendor-name leak ("PipeWire" is our infra) and doesn't
+//!    match the detector's `bundle_id` rendering. Fall back to
+//!    `bundle_id` (binary basename) when the OS string matches the
+//!    framework's generic pattern. Same posture applies to any future
+//!    macOS impl that hits CoreAudio's default fallback strings.
+//!
+//! 5. **Stable `bundle_id`.** Must remain stable across app restarts
+//!    and version updates so `observed_apps` rows survive. A renamed
+//!    `application.name` (e.g. Slack swapping to "Slack | DM") should
+//!    NOT detach the row.
 
 use std::collections::HashSet;
+
+/// Vendor helpers + generic audio-framework labels we never want to
+/// surface as a "mic-using app". Substring-matched case-insensitively
+/// against `bundle_id` AND `friendly_name`. Applied at the source
+/// inside every `raw_mic_consumers()` impl so the observer + the
+/// detector see an identical view (the detector used to carry its own
+/// duplicate of this list — fixed in #604).
+///
+/// New entries land here, NOT in any per-platform list. Per-platform
+/// helper-process patterns (Chromium renderers etc.) live in
+/// `is_helper_proc` because their structure is regex-like rather than
+/// a literal substring.
+pub const MIC_CONSUMER_BLACKLIST: &[&str] = &[
+    "pipewire alsa [client]", // generic ALSA client (our cpal mic path lands here)
+    "pipewire alsa [aftercalls]", // belt-and-braces if PID filter ever drops a frame
+    "chromium input",         // WebKit/GStreamer media source label
+    "pacat",                  // parec's binary
+    "parec",
+    "pw-cat",
+    "pw-record",
+    "speech-dispatcher",
+    "aftercalls",             // our own cpal mic consumer's binary basename
+];
+
+/// True when `s` matches any blacklist entry (case-insensitive
+/// substring). Public so the detector + observer can apply it to
+/// `bundle_id` and `friendly_name` consistently.
+pub fn is_blacklisted(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    MIC_CONSUMER_BLACKLIST
+        .iter()
+        .any(|b| lower.contains(&b.to_lowercase()))
+}
+
+/// Strip the PipeWire-ALSA boilerplate ("PipeWire ALSA [<binary>]")
+/// and the framework-default labels that aren't actually informative.
+/// Returns `None` if `friendly` is fine to surface as-is, or
+/// `Some(replacement)` if the caller should swap to `bundle_id`.
+fn looks_like_generic_framework_label(friendly: &str) -> bool {
+    let trimmed = friendly.trim();
+    if trimmed.starts_with("PipeWire ALSA [") && trimmed.ends_with(']') {
+        return true;
+    }
+    // CoreAudio / WASAPI fallback strings will land here when those
+    // platforms don't get a real session display name — punt with the
+    // bundle_id basename instead.
+    matches!(trimmed.to_lowercase().as_str(), "chromium input" | "system audio")
+}
 
 /// One mic-consuming app the OS reports.
 ///
@@ -105,14 +197,31 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
             // fall back to application.name. If both are missing, skip.
             let bundle = binary.clone().or_else(|| name.clone());
             if let Some(bundle) = bundle {
+                let bundle_blacklisted = is_blacklisted(&bundle);
+                let name_blacklisted =
+                    name.as_deref().map(is_blacklisted).unwrap_or(false);
                 if !is_helper_proc(&bundle)
                     && !name.as_deref().map(is_helper_proc).unwrap_or(false)
+                    && !bundle_blacklisted
+                    && !name_blacklisted
                     && seen.insert(bundle.clone())
                 {
-                    let friendly = name
+                    // Surface bundle_id as friendly_name when the OS
+                    // gave us a generic framework boilerplate
+                    // ("PipeWire ALSA [...]") — those aren't user-
+                    // recognizable labels and they leak our infra
+                    // ("PipeWire") into the catalog UI. The detector
+                    // already prefers bundle_id; this keeps the
+                    // observer's strings in lockstep so the auto-
+                    // detect tag and the auto-record list show the
+                    // same name (#604).
+                    let raw_friendly = name
                         .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| bundle.clone());
+                        .filter(|s| !s.trim().is_empty());
+                    let friendly = match raw_friendly {
+                        Some(s) if !looks_like_generic_framework_label(&s) => s,
+                        _ => bundle.clone(),
+                    };
                     result.push(RawMicConsumer::new(bundle, friendly));
                 }
             }
@@ -162,12 +271,17 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
 /// friendly_name; the `friendly_name` path can be improved later by
 /// reading `IAudioSessionControl::GetDisplayName` but the basename is
 /// stable and recognizable enough for v1.
+///
+/// Applies the same `is_helper_proc` + `is_blacklisted` filters as the
+/// Linux path so the observer's catalog stays consistent across
+/// platforms — see the cross-platform contract in this module's
+/// docstring (item 1 + 2).
 #[cfg(target_os = "windows")]
 pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
     match windows_mic_consumers() {
         Ok(v) => v
             .into_iter()
-            .filter(|name| !is_helper_proc(name))
+            .filter(|name| !is_helper_proc(name) && !is_blacklisted(name))
             .map(|name| RawMicConsumer::new(name.clone(), name))
             .collect(),
         Err(e) => {
@@ -355,5 +469,43 @@ mod tests {
         assert!(!is_helper_proc("zoom"));
         assert!(!is_helper_proc("firefox"));
         assert!(!is_helper_proc("teams-for-linux"));
+    }
+
+    #[test]
+    fn blacklist_catches_our_own_helpers_and_generic_framework_labels() {
+        // The agent's own binary + the helper procs we spawn for
+        // capture must be filtered at source so they never reach the
+        // observer's catalog (#604).
+        assert!(is_blacklisted("aftercalls"));
+        assert!(is_blacklisted("parec"));
+        assert!(is_blacklisted("pacat"));
+        assert!(is_blacklisted("pw-cat"));
+        assert!(is_blacklisted("pw-record"));
+        assert!(is_blacklisted("speech-dispatcher"));
+        // Generic framework labels — surfacing these would leak our
+        // infra ("PipeWire") into user copy.
+        assert!(is_blacklisted("Chromium input"));
+        assert!(is_blacklisted("PipeWire ALSA [aftercalls]"));
+        assert!(is_blacklisted("PipeWire ALSA [client]"));
+        // Real apps must NOT match the blacklist.
+        assert!(!is_blacklisted("zoom"));
+        assert!(!is_blacklisted("cliq"));
+        assert!(!is_blacklisted("slack"));
+        assert!(!is_blacklisted("Microsoft Teams"));
+    }
+
+    #[test]
+    fn generic_framework_label_detection_strips_pipewire_alsa_pattern() {
+        // PipeWire labels raw ALSA streams with this boilerplate when
+        // the app didn't set `application.name` — surfacing it as the
+        // friendly_name reads as a vendor-name leak and doesn't match
+        // the detector's bundle_id rendering.
+        assert!(looks_like_generic_framework_label("PipeWire ALSA [voxtype-avx2]"));
+        assert!(looks_like_generic_framework_label("PipeWire ALSA [aftercalls]"));
+        assert!(looks_like_generic_framework_label("Chromium input"));
+        // App-supplied names must NOT be considered generic.
+        assert!(!looks_like_generic_framework_label("Slack Call"));
+        assert!(!looks_like_generic_framework_label("Zoho Cliq"));
+        assert!(!looks_like_generic_framework_label("Zoom Meeting"));
     }
 }

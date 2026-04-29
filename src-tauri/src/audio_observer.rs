@@ -19,6 +19,27 @@
 //! Public-copy posture: we never name PipeWire / Pulse / WASAPI in any
 //! string the webview can render. The IPC layer just ships
 //! `bundle_id` / `friendly_name` strings.
+//!
+//! ## Initial-tick semantics (read this before changing the spawn loop)
+//!
+//! Two competing requirements:
+//! - **Catalog discovery** wants to surface apps that were already
+//!   running when the agent / observer woke up, so the user can pick
+//!   them in the auto-record list. Without this, a softphone that
+//!   stays open 24/7 (e.g. Cliq) never reaches the catalog and can't
+//!   be whitelisted (#604).
+//! - **Trigger semantics** must NOT auto-start a recording for an app
+//!   that was already running at observer-wake — that'd be a surprise
+//!   recording every time the user opens the agent. Auto-record fires
+//!   on a real "user just engaged the mic" transition, not on a
+//!   process that's been running since boot.
+//!
+//! Resolution: the spawn loop seeds `active` with the current set
+//! BEFORE the diff loop, and emits a synthetic `Started` event with
+//! `initial = true` for each. `auto_recorder::on_started` always
+//! upserts into `observed_apps` (catalog), then short-circuits before
+//! the trigger logic when `initial` is true. Subsequent ticks emit
+//! transition-only `Started` / `Stopped` with `initial = false`.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -27,15 +48,22 @@ use tokio::sync::mpsc;
 
 use crate::mic_consumers::{raw_mic_consumers, RawMicConsumer};
 
-/// Edge-trigger event surfaced to the auto-recorder. Fires only on a
-/// transition between consecutive ticks — apps that were already
-/// capturing when the observer first wakes do NOT fire (matches Q4 of
-/// the architect's plan).
+/// Event surfaced to the auto-recorder. Two flavours:
+///   - Transition events fire when an app appears/disappears between
+///     consecutive ticks (`initial = false`).
+///   - Initial-batch events fire once on observer wake for every app
+///     already capturing the mic at that moment (`initial = true`).
+///     The auto-recorder uses this to populate the catalog without
+///     firing the auto-record trigger — see the module docstring's
+///     "Initial-tick semantics" section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McaEvent {
     pub bundle_id: String,
     pub friendly_name: String,
     pub kind: McaEventKind,
+    /// True for the synthetic batch emitted on observer wake (catalog-
+    /// only). False for real idle→active / active→idle transitions.
+    pub initial: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +101,27 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
     tauri::async_runtime::spawn(async move {
-        let mut active: HashSet<RawMicConsumer> = HashSet::new();
+        // Seed `active` with the current set BEFORE the diff loop so
+        // we don't auto-trigger a recording for apps that were already
+        // running at observer-wake. Emit a catalog-only `initial = true`
+        // batch for each so the auto-record list still discovers them.
+        // See module docstring §"Initial-tick semantics" for why both
+        // halves are needed.
+        let initial_active: HashSet<RawMicConsumer> = raw_mic_consumers().into_iter().collect();
+        for c in &initial_active {
+            let ev = McaEvent {
+                bundle_id: c.bundle_id.clone(),
+                friendly_name: c.friendly_name.clone(),
+                kind: McaEventKind::Started,
+                initial: true,
+            };
+            if tx.send(ev).is_err() {
+                return; // receiver dropped — bail
+            }
+        }
+        let mut active = initial_active;
         loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
             let next: HashSet<RawMicConsumer> = raw_mic_consumers().into_iter().collect();
             for ev in diff(&active, &next) {
                 if tx.send(ev).is_err() {
@@ -82,7 +129,6 @@ pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
                 }
             }
             active = next;
-            tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
 }
@@ -113,6 +159,7 @@ pub fn diff(prev: &HashSet<RawMicConsumer>, next: &HashSet<RawMicConsumer>) -> V
                 bundle_id: c.bundle_id.clone(),
                 friendly_name: c.friendly_name.clone(),
                 kind: McaEventKind::Started,
+                initial: false,
             });
         }
     }
@@ -123,6 +170,7 @@ pub fn diff(prev: &HashSet<RawMicConsumer>, next: &HashSet<RawMicConsumer>) -> V
                 bundle_id: c.bundle_id.clone(),
                 friendly_name: c.friendly_name.clone(),
                 kind: McaEventKind::Stopped,
+                initial: false,
             });
         }
     }
@@ -147,6 +195,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].bundle_id, "zoom");
         assert_eq!(events[0].kind, McaEventKind::Started);
+        // Real transition events MUST be `initial: false` so the
+        // auto-recorder's trigger logic runs (the initial-batch
+        // short-circuit only suppresses observer-wake events).
+        assert!(!events[0].initial);
     }
 
     #[test]
