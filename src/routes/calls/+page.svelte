@@ -18,7 +18,7 @@
 
   // #57 Tag-aware filter bar.
   //
-  // The bar is two parts: a title-only text input and a tag-chip row.
+  // The bar is two parts: a text search input and a tag-chip row.
   // Tag filters live on the URL as repeated `?tag=kind:value` params
   // (the backend accepts this shape natively), so refresh + share-link
   // preserve the filter set. We re-fetch whenever the tag set changes;
@@ -50,6 +50,8 @@
     // responses don't break the type.
     user_id?: string;
     user_display_name?: string;
+    pinned_at?: string | null;
+    snoozed_until?: string | null;
   };
 
   type TagSuggestion = { kind: string; value: string; count: number };
@@ -133,6 +135,8 @@
   let loading = $state(true);
   let query = $state("");
   let me = $state<Me | null>(null);
+  type ListView = "active" | "pinned" | "snoozed";
+  let listView = $state<ListView>("active");
 
   // #386 — keyset pagination. `nextCursor` mirrors the backend
   // envelope; `null` on the final page hides the Load-more button.
@@ -210,6 +214,10 @@
   let fromDate = $state("");
   let toDate = $state("");
   let dateTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  let callActionBusy = $state<Record<string, boolean>>({});
+  let snoozePickerFor = $state<string | null>(null);
+  let snoozeDraft = $state("");
 
   // Admin-only: filter the All-team list to a single member.
   let userFilter = $state<{ id: string; name: string } | null>(null);
@@ -281,6 +289,12 @@
     return "all";
   }
 
+  function readListViewFromUrl(): ListView {
+    if (typeof window === "undefined") return "active";
+    const raw = new URL(window.location.href).searchParams.get("view");
+    return raw === "pinned" || raw === "snoozed" ? raw : "active";
+  }
+
   function syncUrl() {
     if (typeof window === "undefined") return;
     const u = new URL(window.location.href);
@@ -298,6 +312,8 @@
     if (importableFilter !== "all") {
       u.searchParams.set("filter", importableFilter);
     }
+    u.searchParams.delete("view");
+    if (listView !== "active") u.searchParams.set("view", listView);
     // #135 — use SvelteKit's `replaceState` so the browser history
     // stays in sync with the filter pill without a push-navigation.
     // `replaceState` from `$app/navigation` updates `history` +
@@ -331,6 +347,8 @@
           // #386 — first page → no cursor; PAGE_SIZE is the chunk size.
           cursor: null,
           limit: PAGE_SIZE,
+          q: query,
+          view: listView,
         }).catch((e) => ({ _err: e }))
       : Promise.resolve(null);
     const candidatesPromise: Promise<api.ImportCandidatesResponse | { _err: unknown } | null> =
@@ -396,6 +414,8 @@
         toDate: toDate ? `${toDate}T23:59:59Z` : null,
         cursor: nextCursor,
         limit: PAGE_SIZE,
+        q: query,
+        view: listView,
       });
       const resp = parseListResponse(raw);
       calls = [...calls, ...resp.calls];
@@ -419,10 +439,28 @@
     }, 250);
   }
 
+  function onSearchChange() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      void load();
+    }, 250);
+  }
+
+  async function setListView(next: ListView) {
+    if (listView === next) return;
+    listView = next;
+    syncUrl();
+    await load();
+  }
+
   async function clearDates() {
     if (dateTimer) {
       clearTimeout(dateTimer);
       dateTimer = null;
+    }
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
     }
     fromDate = "";
     toDate = "";
@@ -491,9 +529,14 @@
     userFilter = null;
     fromDate = "";
     toDate = "";
+    listView = "active";
     if (dateTimer) {
       clearTimeout(dateTimer);
       dateTimer = null;
+    }
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
     }
     syncUrl();
     await load();
@@ -642,6 +685,7 @@
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
     importableFilter = readImportableFilterFromUrl();
+    listView = readListViewFromUrl();
     if (scope === "all" && canSeeAll) void ensureMemberRoster();
     nowTimer = setInterval(() => {
       nowMs = Date.now();
@@ -659,7 +703,7 @@
       [
         { keys: "j k", label: "Next / previous call" },
         { keys: "enter o", label: "Open the highlighted call" },
-        { keys: "/", label: "Focus the title filter" },
+        { keys: "/", label: "Focus search" },
       ],
     );
     await load();
@@ -669,6 +713,10 @@
     if (nowTimer !== undefined) {
       clearInterval(nowTimer);
       nowTimer = undefined;
+    }
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
     }
     teardownShortcuts?.();
     teardownShortcuts = null;
@@ -685,14 +733,12 @@
     fromDate = readDateFromUrl("from");
     toDate = readDateFromUrl("to");
     importableFilter = readImportableFilterFromUrl();
+    listView = readListViewFromUrl();
     void load();
   });
 
   let filtered = $derived.by(() => {
-    if (!query.trim()) return calls;
-    const q = query.trim().toLowerCase();
-    // Title-only now — client lives in the tag-filter bar above.
-    return calls.filter((c) => (c.title ?? "").toLowerCase().includes(q));
+    return calls;
   });
 
   // #595 — title-search applies to candidates too so the search box
@@ -968,6 +1014,112 @@
       candidateBusy = { ...candidateBusy, [c.id]: false };
     }
   }
+
+  function localDateValue(d: Date): string {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+
+  function tomorrowValue(): string {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return localDateValue(d);
+  }
+
+  function nextMondayValue(): string {
+    const d = new Date();
+    const days = (8 - d.getDay()) % 7 || 7;
+    d.setDate(d.getDate() + days);
+    return localDateValue(d);
+  }
+
+  function snoozeWireValue(day: string): string {
+    return `${day}T00:00:00Z`;
+  }
+
+  function snoozeLabel(iso: string): string {
+    return new Date(iso).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
+  }
+
+  async function togglePin(e: MouseEvent, call: Call) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (callActionBusy[call.id]) return;
+    const nextPinned = !call.pinned_at;
+    callActionBusy = { ...callActionBusy, [call.id]: true };
+    const prev = calls;
+    calls = calls.map((c) =>
+      c.id === call.id
+        ? { ...c, pinned_at: nextPinned ? new Date().toISOString() : null }
+        : c,
+    );
+    try {
+      await invoke("patch_call", { id: call.id, body: { pinned: nextPinned } });
+      await load();
+    } catch (err: any) {
+      calls = prev;
+      toast.error(`Couldn't update pin: ${portalErrorToText(err)}`);
+    } finally {
+      callActionBusy = { ...callActionBusy, [call.id]: false };
+    }
+  }
+
+  function openSnoozePicker(e: MouseEvent, call: Call) {
+    e.preventDefault();
+    e.stopPropagation();
+    snoozePickerFor = snoozePickerFor === call.id ? null : call.id;
+    snoozeDraft = call.snoozed_until
+      ? localDateValue(new Date(call.snoozed_until))
+      : tomorrowValue();
+  }
+
+  async function applySnooze(e: MouseEvent, call: Call, day = snoozeDraft) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!day || callActionBusy[call.id]) return;
+    callActionBusy = { ...callActionBusy, [call.id]: true };
+    const prev = calls;
+    const wire = snoozeWireValue(day);
+    calls = calls.map((c) =>
+      c.id === call.id ? { ...c, snoozed_until: wire } : c,
+    );
+    try {
+      await invoke("patch_call", { id: call.id, body: { snoozed_until: wire } });
+      snoozePickerFor = null;
+      await load();
+    } catch (err: any) {
+      calls = prev;
+      toast.error(`Couldn't snooze: ${portalErrorToText(err)}`);
+    } finally {
+      callActionBusy = { ...callActionBusy, [call.id]: false };
+    }
+  }
+
+  async function clearSnooze(e: MouseEvent, call: Call) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (callActionBusy[call.id]) return;
+    callActionBusy = { ...callActionBusy, [call.id]: true };
+    const prev = calls;
+    calls = calls.map((c) =>
+      c.id === call.id ? { ...c, snoozed_until: null } : c,
+    );
+    try {
+      await invoke("patch_call", { id: call.id, body: { snoozed_until: null } });
+      snoozePickerFor = null;
+      await load();
+    } catch (err: any) {
+      calls = prev;
+      toast.error(`Couldn't clear snooze: ${portalErrorToText(err)}`);
+    } finally {
+      callActionBusy = { ...callActionBusy, [call.id]: false };
+    }
+  }
 </script>
 
 <main class="page">
@@ -1042,6 +1194,33 @@
     </div>
   {/if}
 
+  <div class="list-view-pills" role="group" aria-label="Call list view">
+    <button
+      type="button"
+      class="list-view-pill"
+      class:active={listView === "active"}
+      onclick={() => setListView("active")}
+    >
+      Active
+    </button>
+    <button
+      type="button"
+      class="list-view-pill"
+      class:active={listView === "pinned"}
+      onclick={() => setListView("pinned")}
+    >
+      Pinned
+    </button>
+    <button
+      type="button"
+      class="list-view-pill"
+      class:active={listView === "snoozed"}
+      onclick={() => setListView("snoozed")}
+    >
+      Snoozed
+    </button>
+  </div>
+
   <div class="filter-bar">
     <div class="search">
       <span class="search-glyph" aria-hidden="true">
@@ -1052,9 +1231,10 @@
       </span>
       <input
         type="text"
-        placeholder="Filter by title"
+        placeholder="Search titles and transcripts"
         bind:value={query}
         bind:this={searchInput}
+        oninput={onSearchChange}
       />
     </div>
     <div class="chip-row">
@@ -1279,7 +1459,7 @@
     <p class="state">Loading…</p>
   {:else if error}
     <p class="state err">{error}</p>
-  {:else if calls.length === 0 && candidates.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate && importableFilter === "all"}
+  {:else if calls.length === 0 && candidates.length === 0 && tagFilters.length === 0 && !query.trim() && !fromDate && !toDate && importableFilter === "all" && listView === "active"}
     <div class="empty">
       <p class="empty-title">No calls yet</p>
       <p class="empty-sub">
@@ -1292,6 +1472,10 @@
       <p class="empty-title">
         {#if importableFilter === "importable"}
           No importable recordings
+        {:else if listView === "pinned"}
+          No pinned calls
+        {:else if listView === "snoozed"}
+          No snoozed calls
         {:else if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
           No calls in the selected range
         {:else}
@@ -1413,6 +1597,14 @@
                           <span class="tag-chip-label">client: {call.matched_client}</span>
                         </span>
                       {/if}
+                      {#if call.pinned_at}
+                        <span class="status-chip status-chip-pinned">Pinned</span>
+                      {/if}
+                      {#if call.snoozed_until}
+                        <span class="status-chip status-chip-snoozed">
+                          Snoozed {snoozeLabel(call.snoozed_until)}
+                        </span>
+                      {/if}
                       {#if call.ingest_source && call.ingest_source !== "agent"}
                         <!-- #303 — external-source chip drives off
                              ingest_source (the wire-side external
@@ -1472,6 +1664,73 @@
                         </span>
                       {:else if call.status !== "complete"}
                         <span class="status-chip status-chip-sig">{call.status}</span>
+                      {/if}
+                      <button
+                        type="button"
+                        class="row-action"
+                        disabled={callActionBusy[call.id]}
+                        onclick={(e) => togglePin(e, call)}
+                      >
+                        {call.pinned_at ? "Unpin" : "Pin"}
+                      </button>
+                      <button
+                        type="button"
+                        class="row-action"
+                        disabled={callActionBusy[call.id]}
+                        onclick={(e) => openSnoozePicker(e, call)}
+                      >
+                        Snooze
+                      </button>
+                      {#if call.snoozed_until}
+                        <button
+                          type="button"
+                          class="row-action"
+                          disabled={callActionBusy[call.id]}
+                          onclick={(e) => clearSnooze(e, call)}
+                        >
+                          Unsnooze
+                        </button>
+                      {/if}
+                      {#if snoozePickerFor === call.id}
+                        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                        <span
+                          class="snooze-pop"
+                          role="group"
+                          tabindex="-1"
+                          aria-label="Snooze options"
+                          onclick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onkeydown={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            class="row-action"
+                            onclick={(e) => applySnooze(e, call, tomorrowValue())}
+                          >
+                            Tomorrow
+                          </button>
+                          <button
+                            type="button"
+                            class="row-action"
+                            onclick={(e) => applySnooze(e, call, nextMondayValue())}
+                          >
+                            Next Mon
+                          </button>
+                          <DateInput
+                            value={snoozeDraft}
+                            onchange={(v) => (snoozeDraft = v)}
+                            ariaLabel="Snooze until"
+                          />
+                          <button
+                            type="button"
+                            class="row-action"
+                            onclick={(e) => applySnooze(e, call)}
+                          >
+                            Set
+                          </button>
+                        </span>
                       {/if}
                     </div>
                   </div>
@@ -2343,6 +2602,53 @@
     font-size: 0.7rem;
     padding: 0.1rem 0.5rem;
   }
+  .status-chip-pinned {
+    color: var(--accent);
+    border-color: rgba(58, 155, 146, 0.45);
+    background: rgba(58, 155, 146, 0.12);
+  }
+  .status-chip-snoozed {
+    color: var(--bone-1);
+    border-color: var(--hairline-hi);
+    background: var(--ink-2);
+  }
+  .row-action {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.35rem;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: var(--bone-2);
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .row-action:hover:not(:disabled),
+  .row-action:focus-visible {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+    outline: none;
+  }
+  .row-action:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .snooze-pop {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    padding: 0.25rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--ink-1);
+  }
+  .snooze-pop :global(.date-input-wrap) {
+    width: 8.5rem;
+  }
 
   .entry-dur {
     font-family: var(--font-mono);
@@ -2385,6 +2691,38 @@
     color: var(--bone-0);
   }
   .importable-pill.active {
+    background: var(--ink-0);
+    color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--hairline-hi);
+  }
+  .list-view-pills {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--ink-2);
+    margin: 0 0 0.7rem 0.6rem;
+    width: max-content;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+  .list-view-pill {
+    padding: 0.4rem 0.8rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--bone-3);
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, background 0.15s;
+  }
+  .list-view-pill:hover {
+    color: var(--bone-0);
+  }
+  .list-view-pill.active {
     background: var(--ink-0);
     color: var(--accent);
     box-shadow: inset 0 0 0 1px var(--hairline-hi);

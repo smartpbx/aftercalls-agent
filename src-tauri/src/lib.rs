@@ -562,6 +562,8 @@ async fn list_calls(
     // defaults to the backend's 50 when None.
     cursor: Option<String>,
     limit: Option<i64>,
+    q: Option<String>,
+    view: Option<String>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -577,6 +579,8 @@ async fn list_calls(
         to_date.as_deref(),
         cursor.as_deref(),
         limit,
+        q.as_deref(),
+        view.as_deref(),
     )
     .await
 }

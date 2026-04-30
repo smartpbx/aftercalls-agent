@@ -34,6 +34,10 @@ on:
 permissions:
   contents: write
 
+env:
+  VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+  VITE_SENTRY_ENVIRONMENT: production
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

@@ -305,6 +305,8 @@ pub async fn list_calls(
     // either falls through to the backend default.
     cursor: Option<&str>,
     limit: Option<i64>,
+    q: Option<&str>,
+    view: Option<&str>,
 ) -> std::result::Result<Value, PortalError> {
     // Tag filters are passed as repeated ?tag= params; missing = no
     // filter. scope=all restricts to admin/superadmin; user= narrows
@@ -342,6 +344,16 @@ pub async fn list_calls(
     }
     if let Some(n) = limit {
         params.push(("limit".into(), n.to_string()));
+    }
+    if let Some(search) = q {
+        if !search.trim().is_empty() {
+            params.push(("q".into(), search.trim().into()));
+        }
+    }
+    if let Some(v) = view {
+        if !v.is_empty() && v != "active" {
+            params.push(("view".into(), v.into()));
+        }
     }
     if !params.is_empty() {
         path.push('?');

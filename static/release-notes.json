@@ -1,4 +1,12 @@
 {
+  "0.14.10": {
+    "headline": "Adds faster call triage with transcript search, pinned calls, and action-item snoozing, plus fixes imported-call audio playback.",
+    "changes": [
+      "Search transcripts from the Calls page. The Calls page now has transcript search, so you can find a call by the words said in it instead of hunting by title or date. Results stay in the same call list you already use, with the usual filters and tags still available.",
+      "Pin important calls. You can now pin important calls so they stay easy to find while you work through follow-ups. Pinned calls keep their place of priority without changing the call's transcript, summary, tags, or sharing state.",
+      "Snooze action items until later. Action items can now be snoozed so work that is not ready today can get out of the way until the right time. Snoozed items remain attached to their call and return when they are due."
+    ]
+  },
   "0.14.8": {
     "headline": "Roomier notes editor that fills the window, processing-finished notifications for hidden windows, and a tray-icon fix during back-to-back recordings — plus faster, more resilient call summaries under the hood.",
     "changes": [

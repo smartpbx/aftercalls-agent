@@ -1,8 +1,33 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import { readFileSync as read } from "node:fs";
+import { execSync as exec } from "node:child_process";
 
-// @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+
+function agentVersion() {
+  try {
+    const toml = read(new URL("src-tauri/Cargo.toml", import.meta.url), "utf8");
+    const m = toml.match(/^\s*version\s*=\s*"([^"]+)"/m);
+    return m ? `v${m[1]}` : "";
+  } catch {
+    return "";
+  }
+}
+
+function gitSha() {
+  try {
+    return exec("git rev-parse --short HEAD", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return "dev";
+  }
+}
+
+const git = { sha: gitSha(), tag: agentVersion() };
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -28,5 +53,9 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+  },
+  define: {
+    "import.meta.env.VITE_BUILD_SHA": JSON.stringify(git.sha),
+    "import.meta.env.VITE_BUILD_TAG": JSON.stringify(git.tag),
   },
 }));

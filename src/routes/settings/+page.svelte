@@ -7,6 +7,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
   import { invalidateAppPrefs } from "$lib/stores/appPrefs.svelte";
+  import { setSentryTelemetryAllowed } from "$lib/sentry";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { portalErrorToText } from "$lib/portalError";
 
@@ -399,6 +400,7 @@
       // (compliance.ts / notify.ts) sees the freshly-saved values
       // instead of stale module-level state.
       invalidateAppPrefs();
+      setSentryTelemetryAllowed(telemetryEnabled);
       prefsSavedAt = Date.now();
     } catch (e) {
       error = portalErrorToText(e);

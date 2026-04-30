@@ -18,6 +18,8 @@
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
   import ToastHost from "$lib/ToastHost.svelte";
   import ShortcutsOverlay from "$lib/ShortcutsOverlay.svelte";
+  import { initSentry } from "$lib/sentry";
+  import { getAppPrefs } from "$lib/stores/appPrefs.svelte";
   import {
     initShortcutListener,
     registerShortcuts,
@@ -609,6 +611,8 @@
   let teardownGlobalShortcuts: (() => void) | null = null;
 
   onMount(async () => {
+    const appPrefs = await getAppPrefs();
+    initSentry(appPrefs?.telemetry_enabled === true);
     // #282 — start the shared shortcut listener + register the
     // always-on global bindings.
     initShortcutListener();
