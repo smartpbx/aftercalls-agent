@@ -82,6 +82,8 @@ export type DataExportRow = {
   call_count: number | null;
   audio_count: number | null;
   error_message: string | null;
+  /** Upload progress, 0–100 (#591). Mirrors portal `DataExportRow`. */
+  progress_pct: number | null;
   /** Only present on `getStatus` when the row is `ready` and the
    *  archive hasn't expired. The backend re-issues a fresh 24h
    *  presigned link on every poll, so the page doesn't need to

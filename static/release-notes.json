@@ -1,4 +1,11 @@
 {
+  "0.14.7": {
+    "headline": "Sharper team-wide first-run nudge, live progress on data exports, shorter onboarding for non-admins, plus accordion-style release notes and SEO/help polish on the marketing site.",
+    "changes": [
+      "First-run Calls page now nudges the whole team toward the desktop app. Until someone on your team records their first call with the desktop app, the empty state on the Calls page now reads 'No calls from the desktop app yet' with a short explanation that calls show up there once anyone on the team records — instead of the generic 'No calls yet' message. The Download desktop app button is the same; the copy just makes it clearer to admins setting up a new org what the next step is for the whole team, not just the signed-in user.",
+      "Data export status pill now shows live progress while the archive is being built. When you request a data export from Settings → Privacy, the status pill now shows a percentage while the archive is being assembled — for example, 'Packaging (62%)'. The page polls every two seconds while an export is pending or running, so the pill ticks up without you needing to refresh. Same change applies on both the web portal and the desktop app."
+    ]
+  },
   "0.14.5": {
     "headline": "Multi-speaker transcripts on imported recordings, audio works on every imported-recording detail page, waveforms on imports, transcript download, plus several smaller fixes.",
     "changes": [

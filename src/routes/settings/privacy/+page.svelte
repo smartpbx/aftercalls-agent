@@ -77,6 +77,18 @@
     return s;
   }
 
+  /** #600 — surface worker upload progress on the pill while pending/running. */
+  function exportPillLabel(row: api.DataExportRow): string {
+    let base = statusLabel(row.status);
+    if (
+      (row.status === "pending" || row.status === "running") &&
+      row.progress_pct != null
+    ) {
+      base += ` (${Math.round(row.progress_pct)}%)`;
+    }
+    return base;
+  }
+
   function formatBytes(b: number | null): string {
     if (b == null) return "";
     if (b < 1024) return `${b} B`;
@@ -199,6 +211,24 @@
     await loadExports();
   });
 
+  $effect(() => {
+    const row = latest;
+    if (!row || (row.status !== "pending" && row.status !== "running"))
+      return;
+    const id = row.id;
+    const t = setInterval(() => {
+      void (async () => {
+        try {
+          const next = await api.dataExports.getStatus(id);
+          exports = exports.map((r) => (r.id === id ? next : r));
+        } catch {
+          /* ignore */
+        }
+      })();
+    }, 2000);
+    return () => clearInterval(t);
+  });
+
   async function loadMore() {
     if (!nextCursor || loadingMore) return;
     loadingMore = true;
@@ -274,9 +304,9 @@
           <div class="export-row-main">
             <span
               class="status-pill status-pill-{latest.status}"
-              aria-label="Status: {statusLabel(latest.status)}"
+              aria-label="Status: {exportPillLabel(latest)}"
             >
-              {statusLabel(latest.status)}
+              {exportPillLabel(latest)}
             </span>
             <span class="export-when">
               Requested {fmtDateTimeLocal(latest.requested_at)}

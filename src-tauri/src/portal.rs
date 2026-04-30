@@ -88,6 +88,13 @@ struct MeResponse {
     /// semantics.
     #[serde(default)]
     pending_tos: Vec<PendingTos>,
+    // #329 — `org_has_agent_recording` from the backend MeResponse is
+    // intentionally NOT mirrored here. The agent has no /calls empty-
+    // state CTA today, so the field would be parsed and dropped (dead-
+    // code warning). Serde's default behavior ignores unknown JSON
+    // fields, so this struct remains forward-compatible. If the agent
+    // later adds an equivalent empty-state, plumb it through here +
+    // the AuthFile in `config.rs` at the same time.
 }
 
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
