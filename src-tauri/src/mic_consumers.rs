@@ -75,10 +75,9 @@ use tokio::sync::watch;
 
 /// Vendor helpers + generic audio-framework labels we never want to
 /// surface as a "mic-using app". Substring-matched case-insensitively
-/// against `bundle_id` AND `friendly_name`. Applied at the source
-/// inside every `raw_mic_consumers()` impl so the observer + the
-/// detector see an identical view (the detector used to carry its own
-/// duplicate of this list — fixed in #604).
+/// against the stable app key (`bundle_id`). Generic labels that only
+/// appear as `friendly_name` fall back to the bundle key for display
+/// instead of dropping the app entirely (#610).
 ///
 /// New entries land here, NOT in any per-platform list. Per-platform
 /// helper-process patterns (Chromium renderers etc.) live in
@@ -98,7 +97,7 @@ pub const MIC_CONSUMER_BLACKLIST: &[&str] = &[
 
 /// True when `s` matches any blacklist entry (case-insensitive
 /// substring). Public so the detector + observer can apply it to
-/// `bundle_id` and `friendly_name` consistently.
+/// stable app keys consistently.
 pub fn is_blacklisted(s: &str) -> bool {
     let lower = s.to_lowercase();
     MIC_CONSUMER_BLACKLIST
@@ -207,7 +206,11 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let own_pid = std::process::id().to_string();
+    parse_pactl_source_outputs(&text, &own_pid)
+}
 
+#[cfg(target_os = "linux")]
+fn parse_pactl_source_outputs(text: &str, own_pid: &str) -> Vec<RawMicConsumer> {
     let mut result: Vec<RawMicConsumer> = Vec::new();
     let mut seen_bundles: HashSet<String> = HashSet::new();
     let mut cur_name: Option<String> = None;
@@ -227,22 +230,18 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
             let bundle = binary.clone().or_else(|| name.clone());
             if let Some(bundle) = bundle {
                 let bundle_blacklisted = is_blacklisted(&bundle);
-                let name_blacklisted = name.as_deref().map(is_blacklisted).unwrap_or(false);
                 if !is_helper_proc(&bundle)
                     && !name.as_deref().map(is_helper_proc).unwrap_or(false)
                     && !bundle_blacklisted
-                    && !name_blacklisted
                     && seen.insert(bundle.clone())
                 {
                     // Surface bundle_id as friendly_name when the OS
-                    // gave us a generic framework boilerplate
-                    // ("PipeWire ALSA [...]") — those aren't user-
-                    // recognizable labels and they leak our infra
-                    // ("PipeWire") into the catalog UI. The detector
-                    // already prefers bundle_id; this keeps the
-                    // observer's strings in lockstep so the auto-
-                    // detect tag and the auto-record list show the
-                    // same name (#604).
+                    // gave us generic framework boilerplate
+                    // ("PipeWire ALSA [...]", "Chromium input").
+                    // Those strings aren't user-recognizable labels,
+                    // but they can still accompany a real app binary
+                    // such as "cliq", so they must not drop the row
+                    // entirely (#610).
                     let raw_friendly = name.clone().filter(|s| !s.trim().is_empty());
                     let friendly = match raw_friendly {
                         Some(s) if !looks_like_generic_framework_label(&s) => s,
@@ -533,5 +532,36 @@ mod tests {
         assert!(!looks_like_generic_framework_label("Slack Call"));
         assert!(!looks_like_generic_framework_label("Zoho Cliq"));
         assert!(!looks_like_generic_framework_label("Zoom Meeting"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parser_keeps_real_app_with_generic_chromium_label() {
+        let text = r#"
+Source Output #42
+    Properties:
+        application.name = "Chromium input"
+        application.process.binary = "cliq"
+        application.process.id = "99999"
+"#;
+
+        let consumers = parse_pactl_source_outputs(text, "12345");
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].bundle_id, "cliq");
+        assert_eq!(consumers[0].friendly_name, "cliq");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parser_still_drops_generic_label_without_real_binary() {
+        let text = r#"
+Source Output #43
+    Properties:
+        application.name = "Chromium input"
+        application.process.id = "99999"
+"#;
+
+        let consumers = parse_pactl_source_outputs(text, "12345");
+        assert!(consumers.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.14.8"
+version = "0.14.9"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -81,4 +81,3 @@ tauri-winrt-notification = "0.7"
 lto = "thin"
 codegen-units = 16
 strip = true
-

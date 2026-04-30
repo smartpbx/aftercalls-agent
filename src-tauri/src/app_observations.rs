@@ -256,8 +256,8 @@ impl AppObservations {
         Ok(())
     }
 
-    /// Sweep stale rows whose `bundle_id` or `friendly_name` is now
-    /// blacklisted. Called once at agent startup so users upgrading
+    /// Sweep stale rows whose stable `bundle_id` is now blacklisted.
+    /// Called once at agent startup so users upgrading
     /// from v0.14.0–v0.14.2 (when the source-side blacklist wasn't
     /// applied — see #604) don't have to manually click Forget on
     /// every leaked `aftercalls` / `parec` / `Chromium input` row
@@ -272,9 +272,7 @@ impl AppObservations {
         // little time as possible.
         let rows: Vec<(String, String)> = {
             let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-            let mut stmt = conn.prepare(
-                "SELECT bundle_id, friendly_name FROM observed_apps",
-            )?;
+            let mut stmt = conn.prepare("SELECT bundle_id, friendly_name FROM observed_apps")?;
             let collected: Vec<(String, String)> = stmt
                 .query_map([], |row| {
                     let b: String = row.get(0)?;
@@ -287,10 +285,7 @@ impl AppObservations {
 
         let to_delete: Vec<String> = rows
             .into_iter()
-            .filter(|(b, f)| {
-                crate::mic_consumers::is_blacklisted(b)
-                    || crate::mic_consumers::is_blacklisted(f)
-            })
+            .filter(|(b, _)| crate::mic_consumers::is_blacklisted(b))
             .map(|(b, _)| b)
             .collect();
 
@@ -423,15 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn purge_catches_friendly_name_only_matches() {
-        // friendly_name might match the blacklist when bundle_id
-        // doesn't (e.g. a row stored before the friendly_name fallback
-        // landed). Either field tripping the blacklist deletes the row.
+    fn purge_preserves_real_bundle_with_generic_friendly_name() {
+        // #610: Electron/Chromium apps can report a generic friendly
+        // label while still carrying a real process binary. Preserve
+        // that row, including the user's enabled bit.
         let store = AppObservations::open_in_memory().unwrap();
-        store.upsert("some-bundle", "PipeWire ALSA [aftercalls]", now()).unwrap();
+        store.upsert("cliq", "Chromium input", now()).unwrap();
+        store.set_enabled("cliq", true).unwrap();
         let deleted = store.purge_blacklisted_rows().unwrap();
-        assert_eq!(deleted, 1);
-        assert!(store.list().unwrap().is_empty());
+        assert_eq!(deleted, 0);
+        let rows = store.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bundle_id, "cliq");
+        assert!(rows[0].enabled);
     }
 
     #[test]
