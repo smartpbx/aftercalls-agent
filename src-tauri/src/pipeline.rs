@@ -65,13 +65,27 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
     // today the function can't panic mid-body because both branches
     // of the match already run the telemetry flush, but belt-and-
     // suspenders keeps the counter honest.
-    struct Decrement;
-    impl Drop for Decrement {
-        fn drop(&mut self) {
-            PIPELINE_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    struct InFlightGuard {
+        active: bool,
+    }
+    impl InFlightGuard {
+        fn finish(&mut self) -> usize {
+            if self.active {
+                self.active = false;
+                PIPELINE_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1
+            } else {
+                PIPELINE_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire)
+            }
         }
     }
-    let _guard = Decrement;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            if self.active {
+                PIPELINE_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+    let mut guard = InFlightGuard { active: true };
 
     crate::tray_set_processing(&app);
     let session_str = session_dir.to_string_lossy().into_owned();
@@ -155,7 +169,8 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
     // Ship whatever's buffered so reported bugs don't wait on the
     // next 30s tick.
     let _ = crate::telemetry::flush_now().await;
-    crate::tray_set_idle(&app);
+    let pipeline_still_active = guard.finish() > 0;
+    crate::tray_refresh_after_pipeline(&app, pipeline_still_active);
 }
 
 async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, String)> {

@@ -1,4 +1,11 @@
 {
+  "0.14.8": {
+    "headline": "Roomier notes editor that fills the window, processing-finished notifications for hidden windows, and a tray-icon fix during back-to-back recordings — plus faster, more resilient call summaries under the hood.",
+    "changes": [
+      "Notes panel can now expand to fill the window. The notes editor on the Record screen now has a maximize button in its header. Clicking it expands the editor to fill the window so you have plenty of room to write during a long call; click again to collapse it back. The same shortcut keys still work either way.",
+      "Tray now alerts you when a hidden window finishes processing a call. If you minimise or hide the desktop app right after stopping a recording, you'll now get a system notification when the call finishes processing. Previously the only signal was the tray icon swap — fine if you noticed it, easy to miss for short calls. The visible-window flow is unchanged; this just fills in the hidden-window gap."
+    ]
+  },
   "0.14.7": {
     "headline": "Sharper team-wide first-run nudge, live progress on data exports, shorter onboarding for non-admins, plus accordion-style release notes and SEO/help polish on the marketing site.",
     "changes": [

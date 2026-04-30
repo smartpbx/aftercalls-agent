@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::mpsc;
 
-use crate::mic_consumers::{is_blacklisted, raw_mic_consumers};
+use crate::mic_consumers::{is_blacklisted, subscribe_mic_consumers, RawMicConsumer};
 use crate::notify_actions::{self, ActionSpec, NotifyError};
 use crate::recorder::Recorder;
 
@@ -15,15 +15,14 @@ use crate::recorder::Recorder;
 // skip this list, leaking `parec` + `Chromium input` into the
 // user-visible auto-record catalog). New entries land there, not here.
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the mic consumer must be gone before we prompt to end.
 const CONSUMER_GONE_BEFORE_END_PROMPT: Duration = Duration::from_secs(5);
 /// Safety net for a crashed / force-quit softphone (#74). If the
 /// consumer has been gone this long and the user hasn't answered the
 /// end-prompt, the recording is force-stopped via the same code path
-/// as manual Stop. Three consecutive polls at POLL_INTERVAL=5s — fast
-/// enough that a SIGKILL'd softphone can't keep the recorder pinned
-/// open for more than ~15s while still tolerating a brief restart.
+/// as manual Stop. Three shared mic-consumer ticks at 5s — fast enough
+/// that a SIGKILL'd softphone can't keep the recorder pinned open for
+/// more than ~15s while still tolerating a brief restart.
 const CONSUMER_GONE_FORCE_STOP: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug)]
@@ -95,17 +94,27 @@ impl Detector {
 #[derive(Debug, Clone)]
 enum Phase {
     Idle,
-    AwaitingStartConfirm { consumer: String },
-    Recording { consumer: String, gone_since: Option<Instant> },
+    AwaitingStartConfirm {
+        consumer: String,
+    },
+    Recording {
+        consumer: String,
+        gone_since: Option<Instant>,
+    },
     /// `gone_since` is inherited from Recording so the 15s force-stop
     /// watchdog (#74) measures total consumer-absence, not just time
     /// spent waiting on the user. Without this a user who walks away
     /// from an end-prompt would keep the recorder running until they
     /// returned.
-    AwaitingEndConfirm { consumer: String, gone_since: Instant },
+    AwaitingEndConfirm {
+        consumer: String,
+        gone_since: Instant,
+    },
     /// User explicitly said no to recording this consumer. Release when the
     /// consumer stops using the mic — they may come back for another call.
-    Suppressed { consumer: String },
+    Suppressed {
+        consumer: String,
+    },
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -118,10 +127,14 @@ enum AutoDetectEvent {
 
 async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
     let mut phase = Phase::Idle;
+    let mut consumers_rx = subscribe_mic_consumers();
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => {
-                phase = tick(&app, phase);
+            changed = consumers_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                phase = tick(&app, phase, consumers_rx.borrow().as_slice());
             }
             Some(decision) = rx.recv() => {
                 phase = handle_decision(&app, phase, decision).await;
@@ -130,7 +143,7 @@ async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<UserDecision>) {
     }
 }
 
-fn tick(app: &AppHandle, phase: Phase) -> Phase {
+fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phase {
     // Cheap per-tick config read (the file is tiny) so toggling
     // auto-detect off in Settings takes effect immediately without
     // having to restart the app. When off, we clear any in-flight
@@ -152,7 +165,7 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
         return Phase::Idle;
     }
 
-    let consumers = interesting_mic_consumers();
+    let consumers = interesting_mic_consumers(mic_consumers);
     let state = app.state::<Recorder>();
     let is_recording = state.is_active();
 
@@ -162,9 +175,16 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
         Phase::Idle => {
             if let Some(consumer) = consumers.iter().next() {
                 eprintln!("aftercalls: '{consumer}' is using the mic — prompting");
-                emit(app, AutoDetectEvent::PromptStart { app: consumer.clone() });
+                emit(
+                    app,
+                    AutoDetectEvent::PromptStart {
+                        app: consumer.clone(),
+                    },
+                );
                 maybe_show_window(app, popup_on, PromptKind::Start { consumer });
-                Phase::AwaitingStartConfirm { consumer: consumer.clone() }
+                Phase::AwaitingStartConfirm {
+                    consumer: consumer.clone(),
+                }
             } else {
                 Phase::Idle
             }
@@ -177,26 +197,49 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                 Phase::AwaitingStartConfirm { consumer }
             }
         }
-        Phase::Recording { consumer, gone_since } => {
+        Phase::Recording {
+            consumer,
+            gone_since,
+        } => {
             if consumers.contains(&consumer) {
-                Phase::Recording { consumer, gone_since: None }
+                Phase::Recording {
+                    consumer,
+                    gone_since: None,
+                }
             } else {
                 let since = gone_since.unwrap_or_else(Instant::now);
                 if since.elapsed() >= CONSUMER_GONE_BEFORE_END_PROMPT {
                     eprintln!("aftercalls: '{consumer}' stopped using mic — prompting to end");
-                    emit(app, AutoDetectEvent::PromptEnd { app: consumer.clone() });
+                    emit(
+                        app,
+                        AutoDetectEvent::PromptEnd {
+                            app: consumer.clone(),
+                        },
+                    );
                     maybe_show_window(app, popup_on, PromptKind::End);
-                    Phase::AwaitingEndConfirm { consumer, gone_since: since }
+                    Phase::AwaitingEndConfirm {
+                        consumer,
+                        gone_since: since,
+                    }
                 } else {
-                    Phase::Recording { consumer, gone_since: Some(since) }
+                    Phase::Recording {
+                        consumer,
+                        gone_since: Some(since),
+                    }
                 }
             }
         }
-        Phase::AwaitingEndConfirm { consumer, gone_since } => {
+        Phase::AwaitingEndConfirm {
+            consumer,
+            gone_since,
+        } => {
             if consumers.contains(&consumer) {
                 // Consumer came back — user rejoined. Cancel the end prompt.
                 emit(app, AutoDetectEvent::Cleared);
-                Phase::Recording { consumer, gone_since: None }
+                Phase::Recording {
+                    consumer,
+                    gone_since: None,
+                }
             } else if gone_since.elapsed() >= CONSUMER_GONE_FORCE_STOP {
                 // Safety net (#74): consumer has been dead for
                 // CONSUMER_GONE_FORCE_STOP and the user never answered
@@ -214,7 +257,10 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                 emit(app, AutoDetectEvent::Cleared);
                 Phase::Idle
             } else {
-                Phase::AwaitingEndConfirm { consumer, gone_since }
+                Phase::AwaitingEndConfirm {
+                    consumer,
+                    gone_since,
+                }
             }
         }
         Phase::Suppressed { consumer } => {
@@ -225,7 +271,9 @@ fn tick(app: &AppHandle, phase: Phase) -> Phase {
                 eprintln!("aftercalls: new mic consumer '{other}' — prompting");
                 emit(app, AutoDetectEvent::PromptStart { app: other.clone() });
                 maybe_show_window(app, popup_on, PromptKind::Start { consumer: other });
-                Phase::AwaitingStartConfirm { consumer: other.clone() }
+                Phase::AwaitingStartConfirm {
+                    consumer: other.clone(),
+                }
             } else if still_suppressing {
                 Phase::Suppressed { consumer }
             } else {
@@ -247,7 +295,10 @@ fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phas
         }
         (Phase::AwaitingStartConfirm { consumer }, true) => {
             emit(app, AutoDetectEvent::Cleared);
-            Phase::Recording { consumer, gone_since: None }
+            Phase::Recording {
+                consumer,
+                gone_since: None,
+            }
         }
         (other, _) => other,
     }
@@ -271,7 +322,10 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
                     // gate recording.
                     notify_actions::clear_snooze(&consumer);
                     emit(app, AutoDetectEvent::Cleared);
-                    Phase::Recording { consumer, gone_since: None }
+                    Phase::Recording {
+                        consumer,
+                        gone_since: None,
+                    }
                 }
                 Err(e) => {
                     eprintln!("aftercalls: auto-start failed: {e}");
@@ -293,7 +347,10 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
         }
         (Phase::AwaitingEndConfirm { consumer, .. }, UserDecision::KeepRecording) => {
             emit(app, AutoDetectEvent::Cleared);
-            Phase::Recording { consumer, gone_since: None }
+            Phase::Recording {
+                consumer,
+                gone_since: None,
+            }
         }
         (phase, _) => phase,
     }
@@ -309,12 +366,11 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
 /// (`friendly_name`) if the binary lookup ever produced an empty key.
 /// In practice the two are the same for non-empty rows; the wrapper
 /// just keeps the same shape callers expect.
-fn interesting_mic_consumers() -> Vec<String> {
+fn interesting_mic_consumers(consumers: &[RawMicConsumer]) -> Vec<String> {
     // `raw_mic_consumers` already applies the blacklist + helper-proc
     // filters at the source (#604), so this wrapper is just dedup +
     // bundle_id-preferred display. Belt-and-braces re-check via
     // `is_blacklisted` in case a future refactor lets a row slip past.
-    let consumers = raw_mic_consumers();
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for c in consumers {
@@ -358,7 +414,9 @@ fn show_window(app: &AppHandle) {
 /// name on `Start` lets the toast snooze key match the detector's
 /// own per-consumer state.
 enum PromptKind<'a> {
-    Start { consumer: &'a str },
+    Start {
+        consumer: &'a str,
+    },
     /// Mid-recording end-prompt. Kept on the focus-steal path because
     /// the in-app slide-out for end-prompts lives on the Record page
     /// and the user is almost always there during a live recording.
@@ -394,8 +452,14 @@ fn maybe_show_window(app: &AppHandle, popup_on: bool, kind: PromptKind<'_>) {
                 "aftercalls",
                 "Record this call?",
                 vec![
-                    ActionSpec { id: "record".into(),  label: "Record".into() },
-                    ActionSpec { id: "dismiss".into(), label: "Not now".into() },
+                    ActionSpec {
+                        id: "record".into(),
+                        label: "Record".into(),
+                    },
+                    ActionSpec {
+                        id: "dismiss".into(),
+                        label: "Not now".into(),
+                    },
                 ],
                 "notify-action",
                 Duration::from_secs(30),

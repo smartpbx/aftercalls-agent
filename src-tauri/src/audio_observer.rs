@@ -4,13 +4,9 @@
 //!
 //! Linux: piggy-backs on the existing `pactl list source-outputs` poll
 //! (the same enumeration the call-detect prompt uses) via the shared
-//! `mic_consumers` module. Polls every 5s on its own tick — one extra
-//! `pactl` invocation per cycle is well below the noise floor for
-//! typical desktop CPU load, and it lets the observer compute its
-//! transition diff independently of the prompt detector's phase
-//! machine. (The detector's poll cadence is matched but not coupled —
-//! a future broadcast-channel refactor can collapse the two into one
-//! invocation if pactl ever becomes a hot spot.)
+//! `mic_consumers` ticker. The detector and observer subscribe to one
+//! 5s snapshot stream, so there is one `pactl` process per cycle while
+//! each consumer keeps its own state machine.
 //!
 //! macOS / Windows v1: stub `UnsupportedObserver`. `is_supported()`
 //! returns false so the Settings UI renders the "App detection isn't
@@ -42,11 +38,9 @@
 //! transition-only `Started` / `Stopped` with `initial = false`.
 
 use std::collections::HashSet;
-use std::time::Duration;
-
 use tokio::sync::mpsc;
 
-use crate::mic_consumers::{raw_mic_consumers, RawMicConsumer};
+use crate::mic_consumers::{subscribe_mic_consumers, RawMicConsumer};
 
 /// Event surfaced to the auto-recorder. Two flavours:
 ///   - Transition events fire when an app appears/disappears between
@@ -81,10 +75,6 @@ pub fn is_supported() -> bool {
     cfg!(target_os = "linux") || cfg!(target_os = "windows")
 }
 
-/// 5s tick — matches the call-detect prompt's existing cadence and is
-/// good enough for the 1s "user perception" target the spec asks for.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
 /// Spawn the platform-specific observer. Long-lived for the agent's
 /// lifetime; the JoinHandle is intentionally not surfaced (callers
 /// have nothing to await on shutdown).
@@ -101,13 +91,15 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
     tauri::async_runtime::spawn(async move {
+        let mut consumers_rx = subscribe_mic_consumers();
         // Seed `active` with the current set BEFORE the diff loop so
         // we don't auto-trigger a recording for apps that were already
         // running at observer-wake. Emit a catalog-only `initial = true`
         // batch for each so the auto-record list still discovers them.
         // See module docstring §"Initial-tick semantics" for why both
         // halves are needed.
-        let initial_active: HashSet<RawMicConsumer> = raw_mic_consumers().into_iter().collect();
+        let initial_active: HashSet<RawMicConsumer> =
+            consumers_rx.borrow().iter().cloned().collect();
         for c in &initial_active {
             let ev = McaEvent {
                 bundle_id: c.bundle_id.clone(),
@@ -121,8 +113,10 @@ pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
         }
         let mut active = initial_active;
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let next: HashSet<RawMicConsumer> = raw_mic_consumers().into_iter().collect();
+            if consumers_rx.changed().await.is_err() {
+                return;
+            }
+            let next: HashSet<RawMicConsumer> = consumers_rx.borrow().iter().cloned().collect();
             for ev in diff(&active, &next) {
                 if tx.send(ev).is_err() {
                     return; // receiver dropped — bail

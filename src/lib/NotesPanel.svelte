@@ -29,6 +29,7 @@
   let host: HTMLDivElement | undefined = $state();
   let editor: Editor | undefined = $state();
   let lastEmitted = '';
+  let expanded = $state(false);
 
   // #326 — platform-aware modifier symbol so Mac users see ⌘ and others
   // see Ctrl. The bindings work on both via TipTap; the tooltip should
@@ -133,10 +134,28 @@
 <section
   class="notes-panel"
   class:no-header={!showHeader}
+  class:expanded
 >
   {#if showHeader}
     <header class="notes-header">
       <strong>Notes</strong>
+      <button
+        type="button"
+        class="maximize-btn"
+        onclick={() => (expanded = !expanded)}
+        aria-label={expanded ? 'Restore notes panel' : 'Maximize notes panel'}
+        title={expanded ? 'Restore' : 'Maximize'}
+      >
+        {#if expanded}
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <path d="M6 3H3v3M10 3h3v3M6 13H3v-3M10 13h3v-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        {:else}
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        {/if}
+      </button>
     </header>
   {/if}
   <div class="notes-wrap" class:readonly>
@@ -261,11 +280,44 @@
   .notes-panel.no-header {
     margin-top: 0;
   }
+  .notes-panel.expanded {
+    position: fixed;
+    inset: 1rem;
+    z-index: 90;
+    margin: 0;
+    padding: 1rem;
+    background: var(--ink-0);
+    border: 1px solid var(--hairline-hi);
+    border-radius: 10px;
+    box-shadow: 0 22px 70px rgba(0, 0, 0, 0.5);
+  }
   .notes-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
+  }
+  .maximize-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    color: var(--bone-2);
+    background: var(--ink-1);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .maximize-btn:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    border-color: var(--hairline-hi);
+  }
+  .maximize-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .notes-wrap {
     border: 1px solid var(--hairline);
@@ -285,6 +337,12 @@
   }
   .notes-wrap.readonly {
     background: var(--ink-0);
+    resize: none;
+  }
+  .notes-panel.expanded .notes-wrap {
+    min-height: 0;
+    height: auto;
+    flex: 1;
     resize: none;
   }
 

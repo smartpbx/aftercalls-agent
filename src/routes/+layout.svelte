@@ -123,6 +123,7 @@
   let unlistenAutoRecordFired: UnlistenFn | null = null;
   let unlistenAutoRecordCancelled: UnlistenFn | null = null;
   let unlistenObservedAppsUpdated: UnlistenFn | null = null;
+  let pipelineReadyNotifiedFor = "";
   // Map of pending_id → toast id so the matching `auto-record-fired` /
   // `auto-record-cancelled` event can dismiss the in-flight toast
   // instead of letting the 5s auto-dismiss tick down on a recording
@@ -757,6 +758,17 @@
       }
       callRecording.notePipelineStage(pipelineStage, evt.payload.call_id);
       if (pipelineStage === "done") {
+        if (
+          evt.payload.call_id &&
+          evt.payload.call_id !== pipelineReadyNotifiedFor &&
+          document.hidden
+        ) {
+          pipelineReadyNotifiedFor = evt.payload.call_id;
+          invoke("notify_call_ready", {
+            title: "",
+            body: "Your saved call has finished processing.",
+          }).catch((e) => console.warn("notify_call_ready failed", e));
+        }
         // Auto-fade the floater after a short hold. Failure holds
         // indefinitely (user must dismiss via the Open pointer).
         if (callFloaterDoneTimer) clearTimeout(callFloaterDoneTimer);

@@ -68,6 +68,10 @@
 //!    NOT detach the row.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tokio::sync::watch;
 
 /// Vendor helpers + generic audio-framework labels we never want to
 /// surface as a "mic-using app". Substring-matched case-insensitively
@@ -89,7 +93,7 @@ pub const MIC_CONSUMER_BLACKLIST: &[&str] = &[
     "pw-cat",
     "pw-record",
     "speech-dispatcher",
-    "aftercalls",             // our own cpal mic consumer's binary basename
+    "aftercalls", // our own cpal mic consumer's binary basename
 ];
 
 /// True when `s` matches any blacklist entry (case-insensitive
@@ -114,7 +118,10 @@ fn looks_like_generic_framework_label(friendly: &str) -> bool {
     // CoreAudio / WASAPI fallback strings will land here when those
     // platforms don't get a real session display name — punt with the
     // bundle_id basename instead.
-    matches!(trimmed.to_lowercase().as_str(), "chromium input" | "system audio")
+    matches!(
+        trimmed.to_lowercase().as_str(),
+        "chromium input" | "system audio"
+    )
 }
 
 /// One mic-consuming app the OS reports.
@@ -137,6 +144,28 @@ impl RawMicConsumer {
             friendly_name: friendly_name.into(),
         }
     }
+}
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+static MIC_CONSUMER_TX: OnceLock<watch::Sender<Vec<RawMicConsumer>>> = OnceLock::new();
+
+/// Shared 5s mic-consumer ticker. The detector prompt path and the
+/// auto-record observer both subscribe here, so Linux runs one
+/// `pactl list source-outputs` process per cycle while each consumer
+/// keeps its own state machine.
+pub fn subscribe_mic_consumers() -> watch::Receiver<Vec<RawMicConsumer>> {
+    let tx = MIC_CONSUMER_TX.get_or_init(|| {
+        let (tx, _rx) = watch::channel(raw_mic_consumers());
+        let ticker_tx = tx.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                ticker_tx.send_replace(raw_mic_consumers());
+            }
+        });
+        tx
+    });
+    tx.subscribe()
 }
 
 /// Helper-process basenames we never want to surface as a "mic-using
@@ -198,8 +227,7 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
             let bundle = binary.clone().or_else(|| name.clone());
             if let Some(bundle) = bundle {
                 let bundle_blacklisted = is_blacklisted(&bundle);
-                let name_blacklisted =
-                    name.as_deref().map(is_blacklisted).unwrap_or(false);
+                let name_blacklisted = name.as_deref().map(is_blacklisted).unwrap_or(false);
                 if !is_helper_proc(&bundle)
                     && !name.as_deref().map(is_helper_proc).unwrap_or(false)
                     && !bundle_blacklisted
@@ -215,9 +243,7 @@ pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
                     // observer's strings in lockstep so the auto-
                     // detect tag and the auto-record list show the
                     // same name (#604).
-                    let raw_friendly = name
-                        .clone()
-                        .filter(|s| !s.trim().is_empty());
+                    let raw_friendly = name.clone().filter(|s| !s.trim().is_empty());
                     let friendly = match raw_friendly {
                         Some(s) if !looks_like_generic_framework_label(&s) => s,
                         _ => bundle.clone(),
@@ -312,9 +338,8 @@ fn windows_mic_consumers() -> Result<Vec<String>, String> {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
 
-        let handle: HANDLE =
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-                .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
 
         let mut buf: [u16; 1024] = [0; 1024];
         let mut size: u32 = buf.len() as u32;
@@ -372,16 +397,13 @@ fn windows_mic_consumers() -> Result<Vec<String>, String> {
                 }
             };
 
-            let session_manager: IAudioSessionManager2 =
-                match device.Activate(CLSCTX_ALL, None) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!(
-                            "aftercalls: IMMDevice::Activate IAudioSessionManager2: {e}"
-                        );
-                        continue;
-                    }
-                };
+            let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("aftercalls: IMMDevice::Activate IAudioSessionManager2: {e}");
+                    continue;
+                }
+            };
 
             let session_enum = match session_manager.GetSessionEnumerator() {
                 Ok(s) => s,
@@ -500,8 +522,12 @@ mod tests {
         // the app didn't set `application.name` — surfacing it as the
         // friendly_name reads as a vendor-name leak and doesn't match
         // the detector's bundle_id rendering.
-        assert!(looks_like_generic_framework_label("PipeWire ALSA [voxtype-avx2]"));
-        assert!(looks_like_generic_framework_label("PipeWire ALSA [aftercalls]"));
+        assert!(looks_like_generic_framework_label(
+            "PipeWire ALSA [voxtype-avx2]"
+        ));
+        assert!(looks_like_generic_framework_label(
+            "PipeWire ALSA [aftercalls]"
+        ));
         assert!(looks_like_generic_framework_label("Chromium input"));
         // App-supplied names must NOT be considered generic.
         assert!(!looks_like_generic_framework_label("Slack Call"));

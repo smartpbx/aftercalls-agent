@@ -47,8 +47,19 @@ enum TrayState {
 pub(crate) fn tray_set_processing(app: &AppHandle) {
     apply_tray_state(app, TrayState::Processing);
 }
-pub(crate) fn tray_set_idle(app: &AppHandle) {
-    apply_tray_state(app, TrayState::Idle);
+
+pub(crate) fn tray_refresh_after_pipeline(app: &AppHandle, pipeline_still_active: bool) {
+    if app
+        .try_state::<recorder::Recorder>()
+        .map(|r| r.is_active())
+        .unwrap_or(false)
+    {
+        apply_tray_state(app, TrayState::Recording);
+    } else if pipeline_still_active {
+        apply_tray_state(app, TrayState::Processing);
+    } else {
+        apply_tray_state(app, TrayState::Idle);
+    }
 }
 
 fn apply_tray_state(app: &AppHandle, state: TrayState) {
@@ -2653,20 +2664,6 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if win.label() == "main" {
                     let app = win.app_handle().clone();
-                    // #313 — busy-state takes precedence over the
-                    // close-to-tray preference. A user who clicks X
-                    // mid-recording (or while the post-call pipeline
-                    // is still running) hits the same confirmation
-                    // dialog the tray Quit path uses, regardless of
-                    // their close_to_tray pref. quit_with_confirm
-                    // routes through the dialog and exits on confirm
-                    // / no-ops on cancel; we just need to prevent the
-                    // close from running synchronously.
-                    if is_busy(&app) {
-                        api.prevent_close();
-                        quit_with_confirm(app);
-                        return;
-                    }
                     // Per-user preference: default true (hide to tray),
                     // false means the X button really quits. Fallback to
                     // hide-on-close if config can't be read so users
@@ -2678,6 +2675,12 @@ pub fn run() {
                     if close_to_tray {
                         api.prevent_close();
                         let _ = win.hide();
+                    } else if is_busy(&app) {
+                        // Close-to-tray=false makes the window X a real
+                        // quit path, so protect in-flight recording or
+                        // post-call work the same way tray Quit does.
+                        api.prevent_close();
+                        quit_with_confirm(app);
                     } else {
                         // #313 — close-to-tray = false AND not busy →
                         // honour the user's pref and let the close run,
