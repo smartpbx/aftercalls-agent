@@ -12,25 +12,25 @@
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import { confirmAutoStart } from "$lib/autoStart";
-  import Avatar from "$lib/Avatar.svelte";
-  import OfflineBanner from "$lib/OfflineBanner.svelte";
+  import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
+  import OfflineBanner from "@aftercalls/shared/ui/OfflineBanner.svelte";
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
-  import ToastHost from "$lib/ToastHost.svelte";
-  import ShortcutsOverlay from "$lib/ShortcutsOverlay.svelte";
+  import ToastHost from "@aftercalls/shared/ui/ToastHost.svelte";
+  import ShortcutsOverlay from "@aftercalls/shared/ui/ShortcutsOverlay.svelte";
   import { initSentry } from "$lib/sentry";
   import { getAppPrefs } from "$lib/stores/appPrefs.svelte";
   import {
     initShortcutListener,
     registerShortcuts,
     toggleHelp,
-  } from "$lib/shortcuts.svelte";
+  } from "@aftercalls/shared/shortcuts";
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { callRecording } from "$lib/stores/callRecording.svelte";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
-  import { toast } from "$lib/stores/toast.svelte";
+  import { toast } from "@aftercalls/shared/stores/toast.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import "../app.css";
 
@@ -2074,7 +2074,7 @@
              behaviour (.strip-right is `flex-wrap`); reads from the
              shared `onlineStatus` store. Renders nothing while the
              agent's `backend_health` Tauri command is happy. -->
-        <OfflineBanner />
+        <OfflineBanner online={onlineStatus.online} />
         {#if orphans.length > 0}
           <!-- Orphan recovery pill (#63). Collapsed to a short label +
                single Review button — bulk actions (Resume all / Discard

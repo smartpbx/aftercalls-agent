@@ -18,6 +18,7 @@
 // browser at the same time) pick up the change automatically.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { ZohoStore } from "@aftercalls/shared/contracts";
 
 /** localStorage key used as the cross-tab sentinel. The value is a
  *  millisecond timestamp; we only care that it changes. */
@@ -113,4 +114,4 @@ function createStore() {
   };
 }
 
-export const zohoStore = createStore();
+export const zohoStore: ZohoStore = createStore();

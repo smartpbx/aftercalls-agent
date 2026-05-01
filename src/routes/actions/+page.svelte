@@ -23,45 +23,38 @@
   import { invoke } from "@tauri-apps/api/core";
   import { page } from "$app/state";
   import { replaceState, afterNavigate } from "$app/navigation";
-  import { registerShortcuts } from "$lib/shortcuts.svelte";
+  import { registerShortcuts } from "@aftercalls/shared/shortcuts";
   import ActionsList, {
-    type MeActionItem,
-    type ActionsStatusFilter,
-    type ActionsDueFilter,
-    type MeActionItemsResponse,
     type ActionsActiveRowEdit,
     type ActionsDescriptionSave,
     type ActionsOwnerSave,
     type ActionsDueSave,
-  } from "$lib/ActionsList.svelte";
-  import ActionItem, { type ActionItemUser } from "$lib/ActionItem.svelte";
+  } from "@aftercalls/shared/ui/ActionsList.svelte";
+  import ActionItem, { type ActionItemUser } from "@aftercalls/shared/ui/ActionItem.svelte";
   import {
     rewriteChipOccurrence,
     firstLastInitial,
-  } from "$lib/SummaryText.svelte";
-  import ChipMenu from "$lib/ChipMenu.svelte";
-  import type { SpeakerPick } from "$lib/SpeakerRenamePicker.svelte";
+  } from "@aftercalls/shared/ui/SummaryText.svelte";
+  import ChipMenu from "@aftercalls/shared/ui/ChipMenu.svelte";
+  import type { SpeakerPick } from "@aftercalls/shared/ui/SpeakerRenamePicker.svelte";
   import { isPortalError } from "$lib/portalError";
   // #254 — action-item save / check-off failures route through the
   // shared toast store. Replaces the inline `transientError` flash
   // and the per-row `actionItemErrors` Record.
-  import { toast } from "$lib/stores/toast.svelte";
+  import { toast } from "@aftercalls/shared/stores/toast.svelte";
   // #107 — local save-queue. Same shape as the portal sibling but the
   // queued ops replay through Tauri `invoke` rather than fetch.
   import {
     saveQueue,
     isTransientNetworkError,
   } from "$lib/stores/saveQueue.svelte";
-
-  // Roster shape the Tauri invoke returns. Superset of ActionItemUser
-  // so we just map over the relevant fields.
-  type OrgMember = {
-    id: string;
-    first_name?: string;
-    last_name?: string;
-    display_name: string;
-    email: string;
-  };
+  import type {
+    ActionsDueFilter,
+    ActionsStatusFilter,
+    MeActionItem,
+    MeActionItemsResponse,
+    OrgMember,
+  } from "@aftercalls/shared/types";
 
   const PAGE_SIZE = 50;
 
@@ -216,8 +209,9 @@
   // LoginResult exposes `user_id` (not `id`).
   async function loadMyUserId() {
     try {
-      type Me = { user_id: string; email: string };
-      const me = await invoke<Me | null>("current_user");
+      const me = await invoke<{ user_id: string; email: string } | null>(
+        "current_user",
+      );
       if (me) myUserId = me.user_id;
     } catch {
       // Non-fatal — "Mine" falls back to showing all items.
@@ -367,14 +361,14 @@
   // #390 — group items by parent call. Each entry is a call header +
   // its action items, sorted by the call's recorded_at desc so the
   // most recent call is first.
-  type CallGroup = {
+  type GroupedActionSection = {
     callId: string;
     callTitle: string | null;
     callRecordedAt: string;
     items: MeActionItem[];
   };
-  const callGroups = $derived.by((): CallGroup[] => {
-    const map = new Map<string, CallGroup>();
+  const callGroups = $derived.by((): GroupedActionSection[] => {
+    const map = new Map<string, GroupedActionSection>();
     for (const it of visibleItems) {
       let g = map.get(it.call_id);
       if (!g) {

@@ -4,17 +4,25 @@
   import { page } from "$app/state";
   import { goto, replaceState, afterNavigate } from "$app/navigation";
   import * as api from "$lib/api";
-  import DateInput from "$lib/DateInput.svelte";
-  import SpeakerRenamePicker from "$lib/SpeakerRenamePicker.svelte";
+  import DateInput from "@aftercalls/shared/ui/DateInput.svelte";
+  import SpeakerRenamePicker from "@aftercalls/shared/ui/SpeakerRenamePicker.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import {
     isProcessing,
     isDelayed,
     PILL_PROCESSING,
     PILL_STILL_WORKING,
-  } from "$lib/processing-thresholds";
-  import { registerShortcuts } from "$lib/shortcuts.svelte";
-  import { toast } from "$lib/stores/toast.svelte";
+  } from "@aftercalls/shared/processing-thresholds";
+  import { registerShortcuts } from "@aftercalls/shared/shortcuts";
+  import { toast } from "@aftercalls/shared/stores/toast.svelte";
+  import type {
+    CallListItem as Call,
+    CallsListResponse,
+    Me,
+    OrgMember,
+    Tag,
+    TagSuggestion,
+  } from "@aftercalls/shared/types";
 
   // #57 Tag-aware filter bar.
   //
@@ -27,57 +35,6 @@
   // TODO(refactor): the Add-filter popover duplicates markup with the
   // call-detail Add-tag flow. When the parallel agent extracts a shared
   // TagChip / TagAutocomplete component, switch to importing that.
-
-  type Tag = { kind: string; value: string };
-
-  type Call = {
-    id: string;
-    session_id: string;
-    recorded_at: string;
-    duration_ms: number;
-    title: string | null;
-    matched_client: string | null;
-    status: string;
-    source_app: string | null;
-    source_kind: string | null;
-    /** External-source classification (#303): 'agent' (default),
-     *  'zoho_meeting', 'zoho_cliq', 'smartpbx', 'imported_file'.
-     *  Older backends that don't emit this field land as undefined;
-     *  treat undefined as 'agent'. */
-    ingest_source?: string;
-    tags?: Tag[];
-    // Owner metadata (populated when scope=all). Optional so legacy
-    // responses don't break the type.
-    user_id?: string;
-    user_display_name?: string;
-    pinned_at?: string | null;
-    snoozed_until?: string | null;
-  };
-
-  type TagSuggestion = { kind: string; value: string; count: number };
-
-  type Me = {
-    email: string;
-    // #96: structured first/last alongside display_name. Optional
-    // because older auth.json files may predate the split.
-    first_name?: string;
-    last_name?: string;
-    display_name: string;
-    role: string;
-    org_display_name: string;
-    user_id?: string;
-  };
-
-  // #96: OrgMember now carries first_name + last_name alongside the
-  // display_name the picker renders. Unused here; kept in the type so
-  // TS doesn't drift from the API shape.
-  type OrgMember = {
-    id: string;
-    first_name: string;
-    last_name: string;
-    display_name: string;
-    email: string;
-  };
 
   // Tidy a raw app binary or application-name into something human.
   function prettyApp(raw: string | null): string | null {
@@ -174,7 +131,6 @@
   // but the two ship together — see issue #386 / context-map for the
   // hybrid PR rule. Helper centralises the shape parse so both
   // load + loadMore reuse it.
-  type CallsListResponse = { calls: Call[]; next_cursor: string | null };
   function parseListResponse(raw: unknown): CallsListResponse {
     const r = raw as { calls?: Call[]; next_cursor?: string | null } | null;
     return {

@@ -22,7 +22,7 @@
   import { goto } from "$app/navigation";
   import * as api from "$lib/api";
   import { fmtDateTimeLocal } from "$lib/fmtDate";
-  import { toast } from "$lib/stores/toast.svelte";
+  import { toast } from "@aftercalls/shared/stores/toast.svelte";
   import { isPortalError } from "$lib/portalError";
 
   let bundle = $state<api.MyPrivacyBundle | null>(null);

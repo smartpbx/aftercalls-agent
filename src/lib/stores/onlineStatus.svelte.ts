@@ -20,6 +20,7 @@
 //     events but never marks us back online on its own (browsers lie).
 
 import { invoke } from "@tauri-apps/api/core";
+import type { OnlineStatusStore } from "@aftercalls/shared/contracts";
 
 const FAST_POLL_MS = 2_000;
 const SLOW_POLL_MS = 10_000;
@@ -127,4 +128,4 @@ function createStore() {
   };
 }
 
-export const onlineStatus = createStore();
+export const onlineStatus: OnlineStatusStore = createStore();

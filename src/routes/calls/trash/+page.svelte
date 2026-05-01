@@ -3,34 +3,19 @@
   import { onMount } from "svelte";
   import { replaceState, afterNavigate } from "$app/navigation";
   import { page } from "$app/state";
-  import DateInput from "$lib/DateInput.svelte";
+  import DateInput from "@aftercalls/shared/ui/DateInput.svelte";
   import TosConfirmModal from "$lib/TosConfirmModal.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import type {
+    CallListItem as Call,
+    CallsListResponse,
+    Me,
+  } from "@aftercalls/shared/types";
 
   // Mirrors the portal's trash view. Deleted calls live here for
   // 30 days before the backend's nightly purge drops them for good.
   // Users see their own bin; admins + owners can flip to "all team"
   // (#176, parity with the portal trash view).
-
-  type Call = {
-    id: string;
-    session_id: string;
-    recorded_at: string;
-    duration_ms: number;
-    title: string | null;
-    matched_client: string | null;
-    status: string;
-    source_app: string | null;
-    source_kind: string | null;
-    deleted_at?: string;
-  };
-
-  type Me = {
-    email: string;
-    display_name: string;
-    role: string;
-    org_display_name: string;
-  };
 
   let rows = $state<Call[]>([]);
   let me = $state<Me | null>(null);
@@ -45,7 +30,6 @@
   let loadingMore = $state(false);
   let loadMoreError = $state<string | null>(null);
 
-  type CallsListResponse = { calls: Call[]; next_cursor: string | null };
   function parseListResponse(raw: unknown): CallsListResponse {
     const r = raw as { calls?: Call[]; next_cursor?: string | null } | null;
     return {

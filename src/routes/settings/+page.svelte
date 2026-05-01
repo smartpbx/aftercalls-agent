@@ -10,6 +10,7 @@
   import { setSentryTelemetryAllowed } from "$lib/sentry";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import type { Me } from "@aftercalls/shared/types";
 
   // #69 — About card surfaces the running version + the LGPL ffmpeg
   // notice + a link to the canonical public manifest at
@@ -24,17 +25,6 @@
   type Theme = "dark" | "light" | "system";
   let theme = $state<Theme>("dark");
 
-  type Me = {
-    email: string;
-    // #96: structured first/last ride alongside display_name so the
-    // Profile card can edit them. Optional on the type so older
-    // auth.json files (before the column existed) still typecheck.
-    first_name?: string;
-    last_name?: string;
-    display_name: string;
-    role: string;
-    org_display_name: string;
-  };
   let me = $state<Me | null>(null);
   let signingOut = $state(false);
 

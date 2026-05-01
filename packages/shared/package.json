@@ -1,0 +1,117 @@
+{
+  "name": "@aftercalls/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-surface TS / Svelte utilities reused by both the SvelteKit portal and the Tauri agent. Internal restructure (#355 umbrella) — no runtime deps, no build step. SvelteKit / Vite consume the source files directly via the conditional `svelte` export below.",
+  "exports": {
+    "./types": {
+      "types": "./types.ts",
+      "default": "./types.ts"
+    },
+    "./contracts": {
+      "types": "./contracts.ts",
+      "default": "./contracts.ts"
+    },
+    "./processing-thresholds": {
+      "types": "./processing-thresholds.ts",
+      "default": "./processing-thresholds.ts"
+    },
+    "./shortcuts": {
+      "types": "./shortcuts.svelte.ts",
+      "default": "./shortcuts.svelte.ts"
+    },
+    "./time": {
+      "types": "./time.ts",
+      "default": "./time.ts"
+    },
+    "./stores/toast.svelte": {
+      "types": "./stores/toast.svelte.ts",
+      "default": "./stores/toast.svelte.ts"
+    },
+    "./stores/toast.helpers": {
+      "types": "./stores/toast.helpers.ts",
+      "default": "./stores/toast.helpers.ts"
+    },
+    "./ui/ActionItem.svelte": {
+      "svelte": "./ui/ActionItem.svelte",
+      "default": "./ui/ActionItem.svelte"
+    },
+    "./ui/ActionsList.svelte": {
+      "svelte": "./ui/ActionsList.svelte",
+      "default": "./ui/ActionsList.svelte"
+    },
+    "./ui/Avatar.svelte": {
+      "svelte": "./ui/Avatar.svelte",
+      "default": "./ui/Avatar.svelte"
+    },
+    "./ui/ChipMenu.svelte": {
+      "svelte": "./ui/ChipMenu.svelte",
+      "default": "./ui/ChipMenu.svelte"
+    },
+    "./ui/DateInput.svelte": {
+      "svelte": "./ui/DateInput.svelte",
+      "default": "./ui/DateInput.svelte"
+    },
+    "./ui/HighlightCorrectMenu.svelte": {
+      "svelte": "./ui/HighlightCorrectMenu.svelte",
+      "default": "./ui/HighlightCorrectMenu.svelte"
+    },
+    "./ui/OfflineBanner.svelte": {
+      "svelte": "./ui/OfflineBanner.svelte",
+      "default": "./ui/OfflineBanner.svelte"
+    },
+    "./ui/ReplaceTextModal.svelte": {
+      "svelte": "./ui/ReplaceTextModal.svelte",
+      "default": "./ui/ReplaceTextModal.svelte"
+    },
+    "./ui/SendToZohoModal.svelte": {
+      "svelte": "./ui/SendToZohoModal.svelte",
+      "default": "./ui/SendToZohoModal.svelte"
+    },
+    "./ui/ShareCallModal.svelte": {
+      "svelte": "./ui/ShareCallModal.svelte",
+      "default": "./ui/ShareCallModal.svelte"
+    },
+    "./ui/ShortcutsOverlay.svelte": {
+      "svelte": "./ui/ShortcutsOverlay.svelte",
+      "default": "./ui/ShortcutsOverlay.svelte"
+    },
+    "./ui/SpeakerRenamePicker.svelte": {
+      "svelte": "./ui/SpeakerRenamePicker.svelte",
+      "default": "./ui/SpeakerRenamePicker.svelte"
+    },
+    "./ui/SsoLinkModal.svelte": {
+      "svelte": "./ui/SsoLinkModal.svelte",
+      "default": "./ui/SsoLinkModal.svelte"
+    },
+    "./ui/SummaryText.helpers": {
+      "types": "./ui/SummaryText.helpers.ts",
+      "default": "./ui/SummaryText.helpers.ts"
+    },
+    "./ui/SummaryText.svelte": {
+      "svelte": "./ui/SummaryText.svelte",
+      "default": "./ui/SummaryText.svelte"
+    },
+    "./ui/Toast.svelte": {
+      "svelte": "./ui/Toast.svelte",
+      "default": "./ui/Toast.svelte"
+    },
+    "./ui/ToastHost.svelte": {
+      "svelte": "./ui/ToastHost.svelte",
+      "default": "./ui/ToastHost.svelte"
+    },
+    "./ui/Waveform.svelte": {
+      "svelte": "./ui/Waveform.svelte",
+      "default": "./ui/Waveform.svelte"
+    },
+    "./tosMarkdown": {
+      "types": "./tosMarkdown.ts",
+      "default": "./tosMarkdown.ts"
+    },
+    "./TosConfirmModal.svelte": {
+      "svelte": "./TosConfirmModal.svelte",
+      "default": "./TosConfirmModal.svelte"
+    }
+  }
+}

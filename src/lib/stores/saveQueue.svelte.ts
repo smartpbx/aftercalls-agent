@@ -13,33 +13,18 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { isPortalError, type PortalError } from "$lib/portalError";
-import { toast } from "$lib/stores/toast.svelte";
+import { toast } from "@aftercalls/shared/stores/toast.svelte";
 import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
+import type {
+  QueuedSaveEntry,
+  SaveOp,
+  SaveQueueStore,
+} from "@aftercalls/shared/contracts";
 
 const STORAGE_KEY = "aftercalls:save-queue";
 
-export type SaveOp =
-  | {
-      kind: "notes";
-      callId: string;
-      notes: string;
-      at: number;
-    }
-  | {
-      kind: "patchActionItem";
-      callId: string;
-      itemId: string;
-      body: {
-        description?: string;
-        assignee_user_id?: string | null;
-        status?: "open" | "done";
-        due_kind?: "none" | "asap" | "dated";
-        due_at?: string | null;
-      };
-      at: number;
-    };
-
-type QueuedEntry = SaveOp & { id: string };
+export type { SaveOp } from "@aftercalls/shared/contracts";
+type QueuedEntry = QueuedSaveEntry;
 
 function readPersisted(): QueuedEntry[] {
   if (typeof localStorage === "undefined") return [];
@@ -225,7 +210,7 @@ function createStore() {
   };
 }
 
-export const saveQueue = createStore();
+export const saveQueue: SaveQueueStore = createStore();
 
 export function isTransientNetworkError(err: unknown): boolean {
   return isTransientNetwork(err);

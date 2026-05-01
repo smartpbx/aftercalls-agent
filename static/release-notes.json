@@ -1,4 +1,11 @@
 {
+  "0.14.11": {
+    "headline": "Adds a first-call guide on call detail pages and a team activity dashboard for admins.",
+    "changes": [
+      "First-call guide on call detail pages. When a user opens their first completed call, the call page now offers a short, dismissible guide to the Audio, Highlights, Summary, and Transcript sections. It gives new users a clearer hand-off from recording to review without getting in the way of returning users.",
+      "Team activity dashboard for admins. Admins now have a dashboard that summarizes the last seven days of team activity, including total calls, average call length, top tags, and active team members. It gives managers a quick Monday-morning view of what the team worked on without building filters by hand."
+    ]
+  },
   "0.14.10": {
     "headline": "Adds faster call triage with transcript search, pinned calls, and action-item snoozing, plus fixes imported-call audio playback.",
     "changes": [

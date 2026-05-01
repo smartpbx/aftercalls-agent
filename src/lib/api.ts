@@ -15,40 +15,34 @@
 // sync.
 
 import { invoke } from "@tauri-apps/api/core";
+import type {
+  AcceptedTos,
+  DataExportCreateResponse,
+  DataExportListResponse,
+  DataExportRow,
+  ImportCandidate,
+  ImportCandidatePromoteResponse,
+  ImportCandidatesResponse,
+  MyAccessLogPage,
+  MyAccessLogRow,
+  MyPrivacyBundle,
+} from "@aftercalls/shared/types";
+
+export type {
+  AcceptedTos,
+  DataExportCreateResponse,
+  DataExportListResponse,
+  DataExportRow,
+  DataExportStatus,
+  ImportCandidate,
+  ImportCandidatePromoteResponse,
+  ImportCandidatesResponse,
+  MyAccessLogPage,
+  MyAccessLogRow,
+  MyPrivacyBundle,
+} from "@aftercalls/shared/types";
 
 // ── /settings/privacy bundle (#514, mirrored for #592) ──────────────
-
-export type AcceptedTos = {
-  version_id: string;
-  kind: "terms" | "privacy";
-  slug: string;
-  effective_at: string;
-  accepted_at: string;
-};
-
-export type MyAccessLogRow = {
-  id: string;
-  call_id: string;
-  call_title: string | null;
-  viewer_user_id: string;
-  viewer_display_name: string;
-  access_kind: "view" | "audio";
-  accessed_at: string;
-};
-
-// Cursor envelope for the access-log page. `next_cursor` is the last
-// kept row's `accessed_at` (RFC-3339); `null` on the final page.
-export type MyAccessLogPage = {
-  rows: MyAccessLogRow[];
-  next_cursor: string | null;
-};
-
-export type MyPrivacyBundle = {
-  joined_at: string;
-  tos_acceptances: AcceptedTos[];
-  calls_count: number;
-  access_log: MyAccessLogPage;
-};
 
 export const myPrivacy = {
   bundle: (): Promise<MyPrivacyBundle> =>
@@ -64,41 +58,6 @@ export const myPrivacy = {
 };
 
 // ── Data export (#506, mirrored for #592) ───────────────────────────
-
-export type DataExportStatus =
-  | "pending"
-  | "running"
-  | "ready"
-  | "failed"
-  | "expired";
-
-export type DataExportRow = {
-  id: string;
-  status: DataExportStatus;
-  requested_at: string;
-  expires_at: string | null;
-  finished_at: string | null;
-  bytes: number | null;
-  call_count: number | null;
-  audio_count: number | null;
-  error_message: string | null;
-  /** Upload progress, 0–100 (#591). Mirrors portal `DataExportRow`. */
-  progress_pct: number | null;
-  /** Only present on `getStatus` when the row is `ready` and the
-   *  archive hasn't expired. The backend re-issues a fresh 24h
-   *  presigned link on every poll, so the page doesn't need to
-   *  cache or refresh it on its own. */
-  download_url?: string;
-};
-
-export type DataExportListResponse = {
-  exports: DataExportRow[];
-};
-
-export type DataExportCreateResponse = {
-  id: string;
-  status: DataExportStatus;
-};
 
 export const dataExports = {
   /** Request a new export. 202 on success; the backend's 400 cooldown
@@ -126,35 +85,6 @@ export const dataExports = {
 // `agent/src-tauri/src/portal.rs` (`import_candidates_*`) and ride the
 // same auth-aware header dance as the rest of this surface — kind-based
 // PortalError on non-2xx so the page can surface a precise toast.
-
-/** A single discovered upstream recording the user can promote into a
- *  real `calls` row (Import) or hide (Dismiss). Wire shape matches the
- *  backend's `ImportCandidate` JSON exactly. */
-export type ImportCandidate = {
-  id: string;
-  ingest_source: "smartpbx" | "zoho_meeting";
-  source_external_id: string;
-  discovered_at: string;
-  dismissed_at: string | null;
-  imported_call_id: string | null;
-  /** Source-specific JSON shape. SmartPBX carries
-   *  `{ title, duration_secs, started_at, caller_extension,
-   *  callee_extension }`; Zoho Meeting carries `{ topic, start_time,
-   *  attendees, duration_secs }`. The page renders a small set of
-   *  known keys defensively. */
-  metadata: Record<string, unknown>;
-};
-
-export type ImportCandidatesResponse = {
-  items: ImportCandidate[];
-  next_cursor: string | null;
-};
-
-export type ImportCandidatePromoteResponse = {
-  candidate_id: string;
-  call_id: string;
-  was_new: boolean;
-};
 
 export const importCandidates = {
   /** GET /v1/import-candidates — caller's own open candidates (not

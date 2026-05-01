@@ -4,26 +4,26 @@
   import { writeText, writeHtml } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
-  import Waveform from "$lib/Waveform.svelte";
+  import Waveform from "@aftercalls/shared/ui/Waveform.svelte";
   import NotesPanel from "$lib/NotesPanel.svelte";
-  import Avatar from "$lib/Avatar.svelte";
+  import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
   import SpeakerRenamePicker, {
     type SpeakerPick,
     type SpeakerSubsetPick,
-  } from "$lib/SpeakerRenamePicker.svelte";
+  } from "@aftercalls/shared/ui/SpeakerRenamePicker.svelte";
   import SummaryText, {
     firstLastInitial,
     rewriteChipOccurrence,
-  } from "$lib/SummaryText.svelte";
-  import ActionItem from "$lib/ActionItem.svelte";
-  import ChipMenu from "$lib/ChipMenu.svelte";
+  } from "@aftercalls/shared/ui/SummaryText.svelte";
+  import ActionItem from "@aftercalls/shared/ui/ActionItem.svelte";
+  import ChipMenu from "@aftercalls/shared/ui/ChipMenu.svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import SendToZohoModal, {
     type SzmPriorPush,
     type SzmRecordTypes,
     type SzmSearchResult,
     type SzmPushResponse,
-  } from "$lib/SendToZohoModal.svelte";
+  } from "@aftercalls/shared/ui/SendToZohoModal.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
   // #107 — local save-queue: keep optimistic state + queue mutations
   // when the failure looks like a transient network/server blip.
@@ -35,7 +35,7 @@
   // the shared toast store rather than per-row inline error surfaces.
   // Mirrors the portal handler. Keeps the editor lifecycle clean (no
   // draft re-focus on error, no .ai-confirm-err Retry button).
-  import { toast } from "$lib/stores/toast.svelte";
+  import { toast } from "@aftercalls/shared/stores/toast.svelte";
   import {
     isPortalError,
     portalErrorToText,
@@ -47,95 +47,28 @@
     REASSURANCE_LINE,
     readyToastMessage,
     readyTrayBody,
-  } from "$lib/processing-thresholds";
-  import ShareCallModal from "$lib/ShareCallModal.svelte";
-  import HighlightCorrectMenu, {
-    type HighlightAnchor,
-  } from "$lib/HighlightCorrectMenu.svelte";
+  } from "@aftercalls/shared/processing-thresholds";
+  import ShareCallModal from "@aftercalls/shared/ui/ShareCallModal.svelte";
+  import HighlightCorrectMenu from "@aftercalls/shared/ui/HighlightCorrectMenu.svelte";
+  import type {
+    HighlightAnchor as CorrectHighlightAnchor,
+  } from "@aftercalls/shared/ui/HighlightCorrectMenu.svelte";
   import ReplaceTextModal, {
     type ReplaceAnchor,
     type ReplaceScope,
-  } from "$lib/ReplaceTextModal.svelte";
-  import { registerShortcuts } from "$lib/shortcuts.svelte";
-
-  type Utterance = {
-    idx: number;
-    speaker: string;
-    original_speaker: string;
-    start_ms: number;
-    end_ms: number;
-    text: string;
-    // #82: FK to the org user this speaker resolves to, when the
-    // rename picker matched a teammate. Null for free-form / legacy
-    // rows.
-    speaker_user_id: string | null;
-  };
-
-  type TagKind = "client" | "purpose" | "topic" | "custom";
-  type Tag = { kind: TagKind; value: string };
-  type TagSuggestion = { kind: TagKind; value: string; count: number };
-
-  // Phase 1 of the v0.4.0 action-items bundle (#10 #19 #104 #105).
-  // Structured rows — mirrors the backend `ActionItem` DTO and the
-  // portal's `api.ActionItem` type. Fields line up 1:1 so the
-  // shared `ActionItem.svelte` mirror pair can consume either.
-  type ActionItemRow = {
-    id: string;
-    call_id: string;
-    description: string;
-    assignee_user_id: string | null;
-    status: "open" | "done";
-    completed_at: string | null;
-    completed_by_user_id: string | null;
-    source: "llm" | "manual";
-    created_at: string;
-    order_index: number;
-    // #173 — due-date metadata. `due_at` is `YYYY-MM-DD` only when
-    // `due_kind === "dated"`; null otherwise.
-    due_kind: "none" | "asap" | "dated";
-    due_at: string | null;
-  };
-
-  type Call = {
-    id: string;
-    session_id: string;
-    recorded_at: string;
-    duration_ms: number;
-    title: string | null;
-    matched_client: string | null;
-    summary_text: string | null;
-    action_items: ActionItemRow[];
-    participants: string[];
-    note_markdown_path: string | null;
-    status: string;
-    source_app: string | null;
-    source_kind: string | null;
-    /** External-source classification (#303): 'agent' (default),
-     *  'zoho_meeting', 'zoho_cliq', 'smartpbx', 'imported_file'.
-     *  Older backends without this field land as undefined. */
-    ingest_source?: string;
-    utterances: Utterance[];
-    tags: Tag[];
-    // Manual notes markdown (#73). Server always returns a string
-    // (empty when untouched). Editable via update_call_notes.
-    notes?: string;
-  };
-
-  type Me = {
-    user_id?: string;
-    email: string;
-    // #96: structured first/last alongside display_name. Optional —
-    // old auth.json files may predate the split.
-    first_name?: string;
-    last_name?: string;
-    display_name: string;
-    role: string;
-    org_display_name: string;
-    /// #215 — per-org feature flags. Optional so older auth.json
-    /// files (before this field landed) deserialize cleanly; missing
-    /// keys default to false → Zoho UI hidden.
-    features?: { zoho?: boolean };
-  };
+  } from "@aftercalls/shared/ui/ReplaceTextModal.svelte";
+  import { registerShortcuts } from "@aftercalls/shared/shortcuts";
+  import type {
+    ActionItemRow,
+    Call,
+    Highlight,
+    Me,
+    OrgMember,
+    Tag,
+    TagKind,
+    TagSuggestion,
+    Utterance,
+  } from "@aftercalls/shared/types";
 
   function prettyApp(raw: string | null): string | null {
     if (!raw) return null;
@@ -180,18 +113,6 @@
         return "";
     }
   }
-
-  type Highlight = {
-    id: string;
-    call_id: string;
-    start_ms: number;
-    end_ms: number;
-    kind: string;
-    label: string | null;
-    note: string | null;
-    source: string;
-    created_at: string;
-  };
 
   let call = $state<Call | null>(null);
   let me = $state<Me | null>(null);
@@ -1513,16 +1434,6 @@
   // opens a rename editor; held per-page-instance. Recents are in
   // localStorage (the Tauri webview supports it) with the same key as
   // the portal so the UX matches across the two clients.
-  // #96: OrgMember grew first_name + last_name on the API. Unused
-  // here (picker still matches on display_name); kept in the type so
-  // TS doesn't complain about the extra fields on the wire.
-  type OrgMember = {
-    id: string;
-    first_name: string;
-    last_name: string;
-    display_name: string;
-    email: string;
-  };
   let memberRoster = $state<OrgMember[]>([]);
   let memberRosterLoaded = $state(false);
   let memberRosterError = $state(false);
@@ -3171,7 +3082,7 @@
   type CorrectMenuState = {
     rect: DOMRect;
     selection: string;
-    anchor: HighlightAnchor;
+    anchor: CorrectHighlightAnchor;
   } | null;
   let correctMenu = $state<CorrectMenuState>(null);
   type CorrectModalState = {
@@ -3206,7 +3117,9 @@
     return count;
   }
 
-  function resolveAnchorFromSelection(sel: Selection): HighlightAnchor | null {
+  function resolveAnchorFromSelection(
+    sel: Selection,
+  ): CorrectHighlightAnchor | null {
     if (!sel.rangeCount) return null;
     const range = sel.getRangeAt(0);
     const container = isInsideTextCorrectRegion(range.startContainer);
@@ -3255,7 +3168,7 @@
 
   function openReplaceModal(args: {
     selection: string;
-    anchor: HighlightAnchor;
+    anchor: CorrectHighlightAnchor;
   }) {
     correctModal = { selection: args.selection, anchor: args.anchor };
     correctMenu = null;
