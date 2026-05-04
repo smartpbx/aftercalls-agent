@@ -26,7 +26,7 @@
 // The locked shortcut list (issue #282) — wired by callers, listed
 // here for grep:
 //
-//   Global       : ? (overlay), Escape (close)
+//   Global       : ? (overlay), Cmd/Ctrl+K (command palette), Escape (close)
 //   Calls list   : j/k (next/prev), Enter|o (open), / (focus search)
 //   Call detail  : Space (play/pause), ←/→ (-10s/+10s),
 //                  Shift+←/Shift+→ (-30s/+30s), , / . (rate -/+)
@@ -69,10 +69,14 @@ type ContextEntry = {
 
 const contexts = $state<Map<string, ContextEntry>>(new Map());
 let helpOpen = $state(false);
+let commandOpen = $state(false);
 
 export const shortcutsState = {
   get helpOpen() {
     return helpOpen;
+  },
+  get commandOpen() {
+    return commandOpen;
   },
   get contexts(): ShortcutGroup[] {
     // Stable order: insertion order. The layout registers "global"
@@ -91,10 +95,27 @@ export const shortcutsState = {
 
 export function setHelpVisible(visible: boolean) {
   helpOpen = visible;
+  if (visible) commandOpen = false;
 }
 
 export function toggleHelp() {
-  helpOpen = !helpOpen;
+  const next = !helpOpen;
+  helpOpen = next;
+  if (next) commandOpen = false;
+}
+
+export function openCommandPalette() {
+  commandOpen = true;
+  helpOpen = false;
+}
+
+export function closeCommandPalette() {
+  commandOpen = false;
+}
+
+export function setCommandPaletteVisible(visible: boolean) {
+  commandOpen = visible;
+  if (visible) helpOpen = false;
 }
 
 // ── Registration ────────────────────────────────────────────────────
@@ -178,6 +199,12 @@ function onWindowKeydown(e: KeyboardEvent) {
   // is gated by the input-focus guard further down.
   const key = normalizeKey(e);
 
+  if (key === "escape" && commandOpen) {
+    e.preventDefault();
+    commandOpen = false;
+    return;
+  }
+
   if (key === "escape" && helpOpen) {
     e.preventDefault();
     helpOpen = false;
@@ -193,6 +220,10 @@ function onWindowKeydown(e: KeyboardEvent) {
   // calls preventDefault on Enter/Space to seek), don't fire a
   // second action from the window-level binding.
   if (e.defaultPrevented) return;
+
+  // While the command palette is open, page-level shortcuts are paused.
+  // The palette component handles arrows / Enter / Escape locally.
+  if (commandOpen) return;
 
   // While the help overlay is open, only the global toggle (`?`) and
   // Escape fire — page-level shortcuts pause so a user pressing `j`

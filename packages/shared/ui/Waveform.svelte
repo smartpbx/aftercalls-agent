@@ -24,6 +24,20 @@
     durationMs: number;
     height?: number;
     highlights?: Highlight[];
+    // #564 — when `skipSilence` is true and the playhead enters one of
+    // `silenceRanges`, the RAF loop seeks `audio.currentTime` to the
+    // range end + a 50 ms epsilon. `silenceRanges` is the same array
+    // shape served by the peaks sidecar (`[start_s, end_s]`, sorted).
+    // Pass `null` (or omit) when the call has no silence data — the
+    // overlay is skipped and skip-jumps stay no-ops.
+    skipSilence?: boolean;
+    silenceRanges?: [number, number][] | null;
+    // #564 — invoked once per skip-jump with the seconds skipped, so
+    // the page can update its `aria-live` "Skipped N seconds" region.
+    // The component is the only place that knows when a jump fires;
+    // the parent owns the announcement DOM (single live region per
+    // page, persisted to avoid the "newly added live region" AT bug).
+    onsilenceskip?: (skippedSeconds: number) => void;
     onseek?: (ms: number) => void;
     // Shift-drag emits a range so the parent can create a highlight.
     onmark?: (range: { start_ms: number; end_ms: number }) => void;
@@ -36,9 +50,18 @@
     durationMs,
     height = 140,
     highlights = [],
+    skipSilence = false,
+    silenceRanges = null,
+    onsilenceskip,
     onseek,
     onmark,
   }: Props = $props();
+
+  // #564 — 50 ms epsilon past the silence end. Larger than the
+  // `Math.floor(audio.currentTime * 1000)` rounding error (max 1 ms),
+  // so a fresh `timeupdate` after the seek won't see the playhead
+  // re-enter the same range.
+  const SKIP_EPSILON_S = 0.05;
 
   let dragRange = $state<{ start_ms: number; end_ms: number } | null>(null);
   let isMarking = $state(false);
@@ -133,6 +156,26 @@
     const g = canvas.getContext("2d")!;
     g.scale(DPR, DPR);
     g.clearRect(0, 0, cw, ch);
+
+    // ── Silence bands (painted first, behind highlights + bars) ─────
+    // #564 — semi-transparent rectangle on the same layer highlights
+    // use, but no top/bottom edge cap because silence is ambient
+    // information, not a point of interest. Skipped when there's no
+    // data or the toggle is off (the overlay's job is to telegraph
+    // *what* the toggle skips).
+    if (durationMs > 0 && skipSilence && silenceRanges && silenceRanges.length > 0) {
+      const fill = `color-mix(in srgb, ${getCss("--bone-3")} 18%, transparent)`;
+      g.fillStyle = fill;
+      for (const [startS, endS] of silenceRanges) {
+        const x1 = ((startS * 1000) / durationMs) * cw;
+        const x2 = ((endS * 1000) / durationMs) * cw;
+        const w = x2 - x1;
+        // Skip sub-pixel bands — same floor highlights use to avoid
+        // overdraw on very narrow regions.
+        if (w < 1) continue;
+        g.fillRect(x1, 0, w, ch);
+      }
+    }
 
     // ── Highlight bands (painted behind the bars) ──────────────────────
     if (durationMs > 0) {
@@ -263,6 +306,27 @@
   function loop() {
     rafId = requestAnimationFrame(loop);
     if (audio && !audio.paused) {
+      // #564 — skip-silence jump. If the toggle is on and the playhead
+      // sits inside a silence range, seek past the range end. Done
+      // before the `currentMs` read so the next paint shows the
+      // post-jump position. Cheap linear scan — typical 60-min call has
+      // tens to low hundreds of ranges and we run it at most once per
+      // RAF tick.
+      if (skipSilence && silenceRanges && silenceRanges.length > 0) {
+        const t = audio.currentTime;
+        for (const [startS, endS] of silenceRanges) {
+          if (t >= startS && t < endS) {
+            const target = endS + SKIP_EPSILON_S;
+            audio.currentTime = target;
+            const skipped = Math.max(0, endS - t);
+            onsilenceskip?.(skipped);
+            break;
+          }
+          // Ranges are sorted; bail early once we're left of the next
+          // range.
+          if (t < startS) break;
+        }
+      }
       // currentMs is bound from outside; reading audio.currentTime directly
       // keeps the playhead smooth even when the outside event is throttled.
       currentMs = Math.floor(audio.currentTime * 1000);
@@ -347,11 +411,15 @@
   }
 
   // Repaint reactively for currentMs/durationMs/highlights changes coming
-  // from outside. Svelte 5 effect tracks through property reads.
+  // from outside. Svelte 5 effect tracks through property reads. #564
+  // adds skipSilence + silenceRanges — toggling off clears the overlay
+  // immediately on the next paint instead of waiting for the RAF tick.
   $effect(() => {
     currentMs;
     durationMs;
     highlights;
+    skipSilence;
+    silenceRanges;
     paint();
   });
 </script>

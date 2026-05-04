@@ -21,6 +21,10 @@
       "types": "./shortcuts.svelte.ts",
       "default": "./shortcuts.svelte.ts"
     },
+    "./commandPalette": {
+      "types": "./commandPalette.ts",
+      "default": "./commandPalette.ts"
+    },
     "./time": {
       "types": "./time.ts",
       "default": "./time.ts"
@@ -48,6 +52,10 @@
     "./ui/ChipMenu.svelte": {
       "svelte": "./ui/ChipMenu.svelte",
       "default": "./ui/ChipMenu.svelte"
+    },
+    "./ui/CommandPalette.svelte": {
+      "svelte": "./ui/CommandPalette.svelte",
+      "default": "./ui/CommandPalette.svelte"
     },
     "./ui/DateInput.svelte": {
       "svelte": "./ui/DateInput.svelte",

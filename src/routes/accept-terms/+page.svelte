@@ -101,6 +101,7 @@
         !refreshed.pending_tos ||
         refreshed.pending_tos.length === 0
       ) {
+        window.dispatchEvent(new CustomEvent("aftercalls-auth-refresh"));
         await goto("/calls");
       } else {
         err =

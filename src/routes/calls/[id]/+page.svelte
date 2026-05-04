@@ -1310,6 +1310,40 @@
   // instead of silently pretending the call has no audio.
   let audioUrlsError = $state(false);
   let peaks = $state<Float32Array | null>(null);
+  // #564 — skip-silence toggle. Per-session, per-call (component-local
+  // $state, not persisted). `silenceRanges` rides the same peaks
+  // sidecar; legacy calls predate the field and surface as `null` →
+  // toggle disables.
+  let skipSilence = $state(false);
+  let silenceRanges = $state<[number, number][] | null>(null);
+  let silenceAnnouncement = $state("");
+
+  // #564 — type-narrow + sanity-check the optional `silence_ranges`
+  // field on the peaks sidecar. Legacy sidecars omit it entirely
+  // (treated as null → toggle disabled). Empty array is the explicit
+  // "no detectable silence" signal — toggle stays enabled.
+  function readSilenceRanges(doc: unknown): [number, number][] | null {
+    const ranges = (doc as { silence_ranges?: unknown })?.silence_ranges;
+    if (!Array.isArray(ranges)) return null;
+    return ranges.filter(
+      (r): r is [number, number] =>
+        Array.isArray(r) &&
+        r.length === 2 &&
+        Number.isFinite(r[0]) &&
+        Number.isFinite(r[1]) &&
+        r[1] > r[0],
+    );
+  }
+
+  function toggleSkipSilence() {
+    if (silenceRanges === null) return;
+    skipSilence = !skipSilence;
+  }
+
+  function onSilenceSkip(skippedSeconds: number) {
+    const n = Math.max(1, Math.round(skippedSeconds));
+    silenceAnnouncement = `Skipped ${n} second${n === 1 ? "" : "s"} of silence`;
+  }
   // Guards the auto-retry $effect below that watches peaks_available.
   // Without this a burst of audioUrls updates (e.g. poll ticks after
   // terminal) could fire concurrent get_peaks calls. Cleared in a
@@ -1365,12 +1399,16 @@
     peaksFetchInFlight = true;
     void (async () => {
       try {
-        const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+        const doc = await invoke<{
+          peaks: number[];
+          silence_ranges?: [number, number][];
+        }>("get_peaks", {
           id: page.params.id,
         });
         if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
           peaks = new Float32Array(doc.peaks);
         }
+        silenceRanges = readSilenceRanges(doc);
         trace("get_peaks ok (auto-retry on peaks_available transition)", {
           bytes: doc.peaks?.length ?? 0,
         });
@@ -1552,12 +1590,16 @@
       }
       if (audioUrls.peaks_available) {
         try {
-          const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+          const doc = await invoke<{
+            peaks: number[];
+            silence_ranges?: [number, number][];
+          }>("get_peaks", {
             id: page.params.id,
           });
           if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
             peaks = new Float32Array(doc.peaks);
           }
+          silenceRanges = readSilenceRanges(doc);
           trace("get_peaks ok", { bytes: doc.peaks?.length ?? 0 });
         } catch (e) {
           trace("get_peaks FAILED", e);
@@ -1903,12 +1945,16 @@
     }
     if (audioUrls.peaks_available && (!peaks || peaks.length === 0)) {
       try {
-        const doc = await invoke<{ peaks: number[] }>("get_peaks", {
+        const doc = await invoke<{
+          peaks: number[];
+          silence_ranges?: [number, number][];
+        }>("get_peaks", {
           id: page.params.id,
         });
         if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
           peaks = new Float32Array(doc.peaks);
         }
+        silenceRanges = readSilenceRanges(doc);
       } catch (e) {
         trace("get_peaks FAILED (manual retry)", e);
       }
@@ -3257,12 +3303,17 @@
         "shift+arrowright": () => skip(30),
         ",": () => nudgeRate(-0.25),
         ".": () => nudgeRate(0.25),
+        // #564 — `s` toggles skip-silence. Input-focus guard in
+        // `registerShortcuts` keeps it inert when typing in the notes
+        // editor / search box / tag picker.
+        s: () => toggleSkipSilence(),
       },
       [
         { keys: "space", label: "Play / pause" },
         { keys: "← →", label: "Seek -10s / +10s" },
         { keys: "shift+← shift+→", label: "Seek -30s / +30s" },
         { keys: ", .", label: "Playback speed -0.25× / +0.25×" },
+        { keys: "s", label: "Toggle skip silence" },
       ],
     );
   });
@@ -3519,6 +3570,9 @@
           bind:currentMs
           durationMs={call.duration_ms}
           {highlights}
+          {skipSilence}
+          {silenceRanges}
+          onsilenceskip={onSilenceSkip}
           onseek={(ms) => seekTo(ms)}
           onmark={(r) => createHighlight(r)}
         />
@@ -3599,6 +3653,47 @@
         <button class="rate" onclick={cycleRate} aria-label="Playback rate">
           {rate}×
         </button>
+        <!-- #564 — Skip-silence toggle. Disabled when silenceRanges
+             is null (legacy peaks sidecar without the field). Icon:
+             tilde-wave with strikethrough off, clean wave on. -->
+        <button
+          type="button"
+          class="t-btn skip-silence"
+          class:skip-silence-on={skipSilence}
+          onclick={toggleSkipSilence}
+          disabled={silenceRanges === null}
+          aria-pressed={silenceRanges === null ? undefined : skipSilence}
+          aria-disabled={silenceRanges === null ? "true" : undefined}
+          title={silenceRanges === null
+            ? "Skip silence (not available for this call)"
+            : skipSilence
+              ? "Skip silence: on (s)"
+              : "Skip silence (s)"}
+          aria-label={silenceRanges === null
+            ? "Skip silence (not available for this call)"
+            : skipSilence
+              ? "Skip silence: on (s)"
+              : "Skip silence (s)"}
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path
+              d="M2 8 Q4 5 6 8 T10 8 T14 8"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              fill="none"
+            />
+            {#if !skipSilence}
+              <path
+                d="M3.5 12.5 L12.5 3.5"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                fill="none"
+              />
+            {/if}
+          </svg>
+        </button>
         <button
           class="t-btn download"
           onclick={downloadCurrentTrack}
@@ -3637,6 +3732,13 @@
         onerror={onAudioError}
         preload="auto"
       ></audio>
+
+      <!-- #564 — Single aria-live region for skip-silence
+           announcements. Always in the DOM, text replaced (not
+           appended) on each jump so rapid skips don't queue. -->
+      <div class="sr-only" aria-live="polite" aria-atomic="true">
+        {silenceAnnouncement}
+      </div>
 
       <p class="hint">
         <kbd>Shift</kbd>+drag on the waveform to mark a highlight.
@@ -5025,6 +5127,21 @@
   .t-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  /* #564 — Skip-silence toggle. Reuses the .t-btn shape; .skip-silence-on
+     swaps to the accent tint, mirroring `.t-btn.play.playing`. The
+     :disabled rule above already covers the no-data state. */
+  .t-btn.skip-silence {
+    color: var(--bone-3);
+  }
+  .t-btn.skip-silence:hover:not(:disabled) {
+    color: var(--bone-1);
+  }
+  .t-btn.skip-silence.skip-silence-on {
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-color: var(--accent);
   }
 
   .rate {

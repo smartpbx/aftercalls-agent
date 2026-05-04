@@ -1,4 +1,17 @@
 {
+  "0.15.0": {
+    "headline": "A power-user release: command palette, saved views on Calls, skip-silence playback, opt-in weekly digest emails, a desktop first-run guide, and admin polish (settings tabs and AI-prompt preview).",
+    "changes": [
+      "Quick navigation with Cmd-K command palette. Press Cmd-K (or Ctrl-K) anywhere in the web app or desktop app to jump to recent calls, open action items, settings pages, or quick commands without leaving the keyboard. Results filter as you type with arrow-key navigation and Enter to act.",
+      "First-run guide in the desktop app. After signing in to the desktop app for the first time, a short, dismissible guide walks through record basics, the tray, keyboard shortcuts, call detection, and where to find Settings. You can skip it any time; it stays dismissed across launches.",
+      "Optional weekly digest email. Opt in to receive a Monday-morning email summarizing your last week of calls — total count, recording time, top tags, open action items, talk-time delta, and marked highlights. Empty weeks are silently skipped. Manage the opt-in (and one-click unsubscribe) at Settings → Notifications.",
+      "Section tabs on the Org settings page. Admin → Org settings now organizes Automation, Recording, AI prompts, and Client allowlist into clear section tabs instead of one long scroll. Each tab is link-friendly so a teammate can share a direct link to a specific section.",
+      "Test AI prompt changes on a recent call. Admin → AI prompts now has a Test on a recent call button. Pick one of your last 10 completed calls and watch the summary regenerate against your draft prompt before you save it. The original call's saved summary is left untouched.",
+      "Save filter combinations on the Calls page. On the Calls page, after applying filters (client, person, tags, date), click Save view to keep that combination as a one-click pill above the filters. Saved views also appear in the Cmd-K palette so you can jump to 'Acme this month' from anywhere. Renaming and deleting work from the manage menu.",
+      "Skip-silence toggle in the call audio player. Long calls have a Skip-silence toggle in the audio player (or press s). When on, playback automatically jumps over silent stretches longer than 1.5 seconds, with the silent regions shown as faint bands in the waveform. The toggle resets when you switch calls.",
+      "Help docs catch up with shipped features. The Help section now documents many features that shipped without entries — action items, public sharing, tags and filtering, highlight-to-correct, the offline indicator, the client-name allowlist, AI prompt customization, recording purpose and notification, the call access log, and more. The Help table of contents lists each new section."
+    ]
+  },
   "0.14.11": {
     "headline": "Adds a first-call guide on call detail pages and a team activity dashboard for admins.",
     "changes": [

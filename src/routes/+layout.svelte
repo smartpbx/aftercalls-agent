@@ -8,7 +8,7 @@
   import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { notifyAutoDetect } from "$lib/notify";
   import { detectPlatform, playStartCueIfEnabled } from "$lib/compliance";
   import { confirmAutoStart } from "$lib/autoStart";
@@ -18,13 +18,17 @@
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
   import ToastHost from "@aftercalls/shared/ui/ToastHost.svelte";
   import ShortcutsOverlay from "@aftercalls/shared/ui/ShortcutsOverlay.svelte";
+  import CommandPalette from "@aftercalls/shared/ui/CommandPalette.svelte";
+  import AgentOnboardingDeck from "$lib/AgentOnboardingDeck.svelte";
   import { initSentry } from "$lib/sentry";
   import { getAppPrefs } from "$lib/stores/appPrefs.svelte";
   import {
     initShortcutListener,
+    openCommandPalette,
     registerShortcuts,
     toggleHelp,
   } from "@aftercalls/shared/shortcuts";
+  import { createAgentCommandPaletteSections } from "$lib/commandPalette";
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { callRecording } from "$lib/stores/callRecording.svelte";
@@ -44,6 +48,7 @@
   };
 
   type Me = {
+    user_id: string;
     email: string;
     // #96: structured first/last ride alongside display_name. Optional
     // because older auth.json files may be missing them (serde
@@ -535,6 +540,8 @@
   // is in hand so the greeting can be personal. No key => first install;
   // we still show a welcome with the current version's notes.
   const LAST_SEEN_VERSION_KEY = "aftercalls.lastSeenVersion";
+  const AGENT_ONBOARDING_KEY_PREFIX = "aftercalls:agent-onboarding:v1:";
+  let agentOnboardingOpen = $state(false);
   // A single release-notes modal showing every version the user
   // jumped over since their last launch. `entries` is ordered newest-
   // first so the headline at the top is the version they're now
@@ -619,8 +626,19 @@
     teardownGlobalShortcuts = registerShortcuts(
       "global",
       "Global",
-      { "?": () => toggleHelp() },
-      [{ keys: "?", label: "Show this shortcuts panel" }],
+      {
+        "?": () => toggleHelp(),
+        "meta+k": () => {
+          if (!commandPaletteDisabled) openCommandPalette();
+        },
+        "ctrl+k": () => {
+          if (!commandPaletteDisabled) openCommandPalette();
+        },
+      },
+      [
+        { keys: "?", label: "Show this shortcuts panel" },
+        { keys: "meta+k ctrl+k", label: "Open command palette" },
+      ],
     );
     // Safety net: on webkit2gtk, an unhandled promise rejection during a
     // client-side route transition can take the whole renderer down (blank
@@ -1091,8 +1109,10 @@
     );
     unlistenUpdatePoll = () => window.clearInterval(updateTimer);
 
-    // Fire the release-notes check if we already have an authed user
-    // (returning session). Otherwise wait for the login event below.
+    // First-run education wins over release notes on a fresh install.
+    // ToS/privacy has already been evaluated above, so onboarding only
+    // opens for a fully usable authenticated session.
+    maybeShowAgentOnboarding();
     await maybeShowReleaseNotes();
 
     // Orphan-recovery scan (#63). Only meaningful when the user is
@@ -1107,6 +1127,7 @@
     // refresh the layout's user state + show the release-notes modal
     // personalized with the just-logged-in name.
     window.addEventListener("aftercalls-login", handleLoginEvent);
+    window.addEventListener("aftercalls-auth-refresh", handleLoginEvent);
   });
 
   async function handleLoginEvent() {
@@ -1118,6 +1139,7 @@
     // user has outstanding ToS we want to bounce them to
     // /accept-terms before maybeShowReleaseNotes / loadOrphans run.
     applyTosGate();
+    maybeShowAgentOnboarding();
     await maybeShowReleaseNotes();
     // Fresh login → check for leftover sessions from a previous run.
     // Same call as the onMount path; idempotent.
@@ -1144,6 +1166,51 @@
     if (pending.length === 0 && path === "/accept-terms") {
       goto("/calls");
     }
+  }
+
+  function agentOnboardingKey(userId: string): string {
+    return `${AGENT_ONBOARDING_KEY_PREFIX}${userId}`;
+  }
+
+  function hasPendingTos(): boolean {
+    return (me?.pending_tos?.length ?? 0) > 0;
+  }
+
+  function shouldShowAgentOnboarding(): boolean {
+    if (!me || hasPendingTos()) return false;
+    if (page.url.pathname === "/login" || page.url.pathname === "/accept-terms") {
+      return false;
+    }
+    try {
+      return localStorage.getItem(agentOnboardingKey(me.user_id)) !== "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function maybeShowAgentOnboarding(): boolean {
+    if (agentOnboardingOpen) return true;
+    if (!shouldShowAgentOnboarding()) return false;
+    releaseNotes = null;
+    agentOnboardingOpen = true;
+    return true;
+  }
+
+  async function closeAgentOnboarding(destination: "record" | "settings") {
+    if (me) {
+      try {
+        localStorage.setItem(agentOnboardingKey(me.user_id), "1");
+      } catch (e) {
+        console.warn("agent onboarding persistence failed", e);
+      }
+    }
+    agentOnboardingOpen = false;
+    if (destination === "settings") {
+      await goto("/settings");
+    } else if (page.url.pathname !== "/") {
+      await goto("/");
+    }
+    await maybeShowReleaseNotes();
   }
 
   async function loadOrphans() {
@@ -1242,6 +1309,8 @@
   async function maybeShowReleaseNotes() {
     if (releaseNotesChecked) return;
     if (!version || !me) return;
+    if (hasPendingTos() || page.url.pathname === "/accept-terms") return;
+    if (agentOnboardingOpen || shouldShowAgentOnboarding()) return;
     releaseNotesChecked = true;
     try {
       const lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
@@ -1453,6 +1522,7 @@
     // post-stop UI from the previous session.
     callRecording.reset();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
+    window.removeEventListener("aftercalls-auth-refresh", handleLoginEvent);
     teardownGlobalShortcuts?.();
     teardownGlobalShortcuts = null;
   });
@@ -1771,6 +1841,15 @@
       }
     }
   }
+  async function startRecordingFromCommandPalette() {
+    await goto("/");
+    await tick();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const startButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('button[aria-label="Start recording"]'),
+    ).find((button) => !button.disabled);
+    startButton?.click();
+  }
   async function manualUpdateCheck() {
     closeUserMenu();
     // #79: explicit user action bypasses the processing gate. If
@@ -1812,6 +1891,25 @@
     if (p.startsWith("/settings")) return "Settings";
     return "aftercalls";
   });
+
+  const commandPaletteDisabled = $derived(
+    !me ||
+      hasPendingTos() ||
+      isLoginPage ||
+      page.url.pathname === "/accept-terms" ||
+      agentOnboardingOpen ||
+      releaseNotes !== null ||
+      autoAckOpen ||
+      reportDialogOpen,
+  );
+  const commandPaletteSections = $derived(
+    createAgentCommandPaletteSections(
+      me,
+      goto,
+      openPortalLink,
+      startRecordingFromCommandPalette,
+    ),
+  );
 </script>
 
 <!-- Before auth resolves we render nothing so the login form doesn't flash
@@ -2328,6 +2426,14 @@
      surfaces. -->
 
 
+{#if agentOnboardingOpen}
+  <AgentOnboardingDeck
+    onFinish={() => closeAgentOnboarding("record")}
+    onSkip={() => closeAgentOnboarding("record")}
+    onOpenSettings={() => closeAgentOnboarding("settings")}
+  />
+{/if}
+
 {#if releaseNotes}
   <div
     class="rn-backdrop"
@@ -2537,6 +2643,10 @@
      the user presses `?`. Registered shortcut contexts (per-page)
      drive what's listed inside. -->
 <ShortcutsOverlay />
+<CommandPalette
+  sections={commandPaletteSections}
+  disabled={commandPaletteDisabled}
+/>
 
 <!-- #216 / #327 — Persistent live-recording floater. Mounted at the
      layout root so it stays visible while the main window is

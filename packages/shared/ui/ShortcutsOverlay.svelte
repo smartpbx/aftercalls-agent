@@ -30,6 +30,7 @@
       case "alt":
         return "Alt";
       case "meta":
+        return "Cmd";
       case "super":
         return "Super";
       case "arrowleft":
