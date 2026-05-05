@@ -159,13 +159,28 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func stopAsync() async throws {
-        guard let stream = self.stream else { return }
-        try await stream.stopCapture()
-        self.stream = nil
+        // Stop the capture first, capturing any error to re-throw after
+        // the file is sealed. Even if stopCapture fails, we MUST patch
+        // the WAV header so the bytes already on disk are readable —
+        // otherwise dataSize stays 0 and downstream players (QuickTime,
+        // ffmpeg) reject the file as malformed.
+        var captureError: Error?
+        if let stream = self.stream {
+            do {
+                try await stream.stopCapture()
+            } catch {
+                captureError = error
+            }
+            self.stream = nil
+        }
 
-        // Patch the WAV header in place: bytes 4..8 = riffSize,
-        // bytes 40..44 = dataSize. Our header layout is the standard
-        // 44-byte PCM RIFF/WAVE/fmt /data preamble.
+        // Drain the write-queue before sealing the file so any
+        // in-flight sampleBuffer callbacks have finished writing.
+        // `sync` blocks until the queue is empty.
+        writeQueue.sync {}
+
+        // Patch the WAV header in place: bytes 0..44 = riffSize +
+        // dataSize. Standard 44-byte PCM RIFF/WAVE/fmt /data preamble.
         if let handle = fileHandle {
             try handle.synchronize()
             try handle.seek(toOffset: 0)
@@ -173,6 +188,10 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
             try handle.write(contentsOf: header)
             try handle.close()
             fileHandle = nil
+        }
+
+        if let captureError = captureError {
+            throw captureError
         }
     }
 
@@ -203,9 +222,17 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
 
         // SCK gives us non-interleaved Float32 by default. Convert to
         // interleaved 16-bit signed PCM to match the WAV header.
-        let buffers = UnsafeBufferPointer<AudioBuffer>(
-            start: withUnsafePointer(to: &audioBufferList.mBuffers) { $0 },
-            count: Int(audioBufferList.mNumberBuffers))
+        //
+        // Use UnsafeMutableAudioBufferListPointer to walk the trailing
+        // `mNumberBuffers` array safely. The naive
+        // `withUnsafePointer(to: &audioBufferList.mBuffers)` idiom is
+        // unsafe when mNumberBuffers > 1 — Swift's struct layout for
+        // AudioBufferList doesn't lay out the trailing buffers
+        // contiguously, so reading `buffers[1]` etc. would dereference
+        // unrelated memory. The pointer wrapper handles the C-style
+        // trailing-array layout correctly.
+        let bufferList = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(&audioBufferList))
         let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
         let isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
 
@@ -213,10 +240,10 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
         let outChannels = Int(Self.channelCount)
         var interleaved = [Int16](repeating: 0, count: frameCount * outChannels)
 
-        if isFloat && !isInterleaved && buffers.count >= 1 {
+        if isFloat && !isInterleaved && bufferList.count >= 1 {
             // Non-interleaved float buffers, one per channel.
-            for ch in 0..<min(outChannels, buffers.count) {
-                guard let ptr = buffers[ch].mData?.assumingMemoryBound(to: Float32.self)
+            for ch in 0..<min(outChannels, bufferList.count) {
+                guard let ptr = bufferList[ch].mData?.assumingMemoryBound(to: Float32.self)
                 else { continue }
                 for f in 0..<frameCount {
                     let sample = ptr[f]
@@ -224,7 +251,7 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
                     interleaved[f * outChannels + ch] = Int16(clamped * 32767.0)
                 }
             }
-        } else if isFloat && isInterleaved, let buf = buffers.first,
+        } else if isFloat && isInterleaved, let buf = bufferList.first,
                   let ptr = buf.mData?.assumingMemoryBound(to: Float32.self) {
             // Already interleaved float.
             let totalSamples = frameCount * outChannels

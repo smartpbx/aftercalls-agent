@@ -91,7 +91,11 @@ pub const MIC_CONSUMER_BLACKLIST: &[&str] = &[
     "parec",
     "pw-cat",
     "pw-record",
-    "speech-dispatcher",
+    "speech-dispatcher",      // Linux speech daemon
+    "corespeechd",            // macOS speech recognition daemon (#597 catalog noise)
+    "coreaudiod",             // macOS audio daemon — system-level, never user-engaged
+    "tccd",                   // macOS TCC privacy daemon
+    "speechrecognitiond",     // alt macOS Speech daemon name
     "aftercalls", // our own cpal mic consumer's binary basename
 ];
 
