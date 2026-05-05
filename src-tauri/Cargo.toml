@@ -66,10 +66,11 @@ mac-notification-sys = "0.6"
 # bridge module is `cfg(target_os = "macos")`-gated so non-Mac builds
 # never see this dep.
 swift-bridge = "0.1"
-# CoreAudio HAL bindings for the Phase 4 audio observer (#597). Co-
-# located here because adding it now keeps the Mac dep block to a
-# single edit; the actual usage lands with the observer port.
-coreaudio-rs = "0.13"
+# CoreAudio HAL FFI bindings for the audio observer (#597). The
+# higher-level `coreaudio-rs` crate doesn't re-export the raw `sys`
+# symbols by default, so we depend on `coreaudio-sys` directly for
+# the property-list constants + `AudioObjectGetPropertyData` etc.
+coreaudio-sys = "0.2"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 swift-bridge-build = "0.1"

@@ -596,7 +596,7 @@ fn parse_product_version(s: &str) -> Option<(u32, u32)> {
 
 #[cfg(target_os = "macos")]
 fn macos_mic_consumers() -> Result<Vec<String>, String> {
-    use coreaudio::sys::{
+    use coreaudio_sys::{
         kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
         kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyIsRunningInput,
         kAudioProcessPropertyPID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
