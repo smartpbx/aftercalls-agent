@@ -37,6 +37,15 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var bytesWritten: UInt32 = 0
     private var lastErrorMessage: String?
+    // Sync-FFI result holders. Stored as instance properties (not local
+    // `var`s captured by the Task closure) because Swift's strict
+    // concurrency mode rejects mutation of captured local vars from
+    // concurrently-executing code. The DispatchSemaphore in start()/
+    // stop() handles ordering; ordering between the Task write and the
+    // post-`semaphore.wait()` read is happens-before through the
+    // semaphore signal.
+    private var lastStartResult: Bool = false
+    private var lastStopResult: Bool = false
     private let writeQueue = DispatchQueue(label: "com.aftercalls.loopback.write")
 
     // Parameter label matches the Rust bridge's `output_path: String`
@@ -53,12 +62,12 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
     /// failure, `lastError()` exposes the message for the Rust side.
     public func start() -> Bool {
         let semaphore = DispatchSemaphore(value: 0)
-        var ok = false
+        lastStartResult = false
 
         Task {
             do {
                 try await self.startAsync()
-                ok = true
+                self.lastStartResult = true
             } catch {
                 self.lastErrorMessage = "start: \(error.localizedDescription)"
                 FileHandle.standardError.write(
@@ -68,7 +77,7 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         semaphore.wait()
-        return ok
+        return lastStartResult
     }
 
     /// Synchronous stop — same semaphore pattern as `start`. Idempotent:
@@ -76,12 +85,12 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
     public func stop() -> Bool {
         guard stream != nil else { return true }
         let semaphore = DispatchSemaphore(value: 0)
-        var ok = false
+        lastStopResult = false
 
         Task {
             do {
                 try await self.stopAsync()
-                ok = true
+                self.lastStopResult = true
             } catch {
                 self.lastErrorMessage = "stop: \(error.localizedDescription)"
                 FileHandle.standardError.write(
@@ -91,7 +100,7 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         semaphore.wait()
-        return ok
+        return lastStopResult
     }
 
     /// Returns the last error message (or empty string if none).
