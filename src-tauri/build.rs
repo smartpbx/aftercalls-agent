@@ -60,7 +60,17 @@ mod macos {
         let bridge_glue_swift = bridge_dir.join("SwiftBridgeCore.swift");
         let agent_glue_swift = bridge_dir.join("agent").join("agent.swift");
 
-        let target_triple = env::var("TARGET").unwrap_or_else(|_| "arm64-apple-macosx13.0".into());
+        // Cargo's TARGET (e.g. `aarch64-apple-darwin`) is not the same
+        // shape Swift accepts (`arm64-apple-macosX.Y`). Convert.
+        let cargo_target = env::var("TARGET").unwrap_or_default();
+        let swift_arch = if cargo_target.starts_with("aarch64-") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        let macos_version =
+            env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".into());
+        let target_triple = format!("{swift_arch}-apple-macosx{macos_version}");
 
         let swift_status = Command::new("swiftc")
             .args([
