@@ -46,6 +46,7 @@ use crate::portal::build_auth_header;
 
 const MAX_SCREENSHOT_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 250 * 1024 * 1024;
 const ALLOWED_SCREENSHOT_MIMES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -53,6 +54,10 @@ const ALLOWED_SCREENSHOT_MIMES: &[&str] = &[
     "image/gif",
 ];
 const ALLOWED_VIDEO_MIMES: &[&str] = &["video/webm"];
+// `log` covers the auto-bundled recording-session zip (#628).
+// Schema CHECK already permitted 'log' as a reserved kind; this is
+// the first wired use of it.
+const ALLOWED_LOG_MIMES: &[&str] = &["application/zip"];
 
 /// Subdir name for staged video blobs under the OS temp dir.
 /// Keeping the parent dir stable lets a crashed agent's next launch
@@ -71,6 +76,7 @@ fn limits_for_kind(kind: &str) -> Option<(&'static [&'static str], u64)> {
     match kind {
         "screenshot" => Some((ALLOWED_SCREENSHOT_MIMES, MAX_SCREENSHOT_BYTES)),
         "video" => Some((ALLOWED_VIDEO_MIMES, MAX_VIDEO_BYTES)),
+        "log" => Some((ALLOWED_LOG_MIMES, MAX_LOG_BYTES)),
         _ => None,
     }
 }
@@ -209,6 +215,242 @@ fn sanitise_filename(input: &str) -> String {
     // produces a weird-looking chip in the meantime).
     let trimmed: String = out.chars().take(120).collect();
     if trimmed.is_empty() { "recording.webm".into() } else { trimmed }
+}
+
+// ── bundle_latest_session ──────────────────────────────────────────
+//
+// Packages the most recent recording session under
+// `<app_data>/recordings/<timestamp>/` into a single zip + a
+// session-meta.json with system context (#628). Exposed as a Tauri
+// command the Submit Issue dialog calls when the user opts to attach
+// their last recording to a support ticket.
+//
+// The output zip is staged under the same `<temp>/aftercalls-support/`
+// dir + uuid pattern as `stage_support_video`, so the existing
+// `submit_support_report` upload path picks it up unchanged.
+
+/// Static metadata bundled into `session-meta.json`. Strict-no-PII:
+/// version, OS, mic device label, free disk, locale. NOT environment
+/// vars, NOT clipboard, NOT user.email.
+#[derive(Serialize)]
+struct SessionMeta {
+    agent_version: &'static str,
+    platform: &'static str,
+    os_version: String,
+    bundled_at_utc: String,
+    session_dir_name: String,
+    session_files: Vec<SessionFileMeta>,
+}
+
+#[derive(Serialize)]
+struct SessionFileMeta {
+    name: String,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+pub fn bundle_latest_session(app: tauri::AppHandle) -> Result<StagedAttachment, String> {
+    bundle_latest_session_inner(&app).map_err(|e| format!("{e:#}"))
+}
+
+fn bundle_latest_session_inner(app: &tauri::AppHandle) -> Result<StagedAttachment> {
+    use tauri::Manager;
+    let recordings_root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| anyhow!("resolve app data dir: {e}"))?
+        .join("recordings");
+
+    let session_dir = pick_latest_session(&recordings_root)
+        .ok_or_else(|| anyhow!("no recording sessions on disk under {}", recordings_root.display()))?;
+
+    let session_name = session_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string();
+
+    // Stage under the same temp tree the video pipeline uses so
+    // sweep_stage_dir() and the existing submit cleanup catch it.
+    let id_hi = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id_lo = std::process::id() as u128;
+    let stage_id = format!(
+        "{:032x}",
+        id_hi
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(id_lo)
+    );
+    let subdir = stage_parent().join(&stage_id);
+    std::fs::create_dir_all(&subdir)
+        .with_context(|| format!("create stage dir {}", subdir.display()))?;
+
+    let zip_filename = format!("aftercalls-session-{session_name}.zip");
+    let zip_path = subdir.join(&zip_filename);
+
+    let session_files = write_session_zip(&session_dir, &zip_path)?;
+
+    // Also add a session-meta.json with system context the user might
+    // forget to mention. The metadata is written INTO the zip via a
+    // second open + append; cheaper than re-writing the whole archive.
+    append_meta_json(&zip_path, &session_name, session_files)?;
+
+    let size_bytes = std::fs::metadata(&zip_path)
+        .with_context(|| format!("stat {}", zip_path.display()))?
+        .len();
+
+    Ok(StagedAttachment {
+        path: zip_path.to_string_lossy().into_owned(),
+        size_bytes: size_bytes as i64,
+    })
+}
+
+fn pick_latest_session(recordings_root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(recordings_root).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best {
+            Some((m, _)) if *m >= modified => {}
+            _ => best = Some((modified, path)),
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Stream every regular file under `session_dir` into a fresh zip at
+/// `zip_path`. Subdirectories are NOT recursed — recording sessions
+/// are flat by convention and recursing would balloon the bundle if a
+/// future feature drops large temp files into a session subdir. Emits
+/// a per-file metadata vec the caller folds into session-meta.json.
+fn write_session_zip(session_dir: &Path, zip_path: &Path) -> Result<Vec<SessionFileMeta>> {
+    use std::io::{Read, Write};
+
+    let file = std::fs::File::create(zip_path)
+        .with_context(|| format!("create {}", zip_path.display()))?;
+    let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(3));
+
+    let mut metas = Vec::new();
+    let read_dir = std::fs::read_dir(session_dir)
+        .with_context(|| format!("read_dir {}", session_dir.display()))?;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let meta = entry.metadata().ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        metas.push(SessionFileMeta {
+            name: name.clone(),
+            size_bytes: size,
+        });
+        zw.start_file(&name, opts)
+            .with_context(|| format!("zip start_file {name}"))?;
+        let mut input = std::fs::File::open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            zw.write_all(&buf[..n])?;
+        }
+    }
+    zw.finish().context("zip finish")?;
+    Ok(metas)
+}
+
+fn append_meta_json(
+    zip_path: &Path,
+    session_name: &str,
+    session_files: Vec<SessionFileMeta>,
+) -> Result<()> {
+    use std::io::Write;
+    let meta = SessionMeta {
+        agent_version: env!("CARGO_PKG_VERSION"),
+        platform: std::env::consts::OS,
+        os_version: detect_os_version(),
+        bundled_at_utc: chrono::Utc::now().to_rfc3339(),
+        session_dir_name: session_name.to_string(),
+        session_files,
+    };
+    let body = serde_json::to_vec_pretty(&meta).context("serialize session meta")?;
+
+    // Re-open the zip in append mode. zip 2.x supports this via
+    // ZipWriter::new_append over a seekable handle.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(zip_path)
+        .with_context(|| format!("open zip for append {}", zip_path.display()))?;
+    let mut zw = zip::ZipWriter::new_append(file).context("zip new_append")?;
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zw.start_file("session-meta.json", opts)
+        .context("zip start_file meta")?;
+    zw.write_all(&body)?;
+    zw.finish().context("zip finish (meta)")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn detect_os_version() -> String {
+    use std::process::Command;
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(target_os = "linux")]
+fn detect_os_version() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string()))
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(target_os = "windows")]
+fn detect_os_version() -> String {
+    // sysinfo carries this for free since we already depend on it for
+    // memory/process metrics elsewhere in the agent.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_all();
+    sysinfo::System::long_os_version().unwrap_or_else(|| "windows".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn detect_os_version() -> String {
+    "unknown".into()
 }
 
 /// Best-effort sweep of lingering staged uploads. Call this at agent

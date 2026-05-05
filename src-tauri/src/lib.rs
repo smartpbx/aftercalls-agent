@@ -2600,6 +2600,11 @@ pub fn run() {
             support::inspect_support_attachment,
             support::stage_support_video,
             support::submit_support_report,
+            // #628 — opt-in attachment of the user's most recent
+            // recording session (audio + a session-meta.json)
+            // to a support ticket. Returns a staged zip path that
+            // rides the existing path-based upload pipeline.
+            support::bundle_latest_session,
             // #286 — surface the OS tray notification when a
             // previously-delayed call finishes processing. Called
             // from the agent call-detail page.

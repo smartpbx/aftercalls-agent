@@ -48,7 +48,11 @@
   let telemetryOpen = $state(false);
 
   // Attachments ──────────────────────────────────────────────────
-  type AttachmentKind = "screenshot" | "video";
+  // "log" (#628) is a zip of the user's most recent recording session
+  // + a session-meta.json with system context, produced on demand by
+  // the Tauri command `bundle_latest_session`. Sized differently than
+  // screenshots/video and goes to longer-retention storage server-side.
+  type AttachmentKind = "screenshot" | "video" | "log";
   type Attachment = {
     /** Stable client-side id; server assigns its own UUID once submit lands. */
     localId: string;
@@ -583,6 +587,58 @@
     }
   }
 
+  // #628: opt-in attach of the user's most recent recording session.
+  // Tauri's `bundle_latest_session` finds the latest dir under
+  // <app_data>/recordings/, zips it with a session-meta.json, and
+  // returns a staged path that rides the existing path-based upload
+  // pipeline. The chip appears alongside screenshots/videos and the
+  // user can remove it pre-submit if they change their mind.
+  let bundlingSession = $state(false);
+  let bundleError = $state<string | null>(null);
+  const sessionAttached = $derived(
+    attachments.some((a) => a.kind === "log"),
+  );
+
+  async function attachLatestRecording() {
+    if (submitting || bundlingSession || sessionAttached) return;
+    if (attachments.length >= MAX_ATTACHMENTS) return;
+    bundlingSession = true;
+    bundleError = null;
+    try {
+      const meta = await invoke<{
+        path: string;
+        size_bytes: number;
+      }>("bundle_latest_session");
+      // Filename from the staged path so the chip matches the
+      // backend-side stored filename.
+      const filename =
+        meta.path.split(/[\\/]/).pop() ?? "aftercalls-session.zip";
+      attachments = [
+        ...attachments,
+        {
+          localId: crypto.randomUUID(),
+          filePath: meta.path,
+          filename,
+          mime: "application/zip",
+          sizeBytes: meta.size_bytes,
+          previewUrl: null,
+          error: null,
+          kind: "log",
+          blob: null,
+        },
+      ];
+    } catch (e) {
+      bundleError =
+        e instanceof Error
+          ? e.message
+          : typeof e === "string"
+            ? e
+            : "Could not bundle the latest recording.";
+    } finally {
+      bundlingSession = false;
+    }
+  }
+
   function removeAttachment(localId: string) {
     if (submitting) return;
     const target = attachments.find((a) => a.localId === localId);
@@ -892,6 +948,12 @@
                       aria-hidden="true"
                       title="Screen recording"
                     >▶</span>
+                  {:else if a.kind === "log"}
+                    <span
+                      class="ri-chip-thumb video-thumb"
+                      aria-hidden="true"
+                      title="Recording session bundle"
+                    >ZIP</span>
                   {:else if a.previewUrl}
                     <img
                       class="ri-chip-thumb"
@@ -975,6 +1037,25 @@
                 disabled={submitting || remainingSlots <= 0}
               >Record screen</button>
             {/if}
+            {#if !isRecording}
+              <button
+                type="button"
+                class="ri-attach-btn"
+                onclick={attachLatestRecording}
+                disabled={submitting ||
+                  bundlingSession ||
+                  sessionAttached ||
+                  remainingSlots <= 0}
+              >
+                {#if bundlingSession}
+                  Bundling…
+                {:else if sessionAttached}
+                  Last recording attached
+                {:else}
+                  Attach last recording
+                {/if}
+              </button>
+            {/if}
           </div>
           {#if canRecord && !isRecording}
             <!-- #216: brief hint about what happens when the user
@@ -985,6 +1066,17 @@
               demonstrate the issue. A floating control in the
               bottom-right corner shows the timer and lets you stop.
             </p>
+          {/if}
+          {#if !isRecording}
+            <p class="ri-recorder-hint">
+              The "Attach last recording" option packages the audio +
+              system info from your most recent recording so we can
+              diagnose what went wrong. Remove it from the chip row
+              before submitting if you'd rather not include it.
+            </p>
+          {/if}
+          {#if bundleError}
+            <div class="ri-attach-warning" role="alert">{bundleError}</div>
           {/if}
         </div>
 

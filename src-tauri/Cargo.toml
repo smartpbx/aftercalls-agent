@@ -52,6 +52,12 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 # at 0.8 to match what reqwest's deps already drag in transitively, so
 # we don't bloat the dep graph with a parallel 0.9 chain.
 rand = "0.8"
+# ZIP packaging for the "Include latest recording" toggle in the
+# Submit Issue dialog (#628). `zip` is already a transitive dep
+# (rfd → arboard, etc.); promote to direct so support.rs can use it.
+# default-features stripped because we never write encrypted archives
+# from the agent — saves the aes/bzip2/etc. sub-crates.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
