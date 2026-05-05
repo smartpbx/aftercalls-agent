@@ -113,12 +113,16 @@ struct CpalTrack {
 }
 
 // System audio capture: either a subprocess (parec on Linux, output
-// streamed to system.wav) or a cpal stream (Windows WASAPI loopback,
-// data written via the normal CpalTrack writer). Kept as an enum so
-// finish() can clean up either kind.
+// streamed to system.wav), a cpal stream (Windows WASAPI loopback,
+// data written via the normal CpalTrack writer), or a
+// ScreenCaptureKit-backed Swift shim on macOS that writes the WAV
+// directly from the Swift side. Kept as an enum so finish() can
+// clean up whichever flavor is active.
 enum SystemCapture {
     Child(Child),
     Cpal(CpalTrack),
+    #[cfg(target_os = "macos")]
+    Mac(crate::macos_loopback::MacLoopback),
 }
 
 struct Active {
@@ -484,6 +488,14 @@ fn finish(rec: Active) -> Result<PathBuf> {
                 w.finalize().context("finalize system wav")?;
             }
         }
+        #[cfg(target_os = "macos")]
+        Some(SystemCapture::Mac(mut loopback)) => {
+            // Tear down the SCStream and patch the WAV header. The
+            // Drop impl on `MacLoopback` would also do this, but
+            // calling explicitly lets us bubble a real error message
+            // up instead of swallowing it on drop.
+            loopback.stop().context("stop system loopback")?;
+        }
         None => {}
     }
     Ok(rec.session_dir)
@@ -635,7 +647,21 @@ fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> 
     Ok((SystemCapture::Cpal(track), label))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+// macOS loopback via ScreenCaptureKit (#621 / Phase 2). Audio capture
+// is owned by a Swift shim (`macos/AftercallsLoopback.swift`) bridged
+// through `crate::macos_loopback`. The Swift side writes the WAV
+// file directly; we hand it the same `system.wav` path Linux/Windows
+// use so the rest of the pipeline (mix, transcribe, summarize) is
+// platform-agnostic. The user-facing target string is intentionally
+// vendor-opaque per repo policy.
+#[cfg(target_os = "macos")]
+fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
+    let loopback = crate::macos_loopback::MacLoopback::new(output_path)
+        .context("start system audio loopback")?;
+    Ok((SystemCapture::Mac(loopback), "system audio".to_string()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn start_system_loopback(_output_path: &Path) -> Result<(SystemCapture, String)> {
     anyhow::bail!("system loopback not implemented on this platform yet")
 }

@@ -38,7 +38,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/ffmpeg-aftercalls"]
+    "externalBin": ["binaries/ffmpeg-aftercalls"],
+    "macOS": {
+      "entitlements": "aftercalls.entitlements",
+      "infoPlist": "Info.plist",
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": null,
+      "providerShortName": null
+    }
   },
   "plugins": {
     "updater": {

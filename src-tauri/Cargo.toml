@@ -61,6 +61,18 @@ notify-rust = "4.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
+# Swift ↔ Rust FFI for the ScreenCaptureKit loopback shim
+# (`macos/AftercallsLoopback.swift` + `src/macos_loopback.rs`). The
+# bridge module is `cfg(target_os = "macos")`-gated so non-Mac builds
+# never see this dep.
+swift-bridge = "0.1"
+# CoreAudio HAL bindings for the Phase 4 audio observer (#597). Co-
+# located here because adding it now keeps the Mac dep block to a
+# single edit; the actual usage lands with the observer port.
+coreaudio-rs = "0.13"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+swift-bridge-build = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

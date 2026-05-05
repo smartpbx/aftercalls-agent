@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>aftercalls listens to your microphone so it can record and transcribe your calls.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>aftercalls captures system audio so it can record both sides of your calls.</string>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>aftercalls captures system audio so it can record both sides of your calls.</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.business</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+</dict>
+</plist>

@@ -4,6 +4,8 @@ mod auto_recorder;
 mod config;
 mod detector;
 mod error;
+#[cfg(target_os = "macos")]
+mod macos_loopback;
 mod mic_consumers;
 mod notes;
 mod notify_actions;

@@ -8,9 +8,18 @@
 //! 5s snapshot stream, so there is one `pactl` process per cycle while
 //! each consumer keeps its own state machine.
 //!
-//! macOS / Windows v1: stub `UnsupportedObserver`. `is_supported()`
-//! returns false so the Settings UI renders the "App detection isn't
-//! supported on this OS yet" banner; no `pactl` / WASAPI work happens.
+//! Windows: WASAPI session enumeration via `IAudioSessionManager2` /
+//! `IAudioSessionControl2`. See `mic_consumers::raw_mic_consumers`
+//! under `cfg(target_os = "windows")`. Same 5s snapshot cadence,
+//! same observer/detector fan-out. Untested on real hardware as of
+//! this writing — tracking in #598.
+//!
+//! macOS 14.2+: CoreAudio HAL via `kAudioHardwarePropertyProcessObjectList`
+//! (process-list API, requires macOS 14.2). Same 5s snapshot cadence
+//! as Linux/Windows — see `mic_consumers::raw_mic_consumers` under
+//! `cfg(target_os = "macos")`. Older macOS reports
+//! `is_supported() == false` and the Settings UI shows the same
+//! "App detection isn't supported on this OS yet" banner. Tracked in #597.
 //!
 //! Public-copy posture: we never name PipeWire / Pulse / WASAPI in any
 //! string the webview can render. The IPC layer just ships
@@ -71,8 +80,29 @@ pub enum McaEventKind {
 /// Whether the host OS has a working mic-consumer enumerator. The
 /// Settings UI reads this to decide between rendering the per-app list
 /// vs the "not supported on this OS yet" banner.
+///
+/// macOS is conditionally supported: the `cfg!` arm is true on every
+/// macOS host (the agent ships with a 13.0 minimum-system-version),
+/// but the runtime helper additionally checks for the macOS 14.2
+/// process-list API. macOS 13.0–14.1 hosts evaluate to `false` here
+/// and get the same "not supported" banner Linux/Windows users with
+/// old hosts would hit.
 pub fn is_supported() -> bool {
-    cfg!(target_os = "linux") || cfg!(target_os = "windows")
+    cfg!(target_os = "linux")
+        || cfg!(target_os = "windows")
+        || (cfg!(target_os = "macos") && macos_observer_available())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_observer_available() -> bool {
+    // Run-once cached probe — see `mic_consumers` for the
+    // `sysctlbyname("kern.osproductversion")` implementation.
+    crate::mic_consumers::macos_kernel_supports_process_list()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_observer_available() -> bool {
+    false
 }
 
 /// Spawn the platform-specific observer. Long-lived for the agent's
@@ -88,7 +118,7 @@ pub fn is_supported() -> bool {
 /// the function is called. Every other long-lived task in the agent
 /// (detector, auto_recorder, updater poll) goes through the same
 /// helper for the same reason.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
     tauri::async_runtime::spawn(async move {
         let mut consumers_rx = subscribe_mic_consumers();
@@ -127,10 +157,14 @@ pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
     });
 }
 
-/// macOS + other unsupported targets compile to a no-op spawner — the
+/// Other unsupported targets compile to a no-op spawner — the
 /// caller's setup() code stays uniform, but the spawned task
 /// immediately drops the channel and exits.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+///
+/// macOS is now in the supported arm above; the runtime helper inside
+/// `mic_consumers::raw_mic_consumers` short-circuits to an empty Vec
+/// on pre-14.2 hosts, so the spawn loop runs but never emits events.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn spawn(tx: mpsc::UnboundedSender<McaEvent>) {
     tauri::async_runtime::spawn(async move {
         // Drop tx to release the receiver immediately; the auto-recorder's

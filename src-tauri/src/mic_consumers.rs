@@ -463,10 +463,314 @@ fn windows_mic_consumers() -> Result<Vec<String>, String> {
     }
 }
 
-/// Other targets (macOS today) ship with no working observer; the
-/// auto-record settings UI shows the "App detection isn't supported on
-/// this OS yet" banner and the prompt-detector simply never fires.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// macOS path. Uses CoreAudio HAL's macOS-14.2 process-list API
+/// (`kAudioHardwarePropertyProcessObjectList` + the per-process
+/// `kAudioProcessPropertyIsRunningInput` boolean) to enumerate which
+/// PIDs are currently capturing the system microphone, then resolves
+/// each PID to an executable basename via `libproc::proc_pidpath`.
+///
+/// On older macOS (13.0–14.1) the property doesn't exist; the kernel-
+/// version probe reported by `macos_kernel_supports_process_list` is
+/// false on those hosts, so this function returns an empty Vec and the
+/// observer's `is_supported()` reports false. The Settings UI then
+/// shows the existing "App detection isn't supported on this OS yet"
+/// banner unchanged.
+///
+/// Polled at 5s by the shared `subscribe_mic_consumers` ticker — same
+/// cadence as Linux/Windows. We deliberately do NOT register a
+/// CoreAudio property listener for change notifications; that would
+/// require driving an NSRunLoop on a dedicated thread to receive the
+/// callbacks, and the cross-platform contract here is "snapshot
+/// every 5s".
+///
+/// Applies the same `is_helper_proc` + `is_blacklisted` filters as the
+/// Linux/Windows paths (cross-platform contract items 1–3).
+#[cfg(target_os = "macos")]
+pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
+    match macos_mic_consumers() {
+        Ok(v) => v
+            .into_iter()
+            .filter(|name| !is_helper_proc(name) && !is_blacklisted(name))
+            .map(|name| RawMicConsumer::new(name.clone(), name))
+            .collect(),
+        Err(e) => {
+            eprintln!("aftercalls: CoreAudio mic enumeration failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Run-once probe: does the host kernel expose the macOS-14.2
+/// process-list API? Reads `kern.osproductversion` via `sysctlbyname`
+/// and compares against `14.2`. The result is cached in a `OnceLock`
+/// because the host OS doesn't change at runtime; the syscall cost
+/// only matters once.
+///
+/// Public so `audio_observer::is_supported()` can gate on it.
+#[cfg(target_os = "macos")]
+pub fn macos_kernel_supports_process_list() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        match macos_product_version() {
+            Some((major, minor)) => major > 14 || (major == 14 && minor >= 2),
+            None => {
+                // Couldn't read the version — be conservative and
+                // report unsupported rather than risk calling a
+                // property that might trap on older kernels.
+                eprintln!(
+                    "aftercalls: could not read kern.osproductversion; assuming pre-14.2"
+                );
+                false
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub fn macos_kernel_supports_process_list() -> bool {
+    false
+}
+
+/// Read `kern.osproductversion` via `sysctlbyname` and parse the leading
+/// `<major>.<minor>` pair. Returns `None` if the syscall fails or the
+/// string is unexpectedly shaped (treat as unsupported upstream).
+#[cfg(target_os = "macos")]
+fn macos_product_version() -> Option<(u32, u32)> {
+    use std::ffi::CString;
+
+    let name = CString::new("kern.osproductversion").ok()?;
+    let mut size: libc::size_t = 0;
+    // First call: discover required buffer size.
+    // Safety: name is a valid C string; passing nullptr for `oldp` with
+    // a size pointer is the documented sysctlbyname size-probe form.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0; size];
+    // Safety: buffer is sized per the prior probe; sysctlbyname will
+    // write up to `size` bytes including a trailing NUL.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // Trim trailing NUL(s).
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    let s = std::str::from_utf8(&buf).ok()?;
+    parse_product_version(s)
+}
+
+/// Parse the leading `<major>.<minor>` pair out of a macOS product
+/// version string. Examples: `"14.2"` → `(14, 2)`, `"14.2.1"` →
+/// `(14, 2)`, `"15.0"` → `(15, 0)`. Garbage in returns `None`.
+///
+/// Lives outside the `cfg(target_os = "macos")` block so the unit
+/// test below exercises it on every host (the parser logic itself is
+/// portable; only the `sysctlbyname` caller is Mac-specific).
+#[allow(dead_code)]
+fn parse_product_version(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mic_consumers() -> Result<Vec<String>, String> {
+    use coreaudio::sys::{
+        kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyIsRunningInput,
+        kAudioProcessPropertyPID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+        AudioObjectID, AudioObjectPropertyAddress,
+    };
+
+    // Belt-and-braces: even though `is_supported()` guards the spawn
+    // path, anyone calling `raw_mic_consumers()` directly on a
+    // pre-14.2 host should get an empty list rather than a trap on a
+    // missing property.
+    if !macos_kernel_supports_process_list() {
+        return Ok(Vec::new());
+    }
+
+    let own_pid = std::process::id() as i32;
+
+    // Step 1: enumerate all AudioObjectIDs that have ever opened an
+    // audio object. The kernel returns a flat array of `AudioObjectID`s
+    // (= `UInt32`).
+    let process_list_addr = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+
+    let mut data_size: u32 = 0;
+    // Safety: kAudioObjectSystemObject is the documented well-known ID;
+    // passing &address is the standard form. Out-param `data_size` is
+    // u32-aligned.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject,
+            &process_list_addr,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "AudioObjectGetPropertyDataSize(ProcessObjectList) status={status}"
+        ));
+    }
+    if data_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let count = data_size as usize / std::mem::size_of::<AudioObjectID>();
+    let mut process_ids: Vec<AudioObjectID> = vec![0; count];
+    let mut io_size = data_size;
+    // Safety: process_ids is sized per the probe; AudioObjectID = UInt32
+    // matches the kernel's return shape.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &process_list_addr,
+            0,
+            std::ptr::null(),
+            &mut io_size,
+            process_ids.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "AudioObjectGetPropertyData(ProcessObjectList) status={status}"
+        ));
+    }
+
+    let mut seen_pids: HashSet<i32> = HashSet::new();
+    let mut result: Vec<String> = Vec::new();
+
+    for &obj_id in &process_ids {
+        // Step 2a: is this process currently capturing input? Skip
+        // first so we don't pay the PID-resolve cost for idle entries.
+        let is_input_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioProcessPropertyIsRunningInput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut is_running: u32 = 0;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                obj_id,
+                &is_input_addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut is_running as *mut u32 as *mut std::ffi::c_void,
+            )
+        };
+        if status != 0 {
+            // Per-process query failures are non-fatal — process may
+            // have just exited. Skip it.
+            continue;
+        }
+        if is_running == 0 {
+            continue;
+        }
+
+        // Step 2b: get the PID for this AudioObject.
+        let pid_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut pid: i32 = 0;
+        let mut size: u32 = std::mem::size_of::<i32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                obj_id,
+                &pid_addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut pid as *mut i32 as *mut std::ffi::c_void,
+            )
+        };
+        if status != 0 || pid <= 0 {
+            continue;
+        }
+        if pid == own_pid {
+            continue;
+        }
+        if !seen_pids.insert(pid) {
+            continue;
+        }
+
+        // Step 3: PID → executable basename via libproc.
+        match proc_pidpath_basename(pid) {
+            Ok(name) if !name.is_empty() => result.push(name),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("aftercalls: proc_pidpath({pid}): {e}");
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+#[cfg(target_os = "macos")]
+fn proc_pidpath_basename(pid: i32) -> Result<String, String> {
+    let mut buf: [u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize] =
+        [0; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // Safety: buf is sized to PROC_PIDPATHINFO_MAXSIZE per Apple's
+    // libproc documentation; proc_pidpath writes at most that many
+    // bytes including trailing NUL.
+    let rc = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as u32,
+        )
+    };
+    if rc <= 0 {
+        return Err(format!("proc_pidpath returned {rc} for pid {pid}"));
+    }
+    let len = rc as usize;
+    let full = std::str::from_utf8(&buf[..len])
+        .map_err(|e| format!("proc_pidpath utf8 for pid {pid}: {e}"))?
+        .to_string();
+    let base = full
+        .rsplit('/')
+        .next()
+        .unwrap_or(&full)
+        .to_string();
+    Ok(base)
+}
+
+/// Other targets ship with no working observer; the auto-record
+/// settings UI shows the "App detection isn't supported on this OS
+/// yet" banner and the prompt-detector simply never fires.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn raw_mic_consumers() -> Vec<RawMicConsumer> {
     Vec::new()
 }
@@ -549,6 +853,26 @@ Source Output #42
         assert_eq!(consumers.len(), 1);
         assert_eq!(consumers[0].bundle_id, "cliq");
         assert_eq!(consumers[0].friendly_name, "cliq");
+    }
+
+    #[test]
+    fn product_version_parser_extracts_major_minor() {
+        // Apple ships `kern.osproductversion` as "14.2", "14.2.1",
+        // "15.0", etc. The observer only cares about the major+minor
+        // pair (the process-list API's floor is 14.2).
+        assert_eq!(parse_product_version("14.2"), Some((14, 2)));
+        assert_eq!(parse_product_version("14.2.1"), Some((14, 2)));
+        assert_eq!(parse_product_version("15.0"), Some((15, 0)));
+        assert_eq!(parse_product_version("13.7.2"), Some((13, 7)));
+        // Trailing whitespace / newlines from the syscall buffer must
+        // not break parsing.
+        assert_eq!(parse_product_version("14.2\n"), Some((14, 2)));
+        // A bare major-only string is treated as <major>.0 — defensive
+        // shape we shouldn't see in practice.
+        assert_eq!(parse_product_version("14"), Some((14, 0)));
+        // Garbage in returns None — caller treats as unsupported.
+        assert!(parse_product_version("").is_none());
+        assert!(parse_product_version("not-a-version").is_none());
     }
 
     #[cfg(target_os = "linux")]
