@@ -39,8 +39,12 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastErrorMessage: String?
     private let writeQueue = DispatchQueue(label: "com.aftercalls.loopback.write")
 
-    public init(outputPath: String) {
-        self.outputPath = outputPath
+    // Parameter label matches the Rust bridge's `output_path: String`
+    // — swift-bridge generates a wrapper that passes a `RustString` to
+    // an init expecting `output_path:`. Don't rename to camelCase or
+    // the auto-generated agent.swift wrapper won't compile.
+    public init(output_path: RustString) {
+        self.outputPath = output_path.toString()
         super.init()
     }
 
