@@ -1503,6 +1503,16 @@ async fn download_audio(url: String, dest: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Write a UTF-8 string to a user-chosen path. Mirror of `download_audio`
+/// for text payloads (e.g. transcript export). The WebView's HTML5
+/// `<a download>` is ignored by WKWebView/WebView2, so the desktop
+/// agent routes saves through a native dialog + this Rust command.
+#[tauri::command]
+async fn save_text_file(dest: String, contents: String) -> Result<(), String> {
+    std::fs::write(&dest, contents.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_peaks(id: String) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
@@ -2520,6 +2530,7 @@ pub fn run() {
             get_session_audio_path,
             get_audio_urls,
             download_audio,
+            save_text_file,
             get_app_prefs,
             set_app_prefs,
             list_input_devices,

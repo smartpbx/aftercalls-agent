@@ -1289,6 +1289,7 @@
 
   let audioSrc = $state<string>("");
   let audioError = $state("");
+  let transcriptError = $state("");
   // Only mixed is ever played or downloaded — per-channel mic / system
   // tracks get deleted from storage after the pipeline completes (see
   // backend/src/mix.rs::cleanup_per_channel_tracks, #49 option 1). The
@@ -2111,12 +2112,16 @@
     copyRich(html, plain, "transcript");
   }
 
-  // #608 — download the transcript as a plain-text file. Mirror of
-  // the portal's downloadTranscript: header (title + recorded + duration)
-  // followed by `[mm:ss] Speaker: text` lines, generated from the
-  // already-loaded `call` payload.
-  function downloadTranscript() {
+  // #629 — download the transcript as a plain-text file. WKWebView /
+  // WebView2 ignore <a download>, so the blob-anchor pattern is a no-op
+  // in the desktop agent. Mirror downloadCurrentTrack: native save
+  // dialog picks a path, then the Rust `save_text_file` command writes
+  // the UTF-8 bytes via std::fs::write. Header (title + recorded +
+  // duration) followed by `[mm:ss] Speaker: text` lines, byte-identical
+  // to the portal's downloadTranscript output.
+  async function downloadTranscript() {
     if (!call || !call.utterances || call.utterances.length === 0) return;
+    transcriptError = "";
     const titleStr = call.title?.trim() ? call.title.trim() : "Untitled call";
     const dateStr = (() => {
       try {
@@ -2142,18 +2147,25 @@
       const tsS = (startSec % 60).toString().padStart(2, "0");
       lines.push(`[${tsM}:${tsS}] ${u.speaker}: ${u.text}`);
     }
-    const blob = new Blob([lines.join("\n") + "\n"], {
-      type: "text/plain;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
+    const contents = lines.join("\n") + "\n";
     const safeStem = titleStr.replace(/[^\w\s.-]+/g, "_").slice(0, 80);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${safeStem}-transcript.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    let dest: string | null = null;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      dest = await save({
+        defaultPath: `${safeStem}-transcript.txt`,
+        filters: [{ name: "Text", extensions: ["txt"] }],
+      });
+    } catch (e) {
+      transcriptError = `Save dialog failed: ${e}`;
+      return;
+    }
+    if (!dest) return;
+    try {
+      await invoke("save_text_file", { dest, contents });
+    } catch (e) {
+      transcriptError = portalErrorToText(e);
+    }
   }
 
   function startEdit(u: Utterance) {
@@ -4355,6 +4367,9 @@
           </button>
         </div>
       </div>
+      {#if transcriptError}
+        <p class="inline-err">{transcriptError}</p>
+      {/if}
       {#if bulkStatus}
         {#if bulkStatus.kind === "success"}
           <div class="bulk-toast bulk-toast-success" role="status" aria-live="polite">
