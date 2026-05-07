@@ -181,3 +181,29 @@ export type AutoRecordCancelledPayload = {
   bundle_id: string;
   reason: "user" | "app_stopped" | "error";
 };
+
+// ── #630 — per-user summary style ───────────────────────────────────
+//
+// Mirror of the portal's `mySummaryStyle` TS client. Same wire shape
+// (the agent's IPC layer just routes the JSON through `/v1/me/summary-style`).
+//   - `style` is the user's stored override (`null` = inherit).
+//   - `effective_style` is the resolved style for the next summary.
+//   - `org_default` lets the UI render the "Use team default (X)" hint
+//     without a second round-trip.
+// PATCH `style: null` reverts to inherit. Unknown values reject 400
+// at the backend boundary, surfaced as a `PortalError`.
+
+export type SummaryStyle = "narrative" | "hybrid" | "bulleted";
+
+export type MySummaryStyle = {
+  style: SummaryStyle | null;
+  effective_style: SummaryStyle;
+  org_default: SummaryStyle;
+};
+
+export const mySummaryStyle = {
+  get: (): Promise<MySummaryStyle> =>
+    invoke<MySummaryStyle>("me_summary_style_get"),
+  patch: (style: SummaryStyle | null): Promise<MySummaryStyle> =>
+    invoke<MySummaryStyle>("me_summary_style_patch", { style }),
+};

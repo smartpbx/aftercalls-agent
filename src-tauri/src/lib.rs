@@ -1090,6 +1090,33 @@ async fn data_export_get_status(
     portal::data_exports_get_status(backend, &id).await
 }
 
+/// #630 — GET `/v1/me/summary-style`. Returns the user's stored
+/// override (`null` = inherit), the resolved effective style, and the
+/// org default — feeding the Settings page's "Use team default (X)"
+/// segment label without a second round-trip.
+#[tauri::command]
+async fn me_summary_style_get() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_summary_style_get(backend).await
+}
+
+/// #630 — PATCH `/v1/me/summary-style`. `style: None` reverts to
+/// inherit; `Some("narrative"|"hybrid"|"bulleted")` sets the override.
+/// Unknown values reject with a backend 400 surfaced as `PortalError`.
+#[tauri::command]
+async fn me_summary_style_patch(
+    style: Option<String>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_summary_style_patch(backend, style.as_deref()).await
+}
+
 /// #595 — GET `/v1/import-candidates`. Caller's own open candidates
 /// (per-user, not org-wide). `source` narrows by `ingest_source` —
 /// `smartpbx` or `zoho_meeting`; pass `None` for both. `include_dismissed`
@@ -2583,6 +2610,10 @@ pub fn run() {
             data_export_request,
             data_export_list,
             data_export_get_status,
+            // #630 — per-user summary-style override. Backs the agent's
+            // new "AI summary style" Settings card.
+            me_summary_style_get,
+            me_summary_style_patch,
             // #595 — per-user import-candidate flow. Mirror of the
             // portal's `api.importCandidates.*` client; the agent's
             // `/calls` page renders these alongside real call rows

@@ -1,4 +1,11 @@
 {
+  "0.16.1": {
+    "headline": "Pick how summaries are shaped, plus assignee email + name in action-item webhooks.",
+    "changes": [
+      "Summary style — pick the shape that fits your team. Choose how summaries read. The new Summary style picker offers three shapes: Narrative (prose paragraphs, the current default), Hybrid (a short prose summary plus bulleted decisions and next steps), and Bulleted (fully bulleted under each section). Org admins set a default in Settings → AI; each member can override it for their own account from Settings.",
+      "Webhooks now include assignee email + name on action-item events. Webhook payloads for action-item events now include the assignee's email and display name (plus the email and name of whoever marked the item complete). Useful when bridging Aftercalls to a CRM, ticketing system, or task tracker that keys on email rather than internal user IDs. Existing receivers see no breaking change — these are additive optional fields."
+    ]
+  },
   "0.16.0": {
     "headline": "Outbound webhooks for action items, Submit Issue now auto-bundles your latest recording, and a fix for the desktop transcript download.",
     "changes": [

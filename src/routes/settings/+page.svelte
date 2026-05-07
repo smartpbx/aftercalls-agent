@@ -10,6 +10,8 @@
   import { setSentryTelemetryAllowed } from "$lib/sentry";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import * as api from "$lib/api";
+  import Segmented from "$lib/Segmented.svelte";
   import type { Me } from "@aftercalls/shared/types";
 
   // #69 — About card surfaces the running version + the LGPL ffmpeg
@@ -27,6 +29,79 @@
 
   let me = $state<Me | null>(null);
   let signingOut = $state(false);
+
+  // ── #630 — per-user AI summary style ───────────────────────────────
+  // Per-user override on top of the org default. UI state uses a
+  // synthetic `"team_default"` value for the "Use team default (X)"
+  // segment that maps to `style: null` on PATCH (the wire form for
+  // "inherit"). Save fires inline on `onchange` — no save button.
+  type SummaryStyleUI = "team_default" | api.SummaryStyle;
+  let summaryStylePrefs = $state<api.MySummaryStyle | null>(null);
+  let summaryStyleSelected = $state<SummaryStyleUI>("team_default");
+  let summaryStyleSaving = $state(false);
+  let summaryStyleErr = $state("");
+  let summaryStyleNetwork = $state(false);
+  function styleLabel(s: api.SummaryStyle): string {
+    return s === "narrative" ? "Narrative" : s === "hybrid" ? "Hybrid" : "Bulleted";
+  }
+  let summaryStyleOptions = $derived(
+    [
+      {
+        value: "team_default" as SummaryStyleUI,
+        label: summaryStylePrefs
+          ? `Use team default (${styleLabel(summaryStylePrefs.org_default)})`
+          : "Use team default",
+      },
+      { value: "narrative" as SummaryStyleUI, label: "Narrative" },
+      { value: "hybrid" as SummaryStyleUI, label: "Hybrid" },
+      { value: "bulleted" as SummaryStyleUI, label: "Bulleted" },
+    ],
+  );
+  let summaryStyleHint = $derived.by(() => {
+    if (!summaryStylePrefs) return "Loading…";
+    const eff = styleLabel(summaryStylePrefs.effective_style);
+    const orgDefault = styleLabel(summaryStylePrefs.org_default);
+    if (summaryStylePrefs.style === null) {
+      return `Using team default: ${eff}.`;
+    }
+    return `Your override: ${eff}. Team default is ${orgDefault}.`;
+  });
+
+  async function loadSummaryStyle() {
+    summaryStyleErr = "";
+    summaryStyleNetwork = false;
+    try {
+      const prefs = await api.mySummaryStyle.get();
+      summaryStylePrefs = prefs;
+      summaryStyleSelected = prefs.style ?? "team_default";
+    } catch (e: unknown) {
+      summaryStyleErr = "Couldn't load AI summary style.";
+      summaryStyleNetwork = true;
+      console.warn("loadSummaryStyle failed", e);
+    }
+  }
+
+  async function onSummaryStyleChange(v: SummaryStyleUI) {
+    if (!summaryStylePrefs || summaryStyleSaving) return;
+    const previous: SummaryStyleUI = summaryStylePrefs.style ?? "team_default";
+    if (v === previous) return;
+    summaryStyleSaving = true;
+    summaryStyleErr = "";
+    summaryStyleNetwork = false;
+    try {
+      const wire = v === "team_default" ? null : v;
+      const updated = await api.mySummaryStyle.patch(wire);
+      summaryStylePrefs = updated;
+      summaryStyleSelected = updated.style ?? "team_default";
+    } catch (e: unknown) {
+      summaryStyleErr = "Couldn't save preference. Try again.";
+      summaryStyleNetwork = true;
+      summaryStyleSelected = previous;
+      console.warn("patchSummaryStyle failed", e);
+    } finally {
+      summaryStyleSaving = false;
+    }
+  }
 
   // ── Profile (#96) ──────────────────────────────────────────────────
   let firstDraft = $state("");
@@ -639,6 +714,11 @@
     } catch (e) {
       console.warn("getVersion failed", e);
     }
+
+    // #630 — per-user summary-style preferences. Card renders below
+    // Appearance regardless; loadSummaryStyle() handles its own error
+    // surface so we don't gate the rest of the page on this fetch.
+    await loadSummaryStyle();
   });
 
   async function pickVaultDir() {
@@ -854,6 +934,42 @@
         </button>
       {/each}
     </div>
+  </section>
+
+  <!-- #630 — per-user AI summary style. Mirrors the portal Settings
+       card. The "Use team default (X)" segment is a first-class
+       option (not a checkbox) — selecting it PATCHes `style: null`
+       which reverts the user to inherit. -->
+  <section class="card" style="--i: 1.25">
+    <div class="card-head">
+      <div>
+        <h2>AI summary style</h2>
+        <p class="hint">
+          Pick the shape your call summaries take. Each teammate can
+          override their team's default.
+        </p>
+      </div>
+    </div>
+    <Segmented
+      options={summaryStyleOptions}
+      bind:value={summaryStyleSelected}
+      ariaLabel="AI summary style"
+      disabled={summaryStyleSaving || !summaryStylePrefs}
+      onchange={onSummaryStyleChange}
+    />
+    <p class="hint">{summaryStyleHint}</p>
+    {#if summaryStyleErr}
+      <p class="err" role="alert">
+        {summaryStyleErr}
+        {#if summaryStyleNetwork}
+          <button
+            type="button"
+            class="inline-btn"
+            onclick={loadSummaryStyle}
+          >Retry</button>
+        {/if}
+      </p>
+    {/if}
   </section>
 
   <section class="card" style="--i: 1.5">
@@ -2516,5 +2632,31 @@
   }
   .auto-record-forget {
     flex-shrink: 0;
+  }
+
+  /* #630 — error + inline retry styling for the AI summary style
+     card. `.err` matches the portal's settings page semantic-color
+     scheme (`--live` on the warm-red end of the palette) so the two
+     surfaces present errors with the same visual weight. */
+  .err {
+    margin: 0.5rem 0 0;
+    color: var(--live);
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .inline-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 0.4rem;
+    padding: 0;
+    background: none;
+    border: 0;
+    color: var(--accent);
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .inline-btn:hover {
+    color: var(--accent-hi);
   }
 </style>

@@ -1366,6 +1366,27 @@ pub async fn data_exports_get_status(
     get_json_typed(backend, &path).await
 }
 
+// ── #630 — per-user summary-style override ──────────────────────────
+//
+// Sibling of the privacy + data-export shims above. Backs the agent's
+// new "AI summary style" Settings card. The wire shape matches the
+// portal's `mySummaryStyle` TS client byte-for-byte:
+//   - GET returns `{ style, effective_style, org_default }`.
+//   - PATCH accepts `{ "style": "narrative"|"hybrid"|"bulleted"|null }`.
+//     `null` reverts to inherit. Unknown values reject 400.
+
+pub async fn me_summary_style_get(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/me/summary-style").await
+}
+
+pub async fn me_summary_style_patch(
+    backend: &Backend,
+    style: Option<&str>,
+) -> std::result::Result<Value, PortalError> {
+    let body = serde_json::json!({ "style": style });
+    patch_json_typed(backend, "/v1/me/summary-style", body).await
+}
+
 // ── #595 — per-user import-candidate flow ────────────────────────────
 //
 // Mirror of the portal's `importCandidates` TS client. The agent's
