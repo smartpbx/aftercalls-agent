@@ -7,6 +7,24 @@
     id: string;
     name: string;
     secondary?: string | null;
+    /** #635 — Deals search: which Zoho-side path produced this hit.
+     *  Possible values: "deal" (Deal_Name match — legacy, only-value
+     *  for non-Deals modules and the happy path for Deals), "account"
+     *  (matched via linked Account_Name), "contact_name" /
+     *  "contact_email" / "contact_phone" (matched via linked Contact).
+     *  Multiple values accumulate when the same deal surfaces through
+     *  more than one path. Absent / `["deal"]` → no second-line render. */
+    matched_via?: string[];
+    /** #635 — linked Account_Name for the matched deal, when known.
+     *  Drives the second-line match path. Absent / null when not
+     *  applicable (non-Deals modules, deal-only matches). */
+    account_name?: string | null;
+    /** #635 — linked Contact display name for the matched deal. */
+    contact_name?: string | null;
+    /** #635 — Contact's stored phone or email (whichever matched, if
+     *  available). The backend forwards the Zoho value untouched so
+     *  the user sees the contact's data as their org has it. */
+    contact_secondary?: string | null;
   };
   export type SzmTag = { kind: string; value: string };
   export type SzmPushResponse = {
@@ -503,6 +521,24 @@
   function secondaryFor(r: SzmSearchResult): string {
     return r.secondary ?? "";
   }
+
+  // #635 — match-path second line for the Deals multi-path search.
+  // Returns "" when the row is a happy-path (deal-only) hit, in which
+  // case the renderer suppresses the line entirely. Otherwise joins
+  // the available account/contact fields with thin-space + middle dot.
+  // Nulls are omitted, not rendered as `—`, so a row missing a Contact
+  // shows just the Account, not "Acme · — · —".
+  function matchPathFor(r: SzmSearchResult): string {
+    const via = r.matched_via;
+    if (!via || via.length === 0) return "";
+    if (via.length === 1 && via[0] === "deal") return "";
+    const parts: string[] = [];
+    if (r.account_name) parts.push(r.account_name);
+    if (r.contact_name) parts.push(r.contact_name);
+    if (r.contact_secondary) parts.push(r.contact_secondary);
+    if (parts.length === 0) return "";
+    return parts.join(" · ");
+  }
 </script>
 
 <div
@@ -658,9 +694,21 @@
                 Keep typing to search {chosenType.label}.
               </p>
             {:else if results.length === 0}
-              <p class="szm-results-hint">
-                No {chosenType.label} found for "{query}".
-              </p>
+              {#if chosenType.api_name === "Deals"}
+                <!-- #635 — Deals empty state doubles as the
+                     discoverability hint for the multi-path search.
+                     Other modules keep their single-line hint. -->
+                <p class="szm-results-hint">
+                  No deals found for "{query}".
+                </p>
+                <p class="szm-results-hint">
+                  Search by deal name, account, contact, email, or phone.
+                </p>
+              {:else}
+                <p class="szm-results-hint">
+                  No {chosenType.label} found for "{query}".
+                </p>
+              {/if}
             {:else}
               <ul class="szm-results-list">
                 {#each results as r (r.id)}
@@ -672,11 +720,16 @@
                       aria-pressed={chosenRecord?.id === r.id ? "true" : "false"}
                       onclick={() => selectRecord(r)}
                     >
-                      <span class="szm-result-name">{r.name}</span>
-                      {#if secondaryFor(r)}
-                        <span class="szm-result-secondary"
-                          >{secondaryFor(r)}</span
-                        >
+                      <span class="szm-result-row">
+                        <span class="szm-result-name">{r.name}</span>
+                        {#if secondaryFor(r)}
+                          <span class="szm-result-secondary"
+                            >{secondaryFor(r)}</span
+                          >
+                        {/if}
+                      </span>
+                      {#if matchPathFor(r)}
+                        <span class="szm-result-path">{matchPathFor(r)}</span>
                       {/if}
                     </button>
                   </li>
@@ -1098,7 +1151,13 @@
     gap: 0.15rem;
   }
   .szm-result {
-    display: block;
+    /* #635 — column flex so the optional match-path line stacks
+       under the name+secondary row without disturbing the existing
+       row's geometry. */
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
     width: 100%;
     text-align: left;
     background: transparent;
@@ -1117,6 +1176,17 @@
     padding-left: calc(0.75rem - 2px);
     background: var(--accent-soft);
   }
+  /* #635 — first row inside .szm-result: name (left, flex-grows) +
+     optional secondary (right). Replaces the legacy block-stack
+     layout; the second-line match path now lives below this row. */
+  .szm-result-row {
+    display: flex;
+    width: 100%;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    min-width: 0;
+  }
   .szm-result-name {
     display: block;
     font-size: 0.88rem;
@@ -1124,13 +1194,29 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
   }
   .szm-result-secondary {
     display: block;
     color: var(--bone-3);
     font-family: var(--font-mono, monospace);
     font-size: 0.75rem;
-    margin-top: 0.1rem;
+    flex: 0 0 auto;
+  }
+  /* #635 — match-path second line for Deals multi-path hits. Plain
+     mid-grey treatment, single-line ellipsis, no chips/icons/colour-
+     coding by `matched_via` kind (issue body explicitly asks for a
+     plain visual treatment). Width-constrained to the row so a long
+     account+contact+email string truncates instead of wrapping. */
+  .szm-result-path {
+    display: block;
+    width: 100%;
+    color: var(--bone-3);
+    font-size: 0.85em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Step 3 — review */

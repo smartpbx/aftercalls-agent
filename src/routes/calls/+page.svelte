@@ -92,7 +92,12 @@
   let loading = $state(true);
   let query = $state("");
   let me = $state<Me | null>(null);
-  type ListView = "active" | "pinned" | "snoozed";
+  // #634 — `unread` joins the existing list-view state machine. The
+  // backend's `/v1/calls?view=unread` filter narrows the row set to
+  // calls where `EXISTS (call_reads ...)` is false for the caller;
+  // the row-level `is_read` flag drives the visual indicator on rows
+  // shown by every other view too.
+  type ListView = "active" | "pinned" | "snoozed" | "unread";
   let listView = $state<ListView>("active");
 
   // #386 — keyset pagination. `nextCursor` mirrors the backend
@@ -248,7 +253,17 @@
   function readListViewFromUrl(): ListView {
     if (typeof window === "undefined") return "active";
     const raw = new URL(window.location.href).searchParams.get("view");
-    return raw === "pinned" || raw === "snoozed" ? raw : "active";
+    if (
+      raw === "pinned" ||
+      raw === "snoozed" ||
+      // #634 — `unread` joins the allowlist; anything else still
+      // collapses to the default "active" view so a stray query
+      // param can't wedge the page into a strange state.
+      raw === "unread"
+    ) {
+      return raw;
+    }
+    return "active";
   }
 
   function syncUrl() {
@@ -625,6 +640,19 @@
     if (highlightedCallId) void goto(`/calls/${highlightedCallId}`);
   }
 
+  // #634 — keyboard shortcut handler: `m` marks the highlighted row
+  // read. No-op when the highlighted row is already read or no row
+  // is highlighted. Builds a synthetic MouseEvent so `markRead` can
+  // share the same `e.preventDefault() / stopPropagation()` posture
+  // as the click path (the shared shortcuts module already guards
+  // text-input targets so no extra guard is needed here).
+  function markHighlightedRead() {
+    if (!highlightedCallId) return;
+    const call = calls.find((c) => c.id === highlightedCallId);
+    if (!call || call.is_read !== false) return;
+    void markRead(new MouseEvent("click"), call);
+  }
+
   function focusSearch(e: KeyboardEvent) {
     e.preventDefault();
     searchInput?.focus();
@@ -655,11 +683,17 @@
         enter: () => openHighlighted(),
         o: () => openHighlighted(),
         "/": (e) => focusSearch(e),
+        // #634 — `m` marks the highlighted row as read. The shared
+        // shortcut module already guards against text-input targets
+        // (same guard j/k rely on), so a user typing `m` in the
+        // search box doesn't accidentally fire the action.
+        m: () => markHighlightedRead(),
       },
       [
         { keys: "j k", label: "Next / previous call" },
         { keys: "enter o", label: "Open the highlighted call" },
         { keys: "/", label: "Focus search" },
+        { keys: "m", label: "Mark the highlighted call as read" },
       ],
     );
     await load();
@@ -1076,6 +1110,79 @@
       callActionBusy = { ...callActionBusy, [call.id]: false };
     }
   }
+
+  // #634 — mark-as-read flows. Optimistic update + rollback on error,
+  // matching the existing pin / snooze posture above. Each fires a
+  // window-level `unread-count-changed` event with a delta so the
+  // layout's sidebar pill ticks down on the same animation frame
+  // without waiting for the next 60s poll. Rollback restores both
+  // the row state AND the pill (using the inverse delta).
+  async function markRead(e: MouseEvent, call: Call) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (callActionBusy[call.id]) return;
+    if (call.is_read) return;
+    callActionBusy = { ...callActionBusy, [call.id]: true };
+    const prev = calls;
+    calls = calls.map((c) => (c.id === call.id ? { ...c, is_read: true } : c));
+    window.dispatchEvent(
+      new CustomEvent("unread-count-changed", { detail: { delta: -1 } }),
+    );
+    try {
+      await api.calls.markRead(call.id);
+    } catch (err: any) {
+      calls = prev;
+      // Inverse delta so the sidebar chip restores its previous
+      // value rather than ticking another step in the wrong
+      // direction.
+      window.dispatchEvent(
+        new CustomEvent("unread-count-changed", { detail: { delta: 1 } }),
+      );
+      toast.error(`Couldn't mark read: ${portalErrorToText(err)}`);
+    } finally {
+      callActionBusy = { ...callActionBusy, [call.id]: false };
+    }
+  }
+
+  let markAllBusy = $state(false);
+  async function markAllRead() {
+    if (markAllBusy) return;
+    // Snapshot the unread set we know about locally for optimistic
+    // UI + a precise rollback on error. The backend marks every
+    // unread call in the org for the caller; the local rows we know
+    // about may be a subset. The pill goes to 0 either way.
+    const prevCalls = calls;
+    const prevUnreadIds = calls.filter((c) => !c.is_read).map((c) => c.id);
+    if (prevUnreadIds.length === 0) return;
+    markAllBusy = true;
+    calls = calls.map((c) => ({ ...c, is_read: true }));
+    window.dispatchEvent(
+      new CustomEvent("unread-count-changed", { detail: { absolute: 0 } }),
+    );
+    try {
+      await api.calls.markAllRead();
+      // Re-tick the layout poll in case the server-side count is
+      // ahead of our optimistic 0 (e.g. another browser tab marked
+      // a call read between paint and click). No payload → layout
+      // refetches `/auth/me`.
+      window.dispatchEvent(new CustomEvent("unread-count-changed"));
+    } catch (err: any) {
+      calls = prevCalls;
+      window.dispatchEvent(new CustomEvent("unread-count-changed"));
+      toast.error(`Couldn't mark all read: ${portalErrorToText(err)}`);
+    } finally {
+      markAllBusy = false;
+    }
+  }
+
+  // #634 — derived count of unread rows currently rendered. Drives
+  // the conditional render of the "Mark all read" header button +
+  // the keyboard shortcut handler's enable gate. Stays local to the
+  // page so the sidebar pill (which reflects the org-wide count
+  // from /auth/me) and the page-local visible count don't drift.
+  let visibleUnreadCount = $derived(
+    calls.filter((c) => !c.is_read && c.status === "complete").length,
+  );
 </script>
 
 <main class="page">
@@ -1110,6 +1217,22 @@
             All team
           </button>
         </div>
+      {/if}
+      {#if visibleUnreadCount > 0}
+        <!-- #634 — Mark all read. Renders only when there's at
+             least one unread row in the current view. Optimistic
+             flip + `unread-count-changed` event so the sidebar
+             chip ticks down on the same frame. Same hairline-
+             border quiet-action shape as the adjacent Trash link
+             so the cluster reads as a single right-aligned group. -->
+        <button
+          type="button"
+          class="mark-all-read-btn"
+          disabled={markAllBusy}
+          onclick={markAllRead}
+        >
+          Mark all read
+        </button>
       {/if}
       <a class="trash-link" href="/calls/trash" title="Recycle bin">Trash</a>
     </div>
@@ -1174,6 +1297,18 @@
       onclick={() => setListView("snoozed")}
     >
       Snoozed
+    </button>
+    <!-- #634 — Unread is the narrowest filter (cuts across all of
+         Active/Pinned/Snoozed) so it sits last in the row per
+         ui.md. No count baked into the label — the sidebar chip
+         carries that, this pill's job is navigation. -->
+    <button
+      type="button"
+      class="list-view-pill"
+      class:active={listView === "unread"}
+      onclick={() => setListView("unread")}
+    >
+      Unread
     </button>
   </div>
 
@@ -1432,12 +1567,17 @@
           No pinned calls
         {:else if listView === "snoozed"}
           No snoozed calls
+        {:else if listView === "unread"}
+          You're all caught up.
         {:else if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
           No calls in the selected range
         {:else}
           No calls match these filters
         {/if}
       </p>
+      {#if listView === "unread"}
+        <p class="empty-sub">No unread calls in this view.</p>
+      {/if}
       <p class="empty-sub">
         <button type="button" class="empty-clear" onclick={clearFilters}>
           Clear filters
@@ -1463,6 +1603,8 @@
                 <a
                   href="/calls/{call.id}"
                   class="entry"
+                  class:entry-unread={call.is_read === false &&
+                    call.status === "complete"}
                   data-shortcut-row={highlightedCallId === call.id
                     ? "active"
                     : null}
@@ -1620,6 +1762,25 @@
                         </span>
                       {:else if call.status !== "complete"}
                         <span class="status-chip status-chip-sig">{call.status}</span>
+                      {/if}
+                      {#if call.is_read === false && call.status === "complete"}
+                        <!-- #634 — Mark read row affordance. Only
+                             rendered for unread complete calls (read
+                             rows have nothing to mark). Compact
+                             row-action shape matches the
+                             Pin / Snooze cluster so the four buttons
+                             feel uniform; aria-label carries the
+                             call title for SR users. -->
+                        <button
+                          type="button"
+                          class="row-action mark-read-btn"
+                          disabled={callActionBusy[call.id]}
+                          aria-label="Mark {call.title || 'call'} as read"
+                          aria-keyshortcuts="m"
+                          onclick={(e) => markRead(e, call)}
+                        >
+                          Mark read
+                        </button>
                       {/if}
                       <button
                         type="button"
@@ -1832,6 +1993,40 @@
   .trash-link:hover {
     color: var(--bone-0);
     border-color: var(--hairline-hi);
+  }
+  /* #634 — "Mark all read" header button. Same quiet-action shape
+     as `.trash-link` so the right-aligned head-actions cluster reads
+     uniformly. The button is conditional on `visibleUnreadCount > 0`
+     in markup; CSS makes no assumption about presence. */
+  .mark-all-read-btn {
+    font-size: 0.8rem;
+    color: var(--bone-3);
+    background: transparent;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+    align-self: center;
+    white-space: nowrap;
+  }
+  .mark-all-read-btn:hover:not(:disabled) {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .mark-all-read-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  /* #634 — `.mark-read-btn` row affordance. Inherits everything
+     from `.row-action` (defined below); the dedicated class here
+     just gives the row affordance a stable hook for future tweaks
+     without disturbing the shared row-action shape used by Pin /
+     Snooze. */
+  .row-action.mark-read-btn:hover:not(:disabled),
+  .row-action.mark-read-btn:focus-visible {
+    color: var(--accent);
+    border-color: var(--accent);
   }
 
   /* #142 · v0.4.5 — mic glyph prefix on self-note rows. Decorative
@@ -2442,6 +2637,27 @@
   }
   .entry[data-shortcut-row="active"] .entry-title {
     color: var(--accent);
+  }
+
+  /* #634 — unread call indicator. 3px accent rail on the left edge
+     (slightly wider than the 2px keyboard-shortcut rail above so the
+     two states are distinguishable when both apply) plus the title
+     in a heavier weight. Both signals coexist with hover + the
+     keyboard rail; CSS specificity is single-class so any override
+     stacks predictably. Per ui.md the indicator is purely visual —
+     no extra ARIA decoration on the row. The shortcut-active rule
+     above wins on the rail when both are set because it's later in
+     the cascade; keep that order intact. */
+  .entry-unread {
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .entry-unread .entry-title {
+    font-weight: 600;
+  }
+  .entry[data-shortcut-row="active"].entry-unread {
+    /* Both rails would compete; widen the inset so the keyboard
+       rail's 2px reads as the inner edge of the 3px unread rail. */
+    box-shadow: inset 3px 0 0 var(--accent);
   }
 
   .entry-meta {

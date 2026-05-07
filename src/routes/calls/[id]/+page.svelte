@@ -1553,6 +1553,16 @@
         me = await invoke<Me | null>("current_user");
       } catch {}
       call = await invoke<Call>("get_call", { id: page.params.id });
+      // #634 — backend `get_call` upserts into `call_reads` so this
+      // call is now read for the caller. Nudge the layout's sidebar
+      // chip without waiting for the next 60s `/auth/me` poll. The
+      // empty-detail event triggers a re-fetch on the layout side
+      // (rather than guessing a delta) so a stale local count
+      // refreshes against the authoritative server value. Cheaper
+      // than carrying the call's prior read-state through the wire
+      // and reasoning about whether this navigation actually
+      // decremented the count.
+      window.dispatchEvent(new CustomEvent("unread-count-changed"));
       trace("get_call ok", {
         id: call?.id,
         utterances: call?.utterances?.length,

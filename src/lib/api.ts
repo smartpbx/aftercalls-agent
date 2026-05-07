@@ -207,3 +207,49 @@ export const mySummaryStyle = {
   patch: (style: SummaryStyle | null): Promise<MySummaryStyle> =>
     invoke<MySummaryStyle>("me_summary_style_patch", { style }),
 };
+
+// ── #634 — per-user unread call state ───────────────────────────────
+//
+// Mirror of the portal's `calls.markRead/markAllRead/markBulkRead` TS
+// client. The wire shapes match what `portal/src/lib/api.ts` ships:
+//   - POST /v1/calls/{id}/read         — idempotent upsert, 204 on success.
+//   - POST /v1/calls/read-bulk         — body discriminated on
+//                                        `{ all: true }` | `{ call_ids: [uuid] }`,
+//                                        returns `{ marked: <count> }`.
+// The bulk-mark endpoint is wrapped in two TS helpers (`markAllRead` +
+// `markBulkRead`) so callers don't have to construct the discriminated
+// body themselves.
+//
+// Unread-count surface rides on `/v1/auth/me`'s existing payload via
+// `me.unread_calls`; `meUnreadCount()` is a thin reach-around that
+// fetches the live value without disturbing the cached `auth.json`
+// (`current_user` keeps reading from disk for cheap layout paints).
+
+export type MarkBulkResponse = { marked: number };
+
+export const calls = {
+  /** POST /v1/calls/{id}/read — mark a single call read for the
+   *  caller. Idempotent server-side. Throws PortalError on cross-org
+   *  / unknown id (404). */
+  markRead: (id: string): Promise<void> =>
+    invoke<void>("mark_call_read", { id }),
+  /** POST /v1/calls/read-bulk with `{ all: true }` — mark every
+   *  unread complete call in the caller's org as read. Returns the
+   *  number of newly-marked rows. */
+  markAllRead: (): Promise<MarkBulkResponse> =>
+    invoke<MarkBulkResponse>("mark_calls_read_bulk", { all: true }),
+  /** POST /v1/calls/read-bulk with `{ call_ids: [...] }` — mark a
+   *  specific set of calls read. Empty array short-circuits to
+   *  `{ marked: 0 }` server-side. */
+  markBulkRead: (ids: string[]): Promise<MarkBulkResponse> =>
+    invoke<MarkBulkResponse>("mark_calls_read_bulk", { callIds: ids }),
+};
+
+/** Fetch the live unread-call count from `/v1/auth/me`. Returns 0 on
+ *  any error so the layout poll never throws into a render path; the
+ *  next successful tick refines the value. The agent's cached
+ *  `current_user` shim reads `auth.json` (no live count), so this
+ *  helper exists to surface the fresh `/auth/me.unread_calls` field
+ *  without rewriting the auth bundle on every poll. */
+export const meUnreadCount = (): Promise<number> =>
+  invoke<number>("me_unread_count").catch(() => 0);

@@ -25,6 +25,7 @@ use detector::{Detector, UserDecision};
 use recorder::Recorder;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -46,6 +47,68 @@ enum TrayState {
     Processing,
 }
 
+impl TrayState {
+    fn to_u8(self) -> u8 {
+        match self {
+            TrayState::Idle => 0,
+            TrayState::Recording => 1,
+            TrayState::SelfNote => 2,
+            TrayState::Processing => 3,
+        }
+    }
+
+    fn from_u8(n: u8) -> Self {
+        match n {
+            1 => TrayState::Recording,
+            2 => TrayState::SelfNote,
+            3 => TrayState::Processing,
+            _ => TrayState::Idle,
+        }
+    }
+}
+
+/// #634 — last-applied `TrayState`, mirrored into managed state on
+/// every `apply_tray_state` call so the unread-badge IPC path can
+/// repaint the tooltip + icon without collapsing SelfNote / Processing
+/// down to the binary recording-or-not derivation. `AtomicU8` keeps
+/// this lock-free; the discriminant set is fixed at four values.
+struct CurrentTrayState(AtomicU8);
+impl CurrentTrayState {
+    fn new() -> Self {
+        Self(AtomicU8::new(TrayState::Idle.to_u8()))
+    }
+    fn get(&self) -> TrayState {
+        TrayState::from_u8(self.0.load(Ordering::Relaxed))
+    }
+    fn set(&self, state: TrayState) {
+        self.0.store(state.to_u8(), Ordering::Relaxed);
+    }
+}
+
+/// #634 — process-wide unread-call counter. The webview's
+/// `+layout.svelte` poll calls `set_unread_badge(count)` every 60s
+/// (and on every `unread-count-changed` window event) so the tray
+/// tooltip stays accurate without each tray-state transition having
+/// to re-fetch from the backend. Wired into `apply_tray_state` so the
+/// tooltip composition reads the latest count on every state flip.
+///
+/// `AtomicU32` keeps the surface lock-free; we don't care about
+/// strict ordering between the JS poll and the recorder's state
+/// flips — the worst case is a 60s-stale count for a single tooltip
+/// repaint, fixed by the next poll tick.
+struct TrayUnreadCount(AtomicU32);
+impl TrayUnreadCount {
+    fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+    fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn set(&self, n: u32) {
+        self.0.store(n, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn tray_set_processing(app: &AppHandle) {
     apply_tray_state(app, TrayState::Processing);
 }
@@ -65,12 +128,18 @@ pub(crate) fn tray_refresh_after_pipeline(app: &AppHandle, pipeline_still_active
 }
 
 fn apply_tray_state(app: &AppHandle, state: TrayState) {
+    // #634 — record the state we're about to paint so the unread-badge
+    // IPC path can repaint without re-deriving from the recorder
+    // (which collapses SelfNote → Recording and Processing → Idle).
+    if let Some(current) = app.try_state::<CurrentTrayState>() {
+        current.set(state);
+    }
     let Some(tray) = app.tray_by_id("main") else {
         return;
     };
     // tauri::include_image! decodes the PNG at compile time into raw RGBA,
     // so this is a zero-IO, zero-decode swap at runtime.
-    let (img, tip): (Image<'static>, &str) = match state {
+    let (img, base_tip): (Image<'static>, &str) = match state {
         TrayState::Idle => (
             tauri::include_image!("icons/tray-idle.png"),
             "aftercalls — idle",
@@ -89,7 +158,7 @@ fn apply_tray_state(app: &AppHandle, state: TrayState) {
         ),
     };
     let _ = tray.set_icon(Some(img));
-    let _ = tray.set_tooltip(Some(tip));
+    let _ = tray.set_tooltip(Some(compose_tray_tooltip(app, state, base_tip).as_str()));
 
     // Flip the start/stop menu label to match.
     if let Some(items) = app.try_state::<TrayItems>() {
@@ -100,6 +169,61 @@ fn apply_tray_state(app: &AppHandle, state: TrayState) {
         };
         let _ = items.toggle.set_text(label);
     }
+}
+
+/// #634 — fold the live unread-call count into the tray tooltip per
+/// the ui.md matrix. macOS NSStatusItem + Windows notify-area icons +
+/// Linux libayatana-appindicator all expose the tooltip uniformly;
+/// numeric badges on the icon itself are not first-class on any of
+/// the three menu-bar surfaces (NSStatusItem has no badge API at all,
+/// Windows tray overlay icons require a per-state image variant, and
+/// Linux DE coverage is sparse). Tooltip is the lowest-common-
+/// denominator that works everywhere.
+///
+/// Format follows the issue-634 ui.md spec:
+///   Idle, no unread       → "aftercalls"
+///   Idle, N unread        → "aftercalls — N unread"
+///   Busy state, no unread → "<base_tip>"             (e.g. "aftercalls — recording")
+///   Busy state, N unread  → "<base_tip> (N unread)"
+///
+/// Number is the raw integer (no "99+"); the tooltip has space and
+/// the full count is more informative than a cap.
+fn compose_tray_tooltip(app: &AppHandle, state: TrayState, base_tip: &str) -> String {
+    let count = app
+        .try_state::<TrayUnreadCount>()
+        .map(|s| s.get())
+        .unwrap_or(0);
+    if count == 0 {
+        // Idle's "no unread" tip per ui.md is the bare word
+        // "aftercalls" without the " — idle" suffix; busy states keep
+        // the existing suffix because the suffix carries useful info
+        // (recording / processing / etc.).
+        return match state {
+            TrayState::Idle => "aftercalls".to_string(),
+            _ => base_tip.to_string(),
+        };
+    }
+    match state {
+        TrayState::Idle => format!("aftercalls — {count} unread"),
+        _ => format!("{base_tip} ({count} unread)"),
+    }
+}
+
+/// #634 — re-paint the tray with the latest unread-count tooltip,
+/// preserving whatever `TrayState` was last applied. Used by
+/// `set_unread_badge` so a webview-side count change repaints the
+/// tooltip without the layout having to know what recording state the
+/// agent is in. Reads from the `CurrentTrayState` managed cell rather
+/// than re-deriving from `Recorder::is_active()` — the recorder-only
+/// derivation collapses SelfNote → Recording and Processing → Idle,
+/// which produced a visible flicker on every poll tick when the agent
+/// was self-note-recording or post-stop processing.
+fn tray_refresh_with_current_state(app: &AppHandle) {
+    let state = app
+        .try_state::<CurrentTrayState>()
+        .map(|s| s.get())
+        .unwrap_or(TrayState::Idle);
+    apply_tray_state(app, state);
 }
 
 #[derive(Serialize, Clone)]
@@ -1115,6 +1239,89 @@ async fn me_summary_style_patch(
         message: "no backend configured".into(),
     })?;
     portal::me_summary_style_patch(backend, style.as_deref()).await
+}
+
+// ── #634 — per-user unread call state ────────────────────────────────
+//
+// Three IPC shims for the webview's mark-as-read flow + a tiny tray-
+// badge helper. Mirrors the portal's `api.calls.mark*` /
+// `me.unread_calls` surface so the two `/calls` pages converge on
+// identical optimistic-update behaviour. Tray badge is agent-only;
+// see the `apply_tray_state` + `compose_tray_tooltip` doc-comments
+// above for the per-OS strategy.
+
+/// POST `/v1/calls/{id}/read` — idempotent mark-as-read for a single
+/// call. Cross-org / unknown id → 404 (per learning #82); the
+/// PortalError surfaces to the webview as `kind: "not_found"` so the
+/// page can downgrade gracefully.
+#[tauri::command]
+async fn mark_call_read(id: String) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::mark_call_read(backend, &id).await
+}
+
+/// POST `/v1/calls/read-bulk` — mark-as-read for a set of calls or
+/// every unread complete call in the caller's org. Exactly one of
+/// `all` / `call_ids` is set per the discriminated body the backend
+/// expects; the IPC layer enforces this by accepting the two args
+/// separately and constructing the body. `all=true` AND a non-empty
+/// `call_ids` is rejected client-side as a programmer error rather
+/// than letting the backend 400 round-trip.
+#[tauri::command]
+async fn mark_calls_read_bulk(
+    all: Option<bool>,
+    call_ids: Option<Vec<String>>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let want_all = all.unwrap_or(false);
+    let ids = call_ids.unwrap_or_default();
+    let body = match (want_all, ids.is_empty()) {
+        (true, true) => serde_json::json!({ "all": true }),
+        (false, false) => serde_json::json!({ "call_ids": ids }),
+        // Empty bulk ({all:false, call_ids:[]}) short-circuits to a
+        // no-op so the page can call markBulkRead([]) without an
+        // error path. Mirrors the portal client's defensive check.
+        (false, true) => return Ok(serde_json::json!({ "marked": 0 })),
+        (true, false) => {
+            return Err(error::PortalError::Other {
+                message: "mark_calls_read_bulk: pass `all` OR `call_ids`, not both".into(),
+            });
+        }
+    };
+    portal::mark_calls_read_bulk(backend, body).await
+}
+
+/// GET `/v1/auth/me` → `unread_calls`. Live count for the layout's
+/// 60s poll; doesn't merge into `auth.json` (the cached profile
+/// stays long-lived, matching the existing summary-style / privacy
+/// pattern where webview-driven reads bypass the cache).
+#[tauri::command]
+async fn me_unread_count() -> Result<i64, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_unread_count(backend).await
+}
+
+/// #634 — webview-driven tray-badge update. Pushes the latest count
+/// into `TrayUnreadCount` and re-applies the tray state so the
+/// tooltip reflects the new value immediately. Negative inputs are
+/// not representable (u32). The webview calls this on every poll
+/// tick AND on every `unread-count-changed` window event so the
+/// tooltip stays in lockstep with the sidebar pill.
+#[tauri::command]
+fn set_unread_badge(app: AppHandle, count: u32) {
+    if let Some(state) = app.try_state::<TrayUnreadCount>() {
+        state.set(count);
+    }
+    tray_refresh_with_current_state(&app);
 }
 
 /// #595 — GET `/v1/import-candidates`. Caller's own open candidates
@@ -2516,6 +2723,15 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Recorder::new())
+        // #634 — tray unread-count counter. Lives at process scope so
+        // every `apply_tray_state` site reads the same value. Webview
+        // pumps updates via the `set_unread_badge` command.
+        .manage(TrayUnreadCount::new())
+        // #634 — last-applied tray state, mirrored on every
+        // `apply_tray_state` call. Lets `tray_refresh_with_current_state`
+        // (the unread-badge IPC repaint path) preserve SelfNote /
+        // Processing visuals instead of collapsing to Recording / Idle.
+        .manage(CurrentTrayState::new())
         .invoke_handler(tauri::generate_handler![
             get_autostart,
             set_autostart,
@@ -2614,6 +2830,15 @@ pub fn run() {
             // new "AI summary style" Settings card.
             me_summary_style_get,
             me_summary_style_patch,
+            // #634 — per-user unread-call state + tray badge. Three
+            // shims around the new backend endpoints + one helper that
+            // pushes the live count into the tray tooltip from the
+            // webview's poll callback. See `apply_tray_state` + the
+            // `TrayUnreadCount` notes above for the per-OS strategy.
+            mark_call_read,
+            mark_calls_read_bulk,
+            me_unread_count,
+            set_unread_badge,
             // #595 — per-user import-candidate flow. Mirror of the
             // portal's `api.importCandidates.*` client; the agent's
             // `/calls` page renders these alongside real call rows

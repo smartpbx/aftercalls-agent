@@ -30,6 +30,11 @@ export type Me = {
   features?: Partial<Features>;
   pending_email?: string | null;
   org_has_agent_recording?: boolean;
+  /** #634 — caller's count of unread complete calls. Riding on the
+   *  existing `/auth/me` payload so the layout's poll doesn't need a
+   *  second endpoint. Optional so older backends decode cleanly:
+   *  missing → treated as zero, no chip rendered. */
+  unread_calls?: number;
 };
 
 export type TagKind = "client" | "purpose" | "topic" | "custom";
@@ -62,6 +67,13 @@ export type CallListItem = {
   pinned_at?: string | null;
   snoozed_until?: string | null;
   deleted_at?: string;
+  /** #634 — per-user read state for the calling user. The backend's
+   *  `list_calls` row gains an `EXISTS (...)` subquery against
+   *  `call_reads`. Optional so an older backend (or the
+   *  /calls/trashed shape) decodes cleanly; missing → treat as read
+   *  (no indicator), since we'd rather under-surface than flash a
+   *  false unread. */
+  is_read?: boolean;
 };
 
 export type Utterance = {

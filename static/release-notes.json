@@ -1,4 +1,11 @@
 {
+  "0.17.0": {
+    "headline": "See which calls you haven't reviewed yet, plus find CRM deals by who you spoke with — not just the deal name.",
+    "changes": [
+      "Unread calls — see what you haven't reviewed yet. Calls now mark themselves read when you open them. The sidebar shows how many are unread, and you can mark calls read individually or all at once. The desktop tray icon displays the unread count so you can stay on top of follow-ups. Optionally send a webhook event to your task tracker when a call is ready for review.",
+      "CRM deal search by account or contact name. Find a deal by typing the customer's name, contact email, or phone number — not just the deal name or number. Each match shows a second line indicating how you found it (e.g., Account name, Contact email)."
+    ]
+  },
   "0.16.1": {
     "headline": "Pick how summaries are shaped, plus assignee email + name in action-item webhooks.",
     "changes": [

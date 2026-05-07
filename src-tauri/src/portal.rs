@@ -1387,6 +1387,66 @@ pub async fn me_summary_style_patch(
     patch_json_typed(backend, "/v1/me/summary-style", body).await
 }
 
+// ── #634 — per-user unread-call state ────────────────────────────────
+//
+// Three thin wrappers that ride the `_typed` HTTP helpers so failures
+// surface to the webview as structured PortalError. The portal mirror
+// in `portal/src/lib/api.ts` hits the same endpoints with the same
+// payload shapes; keeping them consistent end-to-end means the agent
+// and portal /calls pages converge on identical optimistic-update
+// behaviour without one surface drifting on cross-org IDOR semantics.
+
+/// `POST /v1/calls/{id}/read` — mark one call read for the caller.
+/// Idempotent (server-side ON CONFLICT DO NOTHING); cross-org or
+/// missing id surfaces as `PortalError::NotFound` (per learning #82,
+/// 404 not 403, so unauthorised callers can't enumerate ids).
+pub async fn mark_call_read(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<(), PortalError> {
+    let path = format!("/v1/calls/{}/read", urlencoding_minimal(id));
+    post_nop_typed(backend, &path, serde_json::json!({})).await
+}
+
+/// `POST /v1/calls/read-bulk` — bulk mark-as-read with the discriminated
+/// body the backend expects: `{ "all": true }` to flip every unread
+/// complete call in the caller's org, or `{ "call_ids": [<uuid>, ...] }`
+/// to flip a specific set. Returns `{ marked: <count> }`. Mixed bodies
+/// (both keys set) reject 400 server-side.
+pub async fn mark_calls_read_bulk(
+    backend: &Backend,
+    body: Value,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(backend, "/v1/calls/read-bulk", body).await
+}
+
+/// Fetch the caller's live unread-call count by hitting `/v1/auth/me`
+/// and pulling out the new `unread_calls` field. We deliberately do
+/// NOT merge the response into `auth.json` — the cached profile is
+/// long-lived (refreshes only on TOS-accept / login / explicit
+/// `refresh_me`); piping a 60s poll through `read_auth_file` /
+/// `write_auth_file` would churn the file on every tick. Returning
+/// the bare i64 keeps the surface tight and matches the portal's
+/// `me.unread_calls` direct-field read.
+pub async fn me_unread_count(backend: &Backend) -> std::result::Result<i64, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}/v1/auth/me", backend.url.trim_end_matches('/'));
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
+    }
+    let body: Value = resp.json().await.map_err(PortalError::from)?;
+    let count = body
+        .get("unread_calls")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Ok(count)
+}
+
 // ── #595 — per-user import-candidate flow ────────────────────────────
 //
 // Mirror of the portal's `importCandidates` TS client. The agent's

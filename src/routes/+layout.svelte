@@ -80,6 +80,24 @@
   let me = $state<Me | null>(null);
   let authResolved = $state(false);
 
+  // #634 — unread-call count for the sidebar Calls pill + tray
+  // tooltip. Polled every 60s from /v1/auth/me (same pattern the
+  // portal uses for the Support staff badge); also bumped manually
+  // when a user opens a call (the detail page dispatches an
+  // `unread-count-changed` event to avoid the next 60s lag) or when
+  // the user clicks "Mark read" / "Mark all read" on /calls (those
+  // pages dispatch the same event after their own optimistic
+  // updates). Persists at the layout level so SvelteKit client
+  // navigation between /calls and /calls/[id] doesn't reset it.
+  let unreadCallsCount = $state(0);
+  let unreadPollTimer: ReturnType<typeof setInterval> | null = null;
+  const UNREAD_POLL_MS = 60_000;
+  // Last value pushed to the Tauri tray. Avoids a needless
+  // `set_unread_badge` IPC every poll tick when the count hasn't
+  // moved (most calls). `-1` is the "never pushed" sentinel; first
+  // tick always lands.
+  let lastTrayBadgePushed = -1;
+
   let recording = $state(false);
   let pipelineStage = $state("");
   // #142 · v0.4.5 — track which mode the in-flight recording is in
@@ -617,6 +635,66 @@
   // detail, actions) register on mount and tear down on destroy.
   let teardownGlobalShortcuts: (() => void) | null = null;
 
+  // #634 — single tick of the unread-call-count poll. Fail-soft: a
+  // transient backend hiccup keeps the last-known count visible
+  // until the next successful tick. Skips when `document.hidden`
+  // matches the portal's Support badge poll posture — a backgrounded
+  // webview shouldn't generate pointless `/auth/me` traffic. The
+  // tray-badge IPC fires only when the count actually changes so a
+  // foregrounded poll on a steady count is a single round-trip.
+  async function tickUnreadCount() {
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (!me) return;
+    try {
+      const count = await invoke<number>("me_unread_count");
+      const next = Math.max(0, Math.floor(count) | 0);
+      if (next !== unreadCallsCount) {
+        unreadCallsCount = next;
+      }
+      pushTrayBadge(next);
+    } catch {
+      // Swallow — keep the last-known value visible. The next tick
+      // catches up. Logging would spam telemetry on offline windows.
+    }
+  }
+
+  /** Update the Tauri tray tooltip with the live count. Idempotent
+   *  per-value (gates on `lastTrayBadgePushed`) so a steady-state
+   *  poll doesn't churn the IPC channel. */
+  function pushTrayBadge(count: number) {
+    if (count === lastTrayBadgePushed) return;
+    lastTrayBadgePushed = count;
+    invoke("set_unread_badge", { count }).catch(() => {
+      // Best-effort. Tauri commands rarely fail in steady state; a
+      // failure here doesn't change the sidebar pill (the same
+      // value is already in `unreadCallsCount` driving the chip).
+    });
+  }
+
+  /** Webview-side dispatcher for the `unread-count-changed` window
+   *  event. Pages that just performed an optimistic mark-as-read
+   *  fire this so the sidebar pill ticks down without waiting for
+   *  the next 60s poll. The detail page's auto-on-open fire is the
+   *  most common caller; the list page's "Mark read" / "Mark all
+   *  read" flows fire it too. Listener lives at the layout level
+   *  so the same handler covers every dispatcher. */
+  function onUnreadCountChanged(ev: Event) {
+    const e = ev as CustomEvent<{ delta?: number; absolute?: number }>;
+    const detail = e?.detail ?? {};
+    if (typeof detail.absolute === "number") {
+      unreadCallsCount = Math.max(0, detail.absolute | 0);
+    } else if (typeof detail.delta === "number") {
+      unreadCallsCount = Math.max(0, unreadCallsCount + (detail.delta | 0));
+    } else {
+      // No payload → re-fetch live. Keeps callers honest if the
+      // local state was wrong (e.g. user hit "Mark all read" but
+      // optimistically the page had stale rows).
+      void tickUnreadCount();
+      return;
+    }
+    pushTrayBadge(unreadCallsCount);
+  }
+
   onMount(async () => {
     const appPrefs = await getAppPrefs();
     initSentry(appPrefs?.telemetry_enabled === true);
@@ -1128,6 +1206,23 @@
     // personalized with the just-logged-in name.
     window.addEventListener("aftercalls-login", handleLoginEvent);
     window.addEventListener("aftercalls-auth-refresh", handleLoginEvent);
+
+    // #634 — start the unread-count poll. Only meaningful when
+    // signed in; the tickUnreadCount guard short-circuits when
+    // `me` is null so a logged-out webview doesn't churn /auth/me.
+    // Listener for `unread-count-changed` is wired regardless so a
+    // page that fires while the layout is mid-mount still lands
+    // (the listener falls back to a refetch when the payload is
+    // empty, which the cached count protects from a 401 on the
+    // logged-out leg).
+    window.addEventListener(
+      "unread-count-changed",
+      onUnreadCountChanged as EventListener,
+    );
+    if (me) {
+      void tickUnreadCount();
+      unreadPollTimer = setInterval(tickUnreadCount, UNREAD_POLL_MS);
+    }
   });
 
   async function handleLoginEvent() {
@@ -1144,6 +1239,15 @@
     // Fresh login → check for leftover sessions from a previous run.
     // Same call as the onMount path; idempotent.
     await loadOrphans();
+    // #634 — start the unread-count poll on the post-login leg too.
+    // Login arrives via `aftercalls-login`, after which `me` is
+    // populated; the onMount-time poll didn't start because `me`
+    // was null. Idempotent: don't double-schedule if the timer is
+    // already alive (handleLoginEvent also fires on token-refresh).
+    if (me && unreadPollTimer === null) {
+      void tickUnreadCount();
+      unreadPollTimer = setInterval(tickUnreadCount, UNREAD_POLL_MS);
+    }
   }
 
   // #320 — Single point of truth for the agent-side ToS gate. Mirrors
@@ -1523,6 +1627,15 @@
     callRecording.reset();
     window.removeEventListener("aftercalls-login", handleLoginEvent);
     window.removeEventListener("aftercalls-auth-refresh", handleLoginEvent);
+    // #634 — stop the unread-count poll + drop the listener.
+    window.removeEventListener(
+      "unread-count-changed",
+      onUnreadCountChanged as EventListener,
+    );
+    if (unreadPollTimer !== null) {
+      clearInterval(unreadPollTimer);
+      unreadPollTimer = null;
+    }
     teardownGlobalShortcuts?.();
     teardownGlobalShortcuts = null;
   });
@@ -1679,6 +1792,11 @@
     /// local /admin or /staff routes — those surfaces live on
     /// app.aftercalls.io.
     external?: boolean;
+    /// #634 — numeric count chip rendered to the right of the label.
+    /// Falsy / undefined / 0 omits the chip entirely (matches the
+    /// portal's `badge: count > 0` pattern). Capped at 99 in the
+    /// rendered text; raw value rides on `aria-label` for SR users.
+    badge?: number;
   };
   type NavSection = {
     id: "workspace" | "admin" | "staff";
@@ -1734,6 +1852,11 @@
           label: "Calls",
           match: (p) => p.startsWith("/calls"),
           icon: ICON_CALLS,
+          // #634 — unread-count chip mirror of the portal Support
+          // badge pattern (`portal/+layout.svelte:616`). Hidden when
+          // zero by the render-side `badge > 0` guard; capped at 99
+          // in the rendered text per ui.md.
+          badge: unreadCallsCount,
         },
         // v0.4.0 Phase 4 (#105): /actions portfolio view.
         {
@@ -1959,6 +2082,19 @@
                   >
                     <span class="glyph">{@html it.icon}</span>
                     <span class="label">{it.label}</span>
+                    {#if typeof it.badge === "number" && it.badge > 0}
+                      <!-- #634 — unread-count chip on the Calls rail
+                           entry. Cap visible text at 99; raw count
+                           rides on aria-label so screen-readers
+                           announce the full number alongside the
+                           item label. Per ui.md: chip is absent at
+                           zero, font weight + variant-numeric keep
+                           digits aligned. -->
+                      <span
+                        class="nav-badge count"
+                        aria-label="{it.badge} unread"
+                      >{it.badge >= 100 ? "99+" : it.badge}</span>
+                    {/if}
                   </a>
                 {/if}
                 {#if it.href === "/" && autoPrompt && !isRecordPage}
@@ -2032,6 +2168,14 @@
           </nav>
         </section>
       {/each}
+      <!-- #634 — visually-hidden live region. SR users hear "{N}
+           unread calls" whenever the count moves so the chip's
+           visual transition has an accessible counterpart. The chip
+           itself is decorative on a nav link (not focusable); this
+           region carries the announcement load. -->
+      <span class="sr-only-live" aria-live="polite" aria-atomic="true"
+        >{unreadCallsCount} unread calls</span
+      >
     </div>
 
     <!-- Rail foot: user name/org doubles as the trigger for a
@@ -2925,6 +3069,52 @@
   .nav-item:hover .glyph,
   .nav-item.active .glyph {
     color: var(--accent);
+  }
+
+  /* #634 — numeric count chip on the Calls rail entry. Mirror of the
+     portal's component-scoped `.nav-badge.count` rule (see
+     `portal/src/routes/+layout.svelte` ~line 1101 — the pattern lives
+     scoped per-surface so it never bleeds into `app.css`, which keeps
+     the byte-identical-mirror invariant intact). Sits at the right
+     end of the nav-item via `margin-left: auto`; tabular-nums keeps
+     the digits aligned as the count climbs. */
+  .nav-badge.count {
+    margin-left: auto;
+    min-width: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--ink-2);
+    color: var(--bone-1);
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+    box-shadow: inset 0 0 0 1px var(--hairline);
+  }
+  .nav-item.active .nav-badge.count,
+  .nav-item:hover .nav-badge.count {
+    /* Lift the chip's contrast on the active / hovered nav row so
+       it stays legible against the brighter `--ink-2` background
+       (which the row itself now occupies). */
+    background: var(--ink-1);
+  }
+  /* Visually-hidden live region (#634, ui.md). Announces count
+     transitions to screen-readers without rendering anything on
+     screen. Same `.sr-only` shape used by `ShortcutsOverlay` —
+     keep this identical so accessibility tooling treats them the
+     same way. */
+  .sr-only-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   /* ── Main area ─────────────────────────────────────────────────────── */
