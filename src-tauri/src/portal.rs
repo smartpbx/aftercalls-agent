@@ -1088,6 +1088,16 @@ pub async fn summarize(
     transcript: &Value,
     candidate_clients: &[String],
 ) -> Result<(Value, Option<String>)> {
+    // v0.17.1 — bumped 240 → 600 to match the surrounding transcribe /
+    // resummarize ceilings and the backend's `length_scaled_timeout`,
+    // which can run to ~600 s per LLM leg (plus a retry slot, plus a
+    // parallel `extract_action_items` leg of the same shape). The
+    // previous 240 s asymmetry was introduced when #614 widened the
+    // backend cap without updating the agent ceiling, so long calls
+    // (~15 min+ transcripts) reliably timed out client-side while the
+    // backend was still legitimately producing a summary. The durable
+    // fire-and-poll refactor is tracked separately; this is the
+    // hotfix.
     let (value, headers) = post_with_timeout(
         backend,
         &format!("/v1/calls/{call_id}/summarize"),
@@ -1095,7 +1105,7 @@ pub async fn summarize(
             "transcript": transcript,
             "candidate_clients": candidate_clients,
         }),
-        Duration::from_secs(240),
+        Duration::from_secs(600),
     )
     .await?;
     Ok((value, extract_api_version(&headers)))
