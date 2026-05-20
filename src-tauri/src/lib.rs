@@ -553,13 +553,23 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
 
 // ── #596 — auto-record IPC surface ─────────────────────────────────────
 //
-// Five commands + four events drive the per-app whitelist UX:
+// Six commands + four events drive the per-app whitelist UX:
 //   - `auto_record_settings_get` returns the bundle the Settings page
 //     paints (master toggles + per-app rows + platform_supported).
+//     Each row carries both `mode` (auto/ask/never, authoritative) and
+//     `enabled` (legacy mirror, kept for one release for downgrade
+//     safety — `mode == 'auto' ⇒ enabled == true`).
 //   - `auto_record_settings_set_master` flips the two booleans that
 //     gate the auto-start / auto-stop paths.
-//   - `auto_record_settings_toggle_app` updates one row's `enabled`
-//     flag — the per-row checkbox in the apps list.
+//   - `auto_record_settings_set_app_mode` updates one row's `mode` to
+//     the three-state user choice ('auto' / 'ask' / 'never'). The
+//     `never` mode silences the detector entirely for that bundle —
+//     no toast, no in-app slide-out, no PIPEDA modal.
+//   - `auto_record_settings_toggle_app` is the legacy boolean shim,
+//     kept so a stale frontend after an in-place update doesn't 500.
+//     Maps enabled=true → mode=auto, enabled=false → mode=ask. A
+//     row currently set to `never` that the legacy shim flips to
+//     enabled=false stays semantically equivalent (ask).
 //   - `auto_record_settings_forget_app` removes a row; it'll reappear
 //     the next time that app captures the mic, by design.
 //   - `confirm_auto_record_cancel` clears the in-flight pending-start
@@ -575,7 +585,15 @@ struct AutoRecordAppRow {
     friendly_name: String,
     first_seen_at: chrono::DateTime<chrono::Utc>,
     last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Legacy mirror of `mode == Auto`. Kept on the wire for one
+    /// release so a v0.17.x frontend reading a v2 backend still gets
+    /// the right behaviour for ticked/unticked rows.
     enabled: bool,
+    /// Authoritative per-row state. `auto` = auto-record on mic
+    /// capture (master toggle permitting), `ask` = current prompt
+    /// flow (default), `never` = silenced — detector filters this
+    /// bundle out of `interesting_mic_consumers`.
+    mode: String,
 }
 
 #[derive(serde::Serialize)]
@@ -607,6 +625,7 @@ fn auto_record_settings_get(
                 first_seen_at: r.first_seen_at,
                 last_seen_at: r.last_seen_at,
                 enabled: r.enabled,
+                mode: r.mode.as_str().to_string(),
             })
             .collect(),
     })
@@ -629,9 +648,41 @@ fn auto_record_settings_toggle_app(
     bundle_id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    // Legacy shim — see the module-level comment block. enabled=true
+    // maps to mode=Auto, enabled=false maps to mode=Ask. The new
+    // mode-aware frontend calls `auto_record_settings_set_app_mode`
+    // instead; this command stays in place for one release so a
+    // stale frontend after an in-place update doesn't 500.
     auto.store()
         .set_enabled(&bundle_id, enabled)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn auto_record_settings_set_app_mode(
+    auto: State<AutoRecorder>,
+    bundle_id: String,
+    mode: String,
+) -> Result<(), String> {
+    let parsed = match mode.as_str() {
+        "auto" => app_observations::AppMode::Auto,
+        "ask" => app_observations::AppMode::Ask,
+        "never" => app_observations::AppMode::Never,
+        other => return Err(format!("unknown app mode {other:?}")),
+    };
+    auto.store()
+        .set_mode(&bundle_id, parsed)
+        .map_err(|e| e.to_string())?;
+    // When the user silences an app, also clear any in-flight snooze
+    // for that consumer so future un-silencing isn't stuck behind a
+    // stale 5-minute snooze window. Snooze is keyed on the consumer
+    // string — same key the detector uses — and clearing on Never
+    // is a one-line nicety per the plan §Risks "Snooze table
+    // interaction" note.
+    if matches!(parsed, app_observations::AppMode::Never) {
+        notify_actions::clear_snooze(&bundle_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2745,12 +2796,13 @@ pub fn run() {
             dismiss_auto_start,
             confirm_auto_end,
             keep_auto_recording,
-            // #596 — auto-record per-app whitelist surface. Five
+            // #596 — auto-record per-app whitelist surface. Six
             // commands + four events drive the Settings page + cancel
             // toast; see the AutoRecord module group above.
             auto_record_settings_get,
             auto_record_settings_set_master,
             auto_record_settings_toggle_app,
+            auto_record_settings_set_app_mode,
             auto_record_settings_forget_app,
             confirm_auto_record_cancel,
             login,

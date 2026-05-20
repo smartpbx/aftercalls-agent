@@ -2,7 +2,7 @@
 //
 // One singleton; both the Settings page and the layout-level event
 // listener share state through it. The Settings page reads `state` and
-// calls `refresh()` / `setMaster()` / `toggleApp()` / `forget()` for
+// calls `refresh()` / `setMaster()` / `setAppMode()` / `forget()` for
 // edits; the layout's `observed-apps-updated` listener bumps
 // `refresh()` so a freshly-observed app appears in the list without
 // the user having to toggle a route.
@@ -15,6 +15,7 @@
 import {
   autoRecord,
   type AutoRecordApp,
+  type AutoRecordAppMode,
   type AutoRecordSettings,
 } from "$lib/api";
 
@@ -65,17 +66,26 @@ function createStore() {
     }
   }
 
-  async function toggleApp(bundleId: string, enabled: boolean): Promise<void> {
+  async function setAppMode(
+    bundleId: string,
+    mode: AutoRecordAppMode,
+  ): Promise<void> {
+    // Optimistic local mutation. Patch BOTH `mode` (authoritative)
+    // and the legacy `enabled` mirror so any downstream consumer
+    // still reading the boolean (the cancel toast in +layout, etc.)
+    // stays consistent until the next refresh.
     if (state.data) {
       state.data = {
         ...state.data,
         apps: state.data.apps.map((a) =>
-          a.bundle_id === bundleId ? { ...a, enabled } : a,
+          a.bundle_id === bundleId
+            ? { ...a, mode, enabled: mode === "auto" }
+            : a,
         ),
       };
     }
     try {
-      await autoRecord.toggleApp(bundleId, enabled);
+      await autoRecord.setAppMode(bundleId, mode);
     } catch (e: unknown) {
       state.error = String((e as { message?: string })?.message ?? e);
       await refresh();
@@ -121,7 +131,7 @@ function createStore() {
     },
     refresh,
     setMaster,
-    toggleApp,
+    setAppMode,
     forget,
   };
 }

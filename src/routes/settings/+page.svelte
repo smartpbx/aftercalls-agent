@@ -1209,12 +1209,15 @@
         <div class="auto-record-apps-header">
           <span class="pref-title">Apps that have used the microphone</span>
           <span class="pref-hint">
-            Tick the apps you want to auto-record. Apps you don't tick
-            stay observed only — they appear here so you can decide,
-            but they never trigger a recording on their own.
-            Browser-based call apps appear as the browser itself;
-            ticking your browser will auto-record any tab that uses
-            the microphone.
+            Pick how the agent should handle each app's mic use.
+            <strong>Auto-record</strong> starts a recording the moment
+            the app opens its microphone. <strong>Ask each time</strong>
+            (the default) prompts you with the usual "Record this
+            call?" toast. <strong>Never ask</strong> silences the
+            prompt for apps you don't want the agent to bother you
+            about. Browser-based call apps appear as the browser
+            itself; choosing Auto-record for your browser will
+            auto-record any tab that uses the microphone.
           </span>
         </div>
 
@@ -1241,21 +1244,28 @@
           <ul class="auto-record-list">
             {#each autoRecordStore.apps as app (app.bundle_id)}
               <li class="auto-record-row">
-                <label class="switch switch--compact">
-                  <input
-                    type="checkbox"
-                    checked={app.enabled}
-                    aria-label={`Auto-record ${app.friendly_name}`}
-                    onchange={(e) =>
-                      autoRecordStore.toggleApp(
-                        app.bundle_id,
-                        (e.currentTarget as HTMLInputElement).checked,
-                      )}
-                  />
-                  <span class="track" aria-hidden="true">
-                    <span class="knob"></span>
-                  </span>
-                </label>
+                <!-- Three-state per-row control (#never-ask-app).
+                     Native <select> + the existing `.input` class
+                     keeps this as one row paint with no new CSS —
+                     `.mic-select` above is the same precedent. The
+                     'never' state silences the detector entirely for
+                     this bundle (no toast, no slide-out, no PIPEDA
+                     modal) until the user flips it back. -->
+                <select
+                  class="input auto-record-mode"
+                  aria-label={`Recording mode for ${app.friendly_name}`}
+                  value={app.mode}
+                  onchange={(e) =>
+                    autoRecordStore.setAppMode(
+                      app.bundle_id,
+                      (e.currentTarget as HTMLSelectElement)
+                        .value as "auto" | "ask" | "never",
+                    )}
+                >
+                  <option value="auto">Auto-record</option>
+                  <option value="ask">Ask each time</option>
+                  <option value="never">Never ask</option>
+                </select>
                 <div class="auto-record-row-meta">
                   <span class="auto-record-row-name">{app.friendly_name}</span>
                   <span class="auto-record-row-times">
@@ -2050,21 +2060,12 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
-  /* #596 — compact switch for the per-app auto-record rows.
-     Smaller knob/track so the row stays light next to the app name +
-     timestamps. Mirrored in the design-system app.css so the portal
-     stays in lockstep. */
-  .switch--compact .track {
-    width: 28px;
-    height: 16px;
-  }
-  .switch--compact .knob {
-    width: 10px;
-    height: 10px;
-  }
-  .switch--compact input:checked + .track .knob {
-    transform: translateX(12px);
-  }
+  /* #596 — the compact switch modifier used to drive the per-app
+     auto-record row checkbox. The HTML was replaced by a three-state
+     <select> (#never-ask-app) so the local duplicates here aren't
+     needed anymore; the shared `.switch--compact` rules in the
+     design-system app.css stay in place for any future cross-
+     surface use. */
   .switch-label {
     font-family: var(--font-mono);
     font-size: 0.72rem;
@@ -2572,9 +2573,10 @@
   }
 
   /* #596 — Auto-record section. Reuses .pref-row / .pref-section /
-     .switch primitives; the only new chrome is the per-app list +
-     the smaller `switch--compact` modifier (which lives in the
-     design-system app.css so the portal stays in lockstep). */
+     .switch primitives. The per-row control is a native <select> +
+     .input + .auto-record-mode (#never-ask-app); previously it was
+     a checkbox driven by the `.switch--compact` modifier (still
+     defined in the shared app.css for any future cross-surface use). */
   .auto-record-banner {
     margin: 0.5rem 0 0.2rem;
   }
@@ -2632,6 +2634,19 @@
   }
   .auto-record-forget {
     flex-shrink: 0;
+  }
+  /* Per-row three-state mode picker (#never-ask-app). Compact form
+     of the .mic-select recipe above so the row fits next to the
+     friendly-name + times block; same `.input` base, no new
+     primitive, no shared-CSS edit. */
+  .auto-record-mode {
+    flex: 0 0 9rem;
+    min-width: 0;
+    cursor: pointer;
+  }
+  .auto-record-mode:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   /* #630 — error + inline retry styling for the AI summary style

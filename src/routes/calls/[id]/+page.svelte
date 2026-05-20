@@ -279,9 +279,11 @@
     pushCall: async (
       callId: string,
       body: {
-        module: string;
-        record_id: string;
-        record_name: string;
+        // #639 — unlinked push (no parent record).
+        unlinked?: boolean;
+        module?: string;
+        record_id?: string;
+        record_name?: string;
         extra_tags?: string[];
       },
     ): Promise<SzmPushResponse> => {

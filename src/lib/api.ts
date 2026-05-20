@@ -116,6 +116,14 @@ export const importCandidates = {
 // `apps` table is privacy-sensitive — never sent upstream — so this
 // client lives in the agent's api.ts only.
 
+/** Per-row state in the Auto-record list.
+ *
+ * - `auto`: auto-record on mic capture (master toggle permitting).
+ * - `ask`: prompt the user via the existing detector flow. Default.
+ * - `never`: silence the detector entirely — no toast, no slide-out,
+ *   no PIPEDA modal. Reversible from Settings. */
+export type AutoRecordAppMode = "auto" | "ask" | "never";
+
 /** One row of the observed-apps list. Maps 1:1 to the AutoRecordAppRow
  *  serializer in the Rust IPC layer. */
 export type AutoRecordApp = {
@@ -125,7 +133,11 @@ export type AutoRecordApp = {
   first_seen_at: string;
   /** RFC-3339 UTC. */
   last_seen_at: string;
+  /** Legacy mirror of `mode === "auto"`. Kept on the wire for one
+   *  release for downgrade safety. New surfaces should read `mode`. */
   enabled: boolean;
+  /** Authoritative per-row state. */
+  mode: AutoRecordAppMode;
 };
 
 /** Bundle returned by `auto_record_settings_get` — drives a single
@@ -149,11 +161,25 @@ export const autoRecord = {
   setMaster: (start: boolean, stop: boolean): Promise<void> =>
     invoke<void>("auto_record_settings_set_master", { start, stop }),
   /** Flip one row's `enabled` flag. Errors when the row was forgotten
-   *  between paint and click. */
+   *  between paint and click.
+   *  @deprecated Prefer {@link autoRecord.setAppMode}; the boolean
+   *    shim maps `true` → `auto` and `false` → `ask`, which can't
+   *    express the new `never` state. Kept for one release while the
+   *    Settings UI migrates. */
   toggleApp: (bundleId: string, enabled: boolean): Promise<void> =>
     invoke<void>("auto_record_settings_toggle_app", {
       bundleId,
       enabled,
+    }),
+  /** Set one row's per-app mode to the user's three-state choice.
+   *  Errors when the row was forgotten between paint and click. */
+  setAppMode: (
+    bundleId: string,
+    mode: AutoRecordAppMode,
+  ): Promise<void> =>
+    invoke<void>("auto_record_settings_set_app_mode", {
+      bundleId,
+      mode,
     }),
   /** Drop a row. Reappears next time that app actually grabs the mic. */
   forgetApp: (bundleId: string): Promise<void> =>

@@ -34,9 +34,13 @@
     tags_added: SzmTag[];
   };
   export type SzmPriorPush = {
-    module: string;
-    record_id: string;
-    record_name: string;
+    /** #639 — Optional for unlinked prior pushes. Backend omits these
+     *  three fields from the wire when the prior push had no parent
+     *  record; render the Step-0 prior-push card with an "Unlinked
+     *  call" label in that case. */
+    module?: string;
+    record_id?: string;
+    record_name?: string;
     pushed_at: string;
     pushed_by_display_name?: string | null;
     zoho_url?: string | null;
@@ -74,9 +78,14 @@
     pushCall: (
       callId: string,
       body: {
-        module: string;
-        record_id: string;
-        record_name: string;
+        /** #639 — unlinked push (no parent record). When `true`, the
+         *  three relation fields below are ignored by the backend; the
+         *  modal omits them entirely (not empty strings) so the wire
+         *  shape stays clean. */
+        unlinked?: boolean;
+        module?: string;
+        record_id?: string;
+        record_name?: string;
         extra_tags?: string[];
       },
     ) => Promise<SzmPushResponse>;
@@ -176,6 +185,17 @@
      *  the divider + sub-label copy; never sent to the backend. */
     is_custom: boolean;
   };
+  // #639 — sentinel api_name for the "Unlinked Call" pinned entry.
+  // UI-only: NEVER sent to the backend as a module name. The doPush
+  // builder branches on this sentinel to send `{ unlinked: true }`
+  // instead of `{ module, record_id, record_name }`.
+  const UNLINKED_API_NAME = "UNLINKED";
+  const UNLINKED_TYPE: RecordType = {
+    api_name: UNLINKED_API_NAME,
+    label: "Unlinked Call",
+    kicker: "No parent record",
+    is_custom: false,
+  };
   // Hard-coded standard kickers — keep the v1 copy verbatim for the
   // 5 standards so the visible copy doesn't regress on a partial
   // record-types fetch.
@@ -200,6 +220,16 @@
   let recordTypesLoading = $state(true);
   let recordTypesError = $state<string | null>(null);
   let chosenType = $state<RecordType>(STANDARD_FALLBACK[0]);
+
+  // #639 — true when the user has picked the pinned Unlinked Call entry.
+  // Drives Step-1 → Step-3 skip, Step-3 review-card branch, push-body
+  // shape, pip-2 dimming, and Step-5 success copy.
+  const isUnlinked = $derived(chosenType.api_name === UNLINKED_API_NAME);
+  // #639 — pip 2 must render as "skipped" (not "done") once we've
+  // advanced past Step 1 via the unlinked path. Drives `pipClass(2)`
+  // override + the `.szm-steps` aria-label suffix + the live-region
+  // announcement at Step 3.
+  const skippedStep2 = $derived(isUnlinked && step >= 3);
 
   // Step-1 record-type filter (#221). Modal-session only — closing
   // and reopening the modal resets to empty, since the whole
@@ -308,7 +338,12 @@
         msg = `Step 2 of 3: search ${chosenType.label}`;
         break;
       case 3:
-        msg = "Step 3 of 3: review and push";
+        // #639 — announce the skipped step for screen readers on the
+        // unlinked path so listeners aren't surprised by the pip-row's
+        // dimmed dot.
+        msg = isUnlinked
+          ? "Step 3 of 3: review and push (step 2 skipped)"
+          : "Step 3 of 3: review and push";
         break;
       case 4:
         msg = "Pushing to Zoho";
@@ -365,9 +400,16 @@
       // (so identity-equality on the radio group works) — fall back to
       // the first standard if the previous chosen entry is no longer
       // in either list.
-      const all = [...standardTypes, ...customTypes];
-      const match = all.find((t) => t.api_name === chosenType.api_name);
-      chosenType = match ?? standardTypes[0];
+      //
+      // #639 — the Unlinked Call sentinel is UI-only and not present in
+      // `standardTypes`/`customTypes`. If the user picked it before
+      // this fetch resolved, leave the selection untouched; clobbering
+      // back to Contact would silently undo their click.
+      if (chosenType.api_name !== UNLINKED_API_NAME) {
+        const all = [...standardTypes, ...customTypes];
+        const match = all.find((t) => t.api_name === chosenType.api_name);
+        chosenType = match ?? standardTypes[0];
+      }
     } catch (e: any) {
       // Keep the fallback standards list; surface a small error
       // banner so the user knows custom modules aren't available.
@@ -445,19 +487,27 @@
   }
 
   async function doPush() {
-    if (!chosenRecord) return;
+    // #639 — unlinked push needs no chosenRecord; linked push still
+    // requires one. Guard accordingly.
+    if (!isUnlinked && !chosenRecord) return;
     pushInFlight = true;
     pushErrorMsg = null;
     pushResponse = null;
     await gotoStep(4);
 
     try {
-      const out = await api.pushCall(callId, {
-        module: chosenType.api_name,
-        record_id: chosenRecord.id,
-        record_name: chosenRecord.name,
-        extra_tags: extraTags,
-      });
+      // #639 — for unlinked, omit module/record_id/record_name entirely
+      // (not empty strings — the backend's wire contract treats absence
+      // as "client honored the unlinked discriminator").
+      const pushBody = isUnlinked
+        ? { unlinked: true, extra_tags: extraTags }
+        : {
+            module: chosenType.api_name,
+            record_id: chosenRecord!.id,
+            record_name: chosenRecord!.name,
+            extra_tags: extraTags,
+          };
+      const out = await api.pushCall(callId, pushBody);
       pushResponse = out;
       onPushed?.(out);
       await gotoStep(5);
@@ -486,6 +536,11 @@
   function pipClass(idx: 1 | 2 | 3): string {
     // Active / done / pending pip styling. Step 0 + 4+ steps have
     // the indicator hidden via the {#if} block.
+    // #639 — pip 2 on the unlinked path renders as "skipped" instead of
+    // "done" once the user has advanced to Step 3 — the user did not
+    // complete Step 2 (they jumped past it), so showing an olive "done"
+    // dot would misrepresent what they did.
+    if (idx === 2 && skippedStep2) return "pip skipped";
     if (step === idx) return "pip working";
     if (step > idx) return "pip done";
     return "pip pending";
@@ -570,7 +625,9 @@
         <div
           class="szm-steps"
           role="group"
-          aria-label={`Step ${step} of 3`}
+          aria-label={skippedStep2
+            ? `Step ${step} of 3 (step 2 skipped)`
+            : `Step ${step} of 3`}
         >
           <span class={pipClass(1)} aria-hidden="true"></span>
           <span class={pipClass(2)} aria-hidden="true"></span>
@@ -584,10 +641,19 @@
     <div class="rn-body">
       {#if step === 0 && priorPush}
         <!-- Step 0: prior push summary -->
+        <!-- #639 — when the prior push was an unlinked Call, the
+             backend omits module + record_name from the response;
+             render a literal "Unlinked call" label instead of running
+             the module-singular transform on `undefined`. -->
         <div class="szm-prior">
           <div class="szm-prior-row">
-            <span class="szm-caps">{priorPush.module.replace(/s$/, "")}</span>
-            <span class="szm-prior-name">{priorPush.record_name}</span>
+            {#if priorPush.module}
+              <span class="szm-caps">{priorPush.module.replace(/s$/, "")}</span>
+              <span class="szm-prior-name">{priorPush.record_name}</span>
+            {:else}
+              <span class="szm-caps">Call</span>
+              <span class="szm-prior-name">Unlinked call</span>
+            {/if}
           </div>
           <div class="szm-prior-meta">
             <span class="szm-prior-when">
@@ -614,6 +680,30 @@
             placeholder="Filter record types"
             aria-label="Filter record types"
           />
+          <!-- #639 — pinned "Unlinked Call" entry. Always rendered above
+               the standards; not filtered by the search input. Selecting
+               it skips Step 2 entirely on Next. -->
+          <label class="szm-rtype-opt szm-rtype-opt-unlinked">
+            <input
+              type="radio"
+              name="szm-rtype"
+              value={UNLINKED_TYPE}
+              bind:group={chosenType}
+            />
+            <span class="szm-rtype-text">
+              <span class="szm-rtype-name">{UNLINKED_TYPE.label}</span>
+              <span class="szm-rtype-kicker">{UNLINKED_TYPE.kicker}</span>
+            </span>
+          </label>
+          <!-- Separator below the pinned entry. Renders unconditionally
+               so the pinned row is always visually distinct from the
+               filterable list below (even when the filter empties all
+               standards). -->
+          <div
+            class="szm-rtype-divider"
+            role="presentation"
+            aria-hidden="true"
+          ></div>
           {#each filteredStandard as rt (rt.api_name)}
             <label class="szm-rtype-opt">
               <input
@@ -738,6 +828,57 @@
             {/if}
           </div>
         </div>
+      {:else if step === 3 && isUnlinked}
+        <!-- #639 — unlinked review card. No chosenRecord; the user is
+             pushing a standalone Call activity with no Zoho parent. -->
+        <div class="szm-review">
+          <div class="szm-record-card szm-record-card-unlinked">
+            <span class="szm-caps">CALL</span>
+            <span class="szm-record-name">Not linked to any Zoho record</span>
+            <span class="szm-record-secondary"
+              >You can link it inside Zoho after pushing.</span
+            >
+          </div>
+
+          <div class="szm-tags">
+            <span class="szm-caps">Tags</span>
+            {#if extraTags.length === 0}
+              <span class="szm-tags-empty">No tags — optional</span>
+            {/if}
+            <div class="szm-tags-row">
+              {#each extraTags as t, i (t)}
+                <span class="szm-chip">
+                  {t}
+                  <button
+                    type="button"
+                    class="szm-chip-x"
+                    aria-label={`Remove tag ${t}`}
+                    onclick={() => removeTag(i)}
+                  >×</button>
+                </span>
+              {/each}
+              <input
+                type="text"
+                class="szm-tag-input"
+                placeholder={extraTags.length === 0 ? "Add tag" : "Add another"}
+                bind:value={newTagInput}
+                onkeydown={onTagInputKey}
+                onblur={() => {
+                  if (newTagInput.trim()) {
+                    addTag(newTagInput);
+                    newTagInput = "";
+                  }
+                }}
+                aria-label="Add a tag"
+              />
+            </div>
+          </div>
+
+          <div class="szm-attr">
+            <span aria-hidden="true">›</span>
+            <span>{attrLine()}</span>
+          </div>
+        </div>
       {:else if step === 3 && chosenRecord}
         <div class="szm-review">
           <div class="szm-record-card">
@@ -799,8 +940,12 @@
           <span class="pip done" aria-hidden="true"></span>
           <p class="szm-success-title">Pushed.</p>
           <p class="szm-success-sub">
-            Linked to {chosenRecord?.name ?? "the record"} as a call
-            activity.
+            {#if isUnlinked}
+              Pushed as an unlinked call activity.
+            {:else}
+              Linked to {chosenRecord?.name ?? "the record"} as a call
+              activity.
+            {/if}
           </p>
           <button
             type="button"
@@ -840,7 +985,7 @@
         <button
           type="button"
           class="rn-dismiss"
-          onclick={() => gotoStep(2)}
+          onclick={() => gotoStep(isUnlinked ? 3 : 2)}
         >Next</button>
       {:else if step === 2}
         <button
@@ -858,7 +1003,7 @@
         <button
           type="button"
           class="rn-link"
-          onclick={() => gotoStep(2)}
+          onclick={() => gotoStep(isUnlinked ? 1 : 2)}
           disabled={pushInFlight}
         >Back</button>
         <button
@@ -866,7 +1011,7 @@
           class="rn-dismiss"
           data-step3-push
           onclick={doPush}
-          disabled={pushInFlight}
+          disabled={pushInFlight || (!isUnlinked && !chosenRecord)}
         >Push</button>
       {:else if step === 4}
         <span></span>
@@ -962,6 +1107,14 @@
   :global(.szm-steps .pip) {
     width: 8px;
     height: 8px;
+  }
+  /* #639 — skipped pip variant for the Unlinked-Call path. Dimmed to
+     signal "this step was bypassed by your choice," not olive (would
+     read as "you completed Step 2"). Component-scoped: never propagated
+     to app.css. */
+  :global(.szm-steps .pip.skipped) {
+    background: var(--bone-4);
+    opacity: 0.45;
   }
 
   .szm-caps {

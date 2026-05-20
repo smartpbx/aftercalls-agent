@@ -1,4 +1,11 @@
 {
+  "0.18.0": {
+    "headline": "Choose how each app behaves on the desktop — Auto-record, Ask, or Never — and push calls to your CRM even before the contact is created.",
+    "changes": [
+      "Per-app recording mode — Auto-record, Ask, or Never. The desktop app's Auto-record settings now offer three choices for every app it sees you use: Auto-record (start the recorder when the app makes a call), Ask (pop a prompt so you can decide each time), or Never (don't watch this app at all — it won't prompt and won't appear in future auto-record candidates). The previous on/off toggle was an either-or; the new three-way picker means you can permanently silence apps you never want recorded (e.g. system utilities, your music player) without losing the ability to gate other apps behind a per-call confirmation.",
+      "Push a call to your CRM even when the contact isn't created yet. When pushing a call to your connected CRM, the record-type picker now offers an Unlinked Call option at the top. Pick it to push the call as a standalone Call activity in your CRM with no contact, deal, account, or lead attached — useful when you've just hung up with someone new and want the transcript, summary, and audio link in your CRM right away. You can link it to the right contact or deal yourself afterwards inside the CRM."
+    ]
+  },
   "0.17.0": {
     "headline": "See which calls you haven't reviewed yet, plus find CRM deals by who you spoke with — not just the deal name.",
     "changes": [

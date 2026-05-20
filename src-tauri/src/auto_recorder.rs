@@ -28,7 +28,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
-use crate::app_observations::AppObservations;
+use crate::app_observations::{AppMode, AppObservations};
 use crate::audio_observer::{McaEvent, McaEventKind};
 use crate::recorder::Recorder;
 
@@ -188,8 +188,23 @@ impl AutoRecorder {
         if !start_on {
             return;
         }
-        let row_enabled = self.inner.store.is_enabled(&ev.bundle_id).unwrap_or(false);
-        if !row_enabled {
+        // Per-row gate (#never-ask-app): only `mode == Auto` rows
+        // arm a pending start. `Ask` and `Never` short-circuit the
+        // same way an unticked row used to. A `Never` row reaching
+        // this point is theoretically impossible — the detector's
+        // `interesting_mic_consumers` filter drops silenced apps
+        // before any phase transition runs — but the audio observer
+        // feeds a SEPARATE event stream into auto_recorder, so the
+        // belt-and-braces check here keeps the two filters honest.
+        // A missing row (None) maps to Ask, matching today's safest-
+        // default behaviour for an unobserved app.
+        let row_mode = self
+            .inner
+            .store
+            .mode_of(&ev.bundle_id)
+            .unwrap_or(None)
+            .unwrap_or(AppMode::Ask);
+        if !matches!(row_mode, AppMode::Auto) {
             return;
         }
         // Already recording (manual OR auto) — never stack a second

@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::mpsc;
 
+use crate::app_observations::AppObservations;
+use crate::auto_recorder::AutoRecorder;
 use crate::mic_consumers::{is_blacklisted, subscribe_mic_consumers, RawMicConsumer};
+
 use crate::notify_actions::{self, ActionSpec, NotifyError};
 use crate::recorder::Recorder;
 
@@ -165,7 +168,18 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
         return Phase::Idle;
     }
 
-    let consumers = interesting_mic_consumers(mic_consumers);
+    // Source-side silence filter (#never-ask-app). Apps the user set
+    // to `mode = Never` in Settings are dropped before any phase
+    // transition runs — kills the toast, the in-app slide-out, AND
+    // the PIPEDA modal in one cut without touching any downstream
+    // surface. The store may not be managed during a degraded
+    // startup (auto_recorder::open failed); when it isn't, we fall
+    // back to today's no-silence behaviour.
+    let consumers = if let Some(auto) = app.try_state::<AutoRecorder>() {
+        interesting_mic_consumers(mic_consumers, Some(auto.store()))
+    } else {
+        interesting_mic_consumers(mic_consumers, None)
+    };
     let state = app.state::<Recorder>();
     let is_recording = state.is_active();
 
@@ -357,8 +371,8 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
 }
 
 /// Apps currently holding a source-output on *any* mic source, filtered
-/// against the blacklist. Deduplicated so a multi-stream app (e.g. WebRTC)
-/// only shows up once.
+/// against the blacklist AND the per-row `mode = Never` silence list.
+/// Deduplicated so a multi-stream app (e.g. WebRTC) only shows up once.
 ///
 /// The detector renders the "consumer" string in user-visible prompts,
 /// so we keep the historical behaviour: prefer `application.process.binary`
@@ -366,7 +380,16 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
 /// (`friendly_name`) if the binary lookup ever produced an empty key.
 /// In practice the two are the same for non-empty rows; the wrapper
 /// just keeps the same shape callers expect.
-fn interesting_mic_consumers(consumers: &[RawMicConsumer]) -> Vec<String> {
+///
+/// `observations` is `Option` so unit tests (and a degraded startup
+/// where AutoRecorder failed to open the store) can pass `None` and
+/// get the today's-no-silence behaviour. When `Some`, a row with
+/// `mode = Never` causes the bundle to be filtered out before any
+/// phase transition runs.
+fn interesting_mic_consumers(
+    consumers: &[RawMicConsumer],
+    observations: Option<&AppObservations>,
+) -> Vec<String> {
     // `raw_mic_consumers` already applies the blacklist + helper-proc
     // filters at the source (#604), so this wrapper is just dedup +
     // bundle_id-preferred display. Belt-and-braces re-check via
@@ -381,6 +404,17 @@ fn interesting_mic_consumers(consumers: &[RawMicConsumer]) -> Vec<String> {
         };
         if is_blacklisted(&display) {
             continue;
+        }
+        if let Some(store) = observations {
+            // A missing row OR a sqlite error both fall through to
+            // "not silenced" — the safest default: the user gets the
+            // prompt and can decide. A new mic-using app the
+            // observer hasn't catalogued yet hits the missing-row
+            // path on every tick until `auto_recorder::on_started`
+            // upserts it, which is correct: silence is opt-in.
+            if store.is_silenced(&display).unwrap_or(false) {
+                continue;
+            }
         }
         if seen.insert(display.clone()) {
             result.push(display);
@@ -490,3 +524,72 @@ fn maybe_show_window(app: &AppHandle, popup_on: bool, kind: PromptKind<'_>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_observations::{AppMode, AppObservations};
+    use chrono::Utc;
+
+    fn raw(bundle: &str) -> RawMicConsumer {
+        RawMicConsumer::new(bundle, bundle)
+    }
+
+    #[test]
+    fn interesting_mic_consumers_passes_through_without_a_store() {
+        // None means "no AppObservations available" — the detector
+        // degrades to today's behaviour (no per-app silencing). A
+        // bundle named "discord" is NOT in the source-side blacklist,
+        // so it survives the wrapper.
+        let consumers = vec![raw("discord"), raw("zoom")];
+        let out = interesting_mic_consumers(&consumers, None);
+        assert_eq!(out, vec!["discord".to_string(), "zoom".to_string()]);
+    }
+
+    #[test]
+    fn interesting_mic_consumers_filters_rows_with_mode_never() {
+        // The whole point of #never-ask-app: a row with `mode=Never`
+        // gets dropped at the source, before any Phase transition
+        // runs. Other rows in the same tick are unaffected.
+        let store = AppObservations::open_in_memory().unwrap();
+        store.upsert("discord", "Discord", Utc::now()).unwrap();
+        store.set_mode("discord", AppMode::Never).unwrap();
+        store.upsert("zoom", "Zoom", Utc::now()).unwrap();
+
+        let consumers = vec![raw("discord"), raw("zoom")];
+        let out = interesting_mic_consumers(&consumers, Some(&store));
+        assert_eq!(out, vec!["zoom".to_string()]);
+    }
+
+    #[test]
+    fn interesting_mic_consumers_does_not_silence_ask_or_auto_rows() {
+        // Regression check: only `Never` rows get dropped. An Ask row
+        // is the default for newly-observed apps and must still show
+        // up so the detector can prompt; an Auto row must show up so
+        // it can fire.
+        let store = AppObservations::open_in_memory().unwrap();
+        store.upsert("zoom", "Zoom", Utc::now()).unwrap();
+        store.set_mode("zoom", AppMode::Auto).unwrap();
+        store.upsert("slack", "Slack", Utc::now()).unwrap();
+        // slack stays at the default mode (Ask).
+
+        let consumers = vec![raw("zoom"), raw("slack")];
+        let out = interesting_mic_consumers(&consumers, Some(&store));
+        assert!(out.contains(&"zoom".to_string()));
+        assert!(out.contains(&"slack".to_string()));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn interesting_mic_consumers_treats_unobserved_rows_as_not_silenced() {
+        // A brand-new bundle the observer hasn't catalogued yet shows
+        // up in the tick BEFORE its on_started upsert lands. The
+        // detector must still surface it (today's safe default —
+        // user can always pick Never afterward).
+        let store = AppObservations::open_in_memory().unwrap();
+        let consumers = vec![raw("brand-new-app")];
+        let out = interesting_mic_consumers(&consumers, Some(&store));
+        assert_eq!(out, vec!["brand-new-app".to_string()]);
+    }
+}
+
