@@ -43,7 +43,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Create the GitHub release once, before the matrix fans out, so
+  # all three matrix jobs (Linux, Windows, macOS) operate on a release
+  # that already exists. v0.18.0 ran without this and we hit two
+  # parallel-matrix races:
+  #   1. macOS's "Attach macOS bundles" ran before tauri-action on
+  #      Linux had created the release → `gh release upload` 404'd.
+  #   2. Both Linux and Windows tauri-action invocations tried to
+  #      PATCH latest.json on the same release → the second one's
+  #      asset-id was stale and 404'd.
+  # Bootstrap-first removes (1) entirely; the `includeUpdaterJson`
+  # gating below removes (2).
+  bootstrap-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create release if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG already exists; matrix jobs will reuse it"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "aftercalls $TAG" \
+            --notes "Installers and auto-updater manifests for aftercalls $TAG.
+
+          ### Install
+
+          - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
+          - **Windows**: .msi or .exe.
+          - **macOS**: .dmg (Apple Silicon). Closed-beta build is unsigned — run \`xattr -cr /Applications/aftercalls.app\` after install.
+
+          All platforms auto-update from a running instance.
+
+          See [aftercalls.io/releases](https://aftercalls.io/releases/) for the full changelog."
+
   release:
+    needs: bootstrap-release
     strategy:
       fail-fast: false
       matrix:
@@ -279,7 +320,15 @@ jobs:
             See [aftercalls.io/releases](https://aftercalls.io/releases/) for the full changelog.
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          # Only Windows emits latest.json. v0.18.0 had both Linux and
+          # Windows tauri-action invocations set to true, and they raced
+          # on the PATCH of the latest.json release asset — the second
+          # job's asset-id was stale and 404'd. Linux contributes
+          # nothing to the updater manifest anyway (we ship deb/rpm
+          # only via tauri-bundler; the slim AppImage updater entry is
+          # injected by publish-to-spaces downstream), so dropping it
+          # here is lossless.
+          includeUpdaterJson: ${{ matrix.os == 'windows-latest' }}
           # Skip tauri-bundler's AppImage on Linux — it invokes
           # linuxdeploy-plugin-gtk.sh which bundles a forked webkit that
           # SIGABRTs on Arch / NixOS / some Ubuntu combos. We build a
