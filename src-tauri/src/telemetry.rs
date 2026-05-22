@@ -25,7 +25,7 @@ use std::{
     collections::VecDeque,
     sync::{Mutex, OnceLock},
 };
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 const RING_CAPACITY: usize = 2000;
 const FLUSH_INTERVAL_SECS: u64 = 30;
@@ -142,6 +142,75 @@ pub async fn flush_now() -> anyhow::Result<()> {
         .get()
         .ok_or_else(|| anyhow::anyhow!("telemetry not started"))?;
     flush_once(app).await
+}
+
+/// #646 Layer D — read-only query over the in-process ring buffer.
+/// Returns the most recent `pipeline::failed` entry for the given
+/// session and the failure_class stamped on its `meta` blob (Phase 1
+/// shape: `{ "failure_class": "transient_network" | ... }`). Returns
+/// None when no matching failure is buffered (e.g. agent restart
+/// dropped the entry, session never failed in-process, or telemetry
+/// is opt-out and the buffer is empty).
+///
+/// Read in the auto-resume sweeper's eligibility classifier
+/// (`recovery::auto_resume_eligible`). Reads only — never mutates the
+/// ring; safe to call from any context.
+pub fn recent_failure_for_session(
+    session_id: &str,
+) -> Option<(crate::portal::FailureClass, DateTime<Utc>)> {
+    let buf = buffer().lock().ok()?;
+    for entry in buf.iter().rev() {
+        if entry.module != "pipeline::failed" {
+            continue;
+        }
+        let Some(sid) = entry.session_id.as_ref() else {
+            continue;
+        };
+        // The pipeline stamps the absolute session_dir path on
+        // `session_id`, while orphan-resume callers typically know
+        // the basename (`20260522T140158Z`). Match both:
+        // exact-equal AND trailing-component-equal.
+        let matches = sid == session_id
+            || std::path::Path::new(sid)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|n| n == session_id)
+                .unwrap_or(false);
+        if !matches {
+            continue;
+        }
+        let meta = entry.meta.as_ref()?;
+        let class_token = meta.get("failure_class")?.as_str()?;
+        let class = match class_token {
+            "transient_network" => crate::portal::FailureClass::TransientNetwork,
+            "backend_5xx" => crate::portal::FailureClass::BackendFiveXx,
+            "auth_expired" => crate::portal::FailureClass::AuthExpired,
+            "decode_error" => crate::portal::FailureClass::DecodeError,
+            "signature_mismatch" => crate::portal::FailureClass::SignatureMismatch,
+            "other" => crate::portal::FailureClass::Other,
+            _ => return None,
+        };
+        return Some((class, entry.ts));
+    }
+    None
+}
+
+/// #646 Layer A — emit a Tauri event on the registered AppHandle.
+/// Used by `retry_http` to broadcast a `PipelineEvent::Retrying`
+/// while it waits for the next attempt slot. Returns false if no
+/// AppHandle has been registered yet (e.g. in unit tests) so callers
+/// can degrade silently. The payload is serialized verbatim — caller
+/// is responsible for matching the existing `PipelineEvent` JSON
+/// shape (`{ stage: "retrying", step, attempt, wait_ms }`).
+pub fn emit_app_event(name: &str, payload: &Value) -> bool {
+    let Some(app) = APP_HANDLE.get() else {
+        return false;
+    };
+    if let Err(e) = app.emit(name, payload) {
+        eprintln!("aftercalls: emit_app_event {name} failed: {e}");
+        return false;
+    }
+    true
 }
 
 /// Return the most recent unique `session_id` values currently held

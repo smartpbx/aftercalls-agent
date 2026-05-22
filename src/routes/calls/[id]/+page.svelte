@@ -3769,6 +3769,20 @@
       </p>
     </section>
 
+    <!-- #646 Layer B — track-quality advisory. Renders only when the
+         backend reports at least one audio track unavailable during
+         upload (`track_quality === "degraded"`, populated in #645
+         Phase 1 via Spaces HEAD-probes). The chip sits directly
+         below .player, above any later banner. role="note" so AT
+         users land on it during natural reading order — no aria-live
+         needed since the value is stable once the call loads. Copy
+         is vendor-opaque per CLAUDE.md hard rule. -->
+    {#if call.track_quality === "degraded"}
+      <div class="track-quality-note" role="note">
+        Audio quality may be reduced — one track was unavailable during upload.
+      </div>
+    {/if}
+
     <section class="block" style="--i: 1.5">
       <div class="block-head">
         <h2>Highlights</h2>
@@ -5094,6 +5108,22 @@
     border: 1px solid var(--hairline);
     border-radius: var(--radius-lg);
     background: var(--ink-1);
+  }
+
+  /* #646 Layer B — track-quality advisory chip. Soft inline note,
+     NOT a banner — the call is still useful, just one track missing.
+     Vendor-opaque body copy. No --live token (informational, not
+     alarm). Component-scoped per ui.md §"CSS note for builder" so
+     no app.css mirror bump for a low-frequency condition. */
+  .track-quality-note {
+    margin: -1rem 0 2rem;
+    padding: 0.55rem 0.75rem;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
+    font-size: 0.78rem;
+    color: var(--bone-2);
+    line-height: 1.4;
   }
 
   .wave-host {

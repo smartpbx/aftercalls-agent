@@ -100,6 +100,22 @@
 
   let recording = $state(false);
   let pipelineStage = $state("");
+  // #646 Layer A/C — true when an in-process retry (Layer A attempt
+  // 2–4) is currently waiting between attempts, OR when Layer C's
+  // sweeper is re-driving the pipeline from an orphan. Drives the
+  // topstrip label swap from the stage name (e.g. "Transcribing")
+  // to "Retrying…" without changing the pip — that stays
+  // `.pip.working` per ui.md §Topstrip indicator. Cleared back to
+  // false when the next stage transition arrives or the retry
+  // ladder bubbles a terminal failure. We accept three wire shapes
+  // from the Rust side (any one suffices to flip the flag):
+  //   1. `pipeline` event with an explicit `retrying: true` field;
+  //   2. `pipeline` event with `stage === "retrying"`;
+  //   3. a dedicated `pipeline-retry` event with `{ active: bool }`.
+  // The pipeline listener below treats all three as equivalent so
+  // the Rust builder doesn't have to commit to one shape before this
+  // ships.
+  let pipelineRetrying = $state(false);
   // #142 · v0.4.5 — track which mode the in-flight recording is in
   // so the note-to-self overlay can surface only during a self-note
   // session. `"call"` defaults in a fallback where the backend's
@@ -148,6 +164,16 @@
   let unlistenAutoRecordFired: UnlistenFn | null = null;
   let unlistenAutoRecordCancelled: UnlistenFn | null = null;
   let unlistenObservedAppsUpdated: UnlistenFn | null = null;
+  // #646 Layer A/C — optional separate retry event listener. Wired
+  // only if the Rust side emits a dedicated `pipeline-retry` channel
+  // (vs. reusing the existing `pipeline` channel with a `retrying`
+  // flag). Either path flips `pipelineRetrying` the same way.
+  let unlistenPipelineRetry: UnlistenFn | null = null;
+  // #646 Layer C — `visibilitychange` handler so the sweeper can stay
+  // paused while the user has the window hidden (battery + noise
+  // mitigation, plus avoids polling the backend for an agent the
+  // user isn't actively touching).
+  let onVisibilityChange: (() => void) | null = null;
   let pipelineReadyNotifiedFor = "";
   // Map of pending_id → toast id so the matching `auto-record-fired` /
   // `auto-record-cancelled` event can dismiss the in-flight toast
@@ -200,18 +226,55 @@
   let autoPrompt = $state<{ app: string } | null>(null);
   let autoEndPrompt = $state<{ app: string } | null>(null);
 
-  // Orphan-session recovery (#63). One-shot check at startup for
-  // session_dirs left behind by a crashed / force-quit previous
-  // session. Non-blocking pill in the top-strip, expandable via
-  // "Review…" into a per-session list. Auto-clean for dirs older
+  // Orphan-session recovery (#63 + #646 Layer D). One-shot check at
+  // startup for session_dirs left behind by a crashed / force-quit
+  // previous session. Non-blocking pill in the top-strip, expandable
+  // via "Review…" into a per-session list. Auto-clean for dirs older
   // than 7 days happens Rust-side inside list_orphan_sessions.
+  //
+  // #646 Layer D extends each row with two fields the Rust side now
+  // ships:
+  //   - `kind` discriminates "never_created" (session_dir exists but
+  //     the backend never saw a call row — typical of an upload that
+  //     died before create_call) from "stuck_pipeline" (backend has a
+  //     call row stuck mid-pipeline, e.g. transcribe never completed).
+  //     The UI renders distinct badges so the user can tell which
+  //     class they're looking at.
+  //   - `auto_resume_count` is the number of silent Layer C resume
+  //     attempts the agent has already made for this session. When it
+  //     hits the 3-attempt ceiling, this row escaped auto-recovery
+  //     and surfaces a "Couldn't resume automatically." line plus the
+  //     orphan-pill's pip flips from sig to live red.
+  type OrphanKind = "never_created" | "stuck_pipeline";
   type OrphanSession = {
     session_id: string;
     recorded_at: string;
     age_minutes: number;
+    kind?: OrphanKind;
+    auto_resume_count?: number;
+  };
+  // #646 Layer C — return shape from the `auto_resume_orphans` IPC.
+  // Surface-only field — the UI never renders this; the side effect
+  // (pipelines re-running) is what matters. Logged at debug level
+  // for development visibility.
+  type AutoResumeResult = {
+    session_id: string;
+    resumed: boolean;
+    reason?: string;
   };
   let orphans = $state<OrphanSession[]>([]);
   let orphanReview = $state(false);
+  // #646 Layer C — sweeper interval handle. Distinct from
+  // `unreadPollTimer` so we can clean it up independently on logout.
+  let autoResumeSweeperTimer: ReturnType<typeof setInterval> | null = null;
+  // 5-min sweeper cadence per plan.md §"Sweeper interval" decision.
+  const AUTO_RESUME_SWEEPER_MS = 5 * 60 * 1000;
+  // #646 Layer D — derived flag: at least one orphan row hit the
+  // 3-attempt auto-resume ceiling. Drives the orphan pill's pip
+  // color flip (sig → live red) without changing label or button.
+  let hasExhaustedAutoResume = $derived(
+    orphans.some((o) => (o.auto_resume_count ?? 0) >= 3),
+  );
   // Set of session_ids currently being resumed or discarded so the
   // per-row buttons can show disabled state without hiding the row
   // before the async work completes.
@@ -847,8 +910,38 @@
       stage: string;
       call_id?: string;
       error?: string;
+      // #646 Layer A — Rust may extend the event with a `retrying`
+      // flag during a Layer A retry wait so the topstrip can swap
+      // the stage label for "Retrying…". Optional so older Rust
+      // builds still type-match cleanly.
+      retrying?: boolean;
     }>("pipeline", (evt) => {
-      pipelineStage = evt.payload.stage ?? "";
+      // #646 Layer A — three accepted wire shapes for "a retry wait
+      // is currently in flight", any one flips the topstrip label
+      // to "Retrying…":
+      //   1. payload `retrying: true` on a regular stage event
+      //   2. payload `stage === "retrying"` (dedicated stage value)
+      //   3. a separate `pipeline-retry` event (handled below)
+      // Cases 1 + 2 are handled here. The `pipelineStage` itself is
+      // left at the prior in-flight stage (e.g. "transcribing") so
+      // the underlying pip class doesn't shift — only the rendered
+      // label swaps, per ui.md §Topstrip indicator.
+      const rawStage = evt.payload.stage ?? "";
+      if (rawStage === "retrying" || evt.payload.retrying === true) {
+        pipelineRetrying = true;
+        // Don't overwrite pipelineStage — keep the prior stage so
+        // the pip class is stable across the retry wait.
+        if (rawStage !== "retrying" && rawStage) {
+          pipelineStage = rawStage;
+        }
+      } else {
+        pipelineStage = rawStage;
+        // Any non-retrying stage transition clears the flag — a
+        // successful retry resumes the normal stage label
+        // seamlessly per ui.md §Topstrip indicator → "Retry
+        // succeeded".
+        pipelineRetrying = false;
+      }
       // #327 — feed the floater so it shows post-stop progress
       // (transcribing → summarizing → done) and a retry pointer on
       // failure. The store collapses the wider stage vocabulary into
@@ -897,6 +990,23 @@
         }, 4000);
       }
     });
+    // #646 Layer A — optional dedicated retry channel. Fires when
+    // the Rust side prefers a separate event over an in-band
+    // `retrying` flag on the `pipeline` event. Either path flips the
+    // same `pipelineRetrying` state, so the topstrip render is
+    // identical regardless of which the Rust builder chooses.
+    try {
+      unlistenPipelineRetry = await listen<{ active: boolean }>(
+        "pipeline-retry",
+        (evt) => {
+          pipelineRetrying = !!evt.payload?.active;
+        },
+      );
+    } catch (e) {
+      // Channel not registered on the Rust side — fine, the
+      // in-band `retrying` flag path covers us.
+      console.debug("pipeline-retry listener wiring noop", e);
+    }
     // #327 — `recording-state` only fires on transitions, so a fresh
     // mount mid-recording (route nav, tray show, hydration) wouldn't
     // know the truth. Probe the backend once so the floater picks up
@@ -1223,7 +1333,60 @@
       void tickUnreadCount();
       unreadPollTimer = setInterval(tickUnreadCount, UNREAD_POLL_MS);
     }
+
+    // #646 Layer C — 5-min orphan-resume sweeper. Fires a Tauri
+    // command that re-classifies recent orphan sessions and silently
+    // re-drives the ones with transient failure classes. Gated on
+    // `authed` (the IPC talks to the backend) AND
+    // `document.visibilityState !== "hidden"` (battery + noise — a
+    // hidden window doesn't need to keep polling). The handler
+    // re-evaluates the visibility guard at every tick so a tab that
+    // gets hidden mid-interval doesn't fire. The IPC return shape
+    // (`AutoResumeResult[]`) is logged at debug level only — all
+    // user-visible state changes happen via the existing `pipeline`
+    // + orphan-list channels.
+    if (me) {
+      onVisibilityChange = () => {
+        // Refresh the orphan list when the window comes back so the
+        // panel reflects whatever Layer C did while we were hidden.
+        if (
+          document.visibilityState !== "hidden" &&
+          autoResumeSweeperTimer !== null
+        ) {
+          void loadOrphans();
+        }
+      };
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      autoResumeSweeperTimer = setInterval(
+        runAutoResumeSweeper,
+        AUTO_RESUME_SWEEPER_MS,
+      );
+    }
   });
+
+  // #646 Layer C — one tick of the sweeper. Best-effort: any failure
+  // is logged at debug level and silently dropped so transient
+  // errors (network blip, backend hiccup, command not yet registered
+  // on older Rust builds) don't surface a user-visible state change.
+  // Re-runs `loadOrphans()` afterwards so the orphan panel UI picks
+  // up: (a) sessions that auto-resumed (now removed from the list),
+  // (b) sessions whose `auto_resume_count` bumped past the ceiling
+  // (which flips the topstrip pip color via `hasExhaustedAutoResume`).
+  async function runAutoResumeSweeper() {
+    if (!me) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    try {
+      const results = await invoke<AutoResumeResult[]>("auto_resume_orphans");
+      console.debug("auto_resume_orphans tick", results);
+    } catch (e) {
+      console.debug("auto_resume_orphans failed (likely unregistered)", e);
+    }
+    // Pick up the side-effects: sessions either resumed (removed) or
+    // bumped their auto_resume_count (visual treatment changes).
+    void loadOrphans();
+  }
 
   async function handleLoginEvent() {
     try {
@@ -1247,6 +1410,26 @@
     if (me && unreadPollTimer === null) {
       void tickUnreadCount();
       unreadPollTimer = setInterval(tickUnreadCount, UNREAD_POLL_MS);
+    }
+    // #646 Layer C — same idempotent kickoff for the auto-resume
+    // sweeper. On the post-login leg `me` is fresh, so this is the
+    // first opportunity to start polling. Guarded behind a null
+    // check so a token-refresh re-firing handleLoginEvent doesn't
+    // double-schedule.
+    if (me && autoResumeSweeperTimer === null) {
+      onVisibilityChange = () => {
+        if (
+          document.visibilityState !== "hidden" &&
+          autoResumeSweeperTimer !== null
+        ) {
+          void loadOrphans();
+        }
+      };
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      autoResumeSweeperTimer = setInterval(
+        runAutoResumeSweeper,
+        AUTO_RESUME_SWEEPER_MS,
+      );
     }
   }
 
@@ -1343,7 +1526,11 @@
       await invoke("resume_orphan_session", { sessionId: id });
       orphans = orphans.filter((o) => o.session_id !== id);
     } catch (e) {
+      // #646 — surface the failure as a transient toast (was a
+      // silent console.warn). Vendor-opaque copy per CLAUDE.md hard
+      // rule. 8 s duration matches ui.md §Orphan row "Error" state.
       console.warn("resume_orphan_session failed", e);
+      toast.error("Couldn't resume this recording.", { duration: 8_000 });
     } finally {
       const next = new Set(orphanBusy);
       next.delete(id);
@@ -1618,6 +1805,7 @@
     unlistenAutoRecordFired?.();
     unlistenAutoRecordCancelled?.();
     unlistenObservedAppsUpdated?.();
+    unlistenPipelineRetry?.();
     if (callFloaterDoneTimer) {
       clearTimeout(callFloaterDoneTimer);
       callFloaterDoneTimer = null;
@@ -1635,6 +1823,17 @@
     if (unreadPollTimer !== null) {
       clearInterval(unreadPollTimer);
       unreadPollTimer = null;
+    }
+    // #646 Layer C — stop the auto-resume sweeper + drop the
+    // visibility-change listener. Same lifecycle shape as the
+    // unread poll above.
+    if (autoResumeSweeperTimer !== null) {
+      clearInterval(autoResumeSweeperTimer);
+      autoResumeSweeperTimer = null;
+    }
+    if (onVisibilityChange) {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      onVisibilityChange = null;
     }
     teardownGlobalShortcuts?.();
     teardownGlobalShortcuts = null;
@@ -1988,6 +2187,17 @@
   }
   async function signOut() {
     closeUserMenu();
+    // #646 Layer C — stop the sweeper before the auth token goes
+    // away so a stale `me` reference doesn't drive a background
+    // IPC against a now-logged-out session.
+    if (autoResumeSweeperTimer !== null) {
+      clearInterval(autoResumeSweeperTimer);
+      autoResumeSweeperTimer = null;
+    }
+    if (onVisibilityChange) {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      onVisibilityChange = null;
+    }
     try {
       await invoke("logout");
     } catch {}
@@ -2318,13 +2528,23 @@
              agent's `backend_health` Tauri command is happy. -->
         <OfflineBanner online={onlineStatus.online} />
         {#if orphans.length > 0}
-          <!-- Orphan recovery pill (#63). Collapsed to a short label +
-               single Review button — bulk actions (Resume all / Discard
-               all) live in the orphan review pane that Review toggles.
-               Full description in tooltip so it still appears in the
-               narrower topstrip cluster. (#432) -->
+          <!-- Orphan recovery pill (#63 + #646 Layer D). Collapsed to
+               a short label + single Review button — bulk actions
+               (Resume all / Discard all) live in the orphan review
+               pane that Review toggles. Full description in tooltip
+               so it still appears in the narrower topstrip cluster.
+               (#432)
+               #646: when any orphan row hit the 3-attempt
+               auto-resume ceiling, the pip flips from sig (heads-up
+               gold) to failed (live red). Label + button are
+               unchanged — color is the only signal that auto-recovery
+               actually tried and failed. See ui.md §"Pill (topstrip,
+               existing .update cluster)". -->
           <div class="update" data-tauri-drag-region>
-            <span class="pip sig" data-tauri-drag-region></span>
+            <span
+              class="pip {hasExhaustedAutoResume ? 'failed' : 'sig'}"
+              data-tauri-drag-region
+            ></span>
             <span
               class="update-label"
               data-tauri-drag-region
@@ -2423,14 +2643,34 @@
             <span class="pip live" data-tauri-drag-region></span>
             <span class="ind-label" data-tauri-drag-region>Recording</span>
             <span class="ind-sep" data-tauri-drag-region>·</span>
-            <span class="pip {pipelineStage}" data-tauri-drag-region></span>
-            <span class="ind-label" data-tauri-drag-region>{stageLabel[pipelineStage] ?? pipelineStage}</span>
+            <!-- #646 Layer A — when a retry wait is in flight the pip
+                 shifts to .working (accent blink) and the label
+                 swaps to "Retrying…". Underlying pipelineStage is
+                 preserved so the transition out of the retry
+                 ladder reads as a normal stage label swap, not a
+                 stage change. -->
+            <span
+              class="pip {pipelineRetrying ? 'working' : pipelineStage}"
+              data-tauri-drag-region
+            ></span>
+            <span class="ind-label" data-tauri-drag-region>
+              {pipelineRetrying
+                ? "Retrying…"
+                : (stageLabel[pipelineStage] ?? pipelineStage)}
+            </span>
           {:else if recording}
             <span class="pip live" data-tauri-drag-region></span>
             <span class="ind-label" data-tauri-drag-region>Recording</span>
           {:else if pipelineStage && pipelineStage !== "done"}
-            <span class="pip {pipelineStage}" data-tauri-drag-region></span>
-            <span class="ind-label" data-tauri-drag-region>{stageLabel[pipelineStage] ?? pipelineStage}</span>
+            <span
+              class="pip {pipelineRetrying ? 'working' : pipelineStage}"
+              data-tauri-drag-region
+            ></span>
+            <span class="ind-label" data-tauri-drag-region>
+              {pipelineRetrying
+                ? "Retrying…"
+                : (stageLabel[pipelineStage] ?? pipelineStage)}
+            </span>
           {:else if pipelineStage === "done"}
             <span class="pip done" data-tauri-drag-region></span>
             <span class="ind-label" data-tauri-drag-region>Saved</span>
@@ -2497,15 +2737,45 @@
         <ul class="orphan-list">
           {#each orphans as o (o.session_id)}
             {@const busy = orphanBusy.has(o.session_id)}
-            <li class="orphan-row">
-              <div class="orphan-meta">
-                <span class="orphan-time">
-                  {new Date(o.recorded_at).toLocaleString(undefined, {
-                    dateStyle: "medium",
-                    timeStyle: "short",
-                  })}
-                </span>
-                <span class="orphan-age">· {ageLabel(o.age_minutes)}</span>
+            {@const exhausted = (o.auto_resume_count ?? 0) >= 3}
+            <!-- #646 Layer D — orphan-row picks up two new visual
+                 elements:
+                 * `.orphan-kind-badge` distinguishes "never_created"
+                   from "stuck_pipeline" (see ui.md
+                   §Orphan review panel).
+                 * "Couldn't resume automatically." line below
+                   .orphan-meta when auto_resume_count >= 3, i.e. the
+                   3-attempt Layer C ceiling tripped.
+                 `.orphan-meta` carries aria-live="polite" so a row
+                 whose ceiling trips while the panel is already open
+                 announces the failure-line text. -->
+            <li class="orphan-row" role="listitem">
+              <div class="orphan-meta" aria-live="polite">
+                <div class="orphan-meta-main">
+                  <span class="orphan-time">
+                    {new Date(o.recorded_at).toLocaleString(undefined, {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    })}
+                  </span>
+                  <span class="orphan-age">· {ageLabel(o.age_minutes)}</span>
+                  {#if o.kind === "never_created"}
+                    <span
+                      class="orphan-kind-badge orphan-kind-never"
+                      aria-hidden="false"
+                    >Never uploaded</span>
+                  {:else if o.kind === "stuck_pipeline"}
+                    <span
+                      class="orphan-kind-badge orphan-kind-stuck"
+                      aria-hidden="false"
+                    >Stuck mid-pipeline</span>
+                  {/if}
+                </div>
+                {#if exhausted}
+                  <span class="orphan-auto-failed">
+                    Couldn't resume automatically.
+                  </span>
+                {/if}
               </div>
               <div class="orphan-actions">
                 <button
@@ -3313,10 +3583,24 @@
   }
   .orphan-meta {
     display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
+    /* #646 Layer D — stacks the time/age/badge row above the
+       optional "Couldn't resume automatically." line. Column
+       layout keeps the aria-live region a single container so
+       AT users hear the failure line when it appears. */
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
     font-size: 0.82rem;
     color: var(--bone-1);
+    min-width: 0;
+  }
+  /* #646 — the inner horizontal row that holds time, age, and the
+     orphan-kind badge. ellipsis clipping moved here from
+     .orphan-meta so the auto-failed line below isn't truncated. */
+  .orphan-meta-main {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3330,6 +3614,42 @@
     font-family: var(--font-mono);
     font-size: 0.72rem;
     color: var(--bone-3);
+  }
+  /* #646 Layer D — orphan-kind badge. Component-scoped (NOT in
+     app.css per the mirror-pair invariant). Two variants share
+     shape + radius + border + padding; only color + background
+     differ. See ui.md §"Orphan review panel — failure ceiling". */
+  .orphan-kind-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.5rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
+    font-size: 0.72rem;
+    font-weight: 500;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  /* "Never uploaded" — neutral bone/ink scheme. Reads as
+     informational ("we never saw this") rather than alarming. */
+  .orphan-kind-never {
+    color: var(--bone-3);
+    background: var(--ink-2);
+  }
+  /* "Stuck mid-pipeline" — sig gold. Reads as "recoverable but
+     needs attention" per design.md §Semantic color rules. */
+  .orphan-kind-stuck {
+    color: var(--sig);
+    background: color-mix(in srgb, var(--sig) 14%, transparent);
+  }
+  /* #646 Layer D — failure-ceiling line surfaced when
+     auto_resume_count >= 3. Live-red signal that auto-recovery
+     was attempted and exhausted — first and only time the user
+     learns the agent tried on its own. */
+  .orphan-auto-failed {
+    font-size: 0.78rem;
+    color: var(--live);
+    line-height: 1.3;
   }
   .orphan-actions {
     display: flex;

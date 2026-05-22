@@ -1,4 +1,11 @@
 {
+  "0.19.0": {
+    "headline": "Brief network blips no longer interrupt your calls — the pipeline retries on its own and quietly self-heals, and partial uploads surface a clear note on the call.",
+    "changes": [
+      "Pipeline auto-recovery — brief network blips no longer interrupt your calls. When the desktop app loses its connection briefly mid-processing — a couple-of-seconds blip, a sleep/wake, a flaky Wi-Fi moment — the pipeline now retries on its own up to four times with backing-off waits (2 s, 8 s, 30 s with a little randomness). If the call needs more time, the agent picks up where it left off the next time it checks (every five minutes while you're signed in), without prompting you. Calls that genuinely can't be recovered still surface in the existing Resume previous recording panel, now with a clearer label so you can tell apart calls that never reached our backend from calls that got stuck mid-pipeline. Failures that aren't transient — bad credentials, an unexpected response — still show up the same way they did before.",
+      "Per-track audio quality indicator on the call page. When a call's audio reaches our servers but one of the three tracks — your microphone, the other side's audio, or the mixed mono — didn't make it through, the call detail page now shows a quiet note below the player explaining that audio quality may be reduced. The transcript and summary still run on whatever tracks landed; the call is fully usable, the note is just so you know what happened in case the playback sounds thinner than usual."
+    ]
+  },
   "0.18.0": {
     "headline": "Choose how each app behaves on the desktop — Auto-record, Ask, or Never — and push calls to your CRM even before the contact is created.",
     "changes": [

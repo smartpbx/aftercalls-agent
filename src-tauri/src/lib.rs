@@ -2901,6 +2901,11 @@ pub fn run() {
             list_orphan_sessions,
             resume_orphan_session,
             discard_orphan_session,
+            // #646 Layer C — 5-min sweeper Tauri command. Returns a
+            // Vec<AutoResumeResult> for diagnostic / test purposes; the
+            // user-visible surface is the silent pipeline run itself
+            // (topstrip indicator picks up the next stage).
+            recovery::auto_resume_orphans,
             // #186 Zoho CRM: status probe + search + push.
             // Connect/disconnect happens on the portal admin page; the
             // agent links out via openUrl, so no connect command here.

@@ -113,6 +113,15 @@ export type Call = CallListItem & {
   utterances: Utterance[];
   tags: Tag[];
   notes: string;
+  // #646 Layer B — per-track upload quality summary shipped by the
+  // backend in #645 Phase 1. `"full"` means every non-NULL audio key
+  // is reachable on object storage; `"degraded"` means at least one
+  // track was unavailable during upload. The call-detail page reads
+  // this to render the soft `.track-quality-note` chip. Optional on
+  // the wire so older backend builds (or proxies that strip unknown
+  // fields) don't blow up the type — UI treats `undefined` as
+  // `"full"` (no chip).
+  track_quality?: "full" | "degraded";
 };
 
 export type Highlight = {

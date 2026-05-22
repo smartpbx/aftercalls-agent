@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{read_auth_file, AuthFile, Backend};
-use crate::portal::{build_auth_header, user_agent};
+use crate::portal::{build_auth_header, retry_http, user_agent, FailureClass, RetryGuard};
 
 #[derive(Deserialize, Debug, Default)]
 pub struct UploadUrls {
@@ -31,10 +31,18 @@ pub struct CreateCallResponse {
 /// estimate (zero is fine — transcribe backfills the real duration),
 /// the source descriptor, and an empty utterances array. The response
 /// carries the presigned PUT URLs the agent needs for the audio.
+///
+/// #646 Layer A — wrapped in `retry_http` so a transient network blip
+/// between agent and backend doesn't lose the row. create_call is
+/// idempotent server-side (UPSERT on session_id with status-preserving
+/// conflict handling, see backend `pipeline.rs::create_call`), so
+/// retrying is safe.
 pub async fn create_call(
     backend: &Backend,
     session_dir: &Path,
     duration_ms_hint: u64,
+    guard: &RetryGuard,
+    session_id_for_telemetry: Option<&str>,
 ) -> Result<CreateCallResponse> {
     let session_id = session_dir
         .file_name()
@@ -61,23 +69,38 @@ pub async fn create_call(
     };
 
     let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
-    let auth = build_auth_header(backend).await?;
-    let client = http_client()?;
-    let resp = client
-        .post(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {status}: {text}");
-    }
-    resp.json::<CreateCallResponse>()
-        .await
-        .context("decode create-call response")
+    let body_value = serde_json::to_value(&body).context("serialize create-call body")?;
+    retry_http(
+        backend,
+        guard,
+        "create_call",
+        4,
+        session_id_for_telemetry,
+        |_attempt| {
+            let url = url.clone();
+            let body_value = body_value.clone();
+            async move {
+                let auth = build_auth_header(backend).await?;
+                let client = http_client()?;
+                let resp = client
+                    .post(&url)
+                    .header("authorization", auth)
+                    .json(&body_value)
+                    .send()
+                    .await
+                    .with_context(|| format!("POST {url}"))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("backend {status}: {text}");
+                }
+                resp.json::<CreateCallResponse>()
+                    .await
+                    .context("decode create-call response")
+            }
+        },
+    )
+    .await
 }
 
 /// After transcribe + summarize land server-side the row already has
@@ -89,10 +112,16 @@ pub async fn create_call(
 /// absent fields. It doesn't — the backend overwrites every column
 /// from EXCLUDED and re-DELETEs utterances. The narrow /note-path
 /// endpoint on the backend only touches the column named.
+///
+/// #646 Layer A — wrapped in `retry_http`. The note-path endpoint is
+/// a narrow PATCH-shape POST that's naturally idempotent (replaces a
+/// single column with the supplied value), so retry is safe.
 pub async fn attach_note_path(
     backend: &Backend,
     call_id: &str,
     note_path: &Path,
+    guard: &RetryGuard,
+    session_id_for_telemetry: Option<&str>,
 ) -> Result<()> {
     let body = serde_json::json!({
         "note_markdown_path": note_path.to_string_lossy(),
@@ -103,21 +132,118 @@ pub async fn attach_note_path(
         backend.url.trim_end_matches('/'),
         call_id
     );
-    let auth = build_auth_header(backend).await?;
-    let client = http_client()?;
-    let resp = client
-        .post(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {s}: {t}");
+    retry_http(
+        backend,
+        guard,
+        "attach_note_path",
+        4,
+        session_id_for_telemetry,
+        |_attempt| {
+            let url = url.clone();
+            let body = body.clone();
+            async move {
+                let auth = build_auth_header(backend).await?;
+                let client = http_client()?;
+                let resp = client
+                    .post(&url)
+                    .header("authorization", auth)
+                    .json(&body)
+                    .send()
+                    .await
+                    .with_context(|| format!("POST {url}"))?;
+                if !resp.status().is_success() {
+                    let s = resp.status();
+                    let t = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("backend {s}: {t}");
+                }
+                Ok(())
+            }
+        },
+    )
+    .await
+}
+
+/// #646 Layer B — per-track outcome of `upload_audio`. One entry per
+/// track the pipeline attempted. `uploaded=true` means Spaces returned
+/// 2xx; `failure_class` carries the last classified error for the
+/// tail-failed tracks so the pending_uploads sentinel can record it.
+/// Skipped tracks (file missing on disk, presigned URL absent in the
+/// create_call response) yield `uploaded=false, failure_class=None,
+/// final_error=None`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackOutcome {
+    /// One of `"mic" | "system" | "mixed"`.
+    pub track: &'static str,
+    pub uploaded: bool,
+    /// `None` on success or skipped; populated only when retry_http
+    /// returned an error.
+    pub failure_class: Option<FailureClass>,
+    /// Human-readable last error string, only present on failure. Kept
+    /// vendor-opaque: "object storage" rather than "DigitalOcean Spaces".
+    pub final_error: Option<String>,
+}
+
+/// #646 Layer B — sentinel file written to `<session_dir>/pending_uploads.json`
+/// when at least one track exhausted its retry ladder. Survives
+/// agent restarts so the orphan-resume path can re-upload only the
+/// missing tracks instead of blindly re-uploading everything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUploads {
+    /// Subset of `["mic", "system", "mixed"]` that still needs to land.
+    pub tracks: Vec<String>,
+    /// `failure_class` of the last failed attempt, snake_case wire
+    /// format (`transient_network`, `backend_5xx`, etc.). The Layer C
+    /// sweeper reads this to decide whether the session is auto-
+    /// resumable.
+    pub last_failure_class: String,
+}
+
+const PENDING_UPLOADS_FILENAME: &str = "pending_uploads.json";
+
+fn pending_uploads_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(PENDING_UPLOADS_FILENAME)
+}
+
+/// Read `pending_uploads.json` if present. A corrupt / unreadable
+/// sentinel returns `None` and the resume path falls back to
+/// "re-upload all tracks" — the failure mode is conservative on
+/// purpose.
+pub fn read_pending_uploads(session_dir: &Path) -> Option<PendingUploads> {
+    let path = pending_uploads_path(session_dir);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Delete the sentinel — called after a successful re-upload run when
+/// every previously-failed track has landed. Best-effort; a leftover
+/// file is cleaned by the 7-day orphan sweep anyway.
+pub fn clear_pending_uploads(session_dir: &Path) {
+    let path = pending_uploads_path(session_dir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!(
+                "aftercalls: clear pending_uploads {} failed: {e}",
+                path.display()
+            );
+        }
     }
-    Ok(())
+}
+
+fn write_pending_uploads(session_dir: &Path, pending: &PendingUploads) {
+    let path = pending_uploads_path(session_dir);
+    match serde_json::to_string_pretty(pending) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                eprintln!(
+                    "aftercalls: write pending_uploads {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("aftercalls: serialize pending_uploads failed: {e}");
+        }
+    }
 }
 
 /// PUTs the three track files to their presigned URLs. Prefers the
@@ -135,55 +261,197 @@ pub async fn attach_note_path(
 /// silently drops. We use the signed-for content-type for the PUT
 /// header and let the consumer sniff the actual bytes.
 ///
-/// Missing files are skipped silently; individual upload failures are
-/// logged but don't abort the batch so one broken track doesn't lose
-/// the others.
-pub async fn upload_audio(session_dir: &Path, urls: &UploadUrls) -> Result<()> {
+/// #646 Layer B — return value is now `Vec<TrackOutcome>` instead of
+/// `Result<()>`. Each PUT routes through `retry_http`; tracks that
+/// exhaust the retry ladder yield a `TrackOutcome { uploaded: false,
+/// ... }` entry and emit `pipeline::track_upload_failed` telemetry.
+/// On any partial failure we write a `pending_uploads.json` sentinel
+/// next to the audio so a later orphan-resume can attempt only the
+/// still-missing tracks. On full success in a re-run we delete the
+/// existing sentinel.
+pub async fn upload_audio(
+    session_dir: &Path,
+    urls: &UploadUrls,
+    guard: &RetryGuard,
+    session_id_for_telemetry: Option<&str>,
+) -> Result<Vec<TrackOutcome>> {
     let client = http_client()?;
 
-    // Each entry: (presigned URL, the content-type the backend signed
-    // the URL with, preferred-then-fallback source paths). The first
-    // existing source file gets uploaded with the signed content-type.
-    let candidates: [(Option<&str>, &str, &[PathBuf]); 3] = [
+    // If a sentinel from a previous failed run is present, narrow this
+    // attempt to ONLY the tracks it lists — tracks that already landed
+    // at Spaces don't need re-PUTting. A missing/corrupt sentinel
+    // falls through to "attempt all three" (conservative re-upload).
+    let pending = read_pending_uploads(session_dir);
+    let allowed: Option<Vec<String>> = pending.as_ref().map(|p| p.tracks.clone());
+
+    // Each entry: (track-name, presigned URL, the content-type the
+    // backend signed the URL with, preferred-then-fallback source
+    // paths). The first existing source file gets uploaded with the
+    // signed content-type.
+    let candidates: [(&'static str, Option<&str>, &str, [PathBuf; 2]); 3] = [
         (
+            "mic",
             urls.mic.as_deref(),
             "audio/ogg",
-            &[
-                session_dir.join("mic.opus"),
-                session_dir.join("mic.wav"),
-            ],
+            [session_dir.join("mic.opus"), session_dir.join("mic.wav")],
         ),
         (
+            "system",
             urls.system.as_deref(),
             "audio/ogg",
-            &[
-                session_dir.join("system.opus"),
-                session_dir.join("system.wav"),
-            ],
+            [session_dir.join("system.opus"), session_dir.join("system.wav")],
         ),
         (
+            "mixed",
             urls.mixed.as_deref(),
             "audio/ogg",
-            &[
-                session_dir.join("mixed.opus"),
-                session_dir.join("mixed.wav"),
-            ],
+            [session_dir.join("mixed.opus"), session_dir.join("mixed.wav")],
         ),
     ];
 
-    for (url, content_type, sources) in candidates {
+    let mut outcomes: Vec<TrackOutcome> = Vec::with_capacity(3);
+
+    for (track, url, content_type, sources) in &candidates {
+        // Skip if a previous run's sentinel restricts the set and
+        // this track is NOT in the resume list — it already landed
+        // and re-PUTting would just rewrite the same object.
+        if let Some(allowed_tracks) = &allowed {
+            if !allowed_tracks.iter().any(|s| s == track) {
+                continue;
+            }
+        }
         let Some(url) = url else { continue };
         let Some(path) = sources.iter().find(|p| p.exists()) else {
             continue;
         };
-        if let Err(e) = put_file(&client, url, path, content_type).await {
-            eprintln!(
-                "aftercalls: audio upload failed for {}: {e:#}",
-                path.display()
-            );
+
+        let attempt_path = path.clone();
+        let attempt_url = url.to_string();
+        let attempt_ct = content_type.to_string();
+        let client_ref = &client;
+        let result = retry_http(
+            // The backend handle is needed for `force_refresh_auth`
+            // on a 401. Spaces PUTs don't carry our JWT (they're
+            // pre-signed), so a 401 here is structurally impossible —
+            // but the helper still wants a backend reference for type
+            // signature consistency, and the no-op refresh path is
+            // safe.
+            &dummy_backend_for_spaces_retry(),
+            guard,
+            "put_file",
+            4,
+            session_id_for_telemetry,
+            |_attempt| {
+                let path = attempt_path.clone();
+                let url = attempt_url.clone();
+                let content_type = attempt_ct.clone();
+                async move { put_file(client_ref, &url, &path, &content_type).await }
+            },
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                outcomes.push(TrackOutcome {
+                    track,
+                    uploaded: true,
+                    failure_class: None,
+                    final_error: None,
+                });
+            }
+            Err(e) => {
+                let class = crate::portal::classify_reqwest_error(&e);
+                let err_str = format!("{e:#}");
+                eprintln!(
+                    "aftercalls: audio upload failed for {} ({track}): {err_str}",
+                    path.display()
+                );
+                // pipeline::track_upload_failed (warn) per failed
+                // track. Vendor-opaque copy: no "DigitalOcean Spaces"
+                // in the message. Final_error is the raw chain — that
+                // ships in telemetry meta to staff, not to users.
+                crate::telemetry::log(
+                    "warn",
+                    "pipeline::track_upload_failed",
+                    format!("track {track} upload failed (object storage)"),
+                    Some(serde_json::json!({
+                        "track": track,
+                        "final_error": err_str,
+                        "failure_class": class,
+                    })),
+                    session_id_for_telemetry.map(|s| s.to_string()),
+                );
+                outcomes.push(TrackOutcome {
+                    track,
+                    uploaded: false,
+                    failure_class: Some(class),
+                    final_error: Some(err_str),
+                });
+            }
         }
     }
-    Ok(())
+
+    // Sentinel bookkeeping. If any track failed, persist the list +
+    // last failure class so the sweeper can re-target this session.
+    // If everything that was attempted landed, clear any stale
+    // sentinel from a previous run.
+    let failed_tracks: Vec<String> = outcomes
+        .iter()
+        .filter(|o| !o.uploaded)
+        .map(|o| o.track.to_string())
+        .collect();
+    if failed_tracks.is_empty() {
+        clear_pending_uploads(session_dir);
+    } else {
+        // The last classified failure wins — useful enough for the
+        // sweeper's eligibility check; the per-track meta is in
+        // pipeline::track_upload_failed for staff triage.
+        let last_class = outcomes
+            .iter()
+            .rev()
+            .find_map(|o| o.failure_class)
+            .unwrap_or(FailureClass::Other);
+        write_pending_uploads(
+            session_dir,
+            &PendingUploads {
+                tracks: failed_tracks,
+                last_failure_class: failure_class_wire_token(last_class),
+            },
+        );
+    }
+
+    Ok(outcomes)
+}
+
+/// Stand-in `Backend` used only as a refresh anchor for `retry_http`
+/// from inside the Spaces PUT loop. The PUTs themselves never hit our
+/// backend URL (they go to Spaces via the presigned URL the
+/// create_call response delivered), so a 401 is structurally
+/// impossible — if it ever appeared it would be a SigV4 issue, which
+/// our classifier surfaces as `SignatureMismatch` and bubbles
+/// non-retryable. The helper still needs a `&Backend` reference for
+/// the type signature, hence this dummy.
+fn dummy_backend_for_spaces_retry() -> Backend {
+    Backend {
+        url: String::new(),
+        token: None,
+    }
+}
+
+/// Serialize a `FailureClass` to the same snake_case wire token the
+/// staff dashboard uses. Kept here to avoid pulling `serde_json` into
+/// every callsite that needs the string. Mirrors the
+/// `#[serde(rename_all = "snake_case")]` on the enum + the explicit
+/// `backend_5xx` rename.
+fn failure_class_wire_token(class: FailureClass) -> String {
+    match class {
+        FailureClass::TransientNetwork => "transient_network".into(),
+        FailureClass::BackendFiveXx => "backend_5xx".into(),
+        FailureClass::AuthExpired => "auth_expired".into(),
+        FailureClass::DecodeError => "decode_error".into(),
+        FailureClass::SignatureMismatch => "signature_mismatch".into(),
+        FailureClass::Other => "other".into(),
+    }
 }
 
 async fn put_file(

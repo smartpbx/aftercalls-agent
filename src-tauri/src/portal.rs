@@ -10,9 +10,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use rand::Rng;
 use reqwest::header::HeaderMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags, PendingTos};
@@ -1779,4 +1782,653 @@ async fn delete_nop_typed(
     let retry = parse_retry_after(resp.headers());
     let body = resp.text().await.unwrap_or_default();
     Err(from_status(status, body, retry))
+}
+
+// ── Failure classification (#645 Phase 1) ─────────────────────────────
+//
+// Substrate for the auto-recovery work tracked in #645 / #646. Phase 1
+// (this commit) only stamps a `failure_class` onto `pipeline::failed`
+// telemetry so the staff agent-logs dashboard can filter by class and
+// we can measure how often transient blips are killing pipelines.
+// Phase 2 (#646) layers a `retry_http<T>` wrapper on top of these same
+// variants; that wrapper is intentionally NOT added here.
+//
+// The classifier inspects an `anyhow::Error` two ways: (1) downcast to
+// `reqwest::Error` / `serde_json::Error` to read structured fields
+// (`is_connect`, `status`, etc.), then (2) fall back to a substring
+// scan of the formatted error chain for the cases where the pipeline
+// HTTP helpers (`post_with_timeout` in this file, `put_file` in
+// `upload.rs`) have already converted a non-2xx response into an
+// `anyhow::bail!("backend {s}: {t}")` / `anyhow::bail!("PUT returned
+// {status}: {text}")` string. Best-effort match is acceptable for a
+// telemetry tag — this isn't a security boundary.
+
+/// Coarse classification of a pipeline HTTP failure, suitable for
+/// stamping into `pipeline::failed` telemetry meta and (Phase 2) for
+/// driving retry-vs-bubble decisions in `retry_http`. Serialized
+/// snake_case to keep the wire format stable for dashboard filters
+/// (`transient_network`, `backend_5xx`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// Connect timeouts, DNS failures, broken pipes, EOFs, "connection
+    /// reset/refused", "network is unreachable", `os error 110`.
+    /// Retryable in Phase 2.
+    TransientNetwork,
+    /// HTTP 500-599 from the backend. Retryable in Phase 2.
+    ///
+    /// Wire format is the plan-mandated `backend_5xx` token (the staff
+    /// dashboard filter the architect specced uses that exact string),
+    /// not whatever serde's snake_case derives from `BackendFiveXx`.
+    #[serde(rename = "backend_5xx")]
+    BackendFiveXx,
+    /// HTTP 401 from the backend — access token expired or rotated.
+    /// Phase 2 retries this once after a `do_refresh` call.
+    AuthExpired,
+    /// `serde_json::Error` decoding a backend response body. Non-
+    /// retryable — schema skew won't fix itself on the next attempt.
+    DecodeError,
+    /// S3 `SignatureDoesNotMatch` (Spaces PUT path) — credential or
+    /// clock-skew issue. Non-retryable.
+    SignatureMismatch,
+    /// Anything we couldn't pin down. Conservatively non-retryable so
+    /// unknown failure modes don't accidentally cause loops.
+    Other,
+}
+
+/// Classify a pipeline error into a `FailureClass`. Best-effort: the
+/// classifier looks at the structured `reqwest::Error` / `serde_json::
+/// Error` first, then falls back to substring matching on the
+/// formatted error chain for cases where the HTTP helpers have already
+/// stringified a non-2xx response. Always returns a class — `Other` on
+/// unknown.
+pub fn classify_reqwest_error(err: &anyhow::Error) -> FailureClass {
+    // Structured `reqwest::Error` — the helpers that propagate the raw
+    // reqwest error (e.g. `c.post(...).send().await.with_context(...)`)
+    // give us `is_connect`/`is_timeout`/`status()` access.
+    if let Some(re) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(class) = classify_reqwest_status(re) {
+            return class;
+        }
+        if re.is_connect() || re.is_timeout() || re.is_request() {
+            return FailureClass::TransientNetwork;
+        }
+    }
+
+    // Structured serde_json decode failure — `post_with_timeout` /
+    // `transcribe` / `summarize` propagate these via `.context("decode")`,
+    // which downcasts back to the inner error.
+    if err.downcast_ref::<serde_json::Error>().is_some() {
+        return FailureClass::DecodeError;
+    }
+    // Also check the cause chain — `.context("decode")` puts the
+    // serde_json::Error one level down.
+    for cause in err.chain() {
+        if cause.downcast_ref::<serde_json::Error>().is_some() {
+            return FailureClass::DecodeError;
+        }
+        if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(class) = classify_reqwest_status(re) {
+                return class;
+            }
+            if re.is_connect() || re.is_timeout() || re.is_request() {
+                return FailureClass::TransientNetwork;
+            }
+        }
+    }
+
+    // Fallback: substring scan of the full error chain. The pipeline
+    // HTTP helpers stringify non-2xx into `anyhow::bail!("backend
+    // {status}: {body}")` (portal.rs `post_with_timeout`) and
+    // `anyhow::bail!("PUT returned {status}: {text}")` (upload.rs
+    // `put_file`), so the structured `reqwest::Error::status()` path
+    // above misses those cases — they're plain `anyhow::Error` strings
+    // by the time the pipeline sees them. Match in priority order
+    // (most-specific first).
+    let msg = format!("{err:#}").to_ascii_lowercase();
+
+    // S3 SignatureDoesNotMatch — Spaces PUT path. The XML body S3
+    // returns is preserved by `put_file`'s `bail!`. Treat 403 with
+    // SignatureDoesNotMatch as a distinct class; bare 403 without
+    // that substring stays Other (could be a Spaces ACL drift, not
+    // necessarily a creds issue).
+    if msg.contains("signaturedoesnotmatch")
+        || (msg.contains("put returned 403") && msg.contains("signature"))
+    {
+        return FailureClass::SignatureMismatch;
+    }
+
+    // HTTP-status substring fallback. Both `post_with_timeout`'s
+    // `backend {status}` and `put_file`'s `PUT returned {status}` land
+    // here. `StatusCode`'s Display is "401 Unauthorized" / "503
+    // Service Unavailable"; the leading 3-digit number is what we
+    // anchor on.
+    if msg.contains("backend 401")
+        || msg.contains("put returned 401")
+        || msg.contains(" 401 unauthorized")
+    {
+        return FailureClass::AuthExpired;
+    }
+    if msg.contains("backend 5") || msg.contains("put returned 5") {
+        // Catches "backend 500", "backend 502", "backend 503",
+        // "backend 504", "PUT returned 500", etc. The leading "backend
+        // 5" prefix is specific enough not to collide with arbitrary
+        // body text — the helpers always print status before body.
+        for code in &["500", "501", "502", "503", "504", "505", "507", "508", "511"] {
+            if msg.contains(&format!("backend {code}"))
+                || msg.contains(&format!("put returned {code}"))
+            {
+                return FailureClass::BackendFiveXx;
+            }
+        }
+    }
+
+    // Network-shape substrings. `os error 110` is Linux ETIMEDOUT,
+    // `os error 111` is ECONNREFUSED, `os error 113` is EHOSTUNREACH.
+    // Cover the common Display formats reqwest/hyper/std::io render.
+    let transient_markers = [
+        "os error 110",
+        "os error 111",
+        "os error 113",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "network is unreachable",
+        "broken pipe",
+        "unexpected end of file",
+        "unexpected eof",
+        "dns error",
+        "failed to lookup",
+        "name or service not known",
+        "operation timed out",
+        "timed out",
+    ];
+    if transient_markers.iter().any(|m| msg.contains(m)) {
+        return FailureClass::TransientNetwork;
+    }
+
+    FailureClass::Other
+}
+
+/// Helper: map a `reqwest::Error` carrying an HTTP status into a class.
+/// Returns `None` when the error has no associated status (i.e. the
+/// failure happened before a response — connect/dns/timeout etc.; the
+/// caller falls through to the transient-network check).
+fn classify_reqwest_status(re: &reqwest::Error) -> Option<FailureClass> {
+    let status = re.status()?;
+    let code = status.as_u16();
+    if code == 401 {
+        return Some(FailureClass::AuthExpired);
+    }
+    if (500..600).contains(&code) {
+        return Some(FailureClass::BackendFiveXx);
+    }
+    // 403 without a body to inspect — we don't have access to the
+    // response here (the error already consumed it). Surface as
+    // `Other`; the substring-fallback path catches SignatureDoesNotMatch
+    // for the put_file flow.
+    None
+}
+
+// ── Retry helper (#646 Phase 2 Layer A) ──────────────────────────────
+//
+// Generic in-process retry wrapper used by every HTTP step in the
+// pipeline (`create_call`, the three Spaces PUTs, `transcribe`,
+// `summarize`, `attach_note_path`, `generate_peaks`). 4 attempts total,
+// 2 s / 8 s / 30 s backoff with ±20% jitter, retry only on
+// `TransientNetwork | BackendFiveXx | AuthExpired` (and the latter only
+// after a single in-process refresh per pipeline run). The reqwest
+// per-request timeout (600 s on `transcribe` / `summarize`, 30 s on the
+// rest) stays unchanged — every retry attempt gets its own fresh
+// timeout budget.
+//
+// The "refresh once per pipeline run" guard lives on a per-call
+// `RetryGuard` struct that the pipeline constructs and threads through.
+// We deliberately do not modify the existing `do_refresh` flow; the
+// guard wraps it in a `force_refresh_auth` helper that reads auth.json,
+// calls `do_refresh`, and persists the new tokens.
+
+/// Per-pipeline-run state for `retry_http`. Today carries the auth-
+/// refresh latch — flipped once a 401 has triggered a refresh inside
+/// this pipeline run so subsequent steps don't loop on a broken token.
+/// Pass the same `&RetryGuard` to every `retry_http` call within one
+/// pipeline run; create a fresh one for the next.
+#[derive(Default)]
+pub struct RetryGuard {
+    auth_refreshed: Mutex<bool>,
+}
+
+impl RetryGuard {
+    pub fn new() -> Self {
+        Self {
+            auth_refreshed: Mutex::new(false),
+        }
+    }
+
+    /// Returns `true` exactly once per `RetryGuard`. The caller treats
+    /// this as "yes, do the refresh now"; subsequent 401s in the same
+    /// pipeline run bubble immediately so we don't loop on stale creds.
+    fn claim_refresh_slot(&self) -> bool {
+        let mut guard = match self.auth_refreshed.lock() {
+            Ok(g) => g,
+            // Poisoned lock means a previous task panicked while
+            // holding it — recover the inner value rather than
+            // propagating poison through the pipeline.
+            Err(p) => p.into_inner(),
+        };
+        if *guard {
+            false
+        } else {
+            *guard = true;
+            true
+        }
+    }
+}
+
+/// Force a token refresh outside of the lazy `build_auth_header` flow.
+/// Used by `retry_http` when a step returned 401 — the cached
+/// `auth.json` might be syntactically not-yet-expired (so
+/// `build_auth_header` won't refresh on its own) but semantically
+/// revoked server-side (rotated by a parallel sign-in / explicit
+/// revoke). Reads the current `auth.json`, posts to `/v1/auth/refresh`
+/// via the existing `do_refresh` helper, persists the new bundle, and
+/// returns `Ok(())`. Errors bubble — the caller drops the retry.
+pub(crate) async fn force_refresh_auth(backend: &Backend) -> Result<()> {
+    let auth = read_auth_file()?
+        .ok_or_else(|| anyhow!("not logged in — cannot refresh auth"))?;
+    if auth.refresh_expires_at <= Utc::now() {
+        return Err(anyhow!("refresh token expired — please log in again"));
+    }
+    let refreshed = do_refresh(backend, &auth.refresh_token).await?;
+    let merged = merge_auth(refreshed);
+    write_auth_file(&merged)?;
+    Ok(())
+}
+
+/// Backoff slot in milliseconds for attempts 2/3/4 with ±20% jitter
+/// applied per the spec. Attempt 1 fires immediately; this returns the
+/// wait BEFORE attempts 2, 3, and 4. `attempt_just_failed` is 1-indexed
+/// — pass 1 after the first failure, etc. Returns None when no further
+/// retry is permitted (attempt 4 has already failed).
+fn backoff_wait_ms(attempt_just_failed: u8) -> Option<u64> {
+    // Plan §Layer A: 2 s / 8 s / 30 s.
+    let base = match attempt_just_failed {
+        1 => 2_000u64,
+        2 => 8_000u64,
+        3 => 30_000u64,
+        _ => return None,
+    };
+    let jitter: f64 = rand::thread_rng().gen_range(0.8..1.2);
+    Some((base as f64 * jitter) as u64)
+}
+
+/// Run `attempt_fn` up to `max_attempts` times. The closure receives
+/// the 1-based attempt index. Classify each `Err` via
+/// `classify_reqwest_error`:
+/// - `DecodeError | SignatureMismatch | Other` → bubble immediately.
+/// - `AuthExpired` → refresh once per `RetryGuard` then retry the next
+///   slot; if the refresh already fired or fails, bubble.
+/// - `TransientNetwork | BackendFiveXx` → wait the next backoff slot
+///   and retry.
+///
+/// Emits `pipeline::retry` at debug level on every retry with
+/// `{ step, attempt, failure_class, wait_ms }`. Stamps the step name
+/// onto the final bubbled error so the pipeline failure log records
+/// which HTTP call ran out of attempts.
+///
+/// `session_id` is threaded through purely for telemetry attribution —
+/// callers pass the same string they use on `pipeline::start` /
+/// `pipeline::failed` so the retry events sit in the same agent_logs
+/// row group.
+pub(crate) async fn retry_http<T, F, Fut>(
+    backend: &Backend,
+    guard: &RetryGuard,
+    step: &'static str,
+    max_attempts: u8,
+    session_id: Option<&str>,
+    mut attempt_fn: F,
+) -> Result<T>
+where
+    F: FnMut(u8) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let max_attempts = max_attempts.max(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=max_attempts {
+        match attempt_fn(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let class = classify_reqwest_error(&e);
+                // Non-retryable classes bubble immediately, no wait.
+                match class {
+                    FailureClass::DecodeError
+                    | FailureClass::SignatureMismatch
+                    | FailureClass::Other => {
+                        return Err(e.context(format!("{step} failed")));
+                    }
+                    FailureClass::AuthExpired => {
+                        if !guard.claim_refresh_slot() {
+                            // Already refreshed once in this pipeline
+                            // run — a second 401 means the refresh
+                            // didn't help. Bubble.
+                            return Err(e.context(format!(
+                                "{step} failed after auth refresh"
+                            )));
+                        }
+                        // Attempt the refresh inline; on failure bubble
+                        // the ORIGINAL 401 (more useful for staff
+                        // triage than a refresh-side bubble).
+                        if let Err(re) = force_refresh_auth(backend).await {
+                            eprintln!(
+                                "aftercalls: retry_http {step} refresh failed: {re:#}"
+                            );
+                            return Err(e.context(format!(
+                                "{step} failed and auth refresh failed"
+                            )));
+                        }
+                        // Fall through into the backoff-wait path so
+                        // the next attempt has a small breathing room
+                        // (mirrors transient retries).
+                    }
+                    FailureClass::TransientNetwork | FailureClass::BackendFiveXx => {
+                        // Fall through into the backoff-wait path.
+                    }
+                }
+
+                // We've decided to retry. Compute the wait and emit a
+                // telemetry breadcrumb. If we've already exhausted
+                // attempts, bubble.
+                let wait_ms = backoff_wait_ms(attempt);
+                let Some(wait_ms) = wait_ms else {
+                    return Err(e.context(format!("{step} failed after {attempt} attempts")));
+                };
+                if attempt >= max_attempts {
+                    return Err(e.context(format!("{step} failed after {attempt} attempts")));
+                }
+                crate::telemetry::log(
+                    "debug",
+                    "pipeline::retry",
+                    format!("{step} attempt {attempt} failed; retrying"),
+                    Some(serde_json::json!({
+                        "step": step,
+                        "attempt": attempt,
+                        "failure_class": class,
+                        "wait_ms": wait_ms,
+                    })),
+                    session_id.map(|s| s.to_string()),
+                );
+                // Mirror the breadcrumb onto the Tauri event bus so
+                // the topstrip can flip its label to "Retrying…" for
+                // the duration of the wait. `pipeline` is the same
+                // event name `PipelineEvent::*` rides; the `Retrying`
+                // variant's serialized shape sits next to the other
+                // tagged variants ({ stage: "retrying", step,
+                // attempt, wait_ms }).
+                crate::telemetry::emit_app_event(
+                    "pipeline",
+                    &serde_json::json!({
+                        "stage": "retrying",
+                        "step": step,
+                        "attempt": attempt,
+                        "wait_ms": wait_ms,
+                    }),
+                );
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+        }
+    }
+    // Shouldn't be reachable — the inner branches return on success or
+    // bubble after the final attempt — but keep a defensive fallback.
+    Err(last_err.unwrap_or_else(|| anyhow!("{step} failed after {max_attempts} attempts")))
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+
+    // Constructing genuine `reqwest::Error` instances outside the
+    // crate is awkward (no public constructor), but the inline-doc
+    // pattern `client.get(<invalid>).send().await.unwrap_err()` works:
+    // we exercise the real `is_connect` / `is_timeout` paths the
+    // pipeline will hit in production. `tokio::runtime::Runtime` keeps
+    // the tests synchronous from cargo's POV.
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+    }
+
+    #[test]
+    fn is_connect_error_classifies_as_transient_network() {
+        // Port 1 on localhost is essentially guaranteed-refused —
+        // generates a real `reqwest::Error` with `is_connect()` true.
+        let err = rt().block_on(async {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get("http://127.0.0.1:1/never")
+                .send()
+                .await
+                .expect_err("port 1 connect must fail")
+        });
+        // Sanity: the structured reqwest::Error reports connect/request.
+        assert!(
+            err.is_connect() || err.is_request() || err.is_timeout(),
+            "expected connect/request/timeout-shaped reqwest error, got {err:?}"
+        );
+        let anyerr: anyhow::Error = anyhow::Error::new(err);
+        assert_eq!(
+            classify_reqwest_error(&anyerr),
+            FailureClass::TransientNetwork
+        );
+    }
+
+    #[test]
+    fn dns_failure_classifies_as_transient_network_via_substring() {
+        // DNS lookup against a non-routable .invalid TLD — surfaces as a
+        // wrapped `with_context` anyhow chain in production
+        // (`post_with_timeout` does `.with_context(|| format!("POST
+        // {url}"))?;`), so this also covers the chain-traversal path.
+        let err = rt().block_on(async {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get("http://this-host-does-not-exist-aftercalls-test.invalid/")
+                .send()
+                .await
+                .expect_err("DNS lookup must fail")
+        });
+        let anyerr = anyhow::Error::new(err).context("POST /v1/calls/x/transcribe");
+        // Either the structured `is_connect`/`is_request` path or the
+        // substring fallback should land us on transient_network.
+        assert_eq!(
+            classify_reqwest_error(&anyerr),
+            FailureClass::TransientNetwork
+        );
+    }
+
+    #[test]
+    fn backend_5xx_substring_classifies_as_backend_fivexx() {
+        // Mirror what `post_with_timeout` produces on a 502/503/504.
+        for code in &[500u16, 502, 503, 504] {
+            let err = anyhow::anyhow!("backend {code} Service Unavailable: upstream down");
+            assert_eq!(
+                classify_reqwest_error(&err),
+                FailureClass::BackendFiveXx,
+                "code {code} should be BackendFiveXx",
+            );
+        }
+        // Same shape for the upload.rs PUT helper.
+        let put_err = anyhow::anyhow!("PUT returned 503 Service Unavailable: x");
+        assert_eq!(
+            classify_reqwest_error(&put_err),
+            FailureClass::BackendFiveXx,
+        );
+    }
+
+    #[test]
+    fn http_401_substring_classifies_as_auth_expired() {
+        let err = anyhow::anyhow!("backend 401 Unauthorized: token expired");
+        assert_eq!(classify_reqwest_error(&err), FailureClass::AuthExpired);
+    }
+
+    #[test]
+    fn serde_decode_error_classifies_as_decode_error() {
+        let serde_err = serde_json::from_str::<Value>("not json at all").unwrap_err();
+        let anyerr: anyhow::Error = anyhow::Error::new(serde_err);
+        assert_eq!(classify_reqwest_error(&anyerr), FailureClass::DecodeError);
+
+        // Also verify the wrapped-in-context path that
+        // `post_with_timeout` uses (`.context("decode")`).
+        let serde_err2 = serde_json::from_str::<Value>("{nope}").unwrap_err();
+        let wrapped: anyhow::Error =
+            anyhow::Error::new(serde_err2).context("decode");
+        assert_eq!(classify_reqwest_error(&wrapped), FailureClass::DecodeError);
+    }
+
+    #[test]
+    fn s3_signature_mismatch_classifies_as_signature_mismatch() {
+        let err = anyhow::anyhow!(
+            "PUT returned 403 Forbidden: <Error><Code>SignatureDoesNotMatch</Code></Error>"
+        );
+        assert_eq!(
+            classify_reqwest_error(&err),
+            FailureClass::SignatureMismatch
+        );
+    }
+
+    #[test]
+    fn unknown_error_classifies_as_other() {
+        let err = anyhow::anyhow!("something weird but http 200 in body somehow");
+        assert_eq!(classify_reqwest_error(&err), FailureClass::Other);
+    }
+
+    #[test]
+    fn enum_serializes_as_snake_case() {
+        // Locked-in wire format for the staff dashboard filter.
+        assert_eq!(
+            serde_json::to_value(FailureClass::TransientNetwork).unwrap(),
+            serde_json::json!("transient_network")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::BackendFiveXx).unwrap(),
+            serde_json::json!("backend_5xx")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::AuthExpired).unwrap(),
+            serde_json::json!("auth_expired")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::DecodeError).unwrap(),
+            serde_json::json!("decode_error")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::SignatureMismatch).unwrap(),
+            serde_json::json!("signature_mismatch")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::Other).unwrap(),
+            serde_json::json!("other")
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_http_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+    }
+
+    /// Build a `Backend` that any HTTP call will bail on instantly (we
+    /// never invoke a real refresh in the retry-only tests below).
+    fn dummy_backend() -> Backend {
+        Backend {
+            url: "http://127.0.0.1:1".to_string(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn retry_http_succeeds_on_attempt_3_after_two_transient_errors() {
+        // Plan acceptance check: 2 injected `TransientNetwork` errors
+        // followed by a success on attempt 3. The closure tracks how
+        // many times it ran via an AtomicU8.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_inner = calls.clone();
+        let started = std::time::Instant::now();
+        let result: Result<&'static str> = rt().block_on(async move {
+            let guard = RetryGuard::new();
+            let backend = dummy_backend();
+            retry_http(&backend, &guard, "test_step", 4, None, |attempt| {
+                let calls = calls_inner.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 3 {
+                        // Synthesize a TransientNetwork via the
+                        // `os error 110` substring path the classifier
+                        // recognises (no real reqwest::Error needed).
+                        Err(anyhow!("connect: os error 110 (connection timed out)"))
+                    } else {
+                        Ok("got-it")
+                    }
+                }
+            })
+            .await
+        });
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Ok("got-it")));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // 2 backoff slots fired: ~2s + ~8s with ±20% jitter. Floor
+        // bounds at 0.8x each = 1.6 + 6.4 = 8 s. Ceiling at 1.2x each
+        // = 2.4 + 9.6 = 12 s. Allow slop on both ends.
+        assert!(
+            elapsed >= Duration::from_millis(7_500),
+            "expected >=7.5s of backoff, got {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(14),
+            "expected <=14s of backoff, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn retry_http_bubbles_immediately_on_decode_error() {
+        // Plan acceptance check: a DecodeError must NOT retry — the
+        // attempt-fn closure runs exactly once. We exercise the
+        // structured `serde_json::Error` path via `serde_json::from_str`.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_inner = calls.clone();
+        let result: Result<()> = rt().block_on(async move {
+            let guard = RetryGuard::new();
+            let backend = dummy_backend();
+            retry_http(&backend, &guard, "test_decode", 4, None, |_attempt| {
+                let calls = calls_inner.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let parse_err =
+                        serde_json::from_str::<Value>("not json at all").unwrap_err();
+                    Err(anyhow::Error::new(parse_err).context("decode"))
+                }
+            })
+            .await
+        });
+        assert!(result.is_err(), "expected decode error to bubble");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "decode errors must not retry",
+        );
+    }
 }

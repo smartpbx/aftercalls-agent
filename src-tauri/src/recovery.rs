@@ -25,12 +25,15 @@
 //!      ours.
 
 use chrono::{DateTime, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 
 use crate::config::Config;
+use crate::portal::FailureClass;
 
 /// Minimum age of a session_dir before we consider it for recovery.
 /// Shorter than this and it might still be in the act of uploading —
@@ -42,6 +45,32 @@ const MIN_AGE_MINUTES: i64 = 5;
 /// backend state. Keeps the recordings folder from accumulating
 /// dismissed orphans forever.
 const AUTO_CLEAN_DAYS: i64 = 7;
+
+/// #646 Layer C — auto-resume is only attempted on sessions younger
+/// than this. Older orphans fall through to the prompted-UI list
+/// regardless of failure class. 30 min matches the architect plan
+/// (auto-resume cap × sweeper interval = 3 × 5 min = 15 min, well
+/// inside this window).
+const AUTO_RESUME_MAX_AGE_MINUTES: i64 = 30;
+
+/// #646 Layer C — max number of silent auto-resume attempts per
+/// session before falling through to the prompted UI. Persisted in
+/// `auto_resume_state.json` next to the session_dir so the count
+/// survives agent restarts.
+const AUTO_RESUME_CAP: u8 = 3;
+
+/// #646 Layer D — discriminator on `OrphanSession`. `NeverCreated`
+/// = no backend row exists (pipeline crashed before create_call).
+/// `StuckPipeline` = backend row exists but `status != 'complete'`
+/// (pipeline crashed mid-transcribe / summarize / etc.). The agent
+/// review UI renders different badge copy per kind so the user
+/// understands what they're resuming.
+#[derive(Serialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanKind {
+    NeverCreated,
+    StuckPipeline,
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct OrphanSession {
@@ -63,6 +92,92 @@ pub struct OrphanSession {
     /// How old the folder is right now, in minutes. The UI uses this
     /// for the "12 min ago / 4 hr ago / 2 days ago" label.
     pub age_minutes: i64,
+    /// #646 Layer D — which class of orphan this is. Drives the
+    /// `.orphan-kind-badge` copy in the review panel.
+    pub kind: OrphanKind,
+    /// #646 Layer C — how many silent auto-resume attempts have fired
+    /// against this session. Read from `auto_resume_state.json`;
+    /// defaults to 0 when no state file exists. When this reaches
+    /// `AUTO_RESUME_CAP` the orphan-review panel shows the
+    /// "Couldn't resume automatically." line.
+    pub auto_resume_count: u8,
+}
+
+/// #646 Layer C — sentinel persisted next to the session_dir so the
+/// auto-resume attempt counter survives agent restarts. Read at the
+/// top of `auto_resume_eligible` to enforce the 3-attempt cap, bumped
+/// when a sweeper-driven pipeline run kicks off, cleared by `discard`
+/// when the user explicitly drops the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoResumeState {
+    pub attempts: u8,
+    pub last_failure_class: Option<String>,
+    pub last_attempt_ts: DateTime<Utc>,
+}
+
+const AUTO_RESUME_STATE_FILENAME: &str = "auto_resume_state.json";
+
+fn auto_resume_state_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(AUTO_RESUME_STATE_FILENAME)
+}
+
+/// Read `auto_resume_state.json` if it exists. A corrupt / missing
+/// file returns `None`; the sweeper treats that as "no prior auto-
+/// resume attempts" which is safe — we'd rather try once too many
+/// than skip a session the user can't recover manually.
+pub fn read_auto_resume_state(session_dir: &Path) -> Option<AutoResumeState> {
+    let path = auto_resume_state_path(session_dir);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Write `auto_resume_state.json`. Best-effort; failure is logged but
+/// not surfaced. A missing state file falls back to "treat as fresh"
+/// on the next sweeper tick.
+pub fn write_auto_resume_state(session_dir: &Path, state: &AutoResumeState) {
+    let path = auto_resume_state_path(session_dir);
+    match serde_json::to_string_pretty(state) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                eprintln!(
+                    "aftercalls: write auto_resume_state {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("aftercalls: serialize auto_resume_state failed: {e}");
+        }
+    }
+}
+
+/// #646 Layer D — module-level lock of session_ids currently being
+/// auto-resumed by the sweeper. `scan_orphans` filters its result
+/// through this set so a session mid-resume never appears in the
+/// prompted-UI list (would let the user race the sweeper). Inserted
+/// before the auto-resume pipeline spawn, removed when it finishes.
+fn in_flight_recovery() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn mark_in_flight(session_id: &str) {
+    if let Ok(mut set) = in_flight_recovery().lock() {
+        set.insert(session_id.to_string());
+    }
+}
+
+pub fn clear_in_flight(session_id: &str) {
+    if let Ok(mut set) = in_flight_recovery().lock() {
+        set.remove(session_id);
+    }
+}
+
+fn is_in_flight(session_id: &str) -> bool {
+    in_flight_recovery()
+        .lock()
+        .map(|set| set.contains(session_id))
+        .unwrap_or(false)
 }
 
 /// Resolve the base recordings directory. Matches what start_recording
@@ -78,6 +193,12 @@ fn recordings_root(app: &AppHandle) -> Option<PathBuf> {
 /// the orphan criteria. Also silently deletes anything older than
 /// AUTO_CLEAN_DAYS while we're iterating — keeps the cleanup in one
 /// pass without a separate scheduled task.
+///
+/// #646 Layer C/D — as of Phase 2 this function runs both on launch
+/// AND on the 5-min sweeper tick driven by the Svelte layout. Both
+/// callers consume the same filtered Vec. Sessions currently mid-
+/// auto-resume (tracked by the `in_flight_recovery` set) are excluded
+/// from the returned list so the prompted-UI never races the sweeper.
 pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
     let Some(root) = recordings_root(app) else {
         return Vec::new();
@@ -180,16 +301,24 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
     };
 
     for (session_dir, session_id, age_anchor) in candidates {
-        let needs_recovery =
+        // Filter out anything Layer C is mid-resuming so the prompted
+        // UI never races the sweeper.
+        if is_in_flight(&session_id) {
+            continue;
+        }
+
+        let (needs_recovery, kind) =
             match crate::portal::get_call_by_session(backend, &session_id).await {
                 Ok(Some(v)) => {
                     // Backend knows this recording. Orphan iff the row
                     // didn't reach complete. Missing status field is
                     // treated as non-complete for safety.
-                    v.get("status")
+                    let stuck = v
+                        .get("status")
                         .and_then(|s| s.as_str())
                         .map(|s| s != "complete")
-                        .unwrap_or(true)
+                        .unwrap_or(true);
+                    (stuck, OrphanKind::StuckPipeline)
                 }
                 Ok(None) => {
                     // No backend row: pipeline crashed before
@@ -198,7 +327,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                     // on. Resume will push it through the full
                     // pipeline (create_call is idempotent on
                     // session_id).
-                    true
+                    (true, OrphanKind::NeverCreated)
                 }
                 Err(e) => {
                     // Network / auth failure. Don't surface — we'd
@@ -207,7 +336,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                     eprintln!(
                         "aftercalls: scan_orphans backend check failed for {session_id}: {e}",
                     );
-                    false
+                    (false, OrphanKind::NeverCreated)
                 }
             };
         if !needs_recovery {
@@ -222,11 +351,17 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         let recorded_at = parse_session_timestamp(&session_id)
             .unwrap_or_else(|| system_time_to_utc(age_anchor));
 
+        let auto_resume_count = read_auto_resume_state(&session_dir)
+            .map(|s| s.attempts)
+            .unwrap_or(0);
+
         out.push(OrphanSession {
             session_dir,
             session_id,
             recorded_at,
             age_minutes,
+            kind,
+            auto_resume_count,
         });
     }
 
@@ -295,4 +430,320 @@ fn parse_session_timestamp(session_id: &str) -> Option<DateTime<Utc>> {
     chrono::NaiveDateTime::parse_from_str(session_id, "%Y%m%dT%H%M%SZ")
         .ok()
         .map(|ndt| ndt.and_utc())
+}
+
+// ── #646 Layer C — auto-resume sweeper plumbing ──────────────────────
+
+/// Eligibility check for the silent-auto-resume path. Returns
+/// `Some(FailureClass)` when the session can be safely auto-resumed
+/// (transient failure class, within the 30 min age window, fewer than
+/// AUTO_RESUME_CAP prior attempts); returns `None` to fall through to
+/// the prompted-UI orphan list.
+///
+/// The age + attempt-cap checks are filesystem-only (the `session_dir`
+/// mtime + `auto_resume_state.json`); the failure-class check reads
+/// the in-process telemetry ring buffer. A session whose
+/// `pipeline::failed` event has already aged out of the ring (agent
+/// restart, very old session) returns `None` here too — the user
+/// makes the call on whether to retry from the prompted UI.
+pub fn auto_resume_eligible(
+    session_id: &str,
+    session_dir: &Path,
+) -> Option<FailureClass> {
+    // Age gate first — cheap. If the dir is older than the cutoff,
+    // skip even reading the state file.
+    let age_minutes = mtime_of(session_dir)
+        .or_else(|| mtime_of(&session_dir.join("mic.wav")))
+        .or_else(|| mtime_of(&session_dir.join("mic.opus")))
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs() as i64 / 60)
+        .unwrap_or(i64::MAX);
+    if age_minutes > AUTO_RESUME_MAX_AGE_MINUTES {
+        return None;
+    }
+
+    // Cap check — 3 strikes and the session falls through.
+    let state = read_auto_resume_state(session_dir);
+    let prior_attempts = state.as_ref().map(|s| s.attempts).unwrap_or(0);
+    if prior_attempts >= AUTO_RESUME_CAP {
+        return None;
+    }
+
+    // Failure class — pull from the in-process ring buffer. Match on
+    // either the full session_str (absolute path) or the bare
+    // session_id basename; pipeline.rs stamps the absolute path while
+    // tests / older entries may use the bare basename.
+    let (class, _ts) = crate::telemetry::recent_failure_for_session(session_id)?;
+    match class {
+        FailureClass::TransientNetwork
+        | FailureClass::BackendFiveXx
+        | FailureClass::AuthExpired => Some(class),
+        FailureClass::DecodeError
+        | FailureClass::SignatureMismatch
+        | FailureClass::Other => None,
+    }
+}
+
+/// One entry in the diagnostic result of `auto_resume_orphans`. Not
+/// rendered in the UI today — tests assert on it and the staff
+/// dashboard can correlate against `pipeline::auto_resume`
+/// telemetry, but the live user surface is the silent pipeline run
+/// itself.
+#[derive(Serialize, Clone, Debug)]
+pub struct AutoResumeResult {
+    pub session_id: String,
+    pub resumed: bool,
+    /// Why this session was not auto-resumed (cap reached, age cutoff,
+    /// non-transient class, no telemetry). `None` when `resumed` is
+    /// true.
+    pub reason: Option<String>,
+}
+
+/// Spawn an auto-resume pipeline for a single session. Helper that
+/// `auto_resume_orphans` uses; broken out so the in-flight lock
+/// bookkeeping is symmetric across the success / failure paths.
+async fn spawn_auto_resume(
+    app: AppHandle,
+    session_dir: PathBuf,
+    session_id: String,
+    attempt_count: u8,
+    prior_failure_class: Option<FailureClass>,
+) {
+    mark_in_flight(&session_id);
+    // Bump the persisted counter BEFORE the pipeline kicks off so a
+    // crash mid-run still counts against the cap (avoids retry loops
+    // on a session that panics the agent).
+    write_auto_resume_state(
+        &session_dir,
+        &AutoResumeState {
+            attempts: attempt_count,
+            last_failure_class: prior_failure_class.map(failure_class_token),
+            last_attempt_ts: Utc::now(),
+        },
+    );
+
+    crate::telemetry::log(
+        "info",
+        "pipeline::auto_resume",
+        format!("auto-resume attempt {attempt_count} for session {session_id}"),
+        Some(serde_json::json!({
+            "session_id": session_id,
+            "attempt_count": attempt_count,
+            "prior_failure_class": prior_failure_class.map(failure_class_token),
+        })),
+        Some(session_dir.to_string_lossy().into_owned()),
+    );
+
+    // Spawn in a fresh task so the sweeper command can return after
+    // dispatching all eligible sessions; each pipeline cleans up its
+    // own in-flight slot when it completes.
+    let session_id_for_cleanup = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::pipeline::run_with_trigger(
+            session_dir,
+            app,
+            crate::pipeline::PipelineTrigger::Auto {
+                attempt_count,
+            },
+        )
+        .await;
+        clear_in_flight(&session_id_for_cleanup);
+    });
+}
+
+fn failure_class_token(class: FailureClass) -> String {
+    match class {
+        FailureClass::TransientNetwork => "transient_network".into(),
+        FailureClass::BackendFiveXx => "backend_5xx".into(),
+        FailureClass::AuthExpired => "auth_expired".into(),
+        FailureClass::DecodeError => "decode_error".into(),
+        FailureClass::SignatureMismatch => "signature_mismatch".into(),
+        FailureClass::Other => "other".into(),
+    }
+}
+
+/// #646 Layer C — Tauri command driven by the Svelte sweeper's 5-min
+/// interval. Re-runs `scan_orphans`, filters to auto-resumable
+/// sessions, and dispatches a silent pipeline run for each one. The
+/// command returns a `Vec<AutoResumeResult>` for diagnostic /
+/// test purposes; the user-visible surface is the pipeline itself
+/// (topstrip indicator picks up the next stage) plus the eventual
+/// orphan-pill failure ceiling if all 3 attempts fail.
+#[tauri::command]
+pub async fn auto_resume_orphans(app: AppHandle) -> Result<Vec<AutoResumeResult>, String> {
+    let orphans = scan_orphans(&app).await;
+    let mut results: Vec<AutoResumeResult> = Vec::with_capacity(orphans.len());
+
+    for orphan in orphans {
+        let session_id = orphan.session_id.clone();
+        let session_dir = orphan.session_dir.clone();
+
+        // Double-check the in-flight set: scan_orphans already filters
+        // through it, but this sweep may take time and another agent
+        // path could have started a resume between scan and dispatch.
+        if is_in_flight(&session_id) {
+            results.push(AutoResumeResult {
+                session_id,
+                resumed: false,
+                reason: Some("already in flight".into()),
+            });
+            continue;
+        }
+
+        match auto_resume_eligible(&session_id, &session_dir) {
+            Some(class) => {
+                let attempt_count = read_auto_resume_state(&session_dir)
+                    .map(|s| s.attempts)
+                    .unwrap_or(0)
+                    + 1;
+                spawn_auto_resume(
+                    app.clone(),
+                    session_dir,
+                    session_id.clone(),
+                    attempt_count,
+                    Some(class),
+                )
+                .await;
+                results.push(AutoResumeResult {
+                    session_id,
+                    resumed: true,
+                    reason: None,
+                });
+            }
+            None => {
+                // Articulate the reason for the diagnostic blob. The
+                // exact why-not isn't critical; the prompted UI will
+                // surface the session shortly anyway.
+                let reason = if read_auto_resume_state(&session_dir)
+                    .map(|s| s.attempts)
+                    .unwrap_or(0)
+                    >= AUTO_RESUME_CAP
+                {
+                    "auto-resume cap reached"
+                } else {
+                    "ineligible (age, failure class, or no telemetry)"
+                };
+                results.push(AutoResumeResult {
+                    session_id,
+                    resumed: false,
+                    reason: Some(reason.into()),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+#[cfg(test)]
+mod auto_resume_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Create a per-test temp dir under the system tmp root. We avoid
+    /// pulling in `tempfile` (not currently a dep) and roll a tiny
+    /// counter-suffixed helper instead. Dirs are best-effort cleaned
+    /// when the test drops them; an orphaned tmp dir is harmless.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("aftercalls-test-{pid}-{tag}-{n}"));
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self { path }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn auto_resume_eligible_transient_returns_some() {
+        // Hand-seed a `pipeline::failed` entry with a transient
+        // failure class for an arbitrary session_id; verify
+        // auto_resume_eligible returns Some(TransientNetwork). Uses a
+        // scratch dir as the session_dir so the age check passes.
+        let tmp = ScratchDir::new("transient");
+        let session_id = "20260522T140158Z";
+        // Create a mic.wav touch so mtime_of finds something. The
+        // file's mtime is now → age 0 min → inside the 30 min window.
+        std::fs::write(tmp.path().join("mic.wav"), &[0u8; 8]).expect("write mic.wav");
+
+        crate::telemetry::log(
+            "error",
+            "pipeline::failed",
+            "synthetic",
+            Some(serde_json::json!({
+                "failure_class": "transient_network",
+            })),
+            Some(session_id.to_string()),
+        );
+
+        let class = auto_resume_eligible(session_id, tmp.path());
+        assert!(
+            matches!(class, Some(FailureClass::TransientNetwork)),
+            "expected Some(TransientNetwork), got {class:?}",
+        );
+    }
+
+    #[test]
+    fn auto_resume_eligible_decode_returns_none() {
+        let tmp = ScratchDir::new("decode");
+        let session_id = "20260522T140159Z";
+        std::fs::write(tmp.path().join("mic.wav"), &[0u8; 8]).expect("write mic.wav");
+
+        crate::telemetry::log(
+            "error",
+            "pipeline::failed",
+            "synthetic decode",
+            Some(serde_json::json!({
+                "failure_class": "decode_error",
+            })),
+            Some(session_id.to_string()),
+        );
+
+        let class = auto_resume_eligible(session_id, tmp.path());
+        assert!(class.is_none(), "decode_error must not auto-resume");
+    }
+
+    #[test]
+    fn auto_resume_eligible_cap_reached_returns_none() {
+        let tmp = ScratchDir::new("cap");
+        let session_id = "20260522T140200Z";
+        std::fs::write(tmp.path().join("mic.wav"), &[0u8; 8]).expect("write mic.wav");
+
+        write_auto_resume_state(
+            tmp.path(),
+            &AutoResumeState {
+                attempts: AUTO_RESUME_CAP,
+                last_failure_class: Some("transient_network".into()),
+                last_attempt_ts: Utc::now(),
+            },
+        );
+
+        crate::telemetry::log(
+            "error",
+            "pipeline::failed",
+            "synthetic capped",
+            Some(serde_json::json!({
+                "failure_class": "transient_network",
+            })),
+            Some(session_id.to_string()),
+        );
+
+        let class = auto_resume_eligible(session_id, tmp.path());
+        assert!(
+            class.is_none(),
+            "cap reached must fall through to prompted UI, got {class:?}",
+        );
+    }
 }

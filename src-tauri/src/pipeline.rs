@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::config::Config;
+use crate::portal::RetryGuard;
 use crate::summary::Summary;
 use crate::transcription::MergedTranscript;
 use crate::{portal, upload, vault};
@@ -29,9 +30,40 @@ use crate::{portal, upload, vault};
 #[derive(Serialize, Clone)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum PipelineEvent {
-    Started { session_dir: String },
+    /// #646 Layer C — `triggered_by` distinguishes a user-initiated
+    /// stop_recording from a Layer C auto-resume sweep. The Svelte
+    /// sweeper treats `"auto"` silently (no toast / no tray flash)
+    /// while `"user"` keeps today's UX. Field defaulted to `"user"`
+    /// on the (de)serializer side via `#[serde(default = ...)]` is
+    /// not possible on a tuple-variant; instead we emit the field on
+    /// every Started and let the frontend default it if absent.
+    Started {
+        session_dir: String,
+        triggered_by: &'static str,
+    },
+    /// #646 Layer C — emitted when the auto-resume sweeper kicks off a
+    /// pipeline for a previously-failed session. Distinct from
+    /// `Started { triggered_by: "auto" }` so the Svelte sweeper can
+    /// react with a quieter UI path while the original `Started` event
+    /// shape stays backwards-compatible with anything reading older
+    /// telemetry.
+    Resuming {
+        session_dir: String,
+        attempt_count: u8,
+    },
     Uploading,
     Transcribing,
+    /// #646 Layer A — emitted while an HTTP step is between retry
+    /// attempts. The Svelte topstrip shows a "Retrying…" indicator
+    /// instead of the stage label. `step` is the same `step` token
+    /// `retry_http` uses (e.g. "transcribe", "put_file"). Optional
+    /// `wait_ms` lets the UI show a "next attempt in Xs" hint —
+    /// today's spec uses it as advisory only.
+    Retrying {
+        step: &'static str,
+        attempt: u8,
+        wait_ms: u64,
+    },
     /// Emitted the moment the transcribe step returns successfully,
     /// *before* summarize kicks in. This is when the call has a
     /// usable transcript but no title/summary/action-items yet —
@@ -59,7 +91,34 @@ pub fn is_pipeline_active() -> bool {
     PIPELINE_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0
 }
 
+/// What kicked off this pipeline run. Drives the `Started` event's
+/// `triggered_by` field, and (for `Auto`) the additional `Resuming`
+/// breadcrumb the Svelte sweeper subscribes to. Defaults to `User`
+/// for backwards-compat with `pub fn run(session_dir, app)`.
+#[derive(Clone, Copy, Debug)]
+pub enum PipelineTrigger {
+    User,
+    Auto { attempt_count: u8 },
+}
+
+impl PipelineTrigger {
+    fn token(&self) -> &'static str {
+        match self {
+            PipelineTrigger::User => "user",
+            PipelineTrigger::Auto { .. } => "auto",
+        }
+    }
+}
+
 pub async fn run(session_dir: PathBuf, app: AppHandle) {
+    run_with_trigger(session_dir, app, PipelineTrigger::User).await
+}
+
+pub async fn run_with_trigger(
+    session_dir: PathBuf,
+    app: AppHandle,
+    trigger: PipelineTrigger,
+) {
     PIPELINE_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     // Scope guard in case any early-return is introduced later —
     // today the function can't panic mid-body because both branches
@@ -100,8 +159,21 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
         &app,
         PipelineEvent::Started {
             session_dir: session_str.clone(),
+            triggered_by: trigger.token(),
         },
     );
+    // #646 Layer C — Resuming fires *in addition to* Started when the
+    // sweeper drove this run. Frontend can subscribe to either; the
+    // Resuming event carries the attempt counter.
+    if let PipelineTrigger::Auto { attempt_count } = trigger {
+        emit(
+            &app,
+            PipelineEvent::Resuming {
+                session_dir: session_str.clone(),
+                attempt_count,
+            },
+        );
+    }
     match run_inner(&session_dir, &app).await {
         Ok((note_path, call_id)) => {
             let note_str = note_path.to_string_lossy().into_owned();
@@ -150,11 +222,24 @@ pub async fn run(session_dir: PathBuf, app: AppHandle) {
         Err(e) => {
             let err_str = format!("{e:#}");
             eprintln!("aftercalls: pipeline failed: {err_str}");
+            // #645 Phase 1 — stamp a `failure_class` onto the
+            // telemetry meta blob so the staff agent-logs dashboard
+            // can filter pipeline failures by class
+            // (transient_network / backend_5xx / auth_expired /
+            // decode_error / signature_mismatch / other). The `error`
+            // free-form string stays in the top-level message field
+            // for backwards compatibility — the dashboard reads it
+            // today and will gain `meta.failure_class`
+            // opportunistically. No retry behavior change ships here;
+            // Phase 2 (#646) layers `retry_http` on top.
+            let failure_class = portal::classify_reqwest_error(&e);
             crate::telemetry::log(
                 "error",
                 "pipeline::failed",
                 err_str.clone(),
-                None,
+                Some(serde_json::json!({
+                    "failure_class": failure_class,
+                })),
                 Some(session_str.clone()),
             );
             let _ = app
@@ -184,6 +269,12 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     // for `pipeline::start` / `pipeline::done` / `pipeline::failed` so
     // the four events tie back to one session_dir in agent_logs.
     let session_str = session_dir.to_string_lossy().into_owned();
+    let session_telemetry = Some(session_str.as_str());
+
+    // #646 Phase 2 Layer A — single retry guard per pipeline run.
+    // Threaded into every retry_http call so a 401 can refresh tokens
+    // ONCE and subsequent steps coast on the freshened bundle.
+    let guard = RetryGuard::new();
 
     // Steps 1–2: mix + compress. Both are best-effort; the pipeline can
     // still upload + transcribe with whichever tracks landed.
@@ -198,17 +289,60 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     // to the wav if ffmpeg is missing (Windows stock).
     compress_for_upload(&session_dir.join("mixed.wav")).await.ok();
 
-    // Step 3: create the call row so we get upload URLs.
+    // Step 3: create the call row so we get upload URLs. Retries the
+    // create_call POST through retry_http (idempotent server-side).
     emit(app, PipelineEvent::Uploading);
-    let created = upload::create_call(backend, session_dir, 0).await?;
+    let created = upload::create_call(backend, session_dir, 0, &guard, session_telemetry).await?;
 
-    // Step 4: PUT audio to Spaces.
-    upload::upload_audio(session_dir, &created.upload_urls).await?;
+    // Step 4: PUT audio to Spaces. Returns per-track outcomes — partial
+    // success keeps the pipeline running so the surviving tracks still
+    // get transcribed. The sentinel + telemetry are managed inside
+    // upload_audio.
+    let track_outcomes =
+        upload::upload_audio(session_dir, &created.upload_urls, &guard, session_telemetry).await?;
+    let any_uploaded = track_outcomes.iter().any(|o| o.uploaded);
+    let any_failed = track_outcomes.iter().any(|o| !o.uploaded);
+    if !any_uploaded && !track_outcomes.is_empty() {
+        // Every track failed — there's nothing for AssemblyAI to chew
+        // on, bubble out instead of marching into a transcribe call
+        // that would fail loudly with "no audio". This still respects
+        // Layer B's per-track surfacing because upload_audio has
+        // already emitted track_upload_failed + written the sentinel.
+        anyhow::bail!("all track uploads failed");
+    }
+    if any_failed {
+        // Quiet structured breadcrumb. Call-detail will surface the
+        // track-quality chip; staff dashboard reads this entry. No
+        // alarm — the pipeline keeps running.
+        crate::telemetry::log(
+            "warn",
+            "pipeline::partial_upload",
+            "one or more tracks failed to upload; pipeline continuing",
+            Some(serde_json::json!({
+                "outcomes": track_outcomes,
+            })),
+            session_telemetry.map(|s| s.to_string()),
+        );
+    }
 
     // Step 5: backend transcribe (AssemblyAI with the org's key).
+    // #646 Layer A — wrapped in retry_http now that Phase 1's backend
+    // short-circuit makes a retry against a status='complete' row
+    // safe (no AssemblyAI re-bill).
     emit(app, PipelineEvent::Transcribing);
-    let (transcript_json, transcribe_api_version) =
-        portal::transcribe(backend, &created.call_id).await?;
+    let call_id_for_transcribe = created.call_id.clone();
+    let (transcript_json, transcribe_api_version) = portal::retry_http(
+        backend,
+        &guard,
+        "transcribe",
+        4,
+        session_telemetry,
+        |_attempt| {
+            let call_id = call_id_for_transcribe.clone();
+            async move { portal::transcribe(backend, &call_id).await }
+        },
+    )
+    .await?;
     let transcript: MergedTranscript = match serde_json::from_value(transcript_json.clone()) {
         Ok(t) => t,
         Err(e) => {
@@ -254,9 +388,27 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         }),
         None => Vec::new(),
     };
-    let (summary_json, summarize_api_version) =
-        portal::summarize(backend, &created.call_id, &serde_json::to_value(&transcript)?, &candidates)
-            .await?;
+    // #646 Layer A — summarize through retry_http. Backend short-
+    // circuit on status='complete' makes a retry idempotent (no
+    // OpenAI re-bill, no overwrite of persisted summary).
+    let transcript_value = serde_json::to_value(&transcript)?;
+    let call_id_for_summarize = created.call_id.clone();
+    let (summary_json, summarize_api_version) = portal::retry_http(
+        backend,
+        &guard,
+        "summarize",
+        4,
+        session_telemetry,
+        |_attempt| {
+            let transcript_value = transcript_value.clone();
+            let candidates = candidates.clone();
+            let call_id = call_id_for_summarize.clone();
+            async move {
+                portal::summarize(backend, &call_id, &transcript_value, &candidates).await
+            }
+        },
+    )
+    .await?;
     let summary: Summary = match serde_json::from_value(summary_json.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -282,8 +434,12 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         match vault::write_note(v, &summary, &transcript, session_dir, &candidates) {
             Ok(p) => {
                 // Step 8: attach the note path onto the call row for
-                // portal deep-linking.
-                if let Err(e) = upload::attach_note_path(backend, &created.call_id, &p).await {
+                // portal deep-linking. Wrapped in retry_http; the
+                // endpoint is narrow PATCH-shape and idempotent.
+                if let Err(e) =
+                    upload::attach_note_path(backend, &created.call_id, &p, &guard, session_telemetry)
+                        .await
+                {
                     eprintln!("aftercalls: attach note path failed: {e:#}");
                 }
                 p
@@ -298,11 +454,28 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     };
 
     // Step 9: peaks, fire-and-forget — failure doesn't block the user
-    // from seeing their note land.
+    // from seeing their note land. Retries via its own RetryGuard
+    // (the per-pipeline guard is scoped to run_inner; this spawned
+    // task lives past it).
     let backend_clone = backend.clone();
     let call_id = created.call_id.clone();
+    let peaks_session = session_str.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = portal::generate_peaks(&backend_clone, &call_id).await {
+        let peaks_guard = RetryGuard::new();
+        let result = portal::retry_http(
+            &backend_clone,
+            &peaks_guard,
+            "generate_peaks",
+            4,
+            Some(peaks_session.as_str()),
+            |_attempt| {
+                let backend_inner = backend_clone.clone();
+                let call_id_inner = call_id.clone();
+                async move { portal::generate_peaks(&backend_inner, &call_id_inner).await }
+            },
+        )
+        .await;
+        if let Err(e) = result {
             eprintln!("aftercalls: peaks generation failed: {e:#}");
         }
     });
