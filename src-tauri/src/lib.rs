@@ -2730,6 +2730,281 @@ fn notify_call_ready(app: AppHandle, title: String, body: String) -> Result<(), 
         .map_err(|e| e.to_string())
 }
 
+/// #644 — sweep orphan `aftercalls` processes left behind by previous
+/// auto-updates. The Tauri AppImage updater renames the running
+/// AppImage (so its exe path resolves to `tauri_current_app*/...
+/// (deleted)`) and writes the new bytes; `relaunch()` then exits the
+/// inner extracted binary, but the AppImage runtime wrapper keeps
+/// serving its FUSE mount and is reparented to `systemd --user`. One
+/// orphan wrapper accumulates per update.
+///
+/// Strategy: at startup, scan processes; SIGTERM anything that looks
+/// like a previous-launch leftover. Conservative — match only what
+/// could not possibly be the current pair:
+///
+///   - exe path contains `tauri_current_app` (the updater's tempdir
+///     name), OR
+///   - exe path carries the `(deleted)` marker, OR
+///   - exe path is under a `/tmp/.mount_*` prefix that differs from
+///     ours (a different AppImage mount = a different launch).
+///
+/// And the candidate name starts with `aftercalls`. We never kill:
+///   - our own PID,
+///   - our parent PID (autostart / login-session wrapper),
+///   - any process whose resolved exe path equals our own,
+///   - any process whose mount prefix matches ours.
+///
+/// Linux-only — the orphan pattern is specific to the AppImage +
+/// FUSE wrapper combo. macOS `.app` and Windows `.msi` don't have
+/// this leak. Safe no-op on every launch when no orphans exist.
+#[cfg(target_os = "linux")]
+fn sweep_orphan_appimage_processes() {
+    // Defensive: any unexpected error inside the sweep is logged and
+    // swallowed so a panic in process introspection can't break
+    // agent startup.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sweep_orphan_appimage_processes_inner();
+    }));
+    if result.is_err() {
+        eprintln!("aftercalls: orphan-sweep panicked; continuing startup");
+        telemetry::log(
+            "warn",
+            "agent::orphan_sweep",
+            "orphan_sweep panicked; continuing",
+            None,
+            None,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sweep_orphan_appimage_processes_inner() {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    let our_pid = std::process::id();
+    // SAFETY: getppid() is async-signal-safe and always succeeds.
+    let our_ppid = unsafe { libc::getppid() } as u32;
+    let our_exe = std::env::current_exe().ok();
+    let our_exe_str = our_exe.as_ref().map(|p| p.to_string_lossy().into_owned());
+
+    // Find our own `/tmp/.mount_*` prefix (if we're running from an
+    // AppImage mount). Anything under the *same* prefix is part of
+    // this launch and must not be touched.
+    let our_mount_prefix: Option<String> = our_exe.as_deref().and_then(|p| {
+        for ancestor in p.ancestors() {
+            let s = ancestor.to_string_lossy();
+            if s.starts_with("/tmp/.mount_") && s.len() > "/tmp/.mount_".len() {
+                return Some(s.into_owned());
+            }
+        }
+        None
+    });
+
+    // Minimum-fields refresh: name is populated unconditionally
+    // (sysinfo-0.32 docs on `ProcessRefreshKind`), and we resolve the
+    // exe path via `/proc/<pid>/exe` ourselves below, so we don't need
+    // sysinfo's exe/cpu/disk/memory sampling — skipping CPU sampling
+    // in particular keeps this startup path under its ~50ms budget.
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut found: u32 = 0;
+    let mut killed: u32 = 0;
+    let skipped_self: u32 = 0;
+    let mut skipped_parent: u32 = 0;
+
+    for (pid, proc_) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+
+        // Self-protection: never our own PID, never our parent.
+        if pid_u32 == our_pid {
+            continue;
+        }
+
+        let name = proc_.name().to_string_lossy();
+        // Match both `aftercalls` (inner binary) and `aftercalls.AppI[mage]`
+        // (the truncated comm value sysinfo returns for the wrapper).
+        if !name.starts_with("aftercalls") {
+            continue;
+        }
+
+        // Resolve exe via `/proc/<pid>/exe` directly — that's the
+        // only place where the `(deleted)` marker is visible (sysinfo
+        // strips it when it builds `Process::exe()`).
+        let exe_link = std::fs::read_link(format!("/proc/{pid_u32}/exe"));
+        let exe_str = match &exe_link {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => String::new(), // process gone mid-scan; treat as no-match
+        };
+
+        // Defense in depth: same exe path as us → same launch.
+        if let Some(ours) = &our_exe_str {
+            if !exe_str.is_empty() && &exe_str == ours {
+                continue;
+            }
+        }
+
+        if !exe_path_looks_like_orphan(&exe_str, our_mount_prefix.as_deref()) {
+            continue;
+        }
+
+        found += 1;
+
+        // Self-protection #2: never the parent PID. Counted after the
+        // orphan match so the telemetry event reflects "we saw it and
+        // chose not to act."
+        if pid_u32 == our_ppid {
+            skipped_parent += 1;
+            telemetry::log(
+                "info",
+                "agent::orphan_sweep",
+                format!("orphan_sweep: skipped parent pid={pid_u32} exe={exe_str}"),
+                Some(serde_json::json!({ "pid": pid_u32, "exe": exe_str, "reason": "parent" })),
+                None,
+            );
+            continue;
+        }
+
+        // SIGTERM, not SIGKILL — orphans may flush telemetry via the
+        // existing panic-hook flush pattern. We don't wait; systemd
+        // --user reaps. Fire-and-forget at startup.
+        let rc = unsafe { libc::kill(pid_u32 as libc::pid_t, libc::SIGTERM) };
+        if rc == 0 {
+            killed += 1;
+            telemetry::log(
+                "info",
+                "agent::orphan_sweep",
+                format!("orphan_sweep: terminated stale aftercalls pid={pid_u32} exe={exe_str}"),
+                Some(serde_json::json!({ "pid": pid_u32, "exe": exe_str })),
+                None,
+            );
+        } else {
+            // ESRCH = process already gone; benign. Anything else is
+            // worth a warn but not a startup failure.
+            let errno = std::io::Error::last_os_error();
+            telemetry::log(
+                "warn",
+                "agent::orphan_sweep",
+                format!(
+                    "orphan_sweep: kill SIGTERM failed pid={pid_u32} exe={exe_str} err={errno}"
+                ),
+                Some(serde_json::json!({ "pid": pid_u32, "exe": exe_str, "errno": errno.raw_os_error() })),
+                None,
+            );
+        }
+    }
+
+    // Suppress unused-warning bookkeeping field on builds where the
+    // skipped_self counter never fires (we early-continue on pid ==
+    // our_pid before reaching the orphan-classification step, so it
+    // stays at zero — kept in the summary payload for symmetry with
+    // the spec).
+    let _ = skipped_self;
+
+    telemetry::log(
+        "info",
+        "agent::orphan_sweep",
+        format!("orphan_sweep done: found={found} killed={killed} skipped_parent={skipped_parent}"),
+        Some(serde_json::json!({
+            "found": found,
+            "killed": killed,
+            "skipped_self": skipped_self,
+            "skipped_parent": skipped_parent,
+        })),
+        None,
+    );
+}
+
+/// Pure heuristic used by `sweep_orphan_appimage_processes_inner`,
+/// factored out so the matching logic is unit-testable without
+/// scanning real `/proc`. `our_mount_prefix` is the caller's
+/// `/tmp/.mount_*` prefix if it lives inside an AppImage mount,
+/// otherwise `None`.
+#[cfg(target_os = "linux")]
+fn exe_path_looks_like_orphan(exe_str: &str, our_mount_prefix: Option<&str>) -> bool {
+    if exe_str.is_empty() {
+        return false;
+    }
+    exe_str.contains("tauri_current_app")
+        || exe_str.contains("(deleted)")
+        || (exe_str.starts_with("/tmp/.mount_")
+            && our_mount_prefix
+                .map(|m| !exe_str.starts_with(m))
+                .unwrap_or(false))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod orphan_sweep_tests {
+    use super::exe_path_looks_like_orphan;
+
+    /// Live evidence from #644 — the leaked v0.18.0 wrapper's exe
+    /// path. Must be classified as an orphan.
+    #[test]
+    fn detects_deleted_tauri_current_app_path() {
+        let stale = "/opt/aftercalls/tauri_current_app38awJr/current_app.AppImage (deleted)";
+        assert!(exe_path_looks_like_orphan(stale, None));
+        // Even when we *are* running from a mount, a stale path
+        // outside that mount should still classify as an orphan.
+        assert!(exe_path_looks_like_orphan(
+            stale,
+            Some("/tmp/.mount_aftercGGANpH"),
+        ));
+    }
+
+    /// The current inner binary's path on the leak report — must
+    /// NOT be classified as an orphan when we resolve our own mount
+    /// prefix to the same root.
+    #[test]
+    fn rejects_current_process_exe_path() {
+        let ours = "/tmp/.mount_aftercGGANpH/usr/bin/aftercalls";
+        assert!(!exe_path_looks_like_orphan(
+            ours,
+            Some("/tmp/.mount_aftercGGANpH"),
+        ));
+    }
+
+    /// A *different* `/tmp/.mount_*` prefix indicates a different
+    /// launch — that wrapper IS an orphan.
+    #[test]
+    fn detects_other_mount_prefix() {
+        let other_launch = "/tmp/.mount_afterckOeijl/usr/bin/aftercalls";
+        assert!(exe_path_looks_like_orphan(
+            other_launch,
+            Some("/tmp/.mount_aftercGGANpH"),
+        ));
+        // With no mount of our own (dev build), don't false-positive
+        // on a single mount path — the heuristic only fires when we
+        // can prove "different mount."
+        assert!(!exe_path_looks_like_orphan(other_launch, None));
+    }
+
+    /// Empty exe-string (read_link failed) is not an orphan — a
+    /// transient failure shouldn't SIGTERM unrelated processes.
+    #[test]
+    fn empty_exe_path_is_not_orphan() {
+        assert!(!exe_path_looks_like_orphan("", None));
+        assert!(!exe_path_looks_like_orphan(
+            "",
+            Some("/tmp/.mount_aftercGGANpH"),
+        ));
+    }
+
+    /// Regular `/opt/aftercalls/aftercalls` (the current-launch
+    /// wrapper symlink target) must not match — it's neither in
+    /// `tauri_current_app*` nor under `/tmp/.mount_*`.
+    #[test]
+    fn rejects_current_wrapper_symlink_target() {
+        let wrapper = "/opt/aftercalls/aftercalls";
+        assert!(!exe_path_looks_like_orphan(wrapper, None));
+        assert!(!exe_path_looks_like_orphan(
+            wrapper,
+            Some("/tmp/.mount_aftercGGANpH"),
+        ));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2949,6 +3224,14 @@ pub fn run() {
                 None,
                 None,
             );
+
+            // #644 — sweep orphan AppImage wrappers left by previous
+            // auto-updates. See `sweep_orphan_appimage_processes`
+            // above for the heuristic + safety rationale. Linux-only;
+            // the helper is `#[cfg(target_os = "linux")]` so this is
+            // a literal no-op on macOS / Windows builds.
+            #[cfg(target_os = "linux")]
+            sweep_orphan_appimage_processes();
 
             // #203: sweep any lingering support-report video stage
             // dirs older than 24 h. If a crash interrupted a submit
