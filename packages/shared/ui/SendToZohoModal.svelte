@@ -577,16 +577,42 @@
     return r.secondary ?? "";
   }
 
-  // #635 — match-path second line for the Deals multi-path search.
-  // Returns "" when the row is a happy-path (deal-only) hit, in which
-  // case the renderer suppresses the line entirely. Otherwise joins
-  // the available account/contact fields with thin-space + middle dot.
-  // Nulls are omitted, not rendered as `—`, so a row missing a Contact
-  // shows just the Account, not "Acme · — · —".
+  // #635 / #648 — match-path second line for the multi-path search.
+  //
+  // Deals (#635): suppress when only the deal-name path matched
+  // (`["deal"]`); otherwise join account / contact / contact-secondary
+  // with thin-space + middle dot.
+  //
+  // Leads (#648): suppress when only the last-name path matched
+  // (`["last_name"]`, the legacy single-path behaviour); otherwise
+  // render the path tags directly as "Matched via …" since Leads are
+  // leaf entities with no account/contact join provenance to surface.
+  // Multiple matched paths join with commas (e.g. "Matched via email,
+  // company") which reads better than the middle-dot separator used
+  // for the Deal provenance triple.
   function matchPathFor(r: SzmSearchResult): string {
     const via = r.matched_via;
     if (!via || via.length === 0) return "";
-    if (via.length === 1 && via[0] === "deal") return "";
+    // Happy paths — suppress the line entirely.
+    if (
+      via.length === 1 &&
+      (via[0] === "deal" || via[0] === "last_name")
+    )
+      return "";
+    // Lead path tags don't carry account/contact join provenance —
+    // render a "Matched via <labels>" string from the tags directly.
+    const leadTagLabels: Record<string, string> = {
+      last_name: "last name",
+      first_name: "first name",
+      email: "email",
+      phone: "phone",
+      company: "company",
+    };
+    if (via.every((t) => t in leadTagLabels)) {
+      const named = via.map((t) => leadTagLabels[t]).join(", ");
+      return `Matched via ${named}`;
+    }
+    // Existing Deal path-line (account · contact · secondary).
     const parts: string[] = [];
     if (r.account_name) parts.push(r.account_name);
     if (r.contact_name) parts.push(r.contact_name);
