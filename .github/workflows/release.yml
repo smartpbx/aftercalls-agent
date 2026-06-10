@@ -6,15 +6,19 @@ name: release
 # release, and the follow-up publish-to-spaces job mirrors everything
 # to the DO Spaces updater channel the installed apps poll.
 #
-# macOS (Intel + Apple Silicon) builds are gated artifact-only until
-# code-signing + notarization land (see #41 / #68). The Mac job runs
-# `pnpm tauri build` directly (NOT tauri-action) so its outputs DON'T
-# get attached to the GitHub release, then uploads the .dmg as a
-# workflow artifact for internal QA. The publish-to-spaces job only
-# pulls assets that ARE attached to the release, so unsigned mac
-# bundles never reach the public updater channel. Flip
-# `enable_mac_publish: true` on workflow_dispatch (after #68 lands)
-# to attach + publish.
+# macOS (Apple Silicon) builds run `pnpm tauri build` directly (NOT
+# tauri-action) and are Developer-ID-signed + notarized + stapled:
+# tauri-bundler reads the APPLE_* secrets itself (temp keychain,
+# `notarytool submit --wait`, `stapler staple` — verified against
+# tauri-bundler v2.9.2 source, 2026-06-10). A hard verification step
+# (`spctl --assess` + `stapler validate`) guards the two silent
+# failure modes: missing notarization creds only WARN in the bundler,
+# and stapler's exit status is unchecked upstream. Signed bundles
+# attach to the GH release and publish to Spaces like Linux/Windows.
+#
+# Windows Authenticode signing is pre-wired but INERT until the
+# AZURE_* secrets exist (Azure Artifact Signing, #67 in the private
+# repo) — see the "Enable Windows code signing" step.
 
 on:
   push:
@@ -25,11 +29,6 @@ on:
       tag:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
-      enable_mac_publish:
-        description: "Attach macOS .dmg to GH release + publish to Spaces. Leave false until signing (#68) lands; default uploads .dmg as a workflow artifact only."
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -37,6 +36,11 @@ permissions:
 env:
   VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
   VITE_SENTRY_ENVIRONMENT: production
+  # Windows Authenticode via Azure Artifact Signing flips on when all
+  # six secrets exist; until then the Windows build ships unsigned
+  # exactly as before. `secrets` isn't usable in step `if:` directly,
+  # hence the env indirection.
+  HAS_AZURE_SIGNING: ${{ secrets.AZURE_ARTIFACT_ENDPOINT != '' && secrets.AZURE_ARTIFACT_ACCOUNT != '' && secrets.AZURE_ARTIFACT_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -77,7 +81,7 @@ jobs:
 
           - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
           - **Windows**: .msi or .exe.
-          - **macOS**: .dmg (Apple Silicon). Closed-beta build is unsigned — run \`xattr -cr /Applications/aftercalls.app\` after install.
+          - **macOS**: .dmg (Apple Silicon; Intel Macs run it via Rosetta 2).
 
           All platforms auto-update from a running instance.
 
@@ -93,20 +97,18 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          # macOS entries are conservative: build artifacts only, no
-          # GitHub-release attachment + no Spaces publish unless
-          # workflow_dispatch input `enable_mac_publish` is true. See
-          # the comment on `enable_mac_publish` for the gating rationale.
-          #
           # `experimental: true` flips per-job continue-on-error so the
           # publish-to-spaces job can fire after Linux + Windows even
-          # when a macOS runner is queued (#41 follow-up).
+          # when a macOS runner is queued or Apple's notary service is
+          # down. Cost of that resilience: a failed mac job ships the
+          # release WITHOUT mac assets and latest.json omits
+          # darwin-aarch64 until the next tag — check the job status
+          # after every release.
           #
           # 2026-04-25: macos-13 (Intel) dropped from the matrix —
           # GitHub deprecated the label in late 2025 and our jobs sat
           # in queue 7+ hours. Apple Silicon (macos-14, aarch64) covers
-          # native ARM builds; Intel-Mac users run via Rosetta 2 until
-          # signing (#68) + a paid macos-13-large self-hosted alt land.
+          # native ARM builds; Intel-Mac users run via Rosetta 2.
           - os: macos-14
             target: aarch64-apple-darwin
             experimental: true
@@ -295,6 +297,31 @@ jobs:
           shasum -a 256 "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
           ls -lh src-tauri/binaries/
 
+      # Inert until the founder finishes Azure Artifact Signing setup
+      # (#67 in the private repo) and sets six secrets on THIS repo:
+      # AZURE_ARTIFACT_ENDPOINT (e.g. https://eus.codesigning.azure.net),
+      # AZURE_ARTIFACT_ACCOUNT, AZURE_ARTIFACT_PROFILE (cert profile
+      # name), AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET.
+      # Once present, this step installs the signing CLI and drops a
+      # tauri.windows.conf.json overlay (auto-merged by Tauri) whose
+      # signCommand signs the inner .exe AND the NSIS/MSI installers
+      # during bundling. Account/profile names stay out of this public
+      # file by living in secrets.
+      - name: Enable Windows code signing (Azure Artifact Signing)
+        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING == 'true'
+        shell: pwsh
+        env:
+          AZURE_ARTIFACT_ENDPOINT: ${{ secrets.AZURE_ARTIFACT_ENDPOINT }}
+          AZURE_ARTIFACT_ACCOUNT: ${{ secrets.AZURE_ARTIFACT_ACCOUNT }}
+          AZURE_ARTIFACT_PROFILE: ${{ secrets.AZURE_ARTIFACT_PROFILE }}
+        run: |
+          cargo install artifact-signing-cli --locked
+          $signCommand = "artifact-signing-cli -e $env:AZURE_ARTIFACT_ENDPOINT -a $env:AZURE_ARTIFACT_ACCOUNT -c $env:AZURE_ARTIFACT_PROFILE -d aftercalls %1"
+          @{ bundle = @{ windows = @{ signCommand = $signCommand } } } |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -Path src-tauri/tauri.windows.conf.json -Encoding UTF8
+          Write-Host "signCommand overlay written"
+
       - name: Build + publish signed release (Linux + Windows)
         if: matrix.os == 'ubuntu-24.04' || matrix.os == 'windows-latest'
         uses: tauri-apps/tauri-action@v0
@@ -302,6 +329,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Auth for artifact-signing-cli (no-ops while unset).
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: "aftercalls ${{ github.event.inputs.tag || github.ref_name }}"
@@ -313,7 +344,7 @@ jobs:
 
             - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
             - **Windows**: .msi or .exe.
-            - **macOS**: .dmg (Apple Silicon). Closed-beta build is unsigned — run `xattr -cr /Applications/aftercalls.app` after install.
+            - **macOS**: .dmg (Apple Silicon; Intel Macs run it via Rosetta 2).
 
             All platforms auto-update from a running instance.
 
@@ -335,29 +366,53 @@ jobs:
           # slim system-webkit AppImage ourselves in the next step.
           args: ${{ matrix.os == 'ubuntu-24.04' && '--bundles deb rpm' || '' }}
 
-      # macOS — build .dmg + .app via tauri-bundler directly. Bypassing
-      # tauri-action means the artifacts DON'T get attached to the
-      # GitHub release, which is the whole point of the artifact-only
-      # gate: unsigned .dmgs would launch with the "unidentified
-      # developer" Gatekeeper block and we don't want them on the
-      # public updater channel before #68 lands.
+      # macOS — build .dmg + .app via tauri-bundler directly (NOT
+      # tauri-action; we keep our own staging/attach steps so asset
+      # names carry the target triple). With the APPLE_* env present,
+      # tauri-bundler imports the cert into a temp keychain, signs
+      # everything inside-out (ffmpeg sidecar first, then the .app),
+      # runs `xcrun notarytool submit --wait`, and staples the ticket
+      # — no extra keychain/notary steps needed. The .p12 in
+      # APPLE_CERTIFICATE must contain ONLY the Developer ID
+      # Application identity (bundler picks the first identity it
+      # finds); APPLE_SIGNING_IDENTITY is a substring cross-check.
       #
       # Pass --target so the runner produces a single-arch bundle
-      # matching the matrix triple. macos-13 → x86_64, macos-14 → arm64.
-      - name: Build macOS .dmg (artifact-only)
+      # matching the matrix triple.
+      - name: Build signed + notarized macOS bundles
         if: startsWith(matrix.os, 'macos-')
         env:
-          # Even with no signing identity present, tauri-bundler still
-          # runs ad-hoc codesign so the .app launches at all on the
-          # build machine. The .dmg won't pass Gatekeeper on a fresh
-          # install — that's the whole point of the gate.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -eux
           pnpm tauri build --target ${{ matrix.target }}
           ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/dmg/" || true
           ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/macos/" || true
+
+      # Hard gate against the two silent failure modes in tauri-bundler:
+      # missing/incomplete notarization creds only log a WARNING (the
+      # build stays green and ships un-notarized), and `stapler staple`'s
+      # exit status is never checked. A release only attaches mac
+      # bundles if the .app genuinely passes Gatekeeper.
+      - name: Verify macOS signature + notarization
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          set -eux
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/aftercalls.app"
+          codesign -dvv "$APP" 2>&1 | grep "Developer ID Application"
+          codesign -d --verbose=2 "$APP" 2>&1 | grep -E "flags=.*runtime"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dvv "$APP/Contents/MacOS/ffmpeg-aftercalls" 2>&1 \
+            | grep "Developer ID Application"
+          spctl --assess --type exec --verbose=2 "$APP" 2>&1 | grep "accepted"
+          xcrun stapler validate "$APP"
 
       - name: Stage macOS bundles
         if: startsWith(matrix.os, 'macos-')
@@ -366,9 +421,8 @@ jobs:
           STAGE=/tmp/macos-stage
           mkdir -p "$STAGE"
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
-          # First-install installer: .dmg. Apple-unsigned during closed
-          # beta — users see Gatekeeper warning + xattr -cr workaround
-          # until #68 lands.
+          # First-install installer: .dmg — Developer-ID-signed, app
+          # inside is notarized + stapled.
           if [ -d "$BUNDLE_DIR/dmg" ]; then
             cp "$BUNDLE_DIR/dmg/"*.dmg "$STAGE/" 2>/dev/null || true
           fi
@@ -401,10 +455,9 @@ jobs:
           retention-days: 30
 
       # Attach mac bundles to the GitHub release so publish-to-spaces
-      # picks them up. We're closed beta — testers accept the unsigned
-      # Gatekeeper warning + xattr -cr workaround until #68 lands.
-      # When notarization ships, this step is unchanged; the warning
-      # just goes away for users.
+      # picks them up. Bundles are signed + notarized (the verify step
+      # above fails the job otherwise, so nothing un-notarized lands
+      # here).
       - name: Attach macOS bundles to GH release
         if: startsWith(matrix.os, 'macos-')
         env:
@@ -605,11 +658,10 @@ jobs:
   # so we add it here from the .sig file produced by the slim-
   # AppImage step above.
   #
-  # macOS bundles attach to the GH release unconditionally (we're
-  # closed beta — testers handle the unsigned Gatekeeper warning until
-  # #68 lands), so the .dmg + .dmg.sig land here via `gh release
-  # download` and get mirrored to Spaces + injected into latest.json
-  # as `darwin-aarch64`.
+  # macOS bundles (signed + notarized) attach to the GH release, so
+  # the .dmg + .app.tar.gz/.sig land here via `gh release download`
+  # and get mirrored to Spaces + injected into latest.json as
+  # `darwin-aarch64`.
   publish-to-spaces:
     needs: release
     runs-on: ubuntu-24.04
