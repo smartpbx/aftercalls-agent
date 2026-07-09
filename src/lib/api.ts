@@ -279,3 +279,35 @@ export const calls = {
  *  without rewriting the auth bundle on every poll. */
 export const meUnreadCount = (): Promise<number> =>
   invoke<number>("me_unread_count").catch(() => 0);
+
+// ── #602 / WS-G — org subscription snapshot ─────────────────────────
+//
+// Mirror of the backend `SubscriptionSnapshot` (entitlements.rs) — the
+// `subscription` block on `/v1/auth/me`. The Settings page renders a
+// compact plan/trial indicator + a "Manage billing" link from this;
+// the app never mutates billing (that lives on the web portal). Fetched
+// fresh via the `me_subscription` reach-around (not cached in auth.json)
+// so the trial countdown + seat readout are live on each Settings open.
+
+export type SubscriptionSeats = {
+  allowance: number;
+  used: number;
+  remaining: number;
+};
+
+export type SubscriptionInfo = {
+  /** `trialing` | `active` | `comped` | `past_due` | `canceled` — or ""
+   *  when an older backend omits the block (render nothing). */
+  status: string;
+  plan_code: string | null;
+  /** RFC-3339 UTC; drives the "N days left" trial countdown. */
+  trial_ends_at: string | null;
+  sunset_at: string | null;
+  seats: SubscriptionSeats;
+};
+
+/** Fetch the caller's live subscription snapshot from `/v1/auth/me`.
+ *  Returns null on any error so the Settings render never throws into a
+ *  render path — the card simply hides until a later successful load. */
+export const meSubscription = (): Promise<SubscriptionInfo | null> =>
+  invoke<SubscriptionInfo>("me_subscription").catch(() => null);

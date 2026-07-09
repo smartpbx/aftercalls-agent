@@ -11,6 +11,7 @@
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import * as api from "$lib/api";
+  import { openBilling } from "$lib/billing";
   import Segmented from "$lib/Segmented.svelte";
   import type { Me } from "@aftercalls/shared/types";
 
@@ -102,6 +103,107 @@
       summaryStyleSaving = false;
     }
   }
+
+  // ── #602 / WS-G — subscription / trial indicator ───────────────────
+  // Fresh reach-around read of `/v1/auth/me`'s `subscription` block. The
+  // app never manages billing — the "Manage billing" button opens the
+  // portal Organization tab in the system browser. A null load (network
+  // error, or an older backend that omits the block) simply hides the
+  // card rather than rendering a broken/half state.
+  let sub = $state<api.SubscriptionInfo | null>(null);
+
+  async function loadSubscription() {
+    sub = await api.meSubscription();
+  }
+
+  // Portal plan-code → display name (mirrors the Organization billing
+  // card's `displayName()` in portal/src/routes/admin/+page.svelte).
+  function planLabel(code: string | null): string {
+    return (
+      {
+        free_sunset: "Complimentary",
+        solo: "Solo",
+        team: "Team",
+        starter: "Starter",
+        enterprise: "Enterprise",
+      }[code ?? ""] ?? ""
+    );
+  }
+
+  // Whole days remaining until trial end (ceil, floored at 0). Null
+  // unless we're trialing with a known end date.
+  let trialDaysLeft = $derived.by(() => {
+    if (!sub || sub.status !== "trialing" || !sub.trial_ends_at) return null;
+    return Math.max(
+      0,
+      Math.ceil(
+        (new Date(sub.trial_ends_at).getTime() - Date.now()) / 86_400_000,
+      ),
+    );
+  });
+
+  // The card renders only for a recognised, non-empty status. An empty
+  // status ("" from an older backend) or an unknown value hides it.
+  let showSubCard = $derived(
+    !!sub &&
+      ["trialing", "active", "comped", "past_due", "canceled"].includes(
+        sub.status,
+      ),
+  );
+
+  // Status-pill tone → component-scoped class.
+  let subTone = $derived(
+    ({
+      trialing: "trial",
+      active: "ok",
+      comped: "ok",
+      past_due: "warn",
+      canceled: "off",
+    })[sub?.status ?? ""] ?? "neutral",
+  );
+
+  // Short status-pill label, matching the portal's billing vocabulary.
+  let subStatusLabel = $derived(
+    ({
+      trialing: "Trial",
+      active: "Active",
+      comped: "Complimentary",
+      past_due: "Payment failed",
+      canceled: "Canceled",
+    })[sub?.status ?? ""] ?? "",
+  );
+
+  // The one-line headline: plan + trial countdown folded into a compact
+  // phrase ("Trial — 5 days left", "Team plan", "Subscription ended").
+  let subHeadline = $derived.by(() => {
+    if (!sub) return "";
+    const plan = planLabel(sub.plan_code);
+    switch (sub.status) {
+      case "trialing": {
+        const d = trialDaysLeft;
+        if (d === 0) return "Trial — ends today";
+        if (d != null) return `Trial — ${d} ${d === 1 ? "day" : "days"} left`;
+        return "Trial";
+      }
+      case "active":
+        return plan ? `${plan} plan` : "Active";
+      case "comped":
+        return "Complimentary";
+      case "past_due":
+        return plan ? `${plan} plan — payment failed` : "Payment failed";
+      case "canceled":
+        return "Subscription ended";
+      default:
+        return plan;
+    }
+  });
+
+  // Optional seat readout, shown only when the plan carries an
+  // allowance we can report against.
+  let subSeatLine = $derived.by(() => {
+    if (!sub || sub.seats.allowance <= 0) return "";
+    return `${sub.seats.used} of ${sub.seats.allowance} seats used`;
+  });
 
   // ── Profile (#96) ──────────────────────────────────────────────────
   let firstDraft = $state("");
@@ -719,6 +821,11 @@
     // Appearance regardless; loadSummaryStyle() handles its own error
     // surface so we don't gate the rest of the page on this fetch.
     await loadSummaryStyle();
+
+    // #602/WS-G — subscription snapshot for the Subscription card.
+    // Best-effort: a null result hides the card, so we don't await-gate
+    // anything else on it.
+    void loadSubscription();
   });
 
   async function pickVaultDir() {
@@ -877,6 +984,30 @@
         </button>
       </div>
     </section>
+
+    <!-- #602 / WS-G — subscription / trial indicator. Status is read-
+         only in the app; full billing management (subscribe, manage,
+         update card) lives on the portal Organization tab, opened in the
+         system browser. Renders only for a recognised status; a null /
+         empty snapshot hides the card entirely. -->
+    {#if showSubCard && sub}
+      <section class="card" style="--i: 0.8">
+        <div class="card-head">
+          <div>
+            <div class="sub-line">
+              <h2>Subscription</h2>
+              <span class="sub-pill sub-pill-{subTone}">{subStatusLabel}</span>
+            </div>
+            <p class="hint">
+              {subHeadline}{#if subSeatLine} · {subSeatLine}{/if}
+            </p>
+          </div>
+          <button type="button" class="add" onclick={openBilling}>
+            Manage billing <span class="sub-ext" aria-hidden="true">↗</span>
+          </button>
+        </div>
+      </section>
+    {/if}
   {/if}
 
   <!-- #572 v2 follow-up — Integrations live on the web portal because
@@ -2356,6 +2487,54 @@
   .add:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+
+  /* #602/WS-G — Subscription card. Title + status pill on one line,
+     the compact plan/trial headline in the .hint below. Pill tones map
+     onto the existing semantic tokens (no new colors): accent = trial,
+     olive = healthy, sig = payment attention, live = ended. */
+  .sub-line {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .sub-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border: 1px solid var(--hairline-hi);
+    color: var(--bone-2);
+    background: var(--ink-2);
+  }
+  .sub-pill-trial {
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+    border-color: transparent;
+  }
+  .sub-pill-ok {
+    color: var(--olive);
+    background: var(--olive-soft);
+    border-color: transparent;
+  }
+  .sub-pill-warn {
+    color: var(--sig);
+    background: rgba(201, 162, 74, 0.14);
+    border-color: transparent;
+  }
+  .sub-pill-off {
+    color: var(--live);
+    background: var(--live-soft);
+    border-color: transparent;
+  }
+  .sub-ext {
+    font-size: 0.72rem;
+    opacity: 0.8;
   }
 
   /* #282 — "See all keyboard shortcuts" link sitting under the

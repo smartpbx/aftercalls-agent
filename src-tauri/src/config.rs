@@ -360,6 +360,43 @@ pub struct FeatureFlags {
     pub zoho: bool,
 }
 
+/// Mirror of the backend's `SeatUsage` (see
+/// `backend/src/routes/entitlements.rs`). Serde defaults keep a
+/// response that predates the field decoding as zeros rather than
+/// failing.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct SeatUsage {
+    #[serde(default)]
+    pub allowance: i64,
+    #[serde(default)]
+    pub used: i64,
+    #[serde(default)]
+    pub remaining: i64,
+}
+
+/// Mirror of the backend's `SubscriptionSnapshot` (see
+/// `backend/src/routes/entitlements.rs`) — the `subscription` block on
+/// `/v1/auth/me`. Surfaced to the Settings page so the agent can show a
+/// compact plan/trial indicator + a Manage-billing link, and consumed
+/// as a fresh reach-around read (never cached into auth.json — see
+/// `portal::me_subscription`). Serde defaults keep an older backend
+/// response (no `subscription` field) decoding as an empty/unknown
+/// snapshot instead of erroring; an empty `status` reads as "unknown"
+/// on the frontend.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Subscription {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub plan_code: Option<String>,
+    #[serde(default)]
+    pub trial_ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub seats: SeatUsage,
+}
+
 pub fn read_auth_file() -> Result<Option<AuthFile>> {
     let p = auth_file()?;
     if !p.exists() {

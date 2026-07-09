@@ -18,7 +18,9 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::{read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags, PendingTos};
+use crate::config::{
+    read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags, PendingTos, Subscription,
+};
 use crate::error::{from_status, parse_retry_after, PortalError};
 
 /// #179 — explicit User-Agent so backend logs can attribute requests to
@@ -1458,6 +1460,35 @@ pub async fn me_unread_count(backend: &Backend) -> std::result::Result<i64, Port
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     Ok(count)
+}
+
+/// #602/WS-G — fetch the caller's live subscription snapshot by hitting
+/// `/v1/auth/me` and pulling out the `subscription` block. Same
+/// reach-around discipline as `me_unread_count`: we deliberately do NOT
+/// merge into `auth.json` — the Settings card wants a fresh trial
+/// countdown / seat readout on each open, and the cached profile stays
+/// long-lived. A backend that predates the field (or omits it) decodes
+/// to the serde `Default` snapshot (empty status), which the frontend
+/// treats as "unknown" and renders nothing rather than a misleading
+/// state.
+pub async fn me_subscription(backend: &Backend) -> std::result::Result<Subscription, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!("{}/v1/auth/me", backend.url.trim_end_matches('/'));
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
+    }
+    let body: Value = resp.json().await.map_err(PortalError::from)?;
+    let sub = body
+        .get("subscription")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<Subscription>(v).ok())
+        .unwrap_or_default();
+    Ok(sub)
 }
 
 // ── #595 — per-user import-candidate flow ────────────────────────────

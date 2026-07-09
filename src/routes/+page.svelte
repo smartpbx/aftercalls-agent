@@ -21,6 +21,7 @@
   import { confirmAutoStart } from "$lib/autoStart";
   import NotesPanel from "$lib/NotesPanel.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import { openBilling } from "$lib/billing";
 
   // Platform string reported to the backend on recording-ack (#44).
   // Kept here (not Rust-side) because navigator UA is already in the
@@ -63,6 +64,20 @@
   let selfNoteShortcut = $state<string | null>("Super+Shift+N");
   let pipelineStage = $state<string>("");
   let pipelineError = $state("");
+  // #602/WS-G — set when recording creation is billing-gated (backend
+  // returns 402 `subscription_inactive`). Swaps the raw error line for a
+  // friendly "subscribe to keep recording" block; never surface the raw
+  // 402 string for this case.
+  let subGate = $state(false);
+
+  /** True when a failed-pipeline error string carries the backend's
+   *  `subscription_inactive` 402 code. The create_call helper bails with
+   *  `backend 402 Payment Required: {"error":"subscription_inactive"}`,
+   *  so we match on the stable error code (not the numeric status, which
+   *  `usage_cap_reached` also uses). */
+  function isSubscriptionInactive(err: string): boolean {
+    return /subscription_inactive/i.test(err ?? "");
+  }
 
   /** #498 — strip internal vendor names from a free-form error
    *  string so the user-facing surface stays vendor-opaque (per
@@ -348,16 +363,25 @@
     unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
       const p = evt.payload;
       pipelineError = "";
+      subGate = false;
       pipelineStage = p.stage;
       if (p.stage === "failed") {
-        // #498 — backend pipeline errors can name internal vendors
-        // (AssemblyAI / OpenAI / Postmark / DigitalOcean) when an
-        // upstream call fails. Per CLAUDE.md hard rule #2, public-
-        // facing copy stays vendor-opaque. Redact vendor names from
-        // the pass-through string before showing it to the user;
-        // the staff `/staff/agent-logs` view still has the raw
-        // unredacted error for debugging.
-        pipelineError = redactVendorNames(p.error);
+        if (isSubscriptionInactive(p.error)) {
+          // #602/WS-G — recording creation was billing-gated (402
+          // subscription_inactive). Show the friendly subscribe block
+          // instead of the raw 402 string; the "Failed" status row is
+          // suppressed too (see the status lane below).
+          subGate = true;
+        } else {
+          // #498 — backend pipeline errors can name internal vendors
+          // (AssemblyAI / OpenAI / Postmark / DigitalOcean) when an
+          // upstream call fails. Per CLAUDE.md hard rule #2, public-
+          // facing copy stays vendor-opaque. Redact vendor names from
+          // the pass-through string before showing it to the user;
+          // the staff `/staff/agent-logs` view still has the raw
+          // unredacted error for debugging.
+          pipelineError = redactVendorNames(p.error);
+        }
         notifyPipelineFailed();
       }
       if (p.stage === "transcribed") openableCallId = p.call_id;
@@ -406,6 +430,7 @@
         if (recording) {
           pipelineStage = "";
           pipelineError = "";
+          subGate = false;
           openableCallId = "";
           startAt = Date.now();
           timer = window.setInterval(
@@ -587,6 +612,7 @@
   async function actuallyStartRecording() {
     pipelineStage = "";
     pipelineError = "";
+    subGate = false;
     openableCallId = "";
     // Play the start cue BEFORE invoking the recorder so the system
     // loopback doesn't capture the beep. Await blocks for ~350ms
@@ -607,6 +633,7 @@
   async function actuallyStartSelfNote() {
     pipelineStage = "";
     pipelineError = "";
+    subGate = false;
     openableCallId = "";
     try {
       // #56 — selfNote: true plays the chime but suppresses the
@@ -760,6 +787,7 @@
     importing = true;
     pipelineStage = "";
     pipelineError = "";
+    subGate = false;
     openableCallId = "";
     try {
       sessionDir = await invoke<string>("process_imported_file", {
@@ -1215,7 +1243,10 @@
         </button>
       </div>
     {/if}
-    {#if pipelineStage}
+    <!-- #602/WS-G — the generic "Failed" row is suppressed when the
+         failure is a billing gate; the friendly subscribe block below
+         is the single, clear message for that case. -->
+    {#if pipelineStage && !subGate}
       <div
         class="row"
         class:row-done={pipelineStage === "done"}
@@ -1255,6 +1286,27 @@
       <p class="idle">Ready when you are.</p>
     {/if}
 
+    <!-- #602/WS-G — subscription gate. Recording captured fine but the
+         backend declined to file the call because the org's plan isn't
+         active (402 subscription_inactive). Friendly, action-oriented
+         block — full billing management lives on the portal, opened in
+         the system browser. -->
+    {#if subGate}
+      <div class="sub-gate" role="alert">
+        <div class="sub-gate-body">
+          <p class="sub-gate-title">Couldn't save this recording</p>
+          <p class="sub-gate-text">
+            Recording needs an active plan. Subscribe to keep recording,
+            transcribing, and saving your calls.
+          </p>
+        </div>
+        <div class="sub-gate-actions">
+          <button type="button" class="btn primary" onclick={openBilling}>
+            Subscribe <span aria-hidden="true">↗</span>
+          </button>
+        </div>
+      </div>
+    {/if}
     {#if pipelineError}
       <p class="inline-error">{pipelineError}</p>
     {/if}
@@ -1832,6 +1884,42 @@
   }
   .btn.ghost {
     background: transparent;
+  }
+
+  /* ── #602/WS-G — subscription gate block ───────────────────────────── */
+  /* Shares the .banner anatomy (sig-gold left border = "heads up, check
+     this" per design.md §Semantic colors) with a title + action layout.
+     The CTA reuses the page's own .btn.primary (accent) — Subscribe is a
+     call to action, not a destructive/error signal. */
+  .sub-gate {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.1rem;
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--sig);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+  }
+  .sub-gate-body {
+    flex: 1;
+    min-width: 0;
+  }
+  .sub-gate-title {
+    margin: 0 0 0.25rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--bone-0);
+  }
+  .sub-gate-text {
+    margin: 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: var(--bone-2);
+    max-width: 44ch;
+  }
+  .sub-gate-actions {
+    flex-shrink: 0;
   }
 
   /* ── Notes panel (#73) ─────────────────────────────────────────────── */

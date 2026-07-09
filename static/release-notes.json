@@ -1,4 +1,12 @@
 {
+  "0.20.0": {
+    "headline": "aftercalls is now self-serve: pick a plan, start a free 14-day trial, and manage billing yourself — and the desktop app shows your subscription status.",
+    "changes": [
+      "Plans, free trials, and self-serve billing. You can now start using aftercalls on your own — no invite needed. Sign up and your team gets a 14-day free trial, with no credit card required. When you're ready, pick a plan in your organization's Billing settings: Solo (CA$15 per seat / month) or Team (CA$30 per seat / month), billed per teammate who uses the agent — not per call. Changing plans, updating your card, viewing invoices, and cancelling all happen in a self-serve billing area, and your seat count adjusts automatically as you add or remove teammates. The desktop app now shows your current plan and trial status at a glance, and points you to billing when your trial is ending.",
+      "Sign up on your own — no invite required. aftercalls is out of invite-only. Anyone can create an organization from the sign-up page, verify their email, and start recording on a free 14-day trial right away. If you were already using aftercalls through an invited account, nothing changes for you.",
+      "Organization settings — rename your org and transfer ownership. Owners now have an Organization tab in Settings to rename the organization and transfer ownership to another teammate. Ownership transfer is atomic and always leaves exactly one owner, so an organization can never end up with none."
+    ]
+  },
   "0.19.0": {
     "headline": "Brief network blips no longer interrupt your calls — the pipeline retries on its own and quietly self-heals, and partial uploads surface a clear note on the call.",
     "changes": [

@@ -1361,6 +1361,19 @@ async fn me_unread_count() -> Result<i64, error::PortalError> {
     portal::me_unread_count(backend).await
 }
 
+/// #602/WS-G — GET `/v1/auth/me` → `subscription`. Fresh snapshot for
+/// the Settings subscription card (plan/trial indicator + Manage-billing
+/// link). Doesn't merge into `auth.json`; mirrors the `me_unread_count`
+/// reach-around pattern for webview-driven reads that want live data.
+#[tauri::command]
+async fn me_subscription() -> Result<config::Subscription, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_subscription(backend).await
+}
+
 /// #634 — webview-driven tray-badge update. Pushes the latest count
 /// into `TrayUnreadCount` and re-applies the tray state so the
 /// tooltip reflects the new value immediately. Negative inputs are
@@ -3165,6 +3178,7 @@ pub fn run() {
             mark_call_read,
             mark_calls_read_bulk,
             me_unread_count,
+            me_subscription,
             set_unread_badge,
             // #595 — per-user import-candidate flow. Mirror of the
             // portal's `api.importCandidates.*` client; the agent's
