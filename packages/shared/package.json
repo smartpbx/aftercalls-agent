@@ -73,6 +73,10 @@
       "svelte": "./ui/ReplaceTextModal.svelte",
       "default": "./ui/ReplaceTextModal.svelte"
     },
+    "./ui/ScreenRecordingPlayer.svelte": {
+      "svelte": "./ui/ScreenRecordingPlayer.svelte",
+      "default": "./ui/ScreenRecordingPlayer.svelte"
+    },
     "./ui/SendToZohoModal.svelte": {
       "svelte": "./ui/SendToZohoModal.svelte",
       "default": "./ui/SendToZohoModal.svelte"

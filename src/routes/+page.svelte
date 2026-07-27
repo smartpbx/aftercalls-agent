@@ -129,13 +129,15 @@
       })) as AskAnswer;
       liveSession.setAskAnswer(
         chip,
-        res?.answer ?? "That's not available right now.",
+        res?.answer ?? "Still working — give it another tap.",
         typeof res?.based_on_turns === "number" ? res.based_on_turns : null,
+        res?.empty === true,
       );
     } catch {
-      // No retry-shame, no vendor name — indistinguishable from "hasn't
-      // generated yet" (ui.md §1c error/no-key calm state).
-      liveSession.setAskAnswer(chip, "That's not available right now.", null);
+      // No retry-shame, no vendor name — a warm re-tap line, never a red
+      // panel (#660 P1). Not an empty-state (empty:false) so it reads as the
+      // error/unavailable treatment, distinct from a calm "nothing yet".
+      liveSession.setAskAnswer(chip, "Still working — give it another tap.", null, false);
     }
   }
 
@@ -260,6 +262,13 @@
   // next time the layout refetches `current_user` this stays in
   // sync automatically.
   let ackCached = $state(false);
+
+  // #302 Slice C — whether screen capture is ON for this user (org flag
+  // AND per-user opt-in). Widens the pre-call disclosure: the recording-
+  // ack modal body + the participant-facing Copy notice both name the
+  // screen so the disclosed consent covers video. Self-notes never
+  // screen-capture, so their surfaces are untouched.
+  let screenCaptureOn = $state(false);
 
   // Copy-notice button UX (#45).
   let copiedNotice = $state(false);
@@ -662,6 +671,10 @@
     // Silently best-effort; any failure is deferred to click-time.
     loadRecordingPrefs();
 
+    // #302 Slice C — resolve whether screen capture is on for this user
+    // so the pre-call disclosure copy can widen to name the screen.
+    void loadScreenCaptureOn();
+
     // Load manual_notes_enabled so the record page knows whether to
     // render the notes panel during active recording, and
     // wayland_hotkey_notice_dismissed so we know whether to show the
@@ -909,6 +922,28 @@
     }
   }
 
+  // #302 Slice C — screen capture is "on" only when the org flag is set
+  // AND the user opted in. Best-effort; any failure leaves the disclosure
+  // copy in its default (audio-only) shape.
+  async function loadScreenCaptureOn() {
+    try {
+      const u = await invoke<{
+        features?: { screen_capture?: boolean };
+      } | null>("current_user");
+      if (!u?.features?.screen_capture) {
+        screenCaptureOn = false;
+        return;
+      }
+      const prefs = await invoke<{ enabled: boolean }>(
+        "get_screen_capture_prefs",
+      );
+      screenCaptureOn = !!prefs.enabled;
+    } catch (e) {
+      console.warn("loadScreenCaptureOn failed", e);
+      screenCaptureOn = false;
+    }
+  }
+
   // #479 — open the preview panel so the user can inspect the notice
   // text before it hits the clipboard.
   async function openNoticePreview() {
@@ -927,9 +962,14 @@
       }
       noticePreview =
         `Heads up — I'm using aftercalls to record and transcribe this ` +
-        `call for the purpose of ${prefs.recording_purpose}. The recording ` +
-        `is stored on Canadian cloud infrastructure and used only for that ` +
-        `purpose. If you'd prefer I didn't, let me know and I'll stop.`;
+        `call for the purpose of ${prefs.recording_purpose}.` +
+        (screenCaptureOn
+          ? ` My screen may also be recorded as video while the call is ` +
+            `recording.`
+          : ``) +
+        ` The recording is stored on Canadian cloud infrastructure and ` +
+        `used only for that purpose. If you'd prefer I didn't, let me ` +
+        `know and I'll stop.`;
     } catch (e) {
       copyError = portalErrorToText(e).replace(/^Error:\s*/, "");
     } finally {
@@ -1593,9 +1633,11 @@
       <p class="ack-body">
         By recording you confirm that you'll tell everyone on the call
         that it's being recorded, get their consent, and use the
-        recording only for the purpose you disclosed. Your audio will
-        be transcribed and summarized by automated services to
-        generate notes for you.
+        recording only for the purpose you disclosed.{#if screenCaptureOn}
+          You also confirm that you'll tell them their screen-share may
+          be recorded as video while the call is recording.{/if} Your
+        audio will be transcribed and summarized by automated services
+        to generate notes for you.
       </p>
 
       <label class="ack-check">

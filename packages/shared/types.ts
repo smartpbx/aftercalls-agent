@@ -22,6 +22,50 @@ export type Features = {
    *  default-off. Optional so an older backend / auth.json decodes as
    *  OFF; the transcript renders any speaker string regardless. */
   live_speaker_separation?: boolean;
+  /** #302 (Slice A) — screen capture during calls. When on, the agent
+   *  may capture the screen as VIDEO alongside the call audio and the
+   *  call-detail page surfaces a `<video>` player. Raw staff toggle,
+   *  default-off. Optional so an older backend / auth.json decodes as
+   *  OFF. The video is stored/displayed only — never fed to the AI. */
+  screen_capture?: boolean;
+};
+
+/** #302 (Slice A) — lifecycle of the per-call screen VIDEO asset.
+ *  `recording` → live capture in flight; `uploading` → resumable upload
+ *  running; `ready` → finalized + streamable; `failed` → aborted /
+ *  never finished; `expired` → swept past the org's retention window
+ *  (object deleted, row kept). Mirrors the backend CHECK constraint. */
+export type ScreenRecordingStatus =
+  | "recording"
+  | "uploading"
+  | "ready"
+  | "failed"
+  | "expired";
+
+/** #302 (Slice C) — screen-recording metadata for a call, returned by
+ *  `GET /v1/calls/{id}/screen` (agent: `get_screen_recording` Tauri
+ *  command; portal: `api.calls.screenRecording`). `url` is a short-lived
+ *  presigned GET, present only when `status === "ready"`. A 404 (org flag
+ *  off OR no row) decodes to `null` at the call site — the player renders
+ *  nothing. `start_offset_ms` is the whole feature: how far into the call
+ *  audio the video began, so the follower can align frames to the audio
+ *  master clock. */
+export type ScreenRecording = {
+  recording_id: string;
+  status: ScreenRecordingStatus;
+  start_offset_ms: number;
+  duration_ms?: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  codec?: string;
+  byte_size?: number;
+  expires_at?: string;
+  /** Presigned GET (Spaces serves Range natively). Only set when
+   *  `status === "ready"`. Both surfaces bind `<video src>` to it —
+   *  cross-origin media playback needs no auth header (like the audio
+   *  `<audio src>` path). */
+  url?: string;
 };
 
 /** #659 P5a — in-call co-pilot persona. `"sales"` grounds the Contact lane
@@ -273,6 +317,12 @@ export type AskChip =
 export type AskAnswer = {
   answer: string;
   based_on_turns: number;
+  /** #660 P1 — honest "nothing yet" signal. `true` when the answer is a VALID
+   *  empty result (empty transcript, or the model judged nothing of the
+   *  requested kind has surfaced yet) so the agent renders a calm "nothing yet"
+   *  state distinct from a transport/gate error line. Optional so an older
+   *  backend (pre-P1) decodes cleanly → treated as `false` (a normal answer). */
+  empty?: boolean;
 };
 
 /** #659 P5b — one cited source on a knowledge answer. `title` is the KB

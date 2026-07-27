@@ -453,6 +453,29 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         session_dir.to_path_buf()
     };
 
+    // Step 8.5 (#302 Slice B): upload the screen recording, if this Call
+    // captured one. AWAITED (so the session_dir isn't discarded out from
+    // under the local mp4 the multipart flow streams) but fully
+    // best-effort — a missing capture, a remux failure, a consent 400, or
+    // an exhausted retry ladder never fails the call. Placed AFTER the
+    // transcript + summary + note so the user already has everything
+    // useful; only the (bounded-size) video lands a touch later. The
+    // screen video is a stored media asset ONLY — it never enters
+    // transcribe / summarize / co-pilot.
+    if let Err(e) = upload::upload_screen_recording(
+        session_dir,
+        &created.call_id,
+        backend,
+        &guard,
+        session_telemetry,
+    )
+    .await
+    {
+        // upload_screen_recording swallows its own errors and returns
+        // Ok on every call-preserving path; this arm is defensive only.
+        eprintln!("aftercalls: screen recording upload errored (non-fatal): {e:#}");
+    }
+
     // Step 9: peaks, fire-and-forget — failure doesn't block the user
     // from seeing their note land. Retries via its own RetryGuard
     // (the per-pipeline guard is scoped to run_inner; this spawned

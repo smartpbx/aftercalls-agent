@@ -14,6 +14,7 @@ mod pipeline;
 mod portal;
 mod recorder;
 mod recovery;
+mod screen_recorder;
 mod summary;
 mod support;
 mod telemetry;
@@ -24,6 +25,7 @@ mod vault;
 use auto_recorder::AutoRecorder;
 use detector::{Detector, UserDecision};
 use recorder::Recorder;
+use screen_recorder::ScreenRecorder;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -393,6 +395,56 @@ fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, l
     });
 }
 
+/// #302 Slice B — best-effort screen capture for a Call recording. Starts
+/// ONLY when every gate passes: Call mode (this is only ever called from
+/// `do_start`; self-notes take `do_start_self_note` and NEVER capture the
+/// screen), the org `screen_capture` feature is on (cached in auth.json),
+/// the per-user `screen_capture_enabled` opt-in is on, and the capture
+/// backend is available at runtime (binary present + a display). A `true`
+/// `screen_capture_enabled` implies the user completed the screen-capture
+/// consent ack when enabling it in Settings (Slice C gates enabling on the
+/// ack); the backend upload path is the authoritative consent backstop —
+/// it rejects `init` with `screen_capture_consent_required` and the
+/// uploader skips gracefully. This helper NEVER blocks or fails the audio
+/// recording: the ScreenRecorder degrades to "no video" internally and we
+/// ignore its boolean result.
+fn maybe_start_screen_capture(app: &AppHandle, session_dir: &std::path::Path) {
+    // Org feature flag (cached in auth.json). Absent / off → no capture.
+    let feature_on = config::read_auth_file()
+        .ok()
+        .flatten()
+        .map(|a| a.features.screen_capture)
+        .unwrap_or(false);
+    if !feature_on {
+        return;
+    }
+    // Per-user opt-in + the capture knobs.
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !cfg.screen_capture_enabled {
+        return;
+    }
+    let start_cfg = screen_recorder::StartConfig {
+        display: cfg.screen_capture_display.clone(),
+        fps: cfg.screen_capture_fps,
+        resolution: cfg.screen_capture_resolution.clone(),
+        bitrate_kbps: cfg.screen_capture_bitrate_kbps,
+    };
+    // Audio-start timestamp → the start-offset baseline. Falls back to now
+    // if the recorder hasn't stamped it (shouldn't happen — start() just
+    // succeeded before this call).
+    let audio_started_at_ms = app
+        .state::<Recorder>()
+        .started_at_ms()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    // Best-effort — logs + degrades internally; the bool is advisory only.
+    let _ = app
+        .state::<ScreenRecorder>()
+        .start(session_dir, &start_cfg, audio_started_at_ms);
+}
+
 pub(crate) fn do_start(
     state: &Recorder,
     app: &AppHandle,
@@ -456,6 +508,11 @@ pub(crate) fn do_start(
     if let Some(uuid) = &session_uuid {
         write_live_session(&path, uuid);
     }
+
+    // #302 Slice B — best-effort screen capture (Call mode only). Started
+    // right after the audio so the start-offset stays small; NEVER blocks
+    // or fails the audio recording.
+    maybe_start_screen_capture(app, &path);
 
     emit_state(
         app,
@@ -525,6 +582,12 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
 
 pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
+    // #302 Slice B — stop the screen capture (SIGINT → clean mp4 finalize)
+    // and persist screen/recording.json for the pipeline's upload step.
+    // No-op when no capture was running; fully best-effort (a finalize
+    // hiccup is logged, never surfaced — the call still saves). The
+    // remux + multipart upload runs async inside pipeline::run below.
+    app.state::<ScreenRecorder>().stop_and_persist(&path);
     // #live — flush + close the live relay (best-effort; no-op when idle).
     app.state::<live::LiveRelay>().end();
     emit_state(app, false, None, None, None);
@@ -1918,6 +1981,161 @@ fn list_input_devices() -> Result<Vec<recorder::DeviceEntry>, String> {
 #[tauri::command]
 fn platform_os() -> &'static str {
     std::env::consts::OS
+}
+
+// ── #302 Slice B — screen capture: displays, prefs, consent ──────────
+//
+// The Settings UI (Slice C) drives these: `list_displays` populates the
+// monitor picker, `get/set_screen_capture_prefs` round-trips the per-user
+// knobs, `screen_capture_ack` posts the (distinct, heavier) consent before
+// the toggle may be enabled, and `screen_capture_status` reports whether
+// capture can actually run (backend binary present + a display). The org
+// feature flag gate lives on `me.features.screen_capture` (read in the
+// layout) and is the security boundary server-side.
+
+/// Enumerate capturable monitors for the Settings picker. `name` is the
+/// exact capture target; `width`/`height` feed the "3840×2160" hint;
+/// `is_primary` marks the focused/primary output. Empty on a machine with
+/// no capture backend → the UI shows the "capture unavailable" state.
+#[tauri::command]
+fn list_displays() -> Vec<screen_recorder::DisplayInfo> {
+    screen_recorder::enumerate_displays()
+}
+
+#[derive(serde::Serialize)]
+struct ScreenCapturePrefs {
+    enabled: bool,
+    /// Saved monitor name; None = "use primary".
+    display: Option<String>,
+    fps: u32,
+    /// `"720p" | "1080p" | "native"`.
+    resolution: Option<String>,
+    bitrate_kbps: u32,
+}
+
+#[tauri::command]
+fn get_screen_capture_prefs() -> Result<ScreenCapturePrefs, String> {
+    let cfg = config::Config::load().map_err(|e| e.to_string())?;
+    Ok(ScreenCapturePrefs {
+        enabled: cfg.screen_capture_enabled,
+        display: cfg.screen_capture_display,
+        fps: cfg.screen_capture_fps,
+        resolution: cfg.screen_capture_resolution,
+        bitrate_kbps: cfg.screen_capture_bitrate_kbps,
+    })
+}
+
+/// Persist the per-user screen-capture knobs. Enabling (`enabled = true`)
+/// should only be reached after the consent ack in the Settings flow — the
+/// backend upload path is the authoritative backstop regardless. fps is
+/// clamped to [10, 30]; an empty display string is normalized to None
+/// ("use primary"); an unrecognized resolution falls back to "1080p".
+#[tauri::command]
+fn set_screen_capture_prefs(
+    enabled: bool,
+    display: Option<String>,
+    fps: u32,
+    resolution: Option<String>,
+    bitrate_kbps: u32,
+) -> Result<(), String> {
+    let display = display
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let fps = screen_recorder::clamp_fps(fps);
+    let resolution = match resolution.as_deref().map(str::trim) {
+        Some("720p") => Some("720p".to_string()),
+        Some("native") => Some("native".to_string()),
+        // Empty / unknown / "1080p" → the 1080p default cap.
+        _ => Some("1080p".to_string()),
+    };
+    // Clamp the bitrate to a sane band so a hand-edited pref can't request
+    // an absurd ceiling (0 would starve the encoder; the upper bound keeps
+    // the storage cost bounded).
+    let bitrate_kbps = bitrate_kbps.clamp(500, 20_000);
+    let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
+    cfg.screen_capture_enabled = enabled;
+    cfg.screen_capture_display = display;
+    cfg.screen_capture_fps = fps;
+    cfg.screen_capture_resolution = resolution;
+    cfg.screen_capture_bitrate_kbps = bitrate_kbps;
+    cfg.save().map_err(|e| e.to_string())
+}
+
+/// POST the screen-capture consent ack. The Settings toggle calls this
+/// before it enables capture (screen video is a distinct, heavier consent
+/// than the audio recording). Frontend passes the running agent version +
+/// platform (it has cheaper access to both than Rust on some paths).
+#[tauri::command]
+async fn screen_capture_ack(
+    agent_version: String,
+    platform: String,
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::post_screen_capture_ack(backend, &agent_version, &platform).await
+}
+
+/// Fetch the call's screen-recording metadata (Slice C player). The agent
+/// webview can't reach the backend directly (no token in the webview), so
+/// this shim proxies `GET /v1/calls/{id}/screen`. `None` on 404 → the
+/// player renders nothing. When ready, the payload carries the presigned
+/// `url` the `<video>` binds directly.
+#[tauri::command]
+async fn get_screen_recording(
+    id: String,
+) -> Result<Option<serde_json::Value>, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::get_screen_recording(backend, &id).await
+}
+
+#[derive(serde::Serialize)]
+struct ScreenCaptureStatus {
+    /// Whether a capture backend can run right now (binary + a display).
+    available: bool,
+    /// Whether a capture is in flight this instant.
+    capturing: bool,
+    /// Whether the user has recorded the screen-capture consent ack. Best-
+    /// effort network read; None when it couldn't be determined (offline).
+    consented: Option<bool>,
+    /// ISO-8601 `accepted_at` from the consent ack, for the Settings stamp
+    /// ("consent accepted on {date}"). None when there's no ack or it
+    /// couldn't be determined.
+    consented_at: Option<String>,
+}
+
+/// Report screen-capture readiness for the Settings UI: backend
+/// availability, whether a capture is live, and (best-effort) whether the
+/// consent ack exists. All three are advisory — the org feature flag gate
+/// + the backend consent gate remain the security boundaries.
+#[tauri::command]
+async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
+    let available = app.state::<ScreenRecorder>().is_available();
+    let capturing = app.state::<ScreenRecorder>().is_active();
+    // Best-effort consent probe — outer None on any error (offline / no
+    // backend). The ack GET returns `Some({ accepted_at })` when a row
+    // exists, so we surface both the boolean and the raw `accepted_at`
+    // (ISO string) the Settings stamp renders as the acceptance date.
+    let ack = match config::Config::load().ok().and_then(|c| c.backend) {
+        Some(backend) => portal::get_screen_capture_ack(&backend).await.ok(),
+        None => None,
+    };
+    let consented = ack.as_ref().map(|opt| opt.is_some());
+    let consented_at = ack.flatten().and_then(|v| {
+        v.get("accepted_at")
+            .and_then(|a| a.as_str())
+            .map(str::to_owned)
+    });
+    ScreenCaptureStatus {
+        available,
+        capturing,
+        consented,
+        consented_at,
+    }
 }
 
 // ── #659 P4 — floating always-on-top co-pilot overlay ────────────────
@@ -3491,6 +3709,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Recorder::new())
+        // #302 Slice B — screen-capture recorder. Process-scoped so
+        // do_start / do_stop reach the same in-flight capture via
+        // app.state, exactly like the audio Recorder.
+        .manage(ScreenRecorder::new())
         // #live — live-transcript relay controller (Phase 1). Process-scoped
         // so do_start / do_stop reach the same session via app.state.
         .manage(live::LiveRelay::new())
@@ -3557,6 +3779,15 @@ pub fn run() {
             set_app_prefs,
             list_input_devices,
             platform_os,
+            // #302 Slice B — screen capture: monitor picker, per-user
+            // prefs, the (distinct) consent ack, + a readiness probe.
+            // The org feature flag gate lives on me.features.screen_capture.
+            list_displays,
+            get_screen_capture_prefs,
+            set_screen_capture_prefs,
+            screen_capture_ack,
+            screen_capture_status,
+            get_screen_recording,
             // #659 P4 — floating always-on-top co-pilot overlay: open/close
             // the second webview + hydrate it from the cold-start snapshot
             // cache. Custom commands need no capability grant; the /overlay

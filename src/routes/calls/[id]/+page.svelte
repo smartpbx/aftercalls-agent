@@ -17,6 +17,8 @@
   } from "@aftercalls/shared/ui/SummaryText.svelte";
   import ActionItem from "@aftercalls/shared/ui/ActionItem.svelte";
   import ChipMenu from "@aftercalls/shared/ui/ChipMenu.svelte";
+  import ScreenRecordingPlayer from "@aftercalls/shared/ui/ScreenRecordingPlayer.svelte";
+  import type { ScreenRecording } from "@aftercalls/shared/types";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import SendToZohoModal, {
     type SzmPriorPush,
@@ -2693,6 +2695,16 @@
     }
   }
 
+  // #302 Slice C — screen-recording player wiring. The agent webview
+  // fetches metadata through a Rust shim (no token in the webview) and
+  // binds `<video src>` to the presigned url directly. The player is a
+  // follower of the audio master clock — `seekTo` above already moves
+  // `currentMs`, and the follower `$effect` inside the component aligns
+  // the frame.
+  const fetchScreenRecording = (id: string): Promise<ScreenRecording | null> =>
+    invoke<ScreenRecording | null>("get_screen_recording", { id });
+  const resolveScreenSrc = (m: ScreenRecording): string => m.url ?? "";
+
   function onTimeUpdate() {
     if (audioEl) currentMs = Math.floor(audioEl.currentTime * 1000);
   }
@@ -3716,6 +3728,19 @@
 
     <!-- ── Player ───────────────────────────────────────────────────────── -->
     <section class="player" style="--i: 1">
+      <!-- #302 Slice C — screen-recording video, a follower of the audio
+           master clock. Gated on the org flag AND a fetched row; renders
+           nothing otherwise (byte-identical to today's audio-only call). -->
+      {#if me?.features?.screen_capture}
+        <ScreenRecordingPlayer
+          callId={page.params.id ?? ""}
+          {currentMs}
+          {playing}
+          durationMs={call.duration_ms}
+          fetchMeta={fetchScreenRecording}
+          resolveSrc={resolveScreenSrc}
+        />
+      {/if}
       <div class="wave-host">
         <Waveform
           {peaks}

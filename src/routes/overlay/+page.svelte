@@ -56,9 +56,37 @@
 
   // Single inline ask slot + single in-flight guard (mirrors the Record
   // page's `handleAsk`). Degrades CALM: an unavailable ask lands a bone
-  // degrade line, never an error surface, never a vendor name.
-  let askAnswer = $state<{ chip: AskChip; answer: string } | null>(null);
+  // degrade line, never an error surface, never a vendor name. #660 P1:
+  // `empty` carries the backend's honest "nothing yet" so the overlay styles
+  // it distinct from an error/unavailable line (parity with the in-app lane).
+  let askAnswer = $state<{ chip: AskChip; answer: string; empty: boolean } | null>(
+    null,
+  );
   let askInFlight = $state<AskChip | null>(null);
+
+  // #660 P1 — escalating in-flight reassurance (parity with LiveTranscriptLane):
+  // a brief dot pulse carries fast asks (<2s, the common case now), only a slow
+  // tick escalates the copy. Timer runs only while an ask is in flight.
+  let askElapsed = $state(0);
+  $effect(() => {
+    if (!askInFlight) {
+      askElapsed = 0;
+      return;
+    }
+    askElapsed = 0;
+    const start = Date.now();
+    const t = setInterval(() => {
+      askElapsed = (Date.now() - start) / 1000;
+    }, 500);
+    return () => clearInterval(t);
+  });
+  let askBusyCopy = $derived(
+    askElapsed >= 6
+      ? "Still working — one moment"
+      : askElapsed >= 2
+        ? "Working…"
+        : "",
+  );
 
   // ── Presentation maps ────────────────────────────────────────────────
   const KIND_LABEL: Record<CoachingCardKind, string> = {
@@ -137,11 +165,16 @@
         sessionUuid,
         chip,
       })) as AskAnswer;
-      askAnswer = { chip, answer: res?.answer ?? "That's not available right now." };
+      askAnswer = {
+        chip,
+        answer: res?.answer ?? "Still working — give it another tap.",
+        empty: res?.empty === true,
+      };
     } catch {
-      // No retry-shame, no vendor name — indistinguishable from "hasn't
-      // generated yet".
-      askAnswer = { chip, answer: "That's not available right now." };
+      // No retry-shame, no vendor name — a warm re-tap line, never red. Not an
+      // empty-state (empty:false) so it reads as the error/unavailable
+      // treatment, distinct from a calm "nothing yet".
+      askAnswer = { chip, answer: "Still working — give it another tap.", empty: false };
     } finally {
       askInFlight = null;
     }
@@ -312,15 +345,33 @@
          four presets + calm degrade as the in-app panel. Disabled until a
          live session exists / while one is in flight. -->
     {#if askAnswer}
-      <div class="ov-answer">
+      <div class="ov-answer" class:empty={askAnswer.empty}>
         <button
           type="button"
           class="ov-answer-dismiss"
           aria-label="Dismiss answer"
           onclick={dismissAsk}
         >×</button>
-        <span class="ov-answer-label">{ASK_LABEL[askAnswer.chip]}</span>
+        <span class="ov-answer-label"
+          >{ASK_LABEL[askAnswer.chip]}{#if askAnswer.empty}<span
+              class="ov-answer-empty-tag"
+            >
+              · nothing yet</span
+            >{/if}</span
+        >
         <p class="ov-answer-text" aria-live="polite">{askAnswer.answer}</p>
+      </div>
+    {/if}
+    <!-- In-flight "typing" indicator (#660 P1) — parity with the in-app lane:
+         a light dot pulse + escalating copy so a slow ask never feels hung. -->
+    {#if askInFlight}
+      <div class="ov-busy" role="status" aria-live="polite">
+        <span class="ov-busy-dots" class:reduce={reduceMotion} aria-hidden="true">
+          <i></i><i></i><i></i>
+        </span>
+        {#if askBusyCopy}
+          <span class="ov-busy-copy">{askBusyCopy}</span>
+        {/if}
       </div>
     {/if}
     <div class="ov-chips" role="group" aria-label="Quick recap">
@@ -563,6 +614,70 @@
     color: var(--bone-0);
     overflow-wrap: anywhere;
     white-space: pre-wrap;
+  }
+
+  /* #660 P1 — empty-state treatment: an honest "nothing yet" reads calm +
+     muted, clearly distinct from an error/unavailable line (drop the accent
+     rail, mute + italicize the body, quiet tag by the label). */
+  .ov-answer.empty {
+    border-left-color: var(--hairline);
+  }
+  .ov-answer-empty-tag {
+    font-size: 0.6rem;
+    letter-spacing: 0.04em;
+    color: var(--bone-3);
+  }
+  .ov-answer.empty .ov-answer-text {
+    color: var(--bone-3);
+    font-style: italic;
+  }
+
+  /* #660 P1 — in-flight "typing" indicator (parity with LiveTranscriptLane):
+     a light three-dot pulse + escalating copy; never a spinner, never red. */
+  .ov-busy {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.1rem 0.1rem;
+  }
+  .ov-busy-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .ov-busy-dots i {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--bone-3);
+    animation: ov-typing 1.2s ease-in-out infinite;
+  }
+  .ov-busy-dots i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .ov-busy-dots i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  .ov-busy-dots.reduce i {
+    animation: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ov-busy-dots i {
+      animation: none;
+    }
+  }
+  @keyframes ov-typing {
+    0%,
+    100% {
+      opacity: 0.3;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .ov-busy-copy {
+    font-size: 0.72rem;
+    color: var(--bone-3);
   }
 
   /* ── Ask chips ──────────────────────────────────────────────────────── */

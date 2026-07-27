@@ -1353,6 +1353,107 @@ pub async fn get_recording_prefs(backend: &Backend) -> std::result::Result<Value
     get_json_typed(backend, "/v1/org/recording-prefs").await
 }
 
+// ── Screen-capture consent ack (#302 Slice B) ────────────────────────
+//
+// Screen capture is a DISTINCT, heavier consent than the audio recording
+// ack (it records the whole screen as continuous video). The backend
+// keeps a separate `screen_capture_acknowledgments` row; the Settings
+// toggle (Slice C) posts the ack before it lets the user enable capture,
+// and the upload path rejects with `screen_capture_consent_required`
+// (400) until a row exists. Shapes mirror the audio recording-ack pair
+// above verbatim.
+
+/// `GET /v1/me/screen-capture-ack` → Some(accepted_at) when the user has
+/// acknowledged, None on 404. Any other status is a structured error so a
+/// network blip isn't mistaken for an un-acked user.
+pub async fn get_screen_capture_ack(
+    backend: &Backend,
+) -> std::result::Result<Option<Value>, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/me/screen-capture-ack",
+        backend.url.trim_end_matches('/')
+    );
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
+    }
+    let text = resp.text().await.map_err(PortalError::from)?;
+    let v: Value = serde_json::from_str(&text).map_err(PortalError::from)?;
+    Ok(Some(v))
+}
+
+/// `POST /v1/me/screen-capture-ack` — record the screen-capture consent
+/// for the current user. Body carries the running agent version +
+/// platform (the agent knows both cheaply). 204 on success.
+pub async fn post_screen_capture_ack(
+    backend: &Backend,
+    agent_version: &str,
+    platform: &str,
+) -> std::result::Result<(), PortalError> {
+    post_nop_typed(
+        backend,
+        "/v1/me/screen-capture-ack",
+        serde_json::json!({
+            "agent_version": agent_version,
+            "platform": platform,
+        }),
+    )
+    .await
+}
+
+/// `GET /v1/calls/{id}/screen` → screen-recording metadata (Slice A).
+/// `Some(json)` when a row exists, `None` on 404 (org flag off OR no
+/// recording — the call-detail player renders nothing). The JSON passes
+/// straight through to the frontend, which types it as
+/// `@aftercalls/shared/types → ScreenRecording`. When `status='ready'`
+/// the payload carries a short-lived presigned `url` the `<video>` binds
+/// directly (Spaces serves Range natively — no proxy needed). Mirrors the
+/// `get_screen_capture_ack` GET shape verbatim.
+pub async fn get_screen_recording(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Option<Value>, PortalError> {
+    // #302 review (security low #1): defense-in-depth — reject a non-UUID
+    // `call_id` before it reaches the URL. `reqwest`/`url` normalize
+    // dot-segments at parse time, so a crafted `../`-bearing id could
+    // otherwise redirect this Bearer-authenticated request to a different
+    // path on the same backend host. Only first-party webview JS invokes
+    // this command, but the guard is free.
+    if uuid::Uuid::parse_str(call_id).is_err() {
+        return Err(PortalError::Other {
+            message: "invalid call id".into(),
+        });
+    }
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/calls/{}/screen",
+        backend.url.trim_end_matches('/'),
+        call_id
+    );
+    let resp = c.get(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let retry = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(from_status(status, body, retry));
+    }
+    let text = resp.text().await.map_err(PortalError::from)?;
+    let v: Value = serde_json::from_str(&text).map_err(PortalError::from)?;
+    Ok(Some(v))
+}
+
 // ── Terms of Service / Privacy gate (#320) ───────────────────────────
 
 /// Public endpoint — no auth required. Returns the latest published

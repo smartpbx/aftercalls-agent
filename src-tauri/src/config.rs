@@ -154,10 +154,53 @@ pub struct Config {
     /// config.toml files loading cleanly.
     #[serde(default)]
     pub overlay_enabled: bool,
+    /// #302 Slice B — per-user opt-in for screen capture during Calls.
+    /// Default OFF: capture is a distinct, heavier consent than the audio
+    /// recording and must never surprise a user on upgrade. When true AND
+    /// the org's `screen_capture` feature is on AND the capture backend is
+    /// available, a Call recording also captures the chosen display as
+    /// video. Enabling this in Settings first requires the screen-capture
+    /// consent ack (Slice C), so a true value here implies consent was
+    /// recorded; the backend upload path is the authoritative consent
+    /// backstop. Serde default keeps existing config.toml files loading.
+    #[serde(default)]
+    pub screen_capture_enabled: bool,
+    /// #302 Slice B — chosen monitor to capture (`-w` target name, as
+    /// printed by the capture backend's monitor list). `None` = pick the
+    /// focused/primary display. Serialized only when set so a fresh
+    /// install / "use primary" state leaves the key absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_capture_display: Option<String>,
+    /// #302 Slice B — capture frame rate. Default 15; the UI + capture
+    /// path clamp to [10, 30]. 15 fps is enough to preserve motion in a
+    /// shared video/demo while keeping the storage cost bounded.
+    #[serde(default = "default_screen_capture_fps")]
+    pub screen_capture_fps: u32,
+    /// #302 Slice B — resolution cap keyword: `"720p" | "1080p" |
+    /// "native"`. Default `"1080p"` (fit-within cap, native-capped).
+    #[serde(default = "default_screen_capture_resolution")]
+    pub screen_capture_resolution: Option<String>,
+    /// #302 Slice B — CBR bitrate ceiling in kbps. Default ~3000 keeps a
+    /// 30-min 1080p@15 call ≈ 0.7 GB and bounds the worst case (a shared
+    /// 4K video playback can't blow the storage budget).
+    #[serde(default = "default_screen_capture_bitrate_kbps")]
+    pub screen_capture_bitrate_kbps: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_screen_capture_fps() -> u32 {
+    15
+}
+
+fn default_screen_capture_resolution() -> Option<String> {
+    Some("1080p".to_string())
+}
+
+fn default_screen_capture_bitrate_kbps() -> u32 {
+    3000
 }
 
 fn default_max_recording_minutes() -> u32 {
@@ -225,6 +268,11 @@ impl Config {
                 auto_record_start_enabled: false,
                 auto_record_stop_enabled: false,
                 overlay_enabled: false,
+                screen_capture_enabled: false,
+                screen_capture_display: None,
+                screen_capture_fps: default_screen_capture_fps(),
+                screen_capture_resolution: default_screen_capture_resolution(),
+                screen_capture_bitrate_kbps: default_screen_capture_bitrate_kbps(),
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;
@@ -400,6 +448,15 @@ pub struct FeatureFlags {
     /// mount. Mirrors the backend `FeaturesSnapshot.copilot`.
     #[serde(default)]
     pub copilot: bool,
+    /// #302 Slice B — org-level screen-capture feature. Same all-false
+    /// default + serde(default) posture: without this field the backend
+    /// `screen_capture` key would be silently dropped, so `do_start`'s
+    /// capture gate would never see it and the Settings surface (Slice C)
+    /// would never render. The backend remains the security boundary; this
+    /// only gates the local capture-start + UI. Mirrors the backend
+    /// `FeaturesSnapshot.screen_capture`.
+    #[serde(default)]
+    pub screen_capture: bool,
 }
 
 /// Mirror of the backend's `SeatUsage` (see

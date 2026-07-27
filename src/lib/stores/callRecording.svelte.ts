@@ -72,6 +72,12 @@ function createStore() {
   let callId = $state<string>("");
   /** Sanitized error string for the failed surface. Plain text. */
   let errorMessage = $state<string>("");
+  /** #302 Slice C — whether the screen is ALSO being captured for this
+   *  call. Driven by the floater polling `screen_capture_status()` while
+   *  live (no dedicated backend event this slice). Widens the floater to
+   *  "Recording call + screen" + a SCREEN chip; the audio Stop halts both
+   *  together on the Rust side. */
+  let screenActive = $state(false);
 
   let timerHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -124,6 +130,9 @@ function createStore() {
     get errorMessage(): string {
       return errorMessage;
     },
+    get screenActive(): boolean {
+      return screenActive;
+    },
 
     /** Transition into the live recording state. Called from the
      *  layout's `recording-state` listener when `recording=true`.
@@ -134,6 +143,7 @@ function createStore() {
       stage = "live";
       callId = "";
       errorMessage = "";
+      screenActive = false;
       state = "recording";
       startTimer(seedAtMs);
     },
@@ -180,6 +190,14 @@ function createStore() {
       errorMessage = msg;
     },
 
+    /** #302 Slice C — the floater's `screen_capture_status()` poll writes
+     *  this while the call is live. Idempotent; ignored once the call
+     *  leaves the live state (post-stop the screen capture is done too). */
+    setScreenActive(active: boolean) {
+      if (state !== "recording") return;
+      screenActive = active;
+    },
+
     /** Called by the layout's auto-fade `setTimeout` after `done`.
      *  Idempotent — a second call from a stale timer is a no-op. */
     reset() {
@@ -191,6 +209,7 @@ function createStore() {
       elapsedMs = 0;
       callId = "";
       errorMessage = "";
+      screenActive = false;
     },
 
     /** Floater calls this when the user clicks Stop. The Record page

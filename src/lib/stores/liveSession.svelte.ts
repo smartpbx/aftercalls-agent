@@ -45,6 +45,11 @@ export type AskAnswerState = {
   chip: AskChip;
   answer: string;
   basedOnTurns: number | null;
+  /** #660 P1 — the backend's honest "nothing yet" flag. When true the lane
+   *  renders a calm empty-state treatment (muted body + "nothing yet" tag),
+   *  visually distinct from a real answer or an error/unavailable line. Defaults
+   *  false (a normal answer or a degrade line). */
+  empty?: boolean;
 };
 
 /** #660 — derived talk-time metric (plan §5, client-side, from segment
@@ -348,10 +353,16 @@ function createStore() {
     },
 
     /** #660 — settle the inline answer slot (replace-in-place). Clears the
-     *  in-flight guard. `answer` may be a real answer or a calm degrade
-     *  line — both render identically. */
-    setAskAnswer(chip: AskChip, answer: string, basedOnTurns: number | null) {
-      askAnswer = { chip, answer, basedOnTurns };
+     *  in-flight guard. `answer` may be a real answer, a calm "nothing yet"
+     *  (`empty:true`), or an error/unavailable degrade line — the lane styles
+     *  each distinctly (P1). */
+    setAskAnswer(
+      chip: AskChip,
+      answer: string,
+      basedOnTurns: number | null,
+      empty = false,
+    ) {
+      askAnswer = { chip, answer, basedOnTurns, empty };
       askInFlight = null;
     },
 

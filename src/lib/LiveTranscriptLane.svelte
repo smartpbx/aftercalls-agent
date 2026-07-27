@@ -119,6 +119,33 @@
     }
   }
 
+  // ── In-flight "typing" reassurance (ui.md §1e / #660 P1) ────────────────
+  // A live three-dot pulse plus escalating copy while an ask is in flight so
+  // it never feels hung. With minimal reasoning most asks now settle <2s → the
+  // brief dot pulse carries them with no nagging text; only a genuinely slow
+  // tick escalates ("Working…" → "Still working — one moment"). The timer runs
+  // only while `askInFlight` is set and is torn down the instant it clears.
+  let askElapsed = $state(0); // seconds since the current ask started
+  $effect(() => {
+    if (!askInFlight) {
+      askElapsed = 0;
+      return;
+    }
+    askElapsed = 0;
+    const start = Date.now();
+    const t = setInterval(() => {
+      askElapsed = (Date.now() - start) / 1000;
+    }, 500);
+    return () => clearInterval(t);
+  });
+  let askBusyCopy = $derived(
+    askElapsed >= 6
+      ? "Still working — one moment"
+      : askElapsed >= 2
+        ? "Working…"
+        : "",
+  );
+
   // ── Star / highlight (plan item 4, ui.md §5 boundary) ───────────────────
   function segKey(s: LiveSegment): string {
     return s.channel + ":" + s.start_ms;
@@ -253,6 +280,7 @@
   {#if askAnswer}
     <div
       class="live-ask-answer"
+      class:empty={askAnswer.empty}
       aria-live="polite"
       aria-atomic="true"
       onkeydowncapture={onAnswerKeydown}
@@ -262,6 +290,9 @@
     >
       <div class="live-ask-answer-head">
         <span class="live-ask-answer-kind">{ASK_MICRO[askAnswer.chip]}</span>
+        {#if askAnswer.empty}
+          <span class="live-ask-answer-empty-tag">· nothing yet</span>
+        {/if}
         {#if askAnswer.basedOnTurns !== null && askAnswer.basedOnTurns > 0}
           <span class="live-ask-answer-turns"
             >· {askAnswer.basedOnTurns} turns</span
@@ -280,6 +311,21 @@
            (ui.md §1c) — the body is the only scrollable region here. -->
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <p class="live-ask-answer-body" tabindex="0">{askAnswer.answer}</p>
+    </div>
+  {/if}
+
+  <!-- In-flight "typing" indicator (ui.md §1e / #660 P1) — a light three-dot
+       pulse + escalating reassurance copy so a slow ask never feels hung. On a
+       first ask it fills the dead gap; on a re-ask it sits beneath the
+       still-visible prior answer. Never a spinner, never red. -->
+  {#if askInFlight}
+    <div class="live-ask-busy" role="status" aria-live="polite">
+      <span class="live-ask-busy-dots" class:reduce={reduceMotion} aria-hidden="true">
+        <i></i><i></i><i></i>
+      </span>
+      {#if askBusyCopy}
+        <span class="live-ask-busy-copy">{askBusyCopy}</span>
+      {/if}
     </div>
   {/if}
 
@@ -513,6 +559,71 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: var(--radius-sm);
+  }
+
+  /* ── Empty-state treatment (#660 P1 §1d) ──────────────────────────────
+     An honest "nothing yet" is a VALID result, not a failure — render it
+     calm + muted and clearly distinct from the error/unavailable line:
+     no accent, a quiet "· nothing yet" tag by the micro-label, italic
+     muted body. The `based_on_turns` caption still rides so the rep sees
+     the model DID look. */
+  .live-ask-answer-empty-tag {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--bone-3);
+  }
+  .live-ask-answer.empty .live-ask-answer-body {
+    color: var(--bone-3);
+    font-style: italic;
+  }
+
+  /* ── In-flight "typing" indicator (#660 P1 §1e) ───────────────────────
+     A light three-dot pulse (reuse the pip glow idiom) + escalating copy;
+     component-scoped, no app.css edit. Never a spinner, never red. */
+  .live-ask-busy {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.1rem;
+  }
+  .live-ask-busy-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+  }
+  .live-ask-busy-dots i {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--bone-3);
+    animation: live-ask-typing 1.2s ease-in-out infinite;
+  }
+  .live-ask-busy-dots i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .live-ask-busy-dots i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  .live-ask-busy-dots.reduce i {
+    animation: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .live-ask-busy-dots i {
+      animation: none;
+    }
+  }
+  @keyframes live-ask-typing {
+    0%,
+    100% {
+      opacity: 0.3;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .live-ask-busy-copy {
+    font-size: 0.75rem;
+    color: var(--bone-3);
   }
 
   /* ── Stream wrapper + jump-to-live (ui.md §3) ─────────────────────────

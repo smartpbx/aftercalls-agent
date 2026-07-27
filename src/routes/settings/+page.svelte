@@ -5,7 +5,12 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
-  import { loadRecordingPrefs, type RecordingNotificationMode } from "$lib/compliance";
+  import {
+    loadRecordingPrefs,
+    detectPlatform,
+    type RecordingNotificationMode,
+  } from "$lib/compliance";
+  import ScreenCaptureConsentModal from "$lib/ScreenCaptureConsentModal.svelte";
   import { invalidateAppPrefs } from "$lib/stores/appPrefs.svelte";
   import { setSentryTelemetryAllowed } from "$lib/sentry";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
@@ -581,6 +586,170 @@
     }
   }
 
+  // ── #302 Slice C — screen-recording section ────────────────────────
+  //
+  // Per-user opt-in (default OFF), consent-gated. Enabling routes through
+  // the dedicated `set_screen_capture_prefs` command pair (NOT the shared
+  // AppPrefs round-trip) — Slice B owns those knobs. Flipping the switch
+  // ON with no prior ack opens the consent modal and does NOT persist
+  // `enabled=true` until the ack POSTs. Card + fetches gate on
+  // `me.features.screen_capture`; the toggle additionally self-disables
+  // when the capture backend isn't present on this machine.
+  type DisplayInfo = {
+    name: string;
+    width: number;
+    height: number;
+    is_primary: boolean;
+  };
+  type ScreenResolution = "720p" | "1080p" | "native";
+
+  let scrEnabled = $state(false);
+  // null = "use primary display".
+  let scrDisplay = $state<string | null>(null);
+  let scrFps = $state("15");
+  let scrResolution = $state<ScreenResolution>("1080p");
+  let scrBitrate = $state(8000);
+  let scrDisplays = $state<DisplayInfo[]>([]);
+  let scrAvailable = $state(true);
+  let scrConsented = $state<boolean | null>(null);
+  // ISO `accepted_at` from the consent ack, for the acceptance-date stamp.
+  let scrConsentedAt = $state<string | null>(null);
+  let scrSaving = $state(false);
+  let scrShowBitrate = $state(false);
+  let scrConsentModalOpen = $state(false);
+  let scrConsentSubmitting = $state(false);
+  let scrConsentError = $state("");
+
+  let screenCaptureFeature = $derived(!!me?.features?.screen_capture);
+
+  // Acceptance date for the consent stamp, in the app's standard short-date
+  // shape (same `toLocaleDateString` idiom as the calls list / share modal).
+  // Null when the ack carries no date → the stamp falls back to dateless.
+  let scrConsentedOn = $derived(
+    scrConsentedAt
+      ? new Date(scrConsentedAt).toLocaleDateString(undefined, {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })
+      : null,
+  );
+
+  const scrFpsOptions = [
+    { value: "15", label: "15 fps" },
+    { value: "24", label: "24 fps" },
+    { value: "30", label: "30 fps" },
+  ];
+  const scrResolutionOptions: { value: ScreenResolution; label: string }[] = [
+    { value: "720p", label: "720p" },
+    { value: "1080p", label: "1080p" },
+    { value: "native", label: "Native" },
+  ];
+
+  async function loadScreenCapture() {
+    if (!me?.features?.screen_capture) return;
+    try {
+      const prefs = await invoke<{
+        enabled: boolean;
+        display: string | null;
+        fps: number;
+        resolution: string | null;
+        bitrate_kbps: number;
+      }>("get_screen_capture_prefs");
+      scrEnabled = prefs.enabled;
+      scrDisplay = prefs.display;
+      // Snap a hand-edited fps to the nearest supported pill for display;
+      // the actual value round-trips clamped [10,30] on the Rust side.
+      scrFps = [15, 24, 30].includes(prefs.fps) ? String(prefs.fps) : "15";
+      scrResolution =
+        prefs.resolution === "720p" || prefs.resolution === "native"
+          ? prefs.resolution
+          : "1080p";
+      scrBitrate = prefs.bitrate_kbps;
+    } catch (e) {
+      console.warn("get_screen_capture_prefs failed", e);
+    }
+    try {
+      const st = await invoke<{
+        available: boolean;
+        capturing: boolean;
+        consented: boolean | null;
+        consented_at: string | null;
+      }>("screen_capture_status");
+      scrAvailable = st.available;
+      scrConsented = st.consented;
+      scrConsentedAt = st.consented_at;
+    } catch (e) {
+      console.warn("screen_capture_status failed", e);
+      scrAvailable = false;
+    }
+    try {
+      scrDisplays = await invoke<DisplayInfo[]>("list_displays");
+    } catch (e) {
+      console.warn("list_displays failed", e);
+      scrDisplays = [];
+    }
+  }
+
+  async function persistScreenPrefs(enabled: boolean) {
+    scrSaving = true;
+    error = "";
+    try {
+      await invoke("set_screen_capture_prefs", {
+        enabled,
+        display: scrDisplay,
+        fps: parseInt(scrFps, 10) || 15,
+        resolution: scrResolution,
+        bitrateKbps: Math.round(Number(scrBitrate) || 8000),
+      });
+      scrEnabled = enabled;
+    } catch (e) {
+      error = portalErrorToText(e);
+    } finally {
+      scrSaving = false;
+    }
+  }
+
+  // Enable is consent-gated; disable is immediate. The switch is a
+  // controlled `checked={scrEnabled}` input, so if we DON'T flip
+  // `scrEnabled` here (gate path), Svelte snaps the checkbox back off.
+  function onScreenToggle(next: boolean) {
+    if (!next) {
+      void persistScreenPrefs(false);
+      return;
+    }
+    if (scrConsented === true) {
+      void persistScreenPrefs(true);
+    } else {
+      scrConsentError = "";
+      scrConsentModalOpen = true;
+    }
+  }
+
+  async function onScreenConsentAccept() {
+    scrConsentSubmitting = true;
+    scrConsentError = "";
+    try {
+      const version = await getVersion();
+      await invoke("screen_capture_ack", {
+        agentVersion: version,
+        platform: detectPlatform(),
+      });
+      scrConsented = true;
+      await persistScreenPrefs(true);
+      scrConsentModalOpen = false;
+    } catch (e) {
+      scrConsentError = portalErrorToText(e).replace(/^Error:\s*/, "");
+    } finally {
+      scrConsentSubmitting = false;
+    }
+  }
+
+  function onScreenConsentCancel() {
+    if (scrConsentSubmitting) return;
+    scrConsentModalOpen = false;
+  }
+
   // #596 — auto-record helpers. The Settings → Auto-record section
   // surfaces relative timestamps ("Last used: 2 hours ago"), so this
   // tiny formatter keeps the markup clean. Coarse buckets are good
@@ -796,6 +965,9 @@
     await loadAppPrefs();
     await loadAutostart();
     await loadInputDevices();
+    // #302 Slice C — screen-recording section. No-ops when the org flag
+    // is off; the card itself is also gated so nothing renders.
+    void loadScreenCapture();
     // #596 — auto-record bundle (master toggles + observed_apps list).
     // Errors here are non-fatal: the section renders an inline retry
     // hint and the rest of the page stays usable.
@@ -1849,6 +2021,194 @@
     </div>
   </section>
 
+  <!-- #302 Slice C — screen recording (video) opt-in. Own card (the
+       consent gravity + monitor/quality controls earn separation),
+       gated entirely on the org `screen_capture` feature flag. Default
+       OFF; enabling is consent-gated via ScreenCaptureConsentModal. -->
+  {#if screenCaptureFeature}
+    <section class="card" style="--i: 1.6">
+      <div class="card-head">
+        <div>
+          <h2>
+            <svg
+              class="scr-head-glyph"
+              viewBox="0 0 20 20"
+              width="15"
+              height="15"
+              aria-hidden="true"
+            >
+              <rect
+                x="2.2"
+                y="3.5"
+                width="15.6"
+                height="10"
+                rx="1.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <path
+                d="M7.5 16.5 h5 M10 13.5 v3"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                fill="none"
+              />
+            </svg>
+            Screen recording
+          </h2>
+          <p class="hint">
+            Record your screen as video during calls so you can review
+            what was shown. Per computer, off by default.
+          </p>
+        </div>
+        {#if scrSaving}<span class="saved">Saving…</span>{/if}
+      </div>
+
+      <div class="pref-row">
+        <div class="pref-label">
+          <span class="pref-title">Record my screen during calls</span>
+          <span class="pref-hint" id="scr-enable-hint">
+            Off by default. When on, your screen is recorded as video
+            while a call is recording, so you can review what was shown.
+            Never used for the AI summary.
+          </span>
+          {#if !scrAvailable}
+            <span class="pref-hint scr-unavailable">
+              Screen recording isn't available on this device.
+            </span>
+          {/if}
+        </div>
+        <label class="switch" aria-busy={scrSaving ? "true" : undefined}>
+          <input
+            type="checkbox"
+            checked={scrEnabled}
+            disabled={scrSaving || !scrAvailable}
+            aria-describedby="scr-enable-hint"
+            onchange={(e) =>
+              onScreenToggle((e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="track" aria-hidden="true">
+            <span class="knob"></span>
+          </span>
+          <span class="switch-label">
+            {scrSaving ? "…" : scrEnabled ? "On" : "Off"}
+          </span>
+        </label>
+      </div>
+
+      {#if scrEnabled}
+        <div class="pref-row">
+          <div class="pref-label">
+            <span class="pref-title">Display</span>
+            <span class="pref-hint">Only the display you pick is recorded.</span>
+          </div>
+          <select
+            class="input scr-display-select"
+            disabled={scrSaving || scrDisplays.length <= 1}
+            value={scrDisplay ?? ""}
+            onchange={(e) => {
+              const v = (e.currentTarget as HTMLSelectElement).value;
+              scrDisplay = v || null;
+              void persistScreenPrefs(scrEnabled);
+            }}
+          >
+            <option value="">Primary display</option>
+            {#each scrDisplays as d (d.name)}
+              <option value={d.name}>
+                {d.name}{d.width
+                  ? ` (${d.width}×${d.height})`
+                  : ""}{d.is_primary ? " · primary" : ""}
+              </option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="pref-row">
+          <div class="pref-label">
+            <span class="pref-title">Frame rate</span>
+            <span class="pref-hint">
+              Higher settings capture more detail but use more space;
+              recordings are kept for a limited time.
+            </span>
+          </div>
+          <Segmented
+            options={scrFpsOptions}
+            bind:value={scrFps}
+            ariaLabel="Screen capture frame rate"
+            disabled={scrSaving}
+            onchange={() => void persistScreenPrefs(scrEnabled)}
+          />
+        </div>
+
+        <div class="pref-row">
+          <div class="pref-label">
+            <span class="pref-title">Resolution</span>
+            <span class="pref-hint">
+              Native captures the display at its full resolution.
+            </span>
+          </div>
+          <Segmented
+            options={scrResolutionOptions}
+            bind:value={scrResolution}
+            ariaLabel="Screen capture resolution"
+            disabled={scrSaving}
+            onchange={() => void persistScreenPrefs(scrEnabled)}
+          />
+        </div>
+
+        <button
+          type="button"
+          class="scr-more-btn"
+          aria-expanded={scrShowBitrate}
+          onclick={() => (scrShowBitrate = !scrShowBitrate)}
+        >
+          {scrShowBitrate ? "Fewer options" : "More"}
+        </button>
+        {#if scrShowBitrate}
+          <div class="pref-row">
+            <div class="pref-label">
+              <span class="pref-title">Bitrate (kbps)</span>
+              <span class="pref-hint">
+                Advanced. Higher bitrate is sharper but larger. Between
+                500 and 20000.
+              </span>
+            </div>
+            <input
+              class="input num-input"
+              type="number"
+              min="500"
+              max="20000"
+              step="500"
+              bind:value={scrBitrate}
+              onchange={() => void persistScreenPrefs(scrEnabled)}
+            />
+          </div>
+        {/if}
+      {/if}
+
+      {#if scrConsented}
+        <p class="consent-stamp">
+          {#if scrConsentedOn}
+            Screen-recording consent accepted on {scrConsentedOn}.
+          {:else}
+            Screen-recording consent accepted.
+          {/if}
+          <button
+            type="button"
+            class="scr-review"
+            onclick={() => {
+              scrConsentError = "";
+              scrConsentModalOpen = true;
+            }}
+          >
+            Review
+          </button>
+        </p>
+      {/if}
+    </section>
+  {/if}
+
   <!-- #592 — Privacy summary entry point. Mirrors the portal's
        `/settings → /settings/privacy` card so a user on the agent can
        reach the same read-only posture surface (TOS history, calls
@@ -2071,6 +2431,18 @@
     >Privacy</a>
   </footer>
 </main>
+
+<!-- #302 Slice C — the distinct, heavier screen-capture consent. Opens
+     from the enable toggle's first flip; on accept it posts the ack then
+     persists enabled=true. Never persists enabled ahead of the ack. -->
+{#if scrConsentModalOpen}
+  <ScreenCaptureConsentModal
+    submitting={scrConsentSubmitting}
+    error={scrConsentError}
+    onaccept={onScreenConsentAccept}
+    oncancel={onScreenConsentCancel}
+  />
+{/if}
 
 <style>
   .page {
@@ -2888,6 +3260,61 @@
     text-decoration: underline;
     cursor: pointer;
   }
+  /* #302 Slice C — screen-recording card. All component-scoped; reuses
+   * the shared pref-row / switch / input / num-input vocabulary plus the
+   * shared Segmented primitive. */
+  .scr-head-glyph {
+    color: var(--bone-2);
+    margin-right: 0.35rem;
+    vertical-align: -0.1em;
+  }
+  .scr-unavailable {
+    color: var(--sig);
+  }
+  .scr-display-select {
+    min-width: 15rem;
+    max-width: 100%;
+  }
+  .scr-more-btn {
+    appearance: none;
+    align-self: flex-start;
+    margin: 0.15rem 0 0.4rem;
+    padding: 0.25rem 0;
+    background: transparent;
+    border: none;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: color 0.15s;
+  }
+  .scr-more-btn:hover {
+    color: var(--accent-hi);
+  }
+  .consent-stamp {
+    margin: 0.85rem 0 0;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--hairline);
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--bone-3);
+  }
+  .scr-review {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    padding: 0 0 0 0.35rem;
+    color: var(--accent);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .scr-review:hover {
+    color: var(--accent-hi);
+  }
+
   .inline-btn:hover {
     color: var(--accent-hi);
   }
