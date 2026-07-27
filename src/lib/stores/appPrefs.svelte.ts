@@ -40,6 +40,11 @@ export type AppPrefs = {
    *  reads these directly. */
   auto_record_start_enabled: boolean;
   auto_record_stop_enabled: boolean;
+  /** #659 P4 — opt-in for the floating always-on-top co-pilot overlay.
+   *  Default false. Read by the layout's record-start handler to decide
+   *  whether to open the `/overlay` window (Call mode + live transcript on);
+   *  toggled from the Settings → Co-pilot row. */
+  overlay_enabled: boolean;
 };
 
 let cached: AppPrefs | null = null;

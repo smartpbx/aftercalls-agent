@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.20.0"
+version = "0.21.0"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -38,6 +38,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "process"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rubato = "4"
+earshot = "1"
+uuid = { version = "1", features = ["v4"] }
+# futures Sink/Stream extension traits for the tokio-tungstenite live-relay
+# WebSocket (SinkExt::send/close, StreamExt::split/next). tokio-tungstenite's
+# WebSocketStream is a futures Sink+Stream; these traits are the standard
+# companion. Already resolved transitively (reqwest); promoted to a direct
+# dep so the live module can `use` them.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 toml = "0.8"
 dirs = "5"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }

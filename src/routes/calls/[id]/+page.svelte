@@ -1470,6 +1470,110 @@
   let editingSpeakerUserId = $state<string | null>(null);
   let editingSpeakerUserName = $state<string | null>(null);
 
+  // ── #661 · speaker-identity Phase A — never-silent naming suggestions ──
+  // Metadata-derived proposals for a diarized speaker (external contact
+  // from the call's resolved CRM contact). Rendered as an editable
+  // confirm chip on the Participants row; NOTHING is written to the
+  // transcript/summary until the user Confirms (which reuses the existing
+  // rename-speaker flow). The live Phase A contract has no fresh-vs-memory
+  // field, so `provenance` is optional/forward-looking (ui.md §4).
+  type SpeakerSuggestion = {
+    id: string;
+    channel: string;
+    speaker_label: string;
+    suggested_user_id: string | null;
+    suggested_name: string;
+    source: string; // 'metadata' | 'voiceprint'
+    confidence: number | null;
+    provenance?: string; // 'fresh' | 'memory' — absent in the live contract
+  };
+  let speakerSuggestions = $state<SpeakerSuggestion[]>([]);
+  let dismissingSuggestionId = $state<string | null>(null);
+  // Scroll-to target + one-shot pulse for the banner's "Review" nudge.
+  let participantsEl = $state<HTMLElement | null>(null);
+  let participantsPulse = $state(false);
+  // `suggestionByLabel` / `unresolvedSuggestionCount` are declared after
+  // the `speakers` derived (below) — they depend on it.
+
+  async function loadSpeakerSuggestions() {
+    if (!call) return;
+    try {
+      speakerSuggestions = await invoke<SpeakerSuggestion[]>(
+        "call_speaker_suggestions",
+        { id: call.id },
+      );
+    } catch {
+      // Non-fatal — suggestions are an enhancement, not core content.
+      speakerSuggestions = [];
+    }
+  }
+
+  // Provenance caption. Source-derived today (the live contract carries no
+  // fresh-vs-memory discriminator); refines automatically if a
+  // `provenance` field ever lands. Vendor-opaque — "Zoho" is sanctioned.
+  function suggestionCaption(s: SpeakerSuggestion): string {
+    if (s.provenance === "memory") return "Remembered from a previous call";
+    return "Suggested from Zoho";
+  }
+
+  // Confirm → the EXISTING bulk-rename path verbatim. Applies the name to
+  // every turn, re-summarizes, and the backend resolves the suggestion +
+  // records contact memory in the same transaction. Undo/toast ride along.
+  function confirmSuggestion(s: SpeakerSuggestion) {
+    void onBulkPick({
+      from: s.speaker_label,
+      user: s.suggested_user_id
+        ? { id: s.suggested_user_id, display_name: s.suggested_name, email: "" }
+        : null,
+      freeText: s.suggested_user_id ? null : s.suggested_name,
+    });
+  }
+
+  // Edit → open the chip rename picker pre-seeded with the suggested name.
+  function editSuggestion(s: SpeakerSuggestion) {
+    startSpeakerRename(s.speaker_label, null);
+    speakerEditValue = s.suggested_name;
+  }
+
+  // Dismiss → resolve server-side, drop the sub-row. No rename; per-call
+  // (does not poison future-call memory).
+  async function dismissSuggestion(s: SpeakerSuggestion) {
+    if (!call) return;
+    dismissingSuggestionId = s.id;
+    try {
+      await invoke("dismiss_speaker_suggestion", {
+        id: call.id,
+        suggestionId: s.id,
+      });
+      speakerSuggestions = speakerSuggestions.filter((x) => x.id !== s.id);
+    } catch (e) {
+      error = portalErrorToText(e);
+    } finally {
+      dismissingSuggestionId = null;
+    }
+  }
+
+  function reviewSuggestions() {
+    participantsEl?.scrollIntoView({ behavior: "smooth", block: "start" });
+    participantsPulse = true;
+    setTimeout(() => (participantsPulse = false), 1200);
+  }
+
+  // Participants-chip tooltip. "You" carries the recorder FK after
+  // enrichment (label stays "You"); expose the real name in the title
+  // only (ui.md §3). Everyone else keeps the linked / rename hints.
+  function chipTitle(p: { speaker: string; userId: string | null }): string {
+    if (p.speaker === "You" && p.userId) {
+      const name = memberRoster.find((m) => m.id === p.userId)?.display_name;
+      return name
+        ? `You (${name}) — the recorder`
+        : "You — the recorder";
+    }
+    return p.userId
+      ? `${p.speaker} — linked teammate. Click to rename.`
+      : `Rename ${p.speaker}`;
+  }
+
   // ── Org-member picker for rename (#65) ───────────────────────────────
   // Fetched once via the `org_members` Tauri command when the user
   // opens a rename editor; held per-page-instance. Recents are in
@@ -1627,6 +1731,9 @@
       } catch (e) {
         trace("list_highlights FAILED", e);
       }
+      // #661 — never-silent naming suggestions for this call (unresolved
+      // only). Non-fatal secondary fetch; the loader swallows failures.
+      await loadSpeakerSuggestions();
       trace("loadAudio start");
       await loadAudio();
       trace("loadAudio done", { src: audioSrc, err: audioError });
@@ -2301,6 +2408,9 @@
     // Refetch — rename also rewrites summary + action items +
     // participants in the same transaction.
     call = await invoke<Call>("get_call", { id: call.id });
+    // #661 — a confirm (or any rename matching a pending label) resolves
+    // the suggestion server-side; refetch so the sub-row drops.
+    void loadSpeakerSuggestions();
     return before;
   }
 
@@ -2772,6 +2882,22 @@
     return out;
   });
 
+  // #661 · first unresolved suggestion per still-original diarized label.
+  // Declared here (after `speakers`) because it depends on it. Never
+  // surfaced over a linked / user-renamed chip (belt-and-suspenders — the
+  // backend already only returns unresolved rows).
+  let suggestionByLabel = $derived.by<Map<string, SpeakerSuggestion>>(() => {
+    const m = new Map<string, SpeakerSuggestion>();
+    for (const s of speakerSuggestions) {
+      if (!m.has(s.speaker_label)) m.set(s.speaker_label, s);
+    }
+    return m;
+  });
+  let unresolvedSuggestionCount = $derived(
+    speakers.filter((p) => p.userId === null && suggestionByLabel.has(p.speaker))
+      .length,
+  );
+
   function fmtSpeakingTime(ms: number) {
     const s = Math.round(ms / 1000);
     if (s < 60) return `${s}s`;
@@ -2836,6 +2962,9 @@
       // locally patching only utterances left the portal-synced bits
       // stale until the user reloaded the page.
       call = await invoke<Call>("get_call", { id: call.id });
+      // #661 — editing a suggested chip to any name resolves the pending
+      // suggestion server-side; refetch so the sub-row drops.
+      void loadSpeakerSuggestions();
       cancelSpeakerRename();
     } catch (e) {
       error = portalErrorToText(e);
@@ -3885,14 +4014,58 @@
       {/if}
     </section>
 
+    {#snippet participantChip(p: SpeakerStat)}
+      <button
+        type="button"
+        class="chip speaker-chip"
+        class:speaker-unlinked={p.userId === null}
+        style="--c: {speakerColor(p.speaker)}"
+        title={chipTitle(p)}
+        onclick={() => startSpeakerRename(p.speaker, p.userId)}
+      >
+        <span class="chip-dot"></span>
+        <span class="chip-body">
+          <span class="chip-name">{p.speaker}</span>
+          <span class="chip-meta">
+            {p.count} {p.count === 1 ? "line" : "lines"} ·
+            {fmtSpeakingTime(p.totalMs)}
+          </span>
+        </span>
+      </button>
+    {/snippet}
     {#if speakers.length > 0 || mentionedMembers.length > 0}
-      <section class="block" style="--i: 2">
+      <!-- #661 · discoverability nudge — count + Review scroll-to. Never
+           hosts confirm/dismiss (single-homed on the chip). -->
+      {#if unresolvedSuggestionCount > 0}
+        <div class="suggest-banner" role="note">
+          <span class="suggest-banner-dot" aria-hidden="true"></span>
+          <span class="suggest-banner-text">
+            We suggested {unresolvedSuggestionCount === 1 ? "a name" : "names"}
+            for {unresolvedSuggestionCount}
+            {unresolvedSuggestionCount === 1 ? "speaker" : "speakers"} on this
+            call. Review below.
+          </span>
+          <button
+            type="button"
+            class="suggest-banner-review"
+            onclick={reviewSuggestions}
+          >Review</button>
+        </div>
+      {/if}
+      <section
+        class="block"
+        style="--i: 2"
+        bind:this={participantsEl}
+        class:participants-pulse={participantsPulse}
+      >
         <div class="block-head">
           <h2>Participants</h2>
           <span class="block-hint">Renaming here rewrites transcript, summary, and action items.</span>
         </div>
         <div class="chips">
           {#each speakers as p (p.speaker)}
+            {@const sug =
+              p.userId === null ? suggestionByLabel.get(p.speaker) : undefined}
             {#if editingSpeaker === p.speaker}
               <div class="chip chip-editing">
                 <SpeakerRenamePicker
@@ -3908,26 +4081,51 @@
                   oncancel={cancelSpeakerRename}
                 />
               </div>
-            {:else}
-              <button
-                type="button"
-                class="chip speaker-chip"
-                class:speaker-unlinked={p.userId === null}
-                style="--c: {speakerColor(p.speaker)}"
-                title={p.userId
-                  ? `${p.speaker} — linked teammate. Click to rename.`
-                  : `Rename ${p.speaker}`}
-                onclick={() => startSpeakerRename(p.speaker, p.userId)}
-              >
-                <span class="chip-dot"></span>
-                <span class="chip-body">
-                  <span class="chip-name">{p.speaker}</span>
-                  <span class="chip-meta">
-                    {p.count} {p.count === 1 ? "line" : "lines"} ·
-                    {fmtSpeakingTime(p.totalMs)}
+            {:else if sug}
+              <!-- #661 · suggestion sub-row: pending, never applied until
+                   Confirm. Chip still shows the ORIGINAL label. -->
+              <div class="speaker-chip-wrap">
+                {@render participantChip(p)}
+                <div
+                  class="speaker-suggestion"
+                  role="group"
+                  aria-label={`Name suggestion for ${p.speaker}`}
+                >
+                  <span class="speaker-suggestion-sig" aria-hidden="true"></span>
+                  <Avatar
+                    name={sug.suggested_name}
+                    color={speakerColor(p.speaker)}
+                    size={18}
+                  />
+                  <span class="speaker-suggestion-body">
+                    <span class="speaker-suggestion-name">{sug.suggested_name}?</span>
+                    <span class="speaker-suggestion-meta">{suggestionCaption(sug)}</span>
                   </span>
-                </span>
-              </button>
+                  <button
+                    type="button"
+                    class="speaker-suggestion-confirm"
+                    disabled={savingSpeaker || savingEdit}
+                    aria-label={`Confirm suggestion: ${p.speaker} is ${sug.suggested_name}`}
+                    onclick={() => confirmSuggestion(sug)}
+                  >Confirm</button>
+                  <button
+                    type="button"
+                    class="speaker-suggestion-edit"
+                    aria-label={`Edit suggested name for ${p.speaker}`}
+                    onclick={() => editSuggestion(sug)}
+                  >Edit</button>
+                  <button
+                    type="button"
+                    class="speaker-suggestion-dismiss"
+                    disabled={dismissingSuggestionId === sug.id}
+                    aria-label={`Dismiss suggestion for ${p.speaker}`}
+                    title="Dismiss"
+                    onclick={() => dismissSuggestion(sug)}
+                  >×</button>
+                </div>
+              </div>
+            {:else}
+              {@render participantChip(p)}
             {/if}
           {/each}
         </div>
@@ -6591,6 +6789,209 @@
     }
     .bulk-toast-body {
       flex-basis: 100%;
+    }
+  }
+
+  /* ── #661 · speaker-identity Phase A — suggestion sub-row + banner ──
+     Never-silent naming: a metadata-derived proposal anchored on the
+     Participants chip. NOTHING writes to the transcript/summary until the
+     user Confirms (which reuses the rename-speaker flow); Edit opens the
+     existing chip picker; Dismiss resolves it server-side so it stops
+     re-nagging. Component-scoped (mirrors the .speaker-chip / .bulk-toast
+     precedent) so the byte-identical app.css invariant is untouched.
+     --sig = "review this" per design.md §Semantic; --accent-soft ground.
+     Visibly distinct from an APPLIED name: dimmed avatar, italic "{name}?",
+     provenance micro-caption. */
+  .speaker-chip-wrap {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.35rem;
+  }
+  .speaker-suggestion {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--hairline);
+    border-left: 2px solid var(--sig);
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    animation: speaker-suggestion-in 160ms ease-out;
+  }
+  @keyframes speaker-suggestion-in {
+    from {
+      opacity: 0;
+      transform: translateY(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .speaker-suggestion {
+      animation: none;
+    }
+  }
+  /* Leading --sig marker — the "heads up, check this" cue. */
+  .speaker-suggestion-sig {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--sig);
+    flex-shrink: 0;
+  }
+  /* Dimmed avatar — pending, not applied. */
+  .speaker-suggestion :global(.avatar) {
+    opacity: 0.6;
+    flex-shrink: 0;
+  }
+  .speaker-suggestion-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .speaker-suggestion-name {
+    font-style: italic;
+    font-weight: 500;
+    font-size: 0.82rem;
+    color: var(--bone-1);
+  }
+  .speaker-suggestion-meta {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.02em;
+    color: var(--bone-3);
+  }
+  .speaker-suggestion-confirm {
+    appearance: none;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink-0);
+    padding: 0.24rem 0.6rem;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 500;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .speaker-suggestion-confirm:hover:not(:disabled) {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .speaker-suggestion-confirm:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .speaker-suggestion-edit {
+    appearance: none;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--bone-1);
+    padding: 0.24rem 0.55rem;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.76rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .speaker-suggestion-edit:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .speaker-suggestion-dismiss {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--bone-3);
+    padding: 0.2rem 0.35rem;
+    font-size: 0.95rem;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .speaker-suggestion-dismiss:hover:not(:disabled) {
+    color: var(--bone-0);
+  }
+  .speaker-suggestion-dismiss:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  @media (max-width: 520px) {
+    .speaker-suggestion {
+      flex-wrap: wrap;
+    }
+    .speaker-suggestion-body {
+      flex-basis: 100%;
+    }
+  }
+
+  /* Discoverability banner — count + Review scroll-to. Informational
+     (--sig dot on the soft .track-quality-note recipe), NEVER --live.
+     Single-homed actions stay on the chip; the banner only nudges. */
+  .suggest-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0 0 1rem;
+    padding: 0.55rem 0.75rem;
+    background: var(--ink-1);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
+    font-size: 0.82rem;
+    color: var(--bone-2);
+    line-height: 1.4;
+  }
+  .suggest-banner-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--sig);
+    flex-shrink: 0;
+  }
+  .suggest-banner-text {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .suggest-banner-review {
+    appearance: none;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--accent-hi);
+    padding: 0.24rem 0.6rem;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 500;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .suggest-banner-review:hover {
+    background: var(--ink-2);
+  }
+
+  /* Review pulse on the Participants block (reduced-motion guarded). */
+  .participants-pulse {
+    animation: participants-pulse 1.1s ease-out;
+  }
+  @keyframes participants-pulse {
+    0% {
+      box-shadow: 0 0 0 0 var(--accent-soft);
+    }
+    30% {
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .participants-pulse {
+      animation: none;
     }
   }
 

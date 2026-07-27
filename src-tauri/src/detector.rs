@@ -322,7 +322,8 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
     let state = app.state::<Recorder>();
     match (phase, decision) {
         (Phase::AwaitingStartConfirm { consumer }, UserDecision::ConfirmStart) => {
-            match crate::do_start(&state, app) {
+            // Auto-detect start has no co-pilot picker context → no contact hint.
+            match crate::do_start(&state, app, None) {
                 Ok(path) => {
                     crate::write_session_source(
                         std::path::Path::new(&path),

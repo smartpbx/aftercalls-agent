@@ -20,8 +20,18 @@
   } from "$lib/compliance";
   import { confirmAutoStart } from "$lib/autoStart";
   import NotesPanel from "$lib/NotesPanel.svelte";
+  import LiveAssistPanel from "$lib/LiveAssistPanel.svelte";
+  import CoPilotPanel from "$lib/CoPilotPanel.svelte";
   import { portalErrorToText } from "$lib/portalError";
   import { openBilling } from "$lib/billing";
+  import { liveSession } from "$lib/stores/liveSession.svelte";
+  import type {
+    AskChip,
+    AskAnswer,
+    KnowledgeAnswer,
+    LiveSegment,
+    CopilotMode,
+  } from "@aftercalls/shared/types";
 
   // Platform string reported to the backend on recording-ack (#44).
   // Kept here (not Rust-side) because navigator UA is already in the
@@ -69,6 +79,123 @@
   // friendly "subscribe to keep recording" block; never surface the raw
   // 402 string for this case.
   let subGate = $state(false);
+
+  // #live — Live-transcript draft (Phase 1). `liveTranscriptEnabled` gates
+  // the whole panel on the org feature flag (read from current_user on
+  // mount, refreshed best-effort via refresh_current_user — #659).
+  // #659 — the live stream itself (segments / status / coaching) now lives
+  // in the persistent `liveSession` store, fed by the layout's `live-*`
+  // listeners, so it survives route navigation while the Rust relay keeps
+  // running. This page reads from that store; it no longer owns the buffer
+  // or the listeners.
+  let liveTranscriptEnabled = $state(false);
+
+  // #653 — in-call co-pilot. `copilotEnabled` (org flag) + Call mode gates
+  // the CoPilotPanel (transcript + CRM context + coaching lanes), which
+  // mounts PRE-call so the "who are you calling?" picker is available before
+  // Start. `copilotIsAdmin` drives the CRM lane's no-Zoho prompt (admins get
+  // a Connect button; members get "ask an admin"). `contactHint` is the
+  // picked Zoho contact id, raised from the CRM lane and threaded into
+  // start_recording so the backend resolves the counterpart off the audio
+  // hot path. All degrade cleanly: copilot OFF keeps today's plain panel.
+  let copilotEnabled = $state(false);
+  let copilotIsAdmin = $state(false);
+  let contactHint = $state<string | null>(null);
+  // #659 P5a — the org's default co-pilot persona (Sales / Support), read
+  // from /auth/me. Seeds the CoPilotPanel mode toggle; the panel then owns
+  // the per-call override. Defaults to "sales" until the me bundle lands.
+  let copilotDefaultMode = $state<CopilotMode>("sales");
+
+  // #660 co-pilot P1 — ask-chip + one-click highlight (star) handlers. +page
+  // owns the Tauri invokes + optimistic store writes; the derived state
+  // (`liveSession.askAnswer` / `.askInFlight` / `.highlighted` / `.talkMetric`)
+  // and these callbacks are threaded into CoPilotPanel → LiveTranscriptLane.
+  // Both degrade CALM: an unavailable ask / a highlight failure never surfaces
+  // a red panel — the ask lands a bone degrade line, the star simply reverts.
+
+  /** Fire one ask preset. Single in-flight (the lane also disables the chips
+   *  while `askInFlight` is set — belt + braces). The backend degrades
+   *  calm-200 so a resolved answer always renders; a gate/transport error
+   *  (`live_ask` throws) lands the same calm "not available" line, never an
+   *  error surface, never a vendor name. */
+  async function handleAsk(chip: AskChip) {
+    const su = liveSession.sessionUuid;
+    if (!su || liveSession.askInFlight) return;
+    liveSession.setAskBusy(chip);
+    try {
+      const res = (await invoke("live_ask", {
+        sessionUuid: su,
+        chip,
+      })) as AskAnswer;
+      liveSession.setAskAnswer(
+        chip,
+        res?.answer ?? "That's not available right now.",
+        typeof res?.based_on_turns === "number" ? res.based_on_turns : null,
+      );
+    } catch {
+      // No retry-shame, no vendor name — indistinguishable from "hasn't
+      // generated yet" (ui.md §1c error/no-key calm state).
+      liveSession.setAskAnswer(chip, "That's not available right now.", null);
+    }
+  }
+
+  function handleDismissAsk() {
+    liveSession.dismissAsk();
+  }
+
+  /** #659 P5b — Support-mode "get an answer" affordance. Fires one grounded,
+   *  cited knowledge answer over the org's KB. Single in-flight (the lane also
+   *  disables the button while `knowledgeInFlight`). No manual query for MVP —
+   *  the backend derives it from the last counterpart turn. The backend
+   *  degrades calm-200 so a resolved answer always renders; a gate/transport
+   *  error (`live_knowledge` throws) lands the same calm "not available" line,
+   *  never an error surface, never a vendor name. */
+  async function handleKnowledge() {
+    const su = liveSession.sessionUuid;
+    if (!su || liveSession.knowledgeInFlight) return;
+    liveSession.setKnowledgeBusy();
+    try {
+      const res = (await invoke("live_knowledge", {
+        sessionUuid: su,
+      })) as KnowledgeAnswer;
+      liveSession.setKnowledgeAnswer({
+        answer: res?.answer ?? "That's not available right now.",
+        sources: Array.isArray(res?.sources) ? res.sources : [],
+      });
+    } catch {
+      liveSession.setKnowledgeAnswer({
+        answer: "That's not available right now.",
+        sources: [],
+      });
+    }
+  }
+
+  function handleDismissKnowledge() {
+    liveSession.dismissKnowledge();
+  }
+
+  /** Toggle a highlight (star) on one transcript turn. Optimistic: flip the
+   *  store immediately, invoke the backend toggle, revert on failure. */
+  async function handleHighlight(seg: LiveSegment, starred: boolean) {
+    const su = liveSession.sessionUuid;
+    if (!su) return;
+    liveSession.setHighlighted(seg.channel, seg.start_ms, starred);
+    try {
+      await invoke("live_highlight", {
+        sessionUuid: su,
+        channel: seg.channel,
+        startMs: seg.start_ms,
+        endMs: seg.end_ms,
+        speaker: seg.speaker ?? null,
+        text: seg.text,
+        starred,
+      });
+    } catch {
+      // Backend rejected the toggle — revert the optimistic star so the UI
+      // matches persisted state. No error surface (a star is advisory).
+      liveSession.setHighlighted(seg.channel, seg.start_ms, !starred);
+    }
+  }
 
   /** True when a failed-pipeline error string carries the backend's
    *  `subscription_inactive` 402 code. The create_call helper bails with
@@ -432,6 +559,10 @@
           pipelineError = "";
           subGate = false;
           openableCallId = "";
+          // #659 — the per-session live-draft reset (clear segments +
+          // coaching, seed status) now lives in the layout's
+          // recording-state handler via liveSession.resetForNewSession(),
+          // so it fires even when the user isn't on /record at start.
           startAt = Date.now();
           timer = window.setInterval(
             () => (elapsedMs = Date.now() - startAt),
@@ -458,6 +589,11 @@
         micFallbackTimer = 0;
       }, 12000);
     });
+    // #659 — the `live-segment` / `live-session` / `live-coaching`
+    // listeners now live in +layout.svelte (registered once, for the
+    // app's lifetime) and write into the persistent `liveSession` store,
+    // so the draft survives route navigation. This page reads from that
+    // store; it no longer registers or tears down these listeners.
     unlistenAuto = await listen<AutoDetectEvent>("auto-detect", (evt) => {
       // prompt_start rendered here as an inline banner when the user
       // is already on /record (#60). The layout's slide-out suppresses
@@ -477,9 +613,49 @@
     try {
       const u = await invoke<{
         recording_acknowledged?: boolean;
+        role?: string;
+        copilot_default_mode?: CopilotMode;
+        features?: { live_transcript?: boolean; copilot?: boolean };
       } | null>("current_user");
       ackCached = !!u?.recording_acknowledged;
+      // #live — gate the whole panel on the org feature flag.
+      liveTranscriptEnabled = !!u?.features?.live_transcript;
+      // #653 — co-pilot gate + admin capability for the CRM lane's no-Zoho
+      // prompt. Admin roles can connect Zoho from the portal; members can't.
+      copilotEnabled = !!u?.features?.copilot;
+      copilotIsAdmin =
+        u?.role === "admin" ||
+        u?.role === "owner" ||
+        u?.role === "superadmin";
+      // #659 P5a — seed the mode toggle from the org default.
+      copilotDefaultMode = u?.copilot_default_mode === "support" ? "support" : "sales";
     } catch {}
+
+    // #659 — best-effort network refresh of the org feature flags. The
+    // sync `current_user` read above is the instant, offline-safe paint;
+    // this re-fetches `/v1/auth/me`, persists the fresh bundle to
+    // auth.json, and re-gates the panels so a feature enabled server-side
+    // (e.g. copilot bought mid-session) surfaces on route re-entry
+    // without a full re-login. Fire-and-forget so it never blocks the
+    // rest of mount; on error (offline / expired refresh token) the
+    // cached values above stand — the panel is never blanked.
+    invoke<{
+      recording_acknowledged?: boolean;
+      role?: string;
+      copilot_default_mode?: CopilotMode;
+      features?: { live_transcript?: boolean; copilot?: boolean };
+    }>("refresh_current_user")
+      .then((u) => {
+        ackCached = !!u?.recording_acknowledged;
+        liveTranscriptEnabled = !!u?.features?.live_transcript;
+        copilotEnabled = !!u?.features?.copilot;
+        copilotIsAdmin =
+          u?.role === "admin" ||
+          u?.role === "owner" ||
+          u?.role === "superadmin";
+        copilotDefaultMode = u?.copilot_default_mode === "support" ? "support" : "sales";
+      })
+      .catch(() => {});
 
     // Warm the recording-prefs cache so the first Copy-notice click
     // and the first Start Recording don't stall on a round-trip.
@@ -623,7 +799,12 @@
     } catch (e) {
       console.warn("start cue failed", e);
     }
-    sessionDir = await invoke<string>("start_recording");
+    // #653 — pass the pre-picked Zoho contact id (if any) so the backend can
+    // resolve the counterpart off the audio hot path. `null` → the command's
+    // `Option<String>` decodes to `None` and today's behavior is unchanged.
+    sessionDir = await invoke<string>("start_recording", {
+      contactHint: contactHint ?? undefined,
+    });
   }
 
   // #142 follow-up — note-to-self path from the record-page tab.
@@ -890,7 +1071,7 @@
   };
 </script>
 
-<main class="page reveal">
+<main class="page reveal" class:copilot-active={copilotEnabled && recordMode === "call"}>
   <header class="head" style="--i: 0">
     <h1>Record</h1>
     <p class="sub">
@@ -1210,6 +1391,46 @@
     </section>
   {/if}
 
+  <!-- #653 — in-call co-pilot. When the org has copilot ON and we're in
+       Call mode, the CoPilotPanel mounts PRE-call (so the "who are you
+       calling?" picker is available before Start) and stays through the
+       post-stop draft. It composes the transcript, CRM-context, and coaching
+       lanes. Note mode has no CRM/coaching counterpart, so it falls through
+       to the plain Phase-1 panel (which stays hidden with no live segments).
+       Copilot OFF preserves today's behavior exactly: the plain
+       LiveAssistPanel renders when live_transcript is ON. -->
+  {#if copilotEnabled && recordMode === "call"}
+    <CoPilotPanel
+      segments={liveSession.segments}
+      status={liveSession.status}
+      {recording}
+      isAdmin={copilotIsAdmin}
+      defaultMode={copilotDefaultMode}
+      {liveTranscriptEnabled}
+      coaching={liveSession.coaching}
+      cues={liveSession.liveCues}
+      checklist={liveSession.checklist}
+      sessionUuid={liveSession.sessionUuid}
+      {elapsedMs}
+      onToggleRecording={toggle}
+      onnotes={() => (sessionNotesOpen = true)}
+      askAnswer={liveSession.askAnswer}
+      askInFlight={liveSession.askInFlight}
+      knowledgeAnswer={liveSession.knowledgeAnswer}
+      knowledgeInFlight={liveSession.knowledgeInFlight}
+      highlighted={liveSession.highlighted}
+      talkMetric={liveSession.talkMetric}
+      onask={handleAsk}
+      ondismissAsk={handleDismissAsk}
+      onknowledge={handleKnowledge}
+      ondismissKnowledge={handleDismissKnowledge}
+      onhighlight={handleHighlight}
+      onpick={(id) => (contactHint = id)}
+    />
+  {:else if liveTranscriptEnabled && (recording || liveSession.segments.length > 0 || liveSession.status === "error")}
+    <LiveAssistPanel segments={liveSession.segments} status={liveSession.status} />
+  {/if}
+
   <!-- Status lane — stacks so a pipeline still in flight is still
        visible while the user records the next call. -->
   <section class="status" style="--i: 4">
@@ -1430,6 +1651,18 @@
     gap: 1.4rem;
     position: relative;
     z-index: 2;
+  }
+
+  /* #653 — the co-pilot panel (transcript + CRM + coaching) needs room the
+     narrow record column can't give. Widen the column only when copilot is
+     active (Call mode). This rule is component-scoped (`.page` lives ONLY in
+     this route's <style>, verified 0 occurrences in app.css), so hard-rule #1
+     is not engaged — no app.css edit, no byte-identical diff to maintain.
+     The narrower children (.cta, .record-btn, .note-title-row) keep their own
+     max-widths and simply center in the wider column; only the co-pilot panel
+     consumes the extra width. */
+  .page.copilot-active {
+    max-width: 900px;
   }
 
   .head h1 {

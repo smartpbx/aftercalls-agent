@@ -4,6 +4,7 @@ mod auto_recorder;
 mod config;
 mod detector;
 mod error;
+mod live;
 #[cfg(target_os = "macos")]
 mod macos_loopback;
 mod mic_consumers;
@@ -29,7 +30,9 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri::{
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -246,6 +249,16 @@ struct RecordingStateEvent {
     /// entry-point, so the notes panel mounts for both modes.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_dir: Option<String>,
+    /// #660 co-pilot P1 — the live `session_uuid` minted at record-start
+    /// for a Call capture with the `live_transcript` relay open. Surfaced
+    /// to the webview here (it was previously only persisted to disk +
+    /// used by the post-call reconcile) so the co-pilot ask-chip /
+    /// highlight surfaces can address the live session. Present only on
+    /// the start transition of a live Call; absent for self-notes, stops,
+    /// and flag-off orgs. Additive + `skip_if_none`, so the recording-
+    /// state shape stays backward-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_uuid: Option<String>,
 }
 
 /// Writes a small metadata file into a newly-created session_dir capturing
@@ -270,18 +283,52 @@ pub(crate) fn write_session_source(
     }
 }
 
+/// #live — persist the record-start `session_uuid` into the session_dir so
+/// the post-call create_call flow can hand it to the backend, which
+/// reconciles the disposable live session to the newly-created call row.
+/// Written only for sessions that opened a live relay; absent otherwise.
+pub(crate) fn write_live_session(session_dir: &std::path::Path, session_uuid: &str) {
+    let payload = serde_json::json!({ "session_uuid": session_uuid });
+    let path = session_dir.join("live_session.json");
+    if let Err(e) = std::fs::write(&path, payload.to_string()) {
+        eprintln!(
+            "aftercalls: failed to write live_session.json for {}: {e}",
+            session_dir.display()
+        );
+    }
+}
+
 fn emit_state(
     app: &AppHandle,
     recording: bool,
     mode: Option<&'static str>,
     session_dir: Option<String>,
+    // #660 — the live session_uuid for a Call start (None otherwise).
+    session_uuid: Option<String>,
 ) {
+    // #659 P4 — keep the overlay's cold-start cache in step with the
+    // recording lifecycle. A Call start resets the cached coaching snapshot +
+    // stashes the session_uuid (so a freshly-opened overlay can address the
+    // session); any stop marks not-recording (final snapshot stays glanceable
+    // through the grace period). Self-notes never open the overlay, so their
+    // starts don't touch the cache.
+    if let Some(cache) = app.try_state::<LiveSnapshotCache>() {
+        if recording {
+            if mode == Some("call") {
+                cache.begin_session(session_uuid.clone());
+            }
+        } else {
+            cache.end_session();
+        }
+    }
+
     let _ = app.emit(
         "recording-state",
         RecordingStateEvent {
             recording,
             mode,
             session_dir,
+            session_uuid,
         },
     );
     apply_tray_state(
@@ -346,7 +393,15 @@ fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, l
     });
 }
 
-pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, String> {
+pub(crate) fn do_start(
+    state: &Recorder,
+    app: &AppHandle,
+    // #653 — Zoho contact id the user pre-picked in the co-pilot panel,
+    // forwarded onto the live-relay `start` frame so the backend resolves
+    // the counterpart off the audio hot path. `None` for CLI/hotkey starts
+    // and whenever copilot is off or no contact was chosen.
+    contact_hint: Option<String>,
+) -> Result<String, String> {
     let base = app
         .path()
         .app_local_data_dir()
@@ -359,12 +414,58 @@ pub(crate) fn do_start(state: &Recorder, app: &AppHandle) -> Result<String, Stri
     let saved_device = config::Config::load()
         .ok()
         .and_then(|c| c.input_device);
-    let path = state.start(base, saved_device, false)?;
+
+    // #live — Live-transcript relay (Phase 1). Gated on the org
+    // `live_transcript` feature flag (cached in auth.json). When on, mint a
+    // session_uuid at record-start and open the relay: it streams a lossy
+    // COPY of the mic/system audio to the backend and forwards draft
+    // segments to the UI. The relay degrades silently on any failure and
+    // never blocks or fails the recording — the batch pipeline stays the
+    // source of truth. Flag-off orgs pay nothing here.
+    let live_on = config::read_auth_file()
+        .ok()
+        .flatten()
+        .map(|a| a.features.live_transcript)
+        .unwrap_or(false);
+    let mut live_tap = None;
+    let mut session_uuid = None;
+    if live_on {
+        if let Some(backend) = config::Config::load().ok().and_then(|c| c.backend) {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            live_tap = Some(app.state::<live::LiveRelay>().begin(
+                app.clone(),
+                backend.url,
+                uuid.clone(),
+                contact_hint.clone(),
+            ));
+            session_uuid = Some(uuid);
+        }
+    }
+
+    let path = match state.start(base, saved_device, false, live_tap) {
+        Ok(p) => p,
+        Err(e) => {
+            // Recording never started — tear down the relay we just opened.
+            app.state::<live::LiveRelay>().end();
+            return Err(e);
+        }
+    };
+
+    // Persist the session_uuid so the post-call create_call flow can hand it
+    // to the backend for live-session reconciliation.
+    if let Some(uuid) = &session_uuid {
+        write_live_session(&path, uuid);
+    }
+
     emit_state(
         app,
         true,
         Some("call"),
         Some(path.to_string_lossy().into_owned()),
+        // #660 — surface the live session_uuid (Some only when the
+        // relay opened) so the co-pilot ask/highlight surfaces can
+        // address it. Same value already persisted to live_session.json.
+        session_uuid.clone(),
     );
     // If the saved-name preference didn't resolve, surface a one-time
     // toast on the Record page. Dedupe lives inside the Recorder
@@ -399,12 +500,17 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
     let saved_device = config::Config::load()
         .ok()
         .and_then(|c| c.input_device);
-    let path = state.start(base, saved_device, true)?;
+    // Note-to-self is mic-only private dictation — no live You/Them relay in
+    // Phase 1 (no system channel, and the feature targets calls). Pass a
+    // `None` tap so the recorder skips the live copy entirely.
+    let path = state.start(base, saved_device, true, None)?;
     emit_state(
         app,
         true,
         Some("self_note"),
         Some(path.to_string_lossy().into_owned()),
+        // Self-notes are mic-only with no live relay → no session_uuid.
+        None,
     );
     if let Some(fallback) = state.take_last_fallback() {
         let _ = app.emit("mic-fallback", &fallback);
@@ -419,7 +525,9 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
 
 pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
     let path: PathBuf = state.stop()?;
-    emit_state(app, false, None, None);
+    // #live — flush + close the live relay (best-effort; no-op when idle).
+    app.state::<live::LiveRelay>().end();
+    emit_state(app, false, None, None, None);
     let session_dir = path.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -429,8 +537,16 @@ pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, Strin
 }
 
 #[tauri::command]
-fn start_recording(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
-    let path = do_start(&state, &app)?;
+fn start_recording(
+    state: State<Recorder>,
+    app: AppHandle,
+    // #653 — optional Zoho contact id from the co-pilot "who are you
+    // calling?" picker (invoked as `{ contactHint }` from the webview).
+    // Threaded onto the live-relay start frame; `None` leaves today's
+    // behavior unchanged.
+    contact_hint: Option<String>,
+) -> Result<String, String> {
+    let path = do_start(&state, &app, contact_hint)?;
     write_session_source(std::path::Path::new(&path), "manual", None);
     Ok(path)
 }
@@ -888,6 +1004,10 @@ struct LoginResult {
     /// so the agent sidebar can gate the STAFF section.
     is_platform_staff: bool,
     org_display_name: String,
+    /// #659 P5a — the org's default in-call co-pilot persona
+    /// (`"sales"` / `"support"`). Surfaced so the Record page seeds the
+    /// CoPilotPanel mode toggle from the org default at mount.
+    copilot_default_mode: String,
     // Surfaced to the layout + Record page so the PIPEDA ack modal
     // (#44) knows not to prompt a user who's already acknowledged.
     recording_acknowledged: bool,
@@ -918,6 +1038,7 @@ async fn login(email: String, password: String) -> Result<LoginResult, error::Po
         role: auth.role,
         is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
+        copilot_default_mode: auth.copilot_default_mode,
         recording_acknowledged: auth.recording_acknowledged,
         features: auth.features,
         pending_tos: auth.pending_tos,
@@ -963,10 +1084,46 @@ fn current_user() -> Result<Option<LoginResult>, error::PortalError> {
         role: a.role,
         is_platform_staff: a.is_platform_staff,
         org_display_name: a.org_display_name,
+        copilot_default_mode: a.copilot_default_mode,
         recording_acknowledged: a.recording_acknowledged,
         features: a.features,
         pending_tos: a.pending_tos,
     }))
+}
+
+/// #659 — best-effort network refresh of the cached profile bundle.
+/// `current_user` reads only `auth.json`, so a feature enabled for the
+/// org server-side (e.g. `copilot` bought mid-session) doesn't surface
+/// until a full re-login. This command re-fetches `/v1/auth/me` via the
+/// refresh-aware `build_auth_header`, persists the fresh bundle (incl.
+/// `features`) to `auth.json`, and returns the updated `LoginResult` so
+/// a surface can re-gate its panels without a re-login. Callers invoke
+/// it best-effort *after* the instant, offline-safe `current_user`
+/// paint; on error (offline / expired refresh token) the cached values
+/// stand — the panel is never blanked. Reuses `portal::refresh_me`;
+/// no new portal code. Mirrors the `tos_accept` `AuthFile → LoginResult`
+/// tail.
+#[tauri::command]
+async fn refresh_current_user() -> Result<LoginResult, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    let auth = portal::refresh_me(backend).await?;
+    Ok(LoginResult {
+        user_id: auth.user_id,
+        email: auth.email,
+        first_name: auth.first_name,
+        last_name: auth.last_name,
+        display_name: auth.display_name,
+        role: auth.role,
+        is_platform_staff: auth.is_platform_staff,
+        org_display_name: auth.org_display_name,
+        copilot_default_mode: auth.copilot_default_mode,
+        recording_acknowledged: auth.recording_acknowledged,
+        features: auth.features,
+        pending_tos: auth.pending_tos,
+    })
 }
 
 /// #96: profile-edit Save handler. PATCHes /v1/auth/me with
@@ -992,6 +1149,7 @@ async fn update_me(
         role: auth.role,
         is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
+        copilot_default_mode: auth.copilot_default_mode,
         recording_acknowledged: auth.recording_acknowledged,
         features: auth.features,
         pending_tos: auth.pending_tos,
@@ -1190,6 +1348,7 @@ async fn tos_accept(ids: Vec<String>) -> Result<LoginResult, error::PortalError>
         role: auth.role,
         is_platform_staff: auth.is_platform_staff,
         org_display_name: auth.org_display_name,
+        copilot_default_mode: auth.copilot_default_mode,
         recording_acknowledged: auth.recording_acknowledged,
         features: auth.features,
         pending_tos: auth.pending_tos,
@@ -1609,6 +1768,11 @@ struct AppPrefs {
     /// any combination of changes.
     auto_record_start_enabled: bool,
     auto_record_stop_enabled: bool,
+    /// #659 P4 — per-machine opt-in for the floating always-on-top co-pilot
+    /// overlay. Default false; the Settings → Co-pilot row renders it as a
+    /// switch and it round-trips through this AppPrefs blob like every other
+    /// per-machine pref.
+    overlay_enabled: bool,
 }
 
 #[tauri::command]
@@ -1630,6 +1794,7 @@ fn get_app_prefs() -> Result<AppPrefs, String> {
         consent_announcement_enabled: cfg.consent_announcement_enabled,
         auto_record_start_enabled: cfg.auto_record_start_enabled,
         auto_record_stop_enabled: cfg.auto_record_stop_enabled,
+        overlay_enabled: cfg.overlay_enabled,
     })
 }
 
@@ -1651,6 +1816,7 @@ fn set_app_prefs(
     consent_announcement_enabled: bool,
     auto_record_start_enabled: bool,
     auto_record_stop_enabled: bool,
+    overlay_enabled: bool,
 ) -> Result<(), String> {
     // Clamp to the same [5, 1440] range the Settings UI enforces so a
     // hand-edited config.toml or a future caller can't pass an
@@ -1709,6 +1875,7 @@ fn set_app_prefs(
     cfg.consent_announcement_enabled = consent_announcement_enabled;
     cfg.auto_record_start_enabled = auto_record_start_enabled;
     cfg.auto_record_stop_enabled = auto_record_stop_enabled;
+    cfg.overlay_enabled = overlay_enabled;
     cfg.save().map_err(|e| e.to_string())?;
     // #149 — re-register the self-note hotkey in place if it changed.
     // Best-effort: a failure to bind (portal denied, combo in use)
@@ -1751,6 +1918,146 @@ fn list_input_devices() -> Result<Vec<recorder::DeviceEntry>, String> {
 #[tauri::command]
 fn platform_os() -> &'static str {
     std::env::consts::OS
+}
+
+// ── #659 P4 — floating always-on-top co-pilot overlay ────────────────
+//
+// A second Tauri v2 webview window (label "overlay") created ON DEMAND
+// from Rust behind `open_overlay` / `close_overlay`. It's opt-in
+// (`config.overlay_enabled`, default OFF) + Call-mode + live-transcript-on;
+// the SvelteKit layer opens it on record-start and closes it on stop. It
+// loads the `/overlay` route — Tauri's asset resolver falls back to
+// `index.html` for the (non-prerendered SPA) path, and SvelteKit's client
+// router lands on the bare `/overlay` page (see `+layout.svelte`).
+//
+// OPAQUE v1 — deliberately NOT `.transparent(true)`. The prod/dev launcher
+// forces `WEBKIT_DISABLE_COMPOSITING_MODE=1` (a real Wayland-stability
+// workaround) which is fundamentally at odds with webkit transparency: a
+// transparent window would render a black box. So the overlay is an opaque,
+// decorationless, rounded-via-solid-background rectangle — safe on every
+// platform. True alpha transparency + real rounded corners are a documented
+// follow-up (also needs `macOSPrivateApi` on macOS).
+//
+// Creating the window from Rust needs no capability grant, and the custom
+// commands the overlay invokes (`get_live_snapshot`, `live_ask`, …) are
+// always permitted. But the `/overlay` route makes `core:window` calls
+// (start-dragging, close) and listens for events, so the "overlay" window
+// label is scoped by `capabilities/overlay.json`.
+
+/// Cold-start hydration cache for the overlay window. The overlay is created
+/// on demand and MISSES every `live-*` broadcast emitted before it existed
+/// (coaching runs on a ~20s cadence, so a freshly-opened overlay could sit
+/// blank up to 20s). This managed cache holds the latest coaching snapshot,
+/// live-session status, and the current recording / session_uuid, updated at
+/// each emit site (`emit_state`, `live::forward_incoming`, `live::emit_session`),
+/// so `get_live_snapshot` can hydrate an overlay instantly. It rides the same
+/// global broadcast thereafter — no main↔overlay IPC, no shared JS store.
+#[derive(Default)]
+pub(crate) struct LiveSnapshotCache {
+    inner: std::sync::Mutex<LiveSnapshot>,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct LiveSnapshot {
+    /// Last `live-coaching` payload (a FULL snapshot). None pre-first-frame /
+    /// after a fresh session start.
+    coaching: Option<serde_json::Value>,
+    /// Last live-session status ("live" | "ended" | "error"). None when idle.
+    status: Option<String>,
+    /// Current live session_uuid — Some during a Call with the relay open, so
+    /// the overlay's ask-chips can address the session on cold start.
+    session_uuid: Option<String>,
+    /// Whether a recording is currently in flight.
+    recording: bool,
+}
+
+impl LiveSnapshotCache {
+    fn snapshot(&self) -> LiveSnapshot {
+        self.inner.lock().unwrap().clone()
+    }
+    pub(crate) fn set_coaching(&self, v: serde_json::Value) {
+        self.inner.lock().unwrap().coaching = Some(v);
+    }
+    pub(crate) fn set_status(&self, s: &str) {
+        self.inner.lock().unwrap().status = Some(s.to_string());
+    }
+    /// Record-start (Call): reset the coaching snapshot (fresh session),
+    /// seed status optimistically to "live", stash the uuid, mark recording.
+    /// Mirrors the JS `liveSession.resetForNewSession` + `setSessionUuid`.
+    pub(crate) fn begin_session(&self, session_uuid: Option<String>) {
+        let mut g = self.inner.lock().unwrap();
+        g.coaching = None;
+        g.status = Some("live".to_string());
+        g.session_uuid = session_uuid;
+        g.recording = true;
+    }
+    /// Record-stop: mark not-recording. Coaching + status + uuid are left
+    /// intact so a grace-period overlay still shows the final snapshot; the
+    /// next `begin_session` clears them.
+    pub(crate) fn end_session(&self) {
+        self.inner.lock().unwrap().recording = false;
+    }
+}
+
+/// #659 P4 — hydrate a freshly-opened overlay with the latest live snapshot
+/// (coaching + session status + recording / session_uuid) so it never sits
+/// blank waiting for the next ~20s coaching frame.
+#[tauri::command]
+fn get_live_snapshot(cache: State<'_, LiveSnapshotCache>) -> LiveSnapshot {
+    cache.snapshot()
+}
+
+fn open_overlay_window(app: &AppHandle) -> tauri::Result<()> {
+    // Idempotent: if it's already open, re-show + re-assert on-top.
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.show();
+        let _ = w.set_always_on_top(true);
+        return Ok(());
+    }
+
+    let mut builder =
+        WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/overlay".into()))
+            .title("aftercalls co-pilot")
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            // Never yank the rep off their call app when the overlay appears.
+            .focused(false)
+            .resizable(true)
+            .inner_size(360.0, 240.0)
+            .min_inner_size(240.0, 120.0);
+
+    // Park it top-right of the primary monitor so it floats over a centered
+    // call window. Fixed offset fallback if the monitor query fails.
+    match app.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let scale = monitor.scale_factor();
+            let size = monitor.size().to_logical::<f64>(scale);
+            let x = (size.width - 360.0 - 24.0).max(0.0);
+            builder = builder.position(x, 56.0);
+        }
+        _ => {
+            builder = builder.position(900.0, 56.0);
+        }
+    }
+
+    builder.build()?;
+    Ok(())
+}
+
+/// #659 P4 — open (or re-show) the floating co-pilot overlay window.
+#[tauri::command]
+fn open_overlay(app: AppHandle) -> Result<(), String> {
+    open_overlay_window(&app).map_err(|e| e.to_string())
+}
+
+/// #659 P4 — close the overlay window if present. No-op when absent. Never
+/// touches the recording — the overlay is a passive display surface.
+#[tauri::command]
+fn close_overlay(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.close();
+    }
 }
 
 // ── Launch-at-sign-in (#4) ───────────────────────────────────────────
@@ -1895,6 +2202,33 @@ async fn rename_speaker(
         utterance_ids.as_deref(),
     )
     .await
+}
+
+// #661 (speaker-identity Phase A) — unresolved speaker-naming suggestions
+// for a call. Read-only; org-scoped on the backend. The front-end renders
+// these as never-silent confirm chips. Confirm reuses `rename_speaker`
+// (no dedicated command); dismiss is the command below.
+#[tauri::command]
+async fn call_speaker_suggestions(id: String) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::speaker_suggestions(backend, &id).await
+}
+
+// #661 — dismiss a pending suggestion so it stops re-surfacing. The only
+// net-new user action beyond confirm (confirm rides `rename_speaker`).
+#[tauri::command]
+async fn dismiss_speaker_suggestion(
+    id: String,
+    suggestion_id: String,
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::dismiss_speaker_suggestion(backend, &id, &suggestion_id).await
 }
 
 // Slim org roster for the speaker-rename autocomplete (#65). Any
@@ -2164,6 +2498,99 @@ async fn zoho_search_records(
     portal::zoho_search_records(backend, &module, &q).await
 }
 
+/// GET /v1/live/crm-context — #653 co-pilot CRM pull. Given the Zoho
+/// contact id the user picked (`contactId`) and optionally the live
+/// `sessionUuid`, returns the contact card + open-Deals envelope the
+/// CrmContextLane renders. Decoupled from the audio WS on purpose; the
+/// copilot flag gate 404s when off, and a Zoho hiccup degrades per-lane
+/// (never errors the panel). Mirrors the `zoho_search_records` shim.
+#[tauri::command]
+async fn live_crm_context(
+    contact_id: Option<String>,
+    session_uuid: Option<String>,
+    mode: Option<String>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_crm_context(
+        backend,
+        contact_id.as_deref(),
+        session_uuid.as_deref(),
+        mode.as_deref(),
+    )
+    .await
+}
+
+/// POST /v1/live/ask — #660 co-pilot ask-chip. Generates a plain-text
+/// answer over the live-transcript window for one of the four presets
+/// (`catch_me_up | summarize | what_did_they_ask | action_items`). The
+/// backend degrades calm-200 (empty / no-key / failure all resolve to a
+/// renderable answer line); a genuine gate/transport error surfaces as a
+/// structured `PortalError` the lane renders as a calm degrade. Mirrors
+/// the `live_crm_context` shim.
+#[tauri::command]
+async fn live_ask(
+    session_uuid: String,
+    chip: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_ask(backend, &session_uuid, &chip).await
+}
+
+/// POST /v1/live/knowledge — #659 P5b Support-mode cited knowledge answer.
+/// Given the live `sessionUuid` and an optional manual `query` (else the
+/// backend derives it from the counterpart's most recent turn), returns
+/// `{ answer, sources }`. Grounding-first: a no-match returns a calm line with
+/// empty sources, never a hallucination. Copilot- + impersonation-write-gated;
+/// degrades calm-200. Mirrors the `live_ask` shim.
+#[tauri::command]
+async fn live_knowledge(
+    session_uuid: String,
+    query: Option<String>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_knowledge(backend, &session_uuid, query.as_deref()).await
+}
+
+/// POST /v1/live/highlight — #660 one-click star toggle on a live
+/// transcript turn (keyed `channel + start_ms`). `starred=false`
+/// un-marks. Returns `{ starred, count }`. Copilot- + impersonation-
+/// write-gated. Mirrors the `live_crm_context` shim.
+#[tauri::command]
+async fn live_highlight(
+    session_uuid: String,
+    channel: String,
+    start_ms: i64,
+    end_ms: i64,
+    speaker: Option<String>,
+    text: String,
+    starred: bool,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_highlight(
+        backend,
+        &session_uuid,
+        &channel,
+        start_ms,
+        end_ms,
+        speaker.as_deref(),
+        &text,
+        starred,
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
 /// activity linked to the picked record (#186). Body is forwarded
 /// verbatim from the SendToZohoModal Step-3 review state.
@@ -2261,7 +2688,8 @@ fn run_cli_action(app: &AppHandle, action: CliAction) {
             if state.is_active() {
                 return;
             }
-            match do_start(&state, app) {
+            // CLI start has no co-pilot picker context → no contact hint.
+            match do_start(&state, app, None) {
                 Ok(path) => {
                     write_session_source(std::path::Path::new(&path), "manual", None);
                 }
@@ -2309,7 +2737,8 @@ fn toggle_recording(app: &AppHandle) {
             eprintln!("aftercalls: hotkey stop error: {e}");
         }
     } else {
-        match do_start(&state, app) {
+        // Hotkey/tray toggle has no co-pilot picker context → no contact hint.
+        match do_start(&state, app, None) {
             Ok(path) => {
                 // Hotkey + tray-menu toggles are manual starts from the user.
                 write_session_source(std::path::Path::new(&path), "manual", None);
@@ -3062,6 +3491,12 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Recorder::new())
+        // #live — live-transcript relay controller (Phase 1). Process-scoped
+        // so do_start / do_stop reach the same session via app.state.
+        .manage(live::LiveRelay::new())
+        // #659 P4 — cold-start hydration cache for the floating overlay
+        // window. Updated at each live emit site; read by get_live_snapshot.
+        .manage(LiveSnapshotCache::default())
         // #634 — tray unread-count counter. Lives at process scope so
         // every `apply_tray_state` site reads the same value. Webview
         // pumps updates via the `set_unread_badge` command.
@@ -3096,6 +3531,10 @@ pub fn run() {
             login,
             logout,
             current_user,
+            // #659 — network refresh of cached org features (co-pilot,
+            // live transcript) so a mid-session purchase surfaces
+            // without a re-login. Reuses portal::refresh_me.
+            refresh_current_user,
             backend_health,
             update_me,
             // #34 — agent → portal session handoff. Frontend calls this
@@ -3118,6 +3557,13 @@ pub fn run() {
             set_app_prefs,
             list_input_devices,
             platform_os,
+            // #659 P4 — floating always-on-top co-pilot overlay: open/close
+            // the second webview + hydrate it from the cold-start snapshot
+            // cache. Custom commands need no capability grant; the /overlay
+            // window's core:window + event perms live in capabilities/overlay.json.
+            open_overlay,
+            close_overlay,
+            get_live_snapshot,
             telemetry::log_event,
             get_peaks,
             get_vault_settings,
@@ -3132,6 +3578,8 @@ pub fn run() {
             delete_call,
             update_utterance_speaker,
             rename_speaker,
+            call_speaker_suggestions,
+            dismiss_speaker_suggestion,
             org_members,
             update_call_tags,
             resummarize_call,
@@ -3201,6 +3649,16 @@ pub fn run() {
             zoho_status,
             zoho_record_types,
             zoho_search_records,
+            // #653 — in-call co-pilot CRM-context pull (contact card +
+            // open Deals). Decoupled from the audio WS relay.
+            live_crm_context,
+            // #660 co-pilot P1 — on-demand ask-chip + one-click highlight
+            // (star) toggle. REST, off the audio WS; copilot-gated.
+            live_ask,
+            live_highlight,
+            // #659 P5b — Support-mode cited knowledge answer over the org's
+            // own knowledge base. REST, off the audio WS; copilot-gated.
+            live_knowledge,
             zoho_push_call,
             notes::save_notes,
             notes::load_notes,

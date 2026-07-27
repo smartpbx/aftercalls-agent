@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
-  import { portalErrorToText } from "$lib/portalError";
+  import { portalErrorToText, isPortalError } from "$lib/portalError";
 
   const REMEMBERED_EMAIL_KEY = "aftercalls.login.rememberedEmail";
 
@@ -77,7 +77,19 @@
       if (pending.length > 0) goto("/accept-terms");
       else goto("/");
     } catch (e: unknown) {
-      error = portalErrorToText(e).replace(/^Error:\s*/, "");
+      // A wrong email/password makes the backend 401 the login POST,
+      // which maps to PortalError::Unauthorized. On the login FORM
+      // that's a bad-credentials failure — NOT a session expiry — so
+      // surface a credential-specific line rather than
+      // portalErrorToText's generic "Not signed in. Please log in
+      // again." (that copy is correct only for an expired session
+      // elsewhere in the app). Every other kind (network, cooldown,
+      // server, …) keeps its normal message.
+      if (isPortalError(e) && e.kind === "unauthorized") {
+        error = "Incorrect email or password.";
+      } else {
+        error = portalErrorToText(e).replace(/^Error:\s*/, "");
+      }
     } finally {
       submitting = false;
     }

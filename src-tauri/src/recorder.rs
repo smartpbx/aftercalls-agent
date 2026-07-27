@@ -14,6 +14,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use crate::live::{LiveTap, CHANNEL_MIC};
+
 type SharedWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
 
 /// Reason we fell back to the system-default mic instead of using the
@@ -100,6 +102,11 @@ enum Command_ {
         // stays closed. The self-note session_dir contains only
         // mic.wav (+ source.json written by `lib.rs`).
         mic_only: bool,
+        // #live — live-transcript tap (Phase 1). `Some` when the org has the
+        // live_transcript feature on; each cpal callback pushes a lossy COPY
+        // of its samples here for the relay. `None` disables the tap entirely
+        // so there's zero extra work on the audio thread.
+        live_tap: Option<LiveTap>,
         reply: Sender<Result<StartOk, String>>,
     },
     Stop {
@@ -119,7 +126,8 @@ struct CpalTrack {
 // directly from the Swift side. Kept as an enum so finish() can
 // clean up whichever flavor is active.
 enum SystemCapture {
-    Child(Child),
+    // Linux: (batch parec → system.wav, optional live-tap parec → "Them" lane).
+    Child(Child, Option<Child>),
     Cpal(CpalTrack),
     #[cfg(target_os = "macos")]
     Mac(crate::macos_loopback::MacLoopback),
@@ -185,6 +193,7 @@ impl Recorder {
         base_dir: PathBuf,
         saved_device: Option<String>,
         mic_only: bool,
+        live_tap: Option<LiveTap>,
     ) -> Result<PathBuf, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.inner
@@ -195,6 +204,7 @@ impl Recorder {
                 base_dir,
                 saved_device,
                 mic_only,
+                live_tap,
                 reply: reply_tx,
             })
             .map_err(|e| e.to_string())?;
@@ -271,13 +281,14 @@ fn worker_loop(rx: Receiver<Command_>) {
                 base_dir,
                 saved_device,
                 mic_only,
+                live_tap,
                 reply,
             } => {
                 if active.is_some() {
                     let _ = reply.send(Err("recording already in progress".into()));
                     continue;
                 }
-                match begin(&base_dir, saved_device.as_deref(), mic_only) {
+                match begin(&base_dir, saved_device.as_deref(), mic_only, live_tap) {
                     Ok(rec) => {
                         let path = rec.session_dir.clone();
                         let fallback = rec.fallback.clone();
@@ -302,14 +313,26 @@ fn worker_loop(rx: Receiver<Command_>) {
     }
 }
 
-fn begin(base_dir: &Path, saved_device: Option<&str>, mic_only: bool) -> Result<Active> {
+fn begin(
+    base_dir: &Path,
+    saved_device: Option<&str>,
+    mic_only: bool,
+    live_tap: Option<LiveTap>,
+) -> Result<Active> {
     let session_dir = base_dir.join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
     fs::create_dir_all(&session_dir).context("create session dir")?;
 
     let host = cpal::default_host();
     let (mic_device, fallback) = resolve_input_device(&host, saved_device)?;
-    let mic_track = build_cpal_track(&mic_device, session_dir.join("mic.wav"))
-        .context("build mic track")?;
+    // Mic → live channel 0 ("You"). The tap is a lossy COPY; the WAV path
+    // below is untouched.
+    let mic_track = build_cpal_track(
+        &mic_device,
+        session_dir.join("mic.wav"),
+        CHANNEL_MIC,
+        live_tap.clone(),
+    )
+    .context("build mic track")?;
     eprintln!(
         "aftercalls: recording mic from {:?}",
         mic_device.name().unwrap_or_default()
@@ -325,7 +348,7 @@ fn begin(base_dir: &Path, saved_device: Option<&str>, mic_only: bool) -> Result<
         eprintln!("aftercalls: mic-only session — skipping system loopback");
         None
     } else {
-        match start_system_loopback(&session_dir.join("system.wav")) {
+        match start_system_loopback(&session_dir.join("system.wav"), live_tap.clone()) {
             Ok((cap, target)) => {
                 eprintln!("aftercalls: recording system audio from {target}");
                 Some(cap)
@@ -479,8 +502,14 @@ fn finish(rec: Active) -> Result<PathBuf> {
         }
     }
     match rec.system {
-        Some(SystemCapture::Child(mut child)) => {
+        Some(SystemCapture::Child(mut child, tap)) => {
             stop_child_gracefully(&mut child).context("stop system loopback")?;
+            // Kill the live-tap parec (Linux "Them" lane); its reader thread
+            // exits on the resulting stdout EOF. Best-effort — never fail the
+            // stop over the disposable live tap.
+            if let Some(mut tap_child) = tap {
+                let _ = tap_child.kill();
+            }
         }
         Some(SystemCapture::Cpal(t)) => {
             drop(t._stream);
@@ -501,20 +530,31 @@ fn finish(rec: Active) -> Result<PathBuf> {
     Ok(rec.session_dir)
 }
 
-fn build_cpal_track(device: &Device, output_path: PathBuf) -> Result<CpalTrack> {
+fn build_cpal_track(
+    device: &Device,
+    output_path: PathBuf,
+    channel_tag: u8,
+    live_tap: Option<LiveTap>,
+) -> Result<CpalTrack> {
     let config = device
         .default_input_config()
         .context("default input config")?;
-    build_cpal_track_from_config(device, output_path, config)
+    build_cpal_track_from_config(device, output_path, config, channel_tag, live_tap)
 }
 
 fn build_cpal_track_from_config(
     device: &Device,
     output_path: PathBuf,
     config: cpal::SupportedStreamConfig,
+    channel_tag: u8,
+    live_tap: Option<LiveTap>,
 ) -> Result<CpalTrack> {
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.clone().into();
+    // Native rate + channel count for the live tap's resampler (16 kHz mono
+    // downmix happens off the audio thread, in the live module).
+    let tap_rate = config.sample_rate().0;
+    let tap_channels = config.channels();
 
     let spec = WavSpec {
         channels: config.channels(),
@@ -533,37 +573,74 @@ fn build_cpal_track_from_config(
     let stream = match sample_format {
         SampleFormat::F32 => {
             let w = Arc::clone(&writer);
+            let tap = live_tap.clone();
             device.build_input_stream(
                 &stream_config,
-                move |d: &[f32], _: &_| write_samples(&w, d, |v| v),
+                move |d: &[f32], _: &_| {
+                    write_samples(&w, d, |v| v);
+                    if let Some(t) = &tap {
+                        t.push(channel_tag, d.to_vec(), tap_rate, tap_channels);
+                    }
+                },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
             let w = Arc::clone(&writer);
+            let tap = live_tap.clone();
             device.build_input_stream(
                 &stream_config,
-                move |d: &[i16], _: &_| write_samples(&w, d, |v| v),
+                move |d: &[i16], _: &_| {
+                    write_samples(&w, d, |v| v);
+                    if let Some(t) = &tap {
+                        t.push(
+                            channel_tag,
+                            d.iter().map(|&v| v as f32 / 32768.0).collect(),
+                            tap_rate,
+                            tap_channels,
+                        );
+                    }
+                },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I32 => {
             let w = Arc::clone(&writer);
+            let tap = live_tap.clone();
             device.build_input_stream(
                 &stream_config,
-                move |d: &[i32], _: &_| write_samples(&w, d, |v| v),
+                move |d: &[i32], _: &_| {
+                    write_samples(&w, d, |v| v);
+                    if let Some(t) = &tap {
+                        t.push(
+                            channel_tag,
+                            d.iter().map(|&v| v as f32 / 2_147_483_648.0).collect(),
+                            tap_rate,
+                            tap_channels,
+                        );
+                    }
+                },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::U16 => {
             let w = Arc::clone(&writer);
+            let tap = live_tap.clone();
             device.build_input_stream(
                 &stream_config,
                 move |d: &[u16], _: &_| {
-                    write_samples(&w, d, |v| (v as i32 - i16::MAX as i32 - 1) as i16)
+                    write_samples(&w, d, |v| (v as i32 - i16::MAX as i32 - 1) as i16);
+                    if let Some(t) = &tap {
+                        t.push(
+                            channel_tag,
+                            d.iter().map(|&v| (v as f32 - 32768.0) / 32768.0).collect(),
+                            tap_rate,
+                            tap_channels,
+                        );
+                    }
                 },
                 err_fn,
                 None,
@@ -591,37 +668,92 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
+fn start_system_loopback(
+    output_path: &Path,
+    live_tap: Option<LiveTap>,
+) -> Result<(SystemCapture, String)> {
+    // Linux system audio: a `parec` subprocess writes system.wav directly
+    // (the lossless batch track — unchanged). When a live tap is present, a
+    // SECOND parec streams the same monitor as raw PCM to a detached reader
+    // thread that feeds the "Them" live lane. The batch WAV path stays
+    // untouched, and a tap failure only costs the live far-end draft.
     use std::os::unix::process::CommandExt;
     let default_sink = default_sink_name().context("get default sink")?;
     let monitor = format!("{default_sink}.monitor");
-    // parec (PulseAudio API) respects the `.monitor` source name; pw-cat's
-    // --target resolves to the wrong node because PipeWire exposes the monitor
-    // as a port of the sink node, not as a separate node.
-    //
-    // PR_SET_PDEATHSIG ties parec's lifetime to the agent process — if the
-    // agent is SIGKILL'd (e.g. binary swap, crash, user force-quit) parec
-    // gets SIGINT instead of being reparented to systemd and silently
-    // writing to a stale session dir forever.
-    let mut cmd = Command::new("parec");
-    cmd.arg("--device")
+
+    // Ties a parec child's lifetime to the agent — if the agent is SIGKILL'd
+    // (binary swap, crash, force-quit) parec gets SIGINT instead of leaking
+    // and writing to a stale session dir. Applied to both parecs.
+    let tie = |cmd: &mut Command| {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    };
+
+    // Batch track → system.wav. parec respects the `.monitor` source name;
+    // pw-cat's --target resolves to the wrong node (PipeWire exposes the
+    // monitor as a port of the sink node, not a separate node).
+    let mut batch = Command::new("parec");
+    batch
+        .arg("--device")
         .arg(&monitor)
         .arg("--file-format=wav")
         .arg(output_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    unsafe {
-        cmd.pre_exec(|| {
-            let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT);
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+    tie(&mut batch);
+    let batch_child = batch.spawn().context("spawn parec")?;
+
+    // Live-tap track → raw s16le PCM on stdout (48 kHz stereo; the live module
+    // downmixes + resamples to 16 kHz mono off-thread). A detached reader
+    // thread pushes each chunk to the "Them" lane and exits on parec's EOF
+    // (the tap parec is killed at stop). Best-effort spawn.
+    let tap_child = live_tap.and_then(|tap| {
+        let mut cmd = Command::new("parec");
+        cmd.arg("--device")
+            .arg(&monitor)
+            .arg("--format=s16le")
+            .arg("--rate=48000")
+            .arg("--channels=2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        tie(&mut cmd);
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut out) = child.stdout.take() {
+                    thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = out.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            let end = n - (n % 2);
+                            let samples: Vec<f32> = buf[..end]
+                                .chunks_exact(2)
+                                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                                .collect();
+                            tap.push(crate::live::CHANNEL_SYSTEM, samples, 48_000, 2);
+                        }
+                    });
+                }
+                Some(child)
             }
-            Ok(())
-        });
-    }
-    let child = cmd.spawn().context("spawn parec")?;
-    Ok((SystemCapture::Child(child), monitor))
+            Err(e) => {
+                eprintln!("aftercalls: live far-end (system) tap unavailable: {e:#}");
+                None
+            }
+        }
+    });
+
+    Ok((SystemCapture::Child(batch_child, tap_child), monitor))
 }
 
 // Windows WASAPI loopback capture. cpal's WASAPI backend uses
@@ -633,7 +765,10 @@ fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> 
 // plumbing as the mic; the resulting system.wav is interchangeable
 // with Linux's parec output from the pipeline's perspective.
 #[cfg(target_os = "windows")]
-fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
+fn start_system_loopback(
+    output_path: &Path,
+    live_tap: Option<LiveTap>,
+) -> Result<(SystemCapture, String)> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -642,8 +777,16 @@ fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> 
     let config = device
         .default_output_config()
         .context("default output config (loopback)")?;
-    let track = build_cpal_track_from_config(&device, output_path.to_path_buf(), config)
-        .context("build system loopback track")?;
+    // System loopback → live channel 1 ("Them"). WASAPI loopback IS a cpal
+    // stream, so it can be tapped like the mic.
+    let track = build_cpal_track_from_config(
+        &device,
+        output_path.to_path_buf(),
+        config,
+        crate::live::CHANNEL_SYSTEM,
+        live_tap,
+    )
+    .context("build system loopback track")?;
     Ok((SystemCapture::Cpal(track), label))
 }
 
@@ -655,14 +798,22 @@ fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> 
 // platform-agnostic. The user-facing target string is intentionally
 // vendor-opaque per repo policy.
 #[cfg(target_os = "macos")]
-fn start_system_loopback(output_path: &Path) -> Result<(SystemCapture, String)> {
+fn start_system_loopback(
+    output_path: &Path,
+    _live_tap: Option<LiveTap>,
+) -> Result<(SystemCapture, String)> {
+    // macOS system audio is written by the ScreenCaptureKit Swift shim, not
+    // a cpal stream, so the Phase-1 live tap covers the mic ("You") lane only.
     let loopback = crate::macos_loopback::MacLoopback::new(output_path)
         .context("start system audio loopback")?;
     Ok((SystemCapture::Mac(loopback), "system audio".to_string()))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn start_system_loopback(_output_path: &Path) -> Result<(SystemCapture, String)> {
+fn start_system_loopback(
+    _output_path: &Path,
+    _live_tap: Option<LiveTap>,
+) -> Result<(SystemCapture, String)> {
     anyhow::bail!("system loopback not implemented on this platform yet")
 }
 

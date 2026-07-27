@@ -73,6 +73,12 @@ struct MeResponse {
     org_id: String,
     org_slug: String,
     org_display_name: String,
+    /// #659 P5a — the org's default co-pilot persona (`"sales"` /
+    /// `"support"`). Serde default = `"sales"` covers a backend that
+    /// predates the field. Cached into `AuthFile` so the Record page seeds
+    /// the CoPilotPanel mode toggle at mount.
+    #[serde(default = "crate::config::default_copilot_mode")]
+    copilot_default_mode: String,
     // Backend added this alongside `pending_tos` for #44 so the agent
     // can cache the one-time recording-ack state at login time and
     // avoid a roundtrip every time Start Recording is clicked.
@@ -171,6 +177,7 @@ fn merge_auth(p: AuthResponsePayload) -> AuthFile {
         org_id: p.user.org_id,
         org_slug: p.user.org_slug,
         org_display_name: p.user.org_display_name,
+        copilot_default_mode: p.user.copilot_default_mode,
         recording_acknowledged: p.user.recording_acknowledged,
         features: p.user.features,
         pending_tos: p.user.pending_tos,
@@ -245,6 +252,7 @@ pub async fn update_me(
         org_id: me.org_id,
         org_slug: me.org_slug,
         org_display_name: me.org_display_name,
+        copilot_default_mode: me.copilot_default_mode,
         recording_acknowledged: me.recording_acknowledged,
         features: me.features,
         pending_tos: me.pending_tos,
@@ -579,6 +587,33 @@ pub async fn rename_speaker(
     )
     .await?;
     Ok(body.get("updated").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+// #661 (speaker-identity Phase A) — unresolved naming suggestions for a
+// call. Returns the raw JSON array; the front-end owns the shape. Confirm
+// has no endpoint of its own (it reuses `rename_speaker`), so only the GET
+// + the dismiss below are net-new on the agent bridge.
+pub async fn speaker_suggestions(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{id}/speaker-suggestions")).await
+}
+
+// #661 — dismiss a pending suggestion (204). Marks it resolved server-side
+// so it stops re-nagging; no rename. Body is unused by the handler (Path
+// extractor only) but `post_nop_typed` always sends one — harmless.
+pub async fn dismiss_speaker_suggestion(
+    backend: &Backend,
+    id: &str,
+    suggestion_id: &str,
+) -> std::result::Result<(), PortalError> {
+    post_nop_typed(
+        backend,
+        &format!("/v1/calls/{id}/speaker-suggestions/{suggestion_id}/dismiss"),
+        serde_json::json!({}),
+    )
+    .await
 }
 
 #[allow(dead_code)]
@@ -961,6 +996,131 @@ pub async fn zoho_search_records(
     get_json_typed(backend, &path).await
 }
 
+/// GET /v1/live/crm-context — #653 co-pilot CRM pull. `contact_id` is the
+/// Zoho contact id the user picked (MVP primary key); `session_uuid` is
+/// the optional live-session anchor (write-through target / future
+/// auto-match fallback). At least one must be present — the backend
+/// returns 400 otherwise. Returns the contact-card + open-Deals envelope;
+/// the copilot flag gate 404s when off, and a Zoho hiccup degrades
+/// in-band (`zoho:"not_connected"` / `deals.status:"unavailable"`).
+/// Mirrors `zoho_search_records`'s `get_json_typed` transport.
+pub async fn live_crm_context(
+    backend: &Backend,
+    contact_id: Option<&str>,
+    session_uuid: Option<&str>,
+    mode: Option<&str>,
+) -> std::result::Result<Value, PortalError> {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(cid) = contact_id.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("contact_id={}", urlencoding_minimal(cid)));
+    }
+    if let Some(su) = session_uuid.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("session_uuid={}", urlencoding_minimal(su)));
+    }
+    // #659 P5a — carry the active persona so the backend best-effort
+    // persists it to `state.copilot.mode` (the post-call record then knows
+    // which persona ran). Backend normalises anything but "support" to
+    // "sales"; does NOT change what's fetched (both Deals + Cases always
+    // return).
+    if let Some(m) = mode.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("mode={}", urlencoding_minimal(m)));
+    }
+    let path = if params.is_empty() {
+        "/v1/live/crm-context".to_string()
+    } else {
+        format!("/v1/live/crm-context?{}", params.join("&"))
+    };
+    get_json_typed(backend, &path).await
+}
+
+/// POST /v1/live/ask — #660 co-pilot ask-chip. `chip` is one of
+/// `catch_me_up | summarize | what_did_they_ask | action_items`; the
+/// backend generates a plain-text answer over the live-transcript window
+/// (org's own summarization key) and returns `{ answer, based_on_turns }`.
+/// The endpoint degrades **calm-200** — empty transcript / no key /
+/// generation failure all resolve to a plain-text answer line, never an
+/// error status — so a successful call always carries a renderable
+/// `answer`. Copilot-gated (404 when off) + impersonation-write-gated;
+/// those + a genuine transport hiccup surface as a structured
+/// `PortalError` the lane renders as its "not available right now" calm
+/// degrade. Mirrors `live_crm_context`'s `post_json_typed` transport.
+pub async fn live_ask(
+    backend: &Backend,
+    session_uuid: &str,
+    chip: &str,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/ask",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "chip": chip,
+        }),
+    )
+    .await
+}
+
+/// POST /v1/live/knowledge — #659 P5b Support-mode cited knowledge answer.
+/// `query` is the optional manual question; when omitted the backend derives it
+/// from the counterpart's most recent transcript turn. Returns
+/// `{ answer, sources }` — grounding-first, so no snippet match yields a calm
+/// no-match line with empty sources rather than a hallucination. The endpoint
+/// degrades calm-200 (no-match / no-key / generation failure all resolve to a
+/// renderable answer line); copilot-gated (404 when off) +
+/// impersonation-write-gated, which + a transport hiccup surface as a
+/// structured `PortalError` the lane renders as its calm degrade. Mirrors
+/// `live_ask`'s `post_json_typed` transport.
+pub async fn live_knowledge(
+    backend: &Backend,
+    session_uuid: &str,
+    query: Option<&str>,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/knowledge",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "query": query,
+        }),
+    )
+    .await
+}
+
+/// POST /v1/live/highlight — #660 one-click star toggle. Marks (or
+/// un-marks, `starred:false`) a live transcript turn keyed by its natural
+/// wire key `channel + start_ms`; the backend stores it on
+/// `state.copilot.highlights` and the post-call summary weights the
+/// flagged text. Returns `{ starred, count }`. Copilot-gated +
+/// impersonation-write-gated. `speaker` is optional (the turn's resolved
+/// label when known). Mirrors `live_crm_context`'s `post_json_typed`
+/// transport.
+#[allow(clippy::too_many_arguments)]
+pub async fn live_highlight(
+    backend: &Backend,
+    session_uuid: &str,
+    channel: &str,
+    start_ms: i64,
+    end_ms: i64,
+    speaker: Option<&str>,
+    text: &str,
+    starred: bool,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/highlight",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "channel": channel,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "speaker": speaker,
+            "text": text,
+            "starred": starred,
+        }),
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
 /// `body` is forwarded verbatim; frontend pre-shapes
 /// `{module, record_id, record_name, extra_tags?}`. (#186)
@@ -1279,6 +1439,7 @@ pub async fn refresh_me(backend: &Backend) -> std::result::Result<AuthFile, Port
         org_id: me.org_id,
         org_slug: me.org_slug,
         org_display_name: me.org_display_name,
+        copilot_default_mode: me.copilot_default_mode,
         recording_acknowledged: me.recording_acknowledged,
         features: me.features,
         pending_tos: me.pending_tos,

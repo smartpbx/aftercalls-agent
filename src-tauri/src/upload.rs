@@ -69,7 +69,19 @@ pub async fn create_call(
     };
 
     let url = format!("{}/v1/calls", backend.url.trim_end_matches('/'));
-    let body_value = serde_json::to_value(&body).context("serialize create-call body")?;
+    let mut body_value = serde_json::to_value(&body).context("serialize create-call body")?;
+    // #live — attach the record-start session_uuid the agent persisted into
+    // the session_dir (`live_session.json`) when it opened a live relay, so
+    // the backend can reconcile the disposable live session to this new call
+    // row. Absent for recordings that never opened a live session.
+    // Forward-compatible: the backend's CreateCall is a plain serde struct
+    // (no deny_unknown_fields), so a build that doesn't yet read the field
+    // ignores it.
+    if let Some(uuid) = read_live_session_uuid(session_dir) {
+        if let serde_json::Value::Object(ref mut map) = body_value {
+            map.insert("session_uuid".to_string(), serde_json::Value::String(uuid));
+        }
+    }
     retry_http(
         backend,
         guard,
@@ -533,6 +545,16 @@ fn read_source_json(session_dir: &Path) -> SourceDescriptor {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(_) => SourceDescriptor::default(),
     }
+}
+
+/// #live — read the record-start `session_uuid` the agent persisted into the
+/// session_dir (`live_session.json`) when a live relay opened. `None` when the
+/// file is absent (no live session) or unparseable.
+fn read_live_session_uuid(session_dir: &Path) -> Option<String> {
+    let path = session_dir.join("live_session.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("session_uuid")?.as_str().map(|s| s.to_string())
 }
 
 // AuthFile needs to be reachable for pipeline.rs's peeks at the current

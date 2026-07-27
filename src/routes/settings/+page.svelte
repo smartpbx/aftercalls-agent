@@ -343,6 +343,10 @@
   // 'enforced' (compliance posture is mandatory; no toggle to flip)
   // or 'off' (chime suppressed → speech makes no sense).
   let consentAnnouncementEnabled = $state(false);
+  // #659 P4 — per-machine opt-in for the floating always-on-top co-pilot
+  // overlay. Default OFF; a second always-on-top window is opt-in. Persisted
+  // in config.toml via set_app_prefs like every other per-machine pref.
+  let overlayEnabled = $state(false);
   // #596 — auto-record master toggles. Both default OFF so an existing
   // upgrade-installed user is never surprised by an automatic
   // recording. The new "Auto-record" section in the markup binds to
@@ -508,6 +512,7 @@
         consent_announcement_enabled: boolean;
         auto_record_start_enabled: boolean;
         auto_record_stop_enabled: boolean;
+        overlay_enabled: boolean;
       }>("get_app_prefs");
       closeToTray = p.close_to_tray;
       autoDetect = p.auto_detect;
@@ -528,6 +533,7 @@
       // combination of pref edits.
       autoRecordStartEnabled = p.auto_record_start_enabled ?? false;
       autoRecordStopEnabled = p.auto_record_stop_enabled ?? false;
+      overlayEnabled = p.overlay_enabled ?? false;
     } catch (e) {
       console.warn("get_app_prefs failed", e);
     }
@@ -562,6 +568,7 @@
         consentAnnouncementEnabled,
         autoRecordStartEnabled,
         autoRecordStopEnabled,
+        overlayEnabled,
       });
       // #501 — drop the shared cache so the next consumer
       // (compliance.ts / notify.ts) sees the freshly-saved values
@@ -1535,6 +1542,37 @@
         bind:value={maxSelfNoteMinutes}
         onchange={saveAppPrefs}
       />
+    </div>
+
+    <h3 class="pref-section">Co-pilot</h3>
+
+    <div class="pref-row">
+      <div class="pref-label">
+        <span class="pref-title">Floating call overlay</span>
+        <span class="pref-hint">
+          Shows a small always-on-top card while you're on a call — your live
+          sentiment read, the single top suggestion, and quick recap buttons —
+          so your co-pilot stays visible over your call window. It appears when
+          a call starts and closes when it ends. Off by default.
+        </span>
+      </div>
+      <label class="switch">
+        <input
+          type="checkbox"
+          checked={overlayEnabled}
+          onchange={(e) => {
+            overlayEnabled = (e.currentTarget as HTMLInputElement).checked;
+            saveAppPrefs();
+            // Turning it off mid-call closes any open overlay immediately;
+            // no-op when none is open.
+            if (!overlayEnabled) invoke("close_overlay").catch(() => {});
+          }}
+        />
+        <span class="track" aria-hidden="true">
+          <span class="knob"></span>
+        </span>
+        <span class="switch-label">{overlayEnabled ? "On" : "Off"}</span>
+      </label>
     </div>
 
     <h3 class="pref-section">Shortcuts</h3>

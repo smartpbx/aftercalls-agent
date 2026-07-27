@@ -369,7 +369,8 @@ impl AutoRecorder {
             );
             return;
         }
-        match crate::do_start(&rec, app) {
+        // Auto-app-triggered start has no co-pilot picker context → no hint.
+        match crate::do_start(&rec, app, None) {
             Ok(path) => {
                 crate::write_session_source(
                     std::path::Path::new(&path),

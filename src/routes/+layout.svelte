@@ -32,6 +32,13 @@
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { callRecording } from "$lib/stores/callRecording.svelte";
+  import { liveSession } from "$lib/stores/liveSession.svelte";
+  import type {
+    LiveSegment,
+    CoachingUpdate,
+    LiveCue,
+    ChecklistSnapshot,
+  } from "@aftercalls/shared/types";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
   import { toast } from "@aftercalls/shared/stores/toast.svelte";
@@ -67,7 +74,7 @@
     /// files deserialize cleanly; missing keys default to false (the
     /// gate hides Zoho UI on those, matching the per-org-disabled
     /// state). Backend re-checks via 404 — this is purely UX.
-    features?: { zoho?: boolean };
+    features?: { zoho?: boolean; live_transcript?: boolean };
     /// #320 — outstanding ToS / privacy versions. The layout routes
     /// the user to /accept-terms when this is non-empty so they can't
     /// reach any recording surface without confirming the legal
@@ -132,6 +139,22 @@
   let callFloaterDoneTimer: ReturnType<typeof setTimeout> | null = null;
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
+  // #659 — live-transcript stream listeners. Registered ONCE here (the
+  // layout never unmounts across route nav) so `live-segment` /
+  // `live-session` / `live-coaching` frames land in the persistent
+  // `liveSession` store even while the user is off the Record route.
+  // The Record page reads the store instead of owning these listeners.
+  let unlistenLiveSegment: UnlistenFn | null = null;
+  let unlistenLiveSession: UnlistenFn | null = null;
+  let unlistenLiveCoaching: UnlistenFn | null = null;
+  // #659 (P2) — fast-lane cue stream (battlecards + deal-risk cues). Same
+  // layout-owned lifetime as the other `live-*` listeners so cues land in the
+  // persistent store regardless of the mounted route.
+  let unlistenLiveCue: UnlistenFn | null = null;
+  // #659 (P3) — auto-checking agenda checklist stream. Same layout-owned
+  // lifetime so checklist snapshots land in the persistent store regardless of
+  // the mounted route.
+  let unlistenLiveChecklist: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
   let unlistenAutoDetect: UnlistenFn | null = null;
@@ -575,6 +598,43 @@
   }
 
   let isLoginPage = $derived(page.url.pathname.startsWith("/login"));
+  // #659 P4 — the floating overlay loads this same SvelteKit app at
+  // `/overlay` in a SECOND webview. That route renders BARE (see the
+  // template's isOverlay branch): no chrome, no nav, no login/ToS gates.
+  // onMount also bails early for it so the main window's heavy wiring
+  // (auth, listeners, updater, tray) never runs in the overlay context —
+  // the /overlay page owns its own minimal live-* listeners.
+  let isOverlay = $derived(page.url.pathname === "/overlay");
+
+  // #659 P4 — floating overlay lifecycle. Opt-in (overlay_enabled pref,
+  // default OFF) + Call mode + live-transcript on (there must be a live feed
+  // to show — mirrors the panel's mount gate + plan §4). Opened on
+  // record-start, closed after a short grace on stop so the frozen final cue
+  // stays glanceable. The overlay's own × button closes it mid-call; disabling
+  // the pref in Settings closes it too (Settings invokes close_overlay). A
+  // second always-on-top window is opt-in, so this is a no-op for the default.
+  let overlayCloseTimer: ReturnType<typeof setTimeout> | null = null;
+  async function maybeOpenOverlay(mode: "call" | "self_note") {
+    if (mode !== "call" || !me?.features?.live_transcript) return;
+    const prefs = await getAppPrefs();
+    if (!prefs?.overlay_enabled) return;
+    if (overlayCloseTimer) {
+      clearTimeout(overlayCloseTimer);
+      overlayCloseTimer = null;
+    }
+    try {
+      await invoke("open_overlay");
+    } catch (e) {
+      console.warn("open_overlay failed", e);
+    }
+  }
+  function scheduleOverlayClose() {
+    if (overlayCloseTimer) clearTimeout(overlayCloseTimer);
+    overlayCloseTimer = setTimeout(() => {
+      overlayCloseTimer = null;
+      void invoke("close_overlay").catch(() => {});
+    }, 6000);
+  }
   // True when the current route is the Record page (`/`). Used to
   // suppress the layout-level auto-detect slide-out (#74 dup-toast),
   // since the Record page renders its own inline DETECTED banner and
@@ -759,6 +819,11 @@
   }
 
   onMount(async () => {
+    // #659 P4 — the overlay webview loads this app at /overlay and renders
+    // bare. It must NOT run the main window's auth/ToS gates, global-shortcut
+    // registration, tray/updater wiring, or the live-store listeners — the
+    // /overlay route is fully self-contained. Bail before any of it.
+    if (page.url.pathname === "/overlay") return;
     const appPrefs = await getAppPrefs();
     initSentry(appPrefs?.telemetry_enabled === true);
     // #282 — start the shared shortcut listener + register the
@@ -854,6 +919,9 @@
     unlistenState = await listen<{
       recording: boolean;
       mode?: "call" | "self_note" | null;
+      // #660 — the live session_uuid minted Rust-side for a Call start with
+      // the relay open; absent for self-notes / flag-off / stop transitions.
+      session_uuid?: string | null;
     }>(
       "recording-state",
       (evt) => {
@@ -876,7 +944,23 @@
             callFloaterDoneTimer = null;
           }
           callRecording.markRecording(mode, Date.now());
+          // #659 — fresh live-transcript draft per session. Clears the
+          // previous call's segments + coaching and seeds status
+          // optimistically ("live" when the feature is on; the relay
+          // confirms via `live-session`). Moved here from the Record
+          // page's own `recording-state` handler so the reset happens
+          // even when the user isn't on /record when the call starts.
+          liveSession.resetForNewSession(!!me?.features?.live_transcript);
+          // #660 — set the fresh live session_uuid AFTER the reset (which
+          // cleared it) so the co-pilot ask/highlight surfaces can address
+          // this session. Null for self-notes / flag-off starts.
+          liveSession.setSessionUuid(evt.payload.session_uuid ?? null);
+          // #659 P4 — open the floating overlay when opted-in (Call + live).
+          void maybeOpenOverlay(mode);
         } else if (wasRecording) {
+          // #659 P4 — close the overlay after a short grace so the final
+          // cue stays glanceable. No-op when the overlay isn't open.
+          scheduleOverlayClose();
           // Backend transitioned us out of recording. The Stop click
           // path already moved the store to "stopping" optimistically;
           // for stops triggered elsewhere (Record page button, hotkey,
@@ -904,6 +988,50 @@
             refreshStaleNudge(),
           ]);
         }
+      },
+    );
+    // #659 — live-transcript stream. Owned here (not the Record page)
+    // so the buffer survives route nav: the Rust `LiveRelay` singleton
+    // keeps the WS open for the whole recording regardless of which
+    // route is mounted, so these listeners must too. `live-segment`
+    // carries each provisional/final segment (mic→You / system→Them);
+    // `live-session` carries status (live / ended / error);
+    // `live-coaching` carries a FULL coaching snapshot per frame. All
+    // three write into the persistent `liveSession` store; the Record
+    // page reads from it. Best-effort — the draft is advisory, the
+    // batch pipeline is authoritative.
+    unlistenLiveSegment = await listen<LiveSegment>("live-segment", (evt) => {
+      liveSession.pushSegment(evt.payload);
+    });
+    unlistenLiveSession = await listen<{ status?: string }>(
+      "live-session",
+      (evt) => {
+        const s = evt.payload?.status;
+        if (s === "live" || s === "ended" || s === "error") {
+          liveSession.setStatus(s);
+        }
+      },
+    );
+    unlistenLiveCoaching = await listen<CoachingUpdate>(
+      "live-coaching",
+      (evt) => {
+        liveSession.setCoaching(evt.payload);
+      },
+    );
+    // #659 (P2) — a `live-cue` frame carries ONE fast-lane cue (battlecard or
+    // deal-risk reminder). Pushed into the persistent store, which owns the
+    // client-side TTL pruning + newest-N cap. Separate from `live-coaching`
+    // (the wholesale-replace snapshot) so the two generators never race.
+    unlistenLiveCue = await listen<LiveCue>("live-cue", (evt) => {
+      liveSession.pushCue(evt.payload);
+    });
+    // #659 (P3) — a `live-checklist` frame carries a FULL agenda-checklist
+    // snapshot (coverage is append-only on the backend, so it never regresses).
+    // Stored wholesale in the persistent store, mirrored by the IntelligenceLane.
+    unlistenLiveChecklist = await listen<ChecklistSnapshot>(
+      "live-checklist",
+      (evt) => {
+        liveSession.setChecklist(evt.payload);
       },
     );
     unlistenPipeline = await listen<{
@@ -1796,6 +1924,11 @@
   onDestroy(() => {
     unlistenState?.();
     unlistenPipeline?.();
+    unlistenLiveSegment?.();
+    unlistenLiveSession?.();
+    unlistenLiveCoaching?.();
+    unlistenLiveCue?.();
+    unlistenLiveChecklist?.();
     unlistenTray?.();
     unlistenUpdatePoll?.();
     unlistenAutoDetect?.();
@@ -1809,6 +1942,11 @@
     if (callFloaterDoneTimer) {
       clearTimeout(callFloaterDoneTimer);
       callFloaterDoneTimer = null;
+    }
+    // #659 P4 — drop the pending overlay-close timer on teardown.
+    if (overlayCloseTimer) {
+      clearTimeout(overlayCloseTimer);
+      overlayCloseTimer = null;
     }
     // Reset the floater store so a remount doesn't pick up stale
     // post-stop UI from the previous session.
@@ -2245,9 +2383,15 @@
   );
 </script>
 
+<!-- #659 P4 — the overlay webview renders BARE: only the /overlay route's own
+     content, no chrome / nav / gates. Checked FIRST (before authResolved) so
+     it never flashes the booting placeholder or the login/ToS gates — the
+     overlay only ever opens for an already-authenticated, recording user. -->
+{#if isOverlay}
+  {@render children()}
 <!-- Before auth resolves we render nothing so the login form doesn't flash
      behind the rail and vice versa. -->
-{#if !authResolved}
+{:else if !authResolved}
   <div class="booting"></div>
 {:else if isLoginPage}
   <div class="bare">

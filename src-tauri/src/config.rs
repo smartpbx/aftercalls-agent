@@ -144,6 +144,16 @@ pub struct Config {
     /// fired the start.
     #[serde(default)]
     pub auto_record_stop_enabled: bool,
+    /// #659 P4 — per-user opt-in for the floating always-on-top co-pilot
+    /// overlay. Default OFF: a second always-on-top window is intrusive, so
+    /// the vast majority of users should never pay for a hidden webview.
+    /// When true AND a Call recording starts with live transcript on, the
+    /// agent opens the `/overlay` window; it closes on stop. A per-machine
+    /// display habit (like `close_to_tray`), so it lives in config.toml
+    /// rather than as an org setting. Serde default keeps existing
+    /// config.toml files loading cleanly.
+    #[serde(default)]
+    pub overlay_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -214,6 +224,7 @@ impl Config {
                 consent_announcement_enabled: false,
                 auto_record_start_enabled: false,
                 auto_record_stop_enabled: false,
+                overlay_enabled: false,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;
@@ -275,6 +286,14 @@ pub fn auth_file() -> Result<PathBuf> {
 }
 
 /// Shape of auth.json. Serialized by the login flow, read by the
+/// #659 P5a — serde default for `AuthFile::copilot_default_mode`: the
+/// Deals-first `"sales"` persona, matching the backend
+/// `orgs.copilot_default_mode` column default. Used for old auth.json files
+/// and backend responses that predate the field.
+pub(crate) fn default_copilot_mode() -> String {
+    "sales".to_string()
+}
+
 /// authenticated HTTP client that talks to the backend.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthFile {
@@ -302,6 +321,14 @@ pub struct AuthFile {
     pub org_id: String,
     pub org_slug: String,
     pub org_display_name: String,
+    /// #659 P5a — the org's default in-call co-pilot persona
+    /// (`"sales"` / `"support"`). Cached from `/v1/auth/me` so the Record
+    /// page can seed the CoPilotPanel mode toggle at mount without a
+    /// round-trip. Serde default = `"sales"` keeps old auth.json files (and
+    /// a backend that predates the field) readable with the Deals-first
+    /// default; the next login/refresh repopulates from the backend.
+    #[serde(default = "default_copilot_mode")]
+    pub copilot_default_mode: String,
     /// Cached from `/v1/auth/me`'s `recording_acknowledged` at login.
     /// The Record page uses this as the source of truth to decide
     /// whether to show the PIPEDA ack modal before Start Recording;
@@ -358,6 +385,21 @@ pub struct PendingTos {
 pub struct FeatureFlags {
     #[serde(default)]
     pub zoho: bool,
+    /// #live — org-level live-transcript feature. Same all-false default +
+    /// serde(default) posture as `zoho`: older auth.json or a backend that
+    /// predates the key decode as OFF, and the agent's Record page gates the
+    /// LiveAssistPanel + the record-start relay on this. Mirrors the backend
+    /// `FeaturesSnapshot.live_transcript`.
+    #[serde(default)]
+    pub live_transcript: bool,
+    /// #653 — org-level in-call co-pilot feature. Same all-false default +
+    /// serde(default) posture: without this field the `copilot` key on the
+    /// backend `/auth/me` `FeaturesSnapshot` would be silently dropped here,
+    /// so the Record page's `CoPilotPanel` gate would never see it. The
+    /// backend remains the security boundary; this only drives the panel
+    /// mount. Mirrors the backend `FeaturesSnapshot.copilot`.
+    #[serde(default)]
+    pub copilot: bool,
 }
 
 /// Mirror of the backend's `SeatUsage` (see
