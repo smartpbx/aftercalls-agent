@@ -3053,6 +3053,47 @@ async fn live_highlight(
     .await
 }
 
+/// POST /v1/live/speaker-identity — #663 Phase 2 per-speaker identity
+/// assignment (live rename → after-call continuity). Assigns (or clears,
+/// `clear=true`) an identity for one live speaker keyed by `channel +
+/// speakerLabel`. `kind` is `"zoho_contact"` | `"internal_user"` | `"adhoc"`;
+/// `contactId` / `userId` are set per source. A primary `zoho_contact`
+/// mirrors into the session's scalar contact anchor. Returns `{ identities }`
+/// (the full stored map) so the frontend reconciles its optimistic set.
+/// Copilot- + impersonation-write-gated; best-effort (fire-and-forget).
+/// Mirrors the `live_highlight` shim.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn live_speaker_identity(
+    session_uuid: String,
+    channel: String,
+    speaker_label: String,
+    kind: String,
+    display_name: String,
+    contact_id: Option<String>,
+    user_id: Option<String>,
+    is_primary: bool,
+    clear: bool,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_speaker_identity(
+        backend,
+        &session_uuid,
+        &channel,
+        &speaker_label,
+        &kind,
+        &display_name,
+        contact_id.as_deref(),
+        user_id.as_deref(),
+        is_primary,
+        clear,
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
 /// activity linked to the picked record (#186). Body is forwarded
 /// verbatim from the SendToZohoModal Step-3 review state.
@@ -4142,6 +4183,9 @@ pub fn run() {
             // (star) toggle. REST, off the audio WS; copilot-gated.
             live_ask,
             live_highlight,
+            // #663 Phase 2 — per-speaker identity assignment (live rename →
+            // after-call continuity). REST, off the audio WS; copilot-gated.
+            live_speaker_identity,
             // #659 P5b — Support-mode cited knowledge answer over the org's
             // own knowledge base. REST, off the audio WS; copilot-gated.
             live_knowledge,

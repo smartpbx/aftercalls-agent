@@ -1121,6 +1121,48 @@ pub async fn live_highlight(
     .await
 }
 
+/// POST /v1/live/speaker-identity — #663 Phase 2 per-speaker identity
+/// assignment (live rename → after-call continuity). Assigns (or clears,
+/// `clear=true`) an identity for one live speaker keyed by `channel +
+/// speaker_label` on `state.copilot.speaker_identities`; a primary
+/// `zoho_contact` also mirrors into `state.copilot.contact`. Three sources:
+/// a Zoho contact (`contact_id`), an internal user (`user_id`), or an ad-hoc
+/// freetext name (neither). Returns `{ identities }` echoing the full stored
+/// map so the caller can reconcile its optimistic UI. Copilot-gated +
+/// impersonation-write-gated; best-effort — the caller fires-and-forgets, so
+/// a `PortalError` here never fails the call. Mirrors `live_highlight`'s
+/// `post_json_typed` transport.
+#[allow(clippy::too_many_arguments)]
+pub async fn live_speaker_identity(
+    backend: &Backend,
+    session_uuid: &str,
+    channel: &str,
+    speaker_label: &str,
+    kind: &str,
+    display_name: &str,
+    contact_id: Option<&str>,
+    user_id: Option<&str>,
+    is_primary: bool,
+    clear: bool,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/speaker-identity",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "channel": channel,
+            "speaker_label": speaker_label,
+            "kind": kind,
+            "display_name": display_name,
+            "contact_id": contact_id,
+            "user_id": user_id,
+            "is_primary": is_primary,
+            "clear": clear,
+        }),
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
 /// `body` is forwarded verbatim; frontend pre-shapes
 /// `{module, record_id, record_name, extra_tags?}`. (#186)

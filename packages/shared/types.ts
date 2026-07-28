@@ -353,6 +353,58 @@ export type LiveHighlight = {
   starred: boolean;
 };
 
+/** #646 (Phase 2) — per-speaker identity assignment for the live co-pilot.
+ *  Maps one diarized speaker (natural key `channel + speaker_label`) to a real
+ *  identity: a Zoho contact, an internal teammate, or a free-form ("adhoc")
+ *  name. Drives the live transcript re-label (`LiveTranscriptLane.labelFor`) and
+ *  the reference-rail speaker roster (`CrmContextLane`). One entry in the
+ *  `POST /v1/live/speaker-identity` response (Tauri: `live_speaker_identity`).
+ *  `speaker_label` is the CANONICAL diarization label the backend emits —
+ *  `"Them"` for the merged far side when speaker separation is OFF, `"Speaker A"`
+ *  / `"Speaker B"` when ON (the endpoint rejects an empty `speaker_label`).
+ *  `is_primary` marks the ONE zoho_contact that grounds the deal/case card and
+ *  the recording's `contact_hint`. `contact_id` / `user_id` are set per `kind`;
+ *  every optional field decodes cleanly from an older/absent backend. */
+export type SpeakerIdentityKind = "zoho_contact" | "internal_user" | "adhoc";
+
+export type SpeakerIdentity = {
+  channel: "mic" | "system";
+  speaker_label: string;
+  kind: SpeakerIdentityKind;
+  display_name: string;
+  /** Set when `kind === "zoho_contact"` — the Zoho Contacts record id. */
+  contact_id?: string;
+  /** Set when `kind === "internal_user"` — the teammate's user id. */
+  user_id?: string;
+  /** The single primary zoho_contact; grounds the deal/case card. */
+  is_primary?: boolean;
+  assigned_at?: string;
+};
+
+/** #646 (Phase 2) — arguments for the `live_speaker_identity` Tauri command
+ *  (backend `POST /v1/live/speaker-identity`). camelCase to match the invoke
+ *  arg contract. `clear: true` removes any identity on `channel + speakerLabel`
+ *  (the remaining fields are then ignored). `isPrimary` designates the grounding
+ *  zoho_contact (backend clears the flag off the others). */
+export type SpeakerIdentityAssignArgs = {
+  sessionUuid: string;
+  channel: "mic" | "system";
+  speakerLabel: string;
+  kind: SpeakerIdentityKind;
+  displayName: string;
+  contactId?: string;
+  userId?: string;
+  isPrimary?: boolean;
+  clear?: boolean;
+};
+
+/** #646 (Phase 2) — response of `live_speaker_identity`: the FULL reconciled
+ *  identity set for the session (the store replaces its map wholesale, so a
+ *  server-side primary re-shuffle stays consistent client-side). */
+export type SpeakerIdentitiesResponse = {
+  identities: SpeakerIdentity[];
+};
+
 export type Me = {
   id?: string;
   user_id?: string;

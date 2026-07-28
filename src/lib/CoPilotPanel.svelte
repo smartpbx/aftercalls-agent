@@ -95,11 +95,14 @@
     AskChip,
     KnowledgeAnswer,
     CoachingSentimentLabel,
+    SpeakerIdentity,
+    SpeakerIdentityAssignArgs,
   } from "@aftercalls/shared/types";
   import type {
     AskAnswerState,
     TalkMetric,
   } from "$lib/stores/liveSession.svelte";
+  import { deriveDetectedSpeakers } from "$lib/stores/liveSession.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
   type Layout = "compact" | "dashboard";
@@ -123,12 +126,14 @@
     knowledgeAnswer = null,
     knowledgeInFlight = false,
     highlighted = new Set<string>(),
+    speakerIdentities = new Map<string, SpeakerIdentity>(),
     talkMetric = null,
     onask = undefined,
     ondismissAsk = undefined,
     onknowledge = undefined,
     ondismissKnowledge = undefined,
     onhighlight = undefined,
+    onassignSpeaker,
     onpick,
   }: {
     segments?: LiveSegment[];
@@ -165,6 +170,9 @@
     knowledgeAnswer?: KnowledgeAnswer | null;
     knowledgeInFlight?: boolean;
     highlighted?: Set<string>;
+    /** #646 (Phase 2) — the speaker→identity map, threaded into BOTH the rail
+     *  CRM tile (roster + primary card) and the transcript drawer (labelFor). */
+    speakerIdentities?: Map<string, SpeakerIdentity>;
     talkMetric?: TalkMetric | null;
     onask?: (chip: AskChip) => void;
     ondismissAsk?: () => void;
@@ -172,9 +180,18 @@
     onknowledge?: () => void;
     ondismissKnowledge?: () => void;
     onhighlight?: (seg: LiveSegment, starred: boolean) => void;
+    /** #646 (Phase 2) — commit one speaker identity assign / clear. +page owns
+     *  the `live_speaker_identity` invoke + the optimistic/reconcile store write. */
+    onassignSpeaker?: (
+      args: Omit<SpeakerIdentityAssignArgs, "sessionUuid">,
+    ) => void;
     // Raised up from CrmContextLane; +page threads it into start_recording.
     onpick: (contactId: string | null) => void;
   } = $props();
+
+  // #646 (Phase 2) — the distinct-speaker roster set, derived from the live
+  // segments (mic recorder + far-side speakers). Passed to the rail CRM tile.
+  let detectedSpeakers = $derived(deriveDetectedSpeakers(segments));
 
   // ── Layout (#662) ─────────────────────────────────────────────────────────
   // Panel-local, NOT persisted: default compact each session (expand is a
@@ -541,6 +558,9 @@
   <aside class="cp-rail" class:dashboard aria-label="Reference">
     <div class="cp-tile cp-tile-crm">
       <CrmContextLane
+        speakers={detectedSpeakers}
+        {speakerIdentities}
+        onassign={onassignSpeaker}
         {onpick}
         oncounts={handleCounts}
         {sessionUuid}
@@ -637,6 +657,7 @@
               {askAnswer}
               {askInFlight}
               {highlighted}
+              {speakerIdentities}
               {onask}
               {ondismissAsk}
               {onhighlight}

@@ -31,6 +31,8 @@
     KnowledgeAnswer,
     LiveSegment,
     CopilotMode,
+    SpeakerIdentityAssignArgs,
+    SpeakerIdentitiesResponse,
   } from "@aftercalls/shared/types";
 
   // Platform string reported to the backend on recording-ack (#44).
@@ -198,6 +200,63 @@
 
   function handleDismissKnowledge() {
     liveSession.dismissKnowledge();
+  }
+
+  /** #646 (Phase 2) — assign (or clear) one speaker's identity. Optimistic: set
+   *  the store immediately so every existing + future line of that speaker
+   *  re-labels at once, then (in-call) invoke `live_speaker_identity` and
+   *  RECONCILE the map wholesale from the response (the endpoint is authoritative
+   *  for the primary). Pre-call there's no session to write to — the optimistic
+   *  label stands and the primary contact rides `start_recording` as
+   *  `contact_hint` (raised separately via `onpick` → `contactHint`). A failed
+   *  write leaves the optimistic label in place (a label is advisory — never a
+   *  red surface); the next successful assign reconciles to the truth. */
+  async function handleAssignSpeaker(
+    args: Omit<SpeakerIdentityAssignArgs, "sessionUuid">,
+  ) {
+    if (args.clear) {
+      liveSession.clearSpeakerIdentity(args.channel, args.speakerLabel);
+    } else {
+      liveSession.setSpeakerIdentity({
+        channel: args.channel,
+        speaker_label: args.speakerLabel,
+        kind: args.kind,
+        display_name: args.displayName,
+        contact_id: args.contactId,
+        user_id: args.userId,
+        is_primary: args.isPrimary,
+      });
+    }
+    const su = liveSession.sessionUuid;
+    if (!su) {
+      // Pre-call: no session to write to yet. STAGE the assignment so it's
+      // replayed to the backend the instant recording starts (the layout drains
+      // the staged set), instead of being wiped by `resetForNewSession`. The
+      // primary also rides `start_recording` as `contact_hint` (via `onpick`).
+      if (args.clear) {
+        liveSession.unstagePendingIdentity(args.channel, args.speakerLabel);
+      } else {
+        liveSession.stagePendingIdentity({
+          channel: args.channel,
+          speaker_label: args.speakerLabel,
+          kind: args.kind,
+          display_name: args.displayName,
+          contact_id: args.contactId,
+          user_id: args.userId,
+          is_primary: args.isPrimary,
+        });
+      }
+      return;
+    }
+    try {
+      const res = (await invoke("live_speaker_identity", {
+        sessionUuid: su,
+        ...args,
+      })) as SpeakerIdentitiesResponse;
+      liveSession.reconcileSpeakerIdentities(res?.identities ?? []);
+    } catch {
+      // Optimistic label stands — no error surface. A later assign reconciles.
+    }
   }
 
   /** Toggle a highlight (star) on one transcript turn. Optimistic: flip the
@@ -1545,12 +1604,14 @@
         knowledgeAnswer={liveSession.knowledgeAnswer}
         knowledgeInFlight={liveSession.knowledgeInFlight}
         highlighted={liveSession.highlighted}
+        speakerIdentities={liveSession.speakerIdentities}
         talkMetric={liveSession.talkMetric}
         onask={handleAsk}
         ondismissAsk={handleDismissAsk}
         onknowledge={handleKnowledge}
         ondismissKnowledge={handleDismissKnowledge}
         onhighlight={handleHighlight}
+        onassignSpeaker={handleAssignSpeaker}
         onpick={(id) => (contactHint = id)}
       />
     {/if}

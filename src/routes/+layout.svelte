@@ -966,6 +966,29 @@
           // cleared it) so the co-pilot ask/highlight surfaces can address
           // this session. Null for self-notes / flag-off starts.
           liveSession.setSessionUuid(evt.payload.session_uuid ?? null);
+          // #646 (Phase 2) — replay any PRE-CALL speaker→identity assignments the
+          // rep staged before this session existed (a contact assigned at/just
+          // before call-connect). Fire-and-forget per entry so it actually lands
+          // in `state.copilot.speaker_identities`; a miss never surfaces (a label
+          // is advisory) and never blocks the call. Only a real call session
+          // (session_uuid present) drains + replays — a self-note keeps them
+          // staged for the eventual call.
+          const replaySu = evt.payload.session_uuid;
+          if (replaySu) {
+            for (const idn of liveSession.takePendingIdentities()) {
+              void invoke("live_speaker_identity", {
+                sessionUuid: replaySu,
+                channel: idn.channel,
+                speakerLabel: idn.speaker_label,
+                kind: idn.kind,
+                displayName: idn.display_name,
+                contactId: idn.contact_id,
+                userId: idn.user_id,
+                isPrimary: idn.is_primary ?? false,
+                clear: false,
+              }).catch(() => {});
+            }
+          }
           // #659 P4 — open the floating overlay when opted-in (Call + live).
           void maybeOpenOverlay(mode);
         } else if (wasRecording) {

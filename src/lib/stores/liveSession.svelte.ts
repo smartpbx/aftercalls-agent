@@ -26,6 +26,7 @@ import type {
   ChecklistSnapshot,
   AskChip,
   KnowledgeAnswer,
+  SpeakerIdentity,
 } from "@aftercalls/shared/types";
 
 export type LiveSessionStatus = "idle" | "live" | "ended" | "error";
@@ -76,6 +77,71 @@ const SEGMENT_CAP = 500;
  *  this pair). Shared so the lane + store agree on the key shape. */
 export function highlightKey(channel: string, startMs: number): string {
   return channel + ":" + startMs;
+}
+
+/** #646 (Phase 2) — natural key for a speaker identity: `channel + speaker_label`.
+ *  The transcript lane (`labelFor`), the reference-rail roster, and the store's
+ *  identity map all key on this exact shape so they agree without a shared object
+ *  reference. The merged far side (separation OFF) keys on the CANONICAL
+ *  diarization label the backend emits for far segments — `"Them"`, NOT `""` — so
+ *  a pre-call "Them → contact" assignment matches the far lines the instant they
+ *  arrive AND survives the `POST /v1/live/speaker-identity` non-empty check. */
+export function speakerIdentityKey(channel: string, label: string): string {
+  return channel + ":" + label;
+}
+
+/** #646 (Phase 2) — one detected speaker in the live stream, the unit the
+ *  reference-rail roster renders one row per. Derived purely from the segment
+ *  buffer via `deriveDetectedSpeakers`. `speakerLabel` is the CANONICAL
+ *  diarization label the backend emits (the identity-map key half — `"Them"` for
+ *  the merged far side, `"Speaker A"` when separated); `diarizationLabel` is the
+ *  display fallback when unassigned ("You" / "Them" / "Speaker A"); `isRecorder`
+ *  marks the mic row, which is the read-only "You". */
+export type DetectedSpeaker = {
+  channel: "mic" | "system";
+  speakerLabel: string;
+  diarizationLabel: string;
+  isRecorder: boolean;
+};
+
+/** #646 (Phase 2) — pure derivation of the roster's distinct-speaker set from
+ *  the live segment buffer. Always leads with the mic recorder ("You",
+ *  read-only). For the far side: the distinct non-empty `system` diarization
+ *  labels when speaker separation is ON ("Speaker A/B/…"); a single merged
+ *  "Them" row when OFF or pre-call (no system audio yet). The merged row keys on
+ *  the CANONICAL `"Them"` label the backend emits for far segments when
+ *  separation is OFF — NOT an empty string — so it's assignable BEFORE the far
+ *  side speaks and the assignment matches the far lines (and the endpoint's
+ *  non-empty `speaker_label` check) once they arrive. A stray empty-label early
+ *  partial is dropped once named labels exist so it can't add a duplicate row
+ *  beside the named speakers. Extracted (not inlined in the panel) so it stays
+ *  testable + the lane/roster share one truth. */
+export function deriveDetectedSpeakers(segments: LiveSegment[]): DetectedSpeaker[] {
+  const rows: DetectedSpeaker[] = [
+    { channel: "mic", speakerLabel: "", diarizationLabel: "You", isRecorder: true },
+  ];
+  const seen = new Set<string>();
+  const labels: string[] = [];
+  for (const s of segments) {
+    if (s.channel !== "system") continue;
+    const label = s.speaker ?? "";
+    if (seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  const named = labels.filter((l) => l.length > 0);
+  // Separation ON → the named speakers; OFF / pre-call → one merged "Them"
+  // (the canonical far label the backend emits + the assignable/lookup key).
+  const effective = named.length > 0 ? named : ["Them"];
+  for (const label of effective) {
+    rows.push({
+      channel: "system",
+      speakerLabel: label,
+      diarizationLabel: label || "Them",
+      isRecorder: false,
+    });
+  }
+  return rows;
 }
 
 /** #659 (P2) — cap concurrent on-screen battlecards to the newest few (plan
@@ -157,6 +223,24 @@ function createStore() {
   // Set mutations).
   let highlighted = $state<Set<string>>(new Set());
 
+  // #646 (Phase 2) — per-speaker identity map, keyed `channel + speaker_label`
+  // (`speakerIdentityKey`). A plain Map, REASSIGNED on every change so the rune
+  // tracks it (Svelte doesn't deep-track Map mutations). Set optimistically on an
+  // assign click, then RECONCILED wholesale from the `live_speaker_identity`
+  // response (the endpoint is the source of truth, incl. which zoho_contact is
+  // primary). Cleared on a new session.
+  let speakerIdentities = $state<Map<string, SpeakerIdentity>>(new Map());
+
+  // #646 (Phase 2) — PRE-CALL staged assignments, keyed `channel + speaker_label`.
+  // An assign made BEFORE the session mints (no session_uuid yet) can't POST, so
+  // it's held here and REPLAYED to the backend the instant recording starts (the
+  // layout drains this via `takePendingIdentities`). It deliberately SURVIVES
+  // `resetForNewSession` — which re-seeds the display map from it — so a contact
+  // the rep assigned for THIS starting call isn't wiped alongside the PREVIOUS
+  // call's assignments (which only ever lived in `speakerIdentities`). In-call
+  // assigns POST directly and never touch this buffer.
+  let pendingIdentities = $state<Map<string, SpeakerIdentity>>(new Map());
+
   // #660 — talk-share + trailing-monologue metric, derived from FINAL
   // segments only (provisionals are drafts). Per-channel durations for the
   // share; a same-channel trailing delta for the You-run.
@@ -231,6 +315,9 @@ function createStore() {
     },
     get highlighted(): Set<string> {
       return highlighted;
+    },
+    get speakerIdentities(): Map<string, SpeakerIdentity> {
+      return speakerIdentities;
     },
     get talkMetric(): TalkMetric {
       return talkMetric;
@@ -409,6 +496,87 @@ function createStore() {
       highlighted = next;
     },
 
+    /** #646 (Phase 2) — OPTIMISTIC set of one speaker identity, applied the
+     *  instant the user commits a pick so every existing + future line of that
+     *  speaker re-labels without waiting on the round-trip. Reassigns a fresh
+     *  Map so the rune tracks it. When the new identity claims `is_primary`, the
+     *  flag is cleared off any other entry first (only one primary at a time) —
+     *  matching what the backend then reconciles. */
+    setSpeakerIdentity(identity: SpeakerIdentity) {
+      const next = new Map(speakerIdentities);
+      if (identity.is_primary) {
+        for (const [k, v] of next) {
+          if (v.is_primary) next.set(k, { ...v, is_primary: false });
+        }
+      }
+      next.set(
+        speakerIdentityKey(identity.channel, identity.speaker_label),
+        identity,
+      );
+      speakerIdentities = next;
+    },
+
+    /** #646 (Phase 2) — OPTIMISTIC clear of one speaker's identity (revert to
+     *  the diarization label). Reassigns a fresh Map so the rune tracks it. */
+    clearSpeakerIdentity(channel: string, label: string) {
+      const key = speakerIdentityKey(channel, label);
+      if (!speakerIdentities.has(key)) return;
+      const next = new Map(speakerIdentities);
+      next.delete(key);
+      speakerIdentities = next;
+    },
+
+    /** #646 (Phase 2) — RECONCILE the whole map from the `live_speaker_identity`
+     *  response (the endpoint returns the full set, incl. the authoritative
+     *  primary). Replaces wholesale so an optimistic guess that diverged from the
+     *  server (e.g. a primary re-shuffle) settles to the truth. */
+    reconcileSpeakerIdentities(identities: SpeakerIdentity[]) {
+      const next = new Map<string, SpeakerIdentity>();
+      for (const idn of identities) {
+        next.set(speakerIdentityKey(idn.channel, idn.speaker_label), idn);
+      }
+      speakerIdentities = next;
+    },
+
+    /** #646 (Phase 2) — STAGE a PRE-CALL assignment (no session yet) for replay
+     *  at record-start. Mirrors `setSpeakerIdentity`'s single-primary strip so
+     *  the staged set never carries two primaries. */
+    stagePendingIdentity(identity: SpeakerIdentity) {
+      const next = new Map(pendingIdentities);
+      if (identity.is_primary) {
+        for (const [k, v] of next) {
+          if (v.is_primary) next.set(k, { ...v, is_primary: false });
+        }
+      }
+      next.set(
+        speakerIdentityKey(identity.channel, identity.speaker_label),
+        identity,
+      );
+      pendingIdentities = next;
+    },
+
+    /** #646 (Phase 2) — drop a PRE-CALL staged assignment (a pre-call clear), so
+     *  a cleared row isn't replayed at record-start. */
+    unstagePendingIdentity(channel: string, label: string) {
+      const key = speakerIdentityKey(channel, label);
+      if (!pendingIdentities.has(key)) return;
+      const next = new Map(pendingIdentities);
+      next.delete(key);
+      pendingIdentities = next;
+    },
+
+    /** #646 (Phase 2) — DRAIN the staged pre-call assignments: return them and
+     *  empty the buffer. The layout calls this right after the session_uuid is
+     *  minted and replays each to the backend (best-effort), so a contact
+     *  assigned before/at call-connect actually lands in
+     *  `state.copilot.speaker_identities` instead of being lost. */
+    takePendingIdentities(): SpeakerIdentity[] {
+      if (pendingIdentities.size === 0) return [];
+      const out = [...pendingIdentities.values()];
+      pendingIdentities = new Map();
+      return out;
+    },
+
     /** Clear the buffer + coaching on a NEW session start, seeding the
      *  status optimistically to `live` when the live-transcript feature
      *  is on (the relay confirms via `live-session`, or flips to
@@ -434,6 +602,12 @@ function createStore() {
       knowledgeAnswer = null;
       knowledgeInFlight = false;
       highlighted = new Set();
+      // #646 (Phase 2) — drop the previous call's speaker→identity assignments
+      // (they only ever lived in `speakerIdentities`) but RE-SEED from the
+      // PRE-CALL staged set so an identity the rep assigned for THIS starting
+      // call survives the reset; the layout replays that staged set to the
+      // backend right after. In-call assigns reconcile in as the rep makes them.
+      speakerIdentities = new Map(pendingIdentities);
       // #659 (P2) — clear fast-lane cues + stop the prune timer so a new call
       // never inherits the previous call's battlecards or risk reminders.
       liveCues = [];

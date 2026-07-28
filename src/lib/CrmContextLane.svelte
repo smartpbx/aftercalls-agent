@@ -1,19 +1,28 @@
 <!--
-  CrmContextLane — #653 co-pilot "Contact" lane.
+  CrmContextLane — #653 co-pilot "Contact" lane, reworked into the #646
+  (Phase 2) SPEAKER → IDENTITY ROSTER.
 
-  The "who are you calling?" combobox (Zoho contact typeahead) + the
-  resulting contact card and the contact's OPEN Deals. Reuses
-  `invoke("zoho_search_records", { module: "Contacts", q })` for search and
-  `invoke("live_crm_context", { contactId })` to hydrate. The picked
-  contact id is raised to `+page.svelte` via `onpick` (threaded into
-  `start_recording` as `contactHint`).
+  Top: one row per DETECTED speaker (distinct `channel + speaker` from the live
+  segments, derived by CoPilotPanel + passed as `speakers`). Each row shows its
+  current label (assigned identity name, else the diarization label) and an
+  ASSIGN affordance that opens the agent-local `SpeakerIdentityPicker`
+  (Zoho contact · teammate · adhoc name). "You" (the mic recorder) is
+  pre-assigned + read-only. Separation OFF → one merged "Them" row; ON → the
+  "Speaker A/B/…" rows; unassigned rows keep their diarization label. The PRIMARY
+  zoho_contact grounds the deal/case card beneath the roster + the recording's
+  `contact_hint` (raised via `onpick`); switching primary re-hydrates the card
+  via the SAME `live_crm_context` fetch (no new endpoint).
+
+  Bottom: the existing matched-contact card + open Deals (Sales) / Cases
+  (Support), hydrated from the primary contact. Reuses
+  `invoke("live_crm_context", { contactId })`.
 
   Degrade posture (hard-rule #2 + design.md semantic-colour rule):
     • "Zoho" is a sanctioned name and MAY appear in copy.
     • Errors are PLAIN BONE TEXT, never a red (`--live`) panel.
     • The lane never blocks the transcript — every failure is soft.
 
-  All chrome is component-scoped (`.crm-*`); the only shared class is
+  All chrome is component-scoped (`.crm-*` / `.spk-*`); the only shared class is
   `.avatar` via Avatar.svelte (markup-only). No app.css touch.
 -->
 <script lang="ts">
@@ -22,19 +31,42 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
-  import type { CrmContext, CopilotMode } from "@aftercalls/shared/types";
-
-  type ContactHit = { id: string; name: string; secondary?: string | null };
+  import SpeakerIdentityPicker from "$lib/SpeakerIdentityPicker.svelte";
+  import type { PickedIdentity } from "$lib/SpeakerIdentityPicker.svelte";
+  import {
+    speakerIdentityKey,
+    type DetectedSpeaker,
+  } from "$lib/stores/liveSession.svelte";
+  import type {
+    CrmContext,
+    CopilotMode,
+    SpeakerIdentity,
+    SpeakerIdentityAssignArgs,
+    SpeakerIdentityKind,
+  } from "@aftercalls/shared/types";
 
   let {
+    speakers = [],
+    speakerIdentities = new Map<string, SpeakerIdentity>(),
+    onassign = () => {},
     onpick,
     oncounts = undefined,
     sessionUuid = null,
     isAdmin = false,
     mode = "sales",
   }: {
-    // Raised on every committed pick (contact id) and on clear (null). The
-    // parent stores it as `contactHint` and threads it into start_recording.
+    // #646 (Phase 2) — the detected-speaker roster rows (mic recorder + the
+    // distinct far-side speakers), derived by CoPilotPanel from the segments.
+    speakers?: DetectedSpeaker[];
+    // #646 (Phase 2) — the identity map (keyed `channel + speaker_label`). The
+    // roster reads it for each row's current label + primary state.
+    speakerIdentities?: Map<string, SpeakerIdentity>;
+    // #646 (Phase 2) — commit one assign (or a `clear`). The parent owns the
+    // `live_speaker_identity` invoke + the optimistic/reconcile store write.
+    onassign?: (args: Omit<SpeakerIdentityAssignArgs, "sessionUuid">) => void;
+    // Raised with the PRIMARY zoho_contact id (or null). The parent stores it as
+    // `contactHint` and threads it into start_recording — the start-frame
+    // counterpart is the primary contact.
     onpick: (contactId: string | null) => void;
     // #662 — counts-only CRM signal for the panel's auto-mode inference. Fired
     // after each hydrate (and on clear) with open Deals/Cases COUNTS + their
@@ -48,7 +80,7 @@
       casesStatus: "ok" | "empty" | "unavailable";
     }) => void;
     // Optional live-session anchor for the crm-context write-through. Null
-    // pre-call (no session yet) — the MVP contact_id path doesn't need it.
+    // pre-call (no session yet) — the contact_id path doesn't need it.
     sessionUuid?: string | null;
     // Admin viewers get the "Connect Zoho" button; members get the muted
     // "ask an admin" text (they can't connect the integration themselves).
@@ -62,36 +94,13 @@
     mode?: CopilotMode;
   } = $props();
 
-  // ── Picker state ───────────────────────────────────────────────────
-  let query = $state("");
-  let results = $state<ContactHit[]>([]);
-  let searching = $state(false);
-  let searchError = $state(false);
-  let dropdownOpen = $state(false);
-  let activeIdx = $state(-1);
-  let searchTimer = 0;
-  // Guards against an out-of-order search: only the latest issued query's
-  // response is allowed to land (a slow early request can't clobber a fast
-  // later one).
-  let searchSeq = 0;
-
-  // ── Selection + hydration state ────────────────────────────────────
-  let selected = $state<ContactHit | null>(null);
-  // `editing` shows the combobox; false shows the collapsed card. Starts
-  // true (picker is the first action). A commit flips it false; the
-  // "Change" affordance flips it back true.
-  let editing = $state(true);
+  // ── Hydration state ────────────────────────────────────────────────
   let crm = $state<CrmContext | null>(null);
   let hydrating = $state(false);
   let hydrateError = $state(false);
-
-  let inputEl = $state<HTMLInputElement | null>(null);
-  let containerEl = $state<HTMLDivElement | null>(null);
-  let cardEl = $state<HTMLDivElement | null>(null);
-  // Polite SR announcement for pick → hydrate transitions.
+  // Polite SR announcement for assign → hydrate transitions.
   let announce = $state("");
 
-  const listboxId = `crm-list-${Math.random().toString(36).slice(2, 10)}`;
   const DEAL_CAP = 5;
 
   // Cross-tab-aware Zoho status (client-only — $effect never runs during
@@ -103,92 +112,112 @@
     void zohoStore.refresh();
   });
 
-  // ── Search ─────────────────────────────────────────────────────────
-  function scheduleSearch() {
-    clearTimeout(searchTimer);
-    searchError = false;
-    const q = query.trim();
-    if (q.length < 2) {
-      // Below the fetch threshold — no request. Clear stale rows but keep
-      // the input responsive.
-      results = [];
-      activeIdx = -1;
-      searching = false;
-      return;
-    }
-    // 150ms debounce — mirrors the SendToZohoModal / tag-popover idiom.
-    searchTimer = window.setTimeout(runSearch, 150);
+  // ── Speaker roster ─────────────────────────────────────────────────
+  // Which row (by `channel:speaker_label`) currently has its inline picker open.
+  let openPickerKey = $state<string | null>(null);
+
+  function identityFor(row: DetectedSpeaker): SpeakerIdentity | undefined {
+    return speakerIdentities.get(
+      speakerIdentityKey(row.channel, row.speakerLabel),
+    );
+  }
+  function kindLabel(k: SpeakerIdentityKind): string {
+    return k === "zoho_contact"
+      ? "Contact"
+      : k === "internal_user"
+        ? "Teammate"
+        : "Name";
+  }
+  function isPrimaryRow(idn: SpeakerIdentity | undefined): boolean {
+    return (
+      !!idn &&
+      idn.kind === "zoho_contact" &&
+      !!idn.contact_id &&
+      idn.contact_id === primaryContactId
+    );
   }
 
-  async function runSearch() {
-    const q = query.trim();
-    if (q.length < 2) return;
-    const seq = ++searchSeq;
-    searching = true;
-    searchError = false;
-    dropdownOpen = true;
-    try {
-      const out = (await invoke("zoho_search_records", {
-        module: "Contacts",
-        q,
-      })) as { results?: ContactHit[] };
-      if (seq !== searchSeq) return; // superseded
-      results = out.results ?? [];
-      activeIdx = -1;
-    } catch {
-      if (seq !== searchSeq) return;
-      // Errors are plain bone text, never a red panel.
-      searchError = true;
-      results = [];
-      activeIdx = -1;
-    } finally {
-      if (seq === searchSeq) searching = false;
-    }
+  function openPicker(row: DetectedSpeaker) {
+    openPickerKey = speakerIdentityKey(row.channel, row.speakerLabel);
+  }
+  function closePicker() {
+    openPickerKey = null;
   }
 
-  function retrySearch() {
-    searchError = false;
-    void runSearch();
-  }
-
-  // ── Pick / change / clear ──────────────────────────────────────────
-  function pick(hit: ContactHit) {
-    selected = hit;
-    query = hit.name;
-    results = [];
-    activeIdx = -1;
-    dropdownOpen = false;
-    editing = false;
-    onpick(hit.id);
-    announce = `Selected ${hit.name}. Loading deals.`;
-    // Focus the card container so keyboard users land on the freshly
-    // rendered card (Start Recording stays reachable by Tab).
-    queueMicrotask(() => cardEl?.focus());
-    void hydrate(hit.id);
-  }
-
-  function changeContact() {
-    editing = true;
-    dropdownOpen = false;
-    queueMicrotask(() => {
-      inputEl?.focus();
-      inputEl?.select();
+  // Commit a pick from the inline picker. A zoho_contact becomes the primary
+  // (grounds the card + contact_hint). Optimistic + backend write live in the
+  // parent's `onassign`.
+  function commitAssign(row: DetectedSpeaker, picked: PickedIdentity) {
+    const isZoho = picked.kind === "zoho_contact";
+    onassign({
+      channel: row.channel,
+      speakerLabel: row.speakerLabel,
+      kind: picked.kind,
+      displayName: picked.display_name,
+      contactId: picked.contact_id,
+      userId: picked.user_id,
+      isPrimary: isZoho ? true : undefined,
     });
+    if (isZoho && picked.contact_id) onpick(picked.contact_id);
+    openPickerKey = null;
+    announce = `${row.diarizationLabel} assigned to ${picked.display_name}.`;
   }
 
-  function clearSelection() {
-    selected = null;
-    crm = null;
-    hydrateError = false;
-    query = "";
-    results = [];
-    activeIdx = -1;
-    editing = true;
-    onpick(null);
-    // #662 — a cleared contact has no CRM signal; reset the panel's inference.
-    raiseCounts(null);
-    queueMicrotask(() => inputEl?.focus());
+  // Clear one speaker's identity (revert to the diarization label). If it held
+  // the primary contact, hand the card + contact_hint to the next remaining
+  // zoho_contact (or null).
+  function clearAssign(row: DetectedSpeaker) {
+    const idn = identityFor(row);
+    const wasPrimary = isPrimaryRow(idn);
+    onassign({
+      channel: row.channel,
+      speakerLabel: row.speakerLabel,
+      kind: idn?.kind ?? "adhoc",
+      displayName: idn?.display_name ?? "",
+      clear: true,
+    });
+    if (wasPrimary) {
+      const next = [...speakerIdentities.values()].find(
+        (i) =>
+          i.kind === "zoho_contact" &&
+          i.contact_id &&
+          !(
+            i.channel === row.channel && i.speaker_label === row.speakerLabel
+          ),
+      );
+      onpick(next?.contact_id ?? null);
+    }
+    openPickerKey = null;
+    announce = `${row.diarizationLabel} identity cleared.`;
   }
+
+  // Promote an already-assigned zoho_contact to primary (re-hydrates the card).
+  function makePrimary(row: DetectedSpeaker) {
+    const idn = identityFor(row);
+    if (!idn || idn.kind !== "zoho_contact" || !idn.contact_id) return;
+    onassign({
+      channel: row.channel,
+      speakerLabel: row.speakerLabel,
+      kind: "zoho_contact",
+      displayName: idn.display_name,
+      contactId: idn.contact_id,
+      isPrimary: true,
+    });
+    onpick(idn.contact_id);
+    announce = `${idn.display_name} is now the primary contact.`;
+  }
+
+  // ── Primary contact (grounds the card) ─────────────────────────────
+  // The one is_primary zoho_contact, else the first zoho_contact assigned.
+  let primaryContact = $derived.by<SpeakerIdentity | null>(() => {
+    const zoho = [...speakerIdentities.values()].filter(
+      (i) => i.kind === "zoho_contact" && i.contact_id,
+    );
+    if (zoho.length === 0) return null;
+    return zoho.find((i) => i.is_primary) ?? zoho[0];
+  });
+  let primaryContactId = $derived(primaryContact?.contact_id ?? null);
+  let primaryName = $derived(primaryContact?.display_name ?? "Contact");
 
   // #662 — raise the counts-only CRM signal for the panel's auto-mode
   // inference. Open COUNTS + degrade status ONLY — never names/subjects/PII.
@@ -233,15 +262,15 @@
       // #662 — feed the panel's inference from the fresh envelope.
       raiseCounts(ctx);
       if (ctx.zoho === "not_connected") {
-        announce = `${selected?.name ?? "Contact"} selected. Zoho is not connected.`;
+        announce = `${primaryName} selected. Zoho is not connected.`;
       } else if (mode === "support") {
         const caseCount = ctx.cases?.items?.length ?? 0;
-        announce = `${selected?.name ?? "Contact"} loaded. ${caseCount} open ${
+        announce = `${primaryName} loaded. ${caseCount} open ${
           caseCount === 1 ? "case" : "cases"
         }.`;
       } else {
         const dealCount = ctx.deals?.items?.length ?? 0;
-        announce = `${selected?.name ?? "Contact"} loaded. ${dealCount} open ${
+        announce = `${primaryName} loaded. ${dealCount} open ${
           dealCount === 1 ? "deal" : "deals"
         }.`;
       }
@@ -258,30 +287,51 @@
   }
 
   function retryHydrate() {
-    if (selected) void hydrate(selected.id);
+    if (primaryContactId) void hydrate(primaryContactId);
   }
+
+  // ── Re-hydrate the card when the primary contact changes ───────────
+  // Reactively fetch the primary contact's Deals/Cases. Guarded on the last
+  // hydrated id so a re-render that doesn't change the primary is a no-op; a
+  // switch of primary (assign / clear / make-primary) re-hydrates. When there's
+  // no primary the card clears + counts reset. `onpick` is raised imperatively
+  // from the assign handlers (NOT here), so the session-start map reset can't
+  // wipe the already-captured `contact_hint`.
+  let lastHydratedContact: string | null = null;
+  $effect(() => {
+    const cid = primaryContactId;
+    untrack(() => {
+      if (cid === lastHydratedContact) return;
+      lastHydratedContact = cid;
+      if (cid) {
+        void hydrate(cid);
+      } else {
+        crm = null;
+        hydrateError = false;
+        raiseCounts(null);
+      }
+    });
+  });
 
   // #662 — persist `state.copilot.mode` so the backend coach loop re-targets
   // the checklist template to the active persona. The write-through is the
   // existing `live_crm_context` (reused — NO new endpoint); it re-fetches
   // Deals/Cases but the returned envelope is identical (mode changes only what
   // is PERSISTED, not what is fetched), so we fire-and-forget and never disturb
-  // the already-hydrated `crm`. Fires when there IS a live session + committed
+  // the already-hydrated `crm`. Fires when there IS a live session + a primary
   // contact AND either the persona flipped (auto OR manual) OR the session was
-  // just established (seeding a pre-call inferred persona at record start).
-  // Flips are rare (the panel's hysteresis gates them), so the redundant fetch
-  // is an accepted cost. `hydrate` already persists the mode for a mid-call
-  // re-pick, so `selected` is read UNTRACKED here to avoid a double write.
+  // just established. `hydrate` already persists the mode for a fresh primary,
+  // so `primaryContact` is read UNTRACKED here to avoid a double write.
   let lastPersistedMode: CopilotMode | null = null;
   let lastPersistedSession: string | null = null;
   $effect(() => {
     const m = mode;
     const su = sessionUuid;
     untrack(() => {
-      const sel = selected;
-      if (!sel || !su) {
-        // No live session / no contact yet — nothing to persist; reset the
-        // cursor so the first real persist always fires.
+      const cid = primaryContactId;
+      if (!cid || !su) {
+        // No live session / no primary contact yet — nothing to persist; reset
+        // the cursor so the first real persist always fires.
         lastPersistedMode = null;
         lastPersistedSession = su;
         return;
@@ -291,65 +341,13 @@
       lastPersistedMode = m;
       lastPersistedSession = su;
       void invoke("live_crm_context", {
-        contactId: sel.id,
+        contactId: cid,
         sessionUuid: su,
         mode: m,
       }).catch((e) =>
         console.warn("live_crm_context mode re-persist failed", e),
       );
     });
-  });
-
-  // ── Keyboard (combobox) ────────────────────────────────────────────
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      dropdownOpen = true;
-      if (results.length === 0) return;
-      activeIdx = activeIdx + 1 >= results.length ? 0 : activeIdx + 1;
-      return;
-    }
-    if (e.key === "ArrowUp") {
-      e.preventDefault();
-      dropdownOpen = true;
-      if (results.length === 0) return;
-      activeIdx = activeIdx <= 0 ? results.length - 1 : activeIdx - 1;
-      return;
-    }
-    if (e.key === "Enter") {
-      e.preventDefault();
-      if (activeIdx >= 0 && activeIdx < results.length) {
-        pick(results[activeIdx]);
-      }
-      return;
-    }
-    if (e.key === "Escape") {
-      e.preventDefault();
-      // First Escape closes the dropdown (keeps the typed text); a second
-      // Escape on an already-closed list clears the field.
-      if (dropdownOpen) {
-        dropdownOpen = false;
-      } else if (query.length > 0) {
-        query = "";
-        results = [];
-        activeIdx = -1;
-      }
-      return;
-    }
-  }
-
-  // Capture-phase outside-click dismissal (mirrors SpeakerRenamePicker).
-  // Only closes the dropdown — never clears the typed value.
-  function onOutsidePointerDown(e: PointerEvent) {
-    const t = e.target as Node | null;
-    if (!t) return;
-    if (containerEl && containerEl.contains(t)) return;
-    dropdownOpen = false;
-  }
-  $effect(() => {
-    document.addEventListener("pointerdown", onOutsidePointerDown, true);
-    return () =>
-      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
   });
 
   // ── Deals helpers ──────────────────────────────────────────────────
@@ -387,10 +385,10 @@
   // `{crm_host}/crm/tab/{Deals|Cases}/{id}`, so the prefix before `/crm/tab/`
   // is the host. Returns "" when it can't be derived (row renders unlinked).
   function contactMoreUrl(firstUrl?: string): string {
-    if (!firstUrl || !selected) return "";
+    if (!firstUrl || !primaryContactId) return "";
     const idx = firstUrl.indexOf("/crm/tab/");
     if (idx <= 0) return "";
-    return `${firstUrl.slice(0, idx)}/crm/tab/Contacts/${selected.id}`;
+    return `${firstUrl.slice(0, idx)}/crm/tab/Contacts/${primaryContactId}`;
   }
 
   function openDeal(url: string) {
@@ -413,99 +411,102 @@
   let envelopeOff = $derived(crm?.zoho === "not_connected");
 </script>
 
-<div class="crm-lane" bind:this={containerEl} aria-label="Contact and deals">
+<div class="crm-lane" aria-label="Speakers and contact">
   <span class="sr-only" aria-live="polite">{announce}</span>
 
-  {#if zohoOff}
-    <!-- Whole-lane degrade — Zoho not connected. Soft, never red. -->
-    {@render connectPrompt()}
-  {:else if editing || !selected}
-    <!-- ── Combobox ── -->
-    <div class="crm-picker">
-      <input
-        bind:this={inputEl}
-        class="crm-input"
-        type="text"
-        role="combobox"
-        placeholder="Who are you calling?"
-        autocomplete="off"
-        aria-label="Search your Zoho contacts"
-        aria-expanded={dropdownOpen}
-        aria-controls={listboxId}
-        aria-autocomplete="list"
-        aria-activedescendant={activeIdx >= 0
-          ? `crm-opt-${activeIdx}`
-          : undefined}
-        bind:value={query}
-        oninput={scheduleSearch}
-        onfocus={() => {
-          if (results.length > 0) dropdownOpen = true;
-        }}
-        onkeydown={handleKeydown}
-      />
-
-      {#if query.trim().length === 1}
-        <p class="crm-hint">Keep typing…</p>
-      {/if}
-
-      {#if dropdownOpen && query.trim().length >= 2}
-        <div
-          class="crm-dropdown"
-          id={listboxId}
-          role="listbox"
-          aria-busy={searching}
-        >
-          {#if searching}
-            <div class="crm-status">Searching…</div>
-          {:else if searchError}
-            <div class="crm-error-row">
-              <span>Couldn't reach Zoho just now.</span>
-              <button type="button" class="ghost-btn" onclick={retrySearch}>
-                Retry
-              </button>
-            </div>
-          {:else if results.length === 0}
-            <div class="crm-status crm-nomatch">
-              No contacts match "{query.trim()}". Check the spelling or try an
-              email.
-            </div>
-          {:else}
-            {#each results as hit, i (hit.id)}
+  <!-- ── Speaker → identity roster ──
+       One row per detected speaker. "You" (mic recorder) is read-only; the far
+       side is one merged "Them" (separation OFF) or the "Speaker A/B/…" rows
+       (ON). Assigning opens the inline SpeakerIdentityPicker; the picked
+       identity re-labels ALL of that speaker's transcript lines instantly. -->
+  <div class="spk-roster" aria-label="Speakers on this call">
+    <div class="spk-head">Speakers</div>
+    {#each speakers as row (speakerIdentityKey(row.channel, row.speakerLabel))}
+      {@const rowKey = speakerIdentityKey(row.channel, row.speakerLabel)}
+      {@const idn = identityFor(row)}
+      {@const primary = isPrimaryRow(idn)}
+      <div class="spk-row" class:picking={openPickerKey === rowKey}>
+        {#if openPickerKey === rowKey}
+          <SpeakerIdentityPicker
+            speakerLabel={row.diarizationLabel}
+            onpick={(picked) => commitAssign(row, picked)}
+            oncancel={closePicker}
+          />
+        {:else}
+          <div class="spk-id">
+            <Avatar name={idn?.display_name ?? row.diarizationLabel} size={22} />
+            <span
+              class="spk-name"
+              title={idn?.display_name ?? row.diarizationLabel}
+            >
+              {idn?.display_name ?? row.diarizationLabel}
+            </span>
+            {#if idn}
+              <span class="spk-kind">{kindLabel(idn.kind)}</span>
+            {/if}
+            {#if primary}
+              <span class="spk-primary" title="Grounds the deal card below"
+                >Primary</span
+              >
+            {/if}
+          </div>
+          <div class="spk-actions">
+            {#if row.isRecorder}
+              <span class="spk-you">You</span>
+            {:else if idn}
+              {#if idn.kind === "zoho_contact" && !primary}
+                <button
+                  type="button"
+                  class="spk-btn"
+                  onclick={() => makePrimary(row)}
+                >
+                  Make primary
+                </button>
+              {/if}
               <button
                 type="button"
-                id="crm-opt-{i}"
-                class="crm-option"
-                class:active={i === activeIdx}
-                role="option"
-                aria-selected={i === activeIdx}
-                onmouseenter={() => (activeIdx = i)}
-                onclick={() => pick(hit)}
+                class="spk-btn"
+                onclick={() => openPicker(row)}
               >
-                <Avatar name={hit.name} size={20} />
-                <span class="crm-opt-body">
-                  <span class="crm-opt-name">{hit.name}</span>
-                  {#if hit.secondary}
-                    <span class="crm-opt-sec">{hit.secondary}</span>
-                  {/if}
-                </span>
+                Change
               </button>
-            {/each}
-          {/if}
-        </div>
-      {/if}
-    </div>
+              <button
+                type="button"
+                class="spk-btn spk-clear"
+                aria-label="Clear identity"
+                title="Clear identity"
+                onclick={() => clearAssign(row)}
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="spk-btn spk-assign"
+                onclick={() => openPicker(row)}
+              >
+                Assign
+              </button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/each}
+  </div>
+
+  <!-- ── Contact card — grounded on the PRIMARY zoho_contact ── -->
+  {#if zohoOff}
+    <!-- Zoho not connected — can't fetch deals; roster teammate/adhoc still work. -->
+    {@render connectPrompt()}
+  {:else if !primaryContact}
+    <p class="crm-empty">
+      Assign a speaker to a Zoho contact to see their open deals.
+    </p>
   {:else}
-    <!-- ── Collapsed contact card ── -->
-    <div class="crm-card" bind:this={cardEl} tabindex="-1">
+    <div class="crm-card">
       <div class="crm-card-head">
-        <Avatar
-          name={crm?.contact.name ?? selected.name}
-          size={28}
-        />
-        <span class="crm-card-name">{crm?.contact.name ?? selected.name}</span>
-        <button type="button" class="crm-change" onclick={changeContact}>
-          Change
-        </button>
+        <Avatar name={crm?.contact.name ?? primaryName} size={28} />
+        <span class="crm-card-name">{crm?.contact.name ?? primaryName}</span>
       </div>
 
       {#if hydrating}
@@ -687,64 +688,6 @@
     border: 0;
   }
 
-  /* ── Combobox ── */
-  .crm-picker {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-  .crm-input {
-    width: 100%;
-    padding: 0.55rem 0.7rem;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--hairline);
-    background: var(--ink-0);
-    color: var(--bone-0);
-    font: inherit;
-    font-size: 0.9rem;
-  }
-  .crm-input:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-color: var(--accent);
-  }
-  .crm-hint {
-    margin: 0;
-    font-size: 0.76rem;
-    color: var(--bone-4);
-  }
-
-  .crm-dropdown {
-    position: absolute;
-    top: calc(100% + 0.3rem);
-    left: 0;
-    right: 0;
-    z-index: 20;
-    max-height: 240px;
-    overflow-y: auto;
-    padding: 0.3rem 0;
-    border: 1px solid var(--hairline-hi);
-    border-radius: var(--radius);
-    background: var(--ink-1);
-    box-shadow: 0 10px 24px -8px rgba(0, 0, 0, 0.45);
-    animation: crm-pop 100ms ease-out both;
-  }
-  @keyframes crm-pop {
-    from {
-      opacity: 0;
-      transform: translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .crm-dropdown {
-      animation: crm-fade-in 100ms ease-out both;
-    }
-  }
   @keyframes crm-fade-in {
     from {
       opacity: 0;
@@ -754,53 +697,135 @@
     }
   }
 
+  /* ── Speaker → identity roster ── */
+  .spk-roster {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .spk-head {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+    margin-bottom: 0.1rem;
+  }
+  .spk-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 1.9rem;
+  }
+  /* When the inline picker is open the row becomes a column so the picker
+     spans the full tile width. */
+  .spk-row.picking {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .spk-id {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .spk-name {
+    font-size: 0.85rem;
+    color: var(--bone-0);
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Kind chip — neutral ground, NOT a semantic-colour signal (design.md
+     §Never-do-this palette rule). */
+  .spk-kind {
+    flex-shrink: 0;
+    padding: 0.02rem 0.4rem;
+    border-radius: var(--radius-sm);
+    background: var(--ink-2);
+    color: var(--bone-2);
+    font-size: 0.66rem;
+    letter-spacing: 0.02em;
+  }
+  /* Primary badge — the single grounding contact. Accent-tinted (it IS a
+     meaningful "this drives the card" signal, not decorative colour). */
+  .spk-primary {
+    flex-shrink: 0;
+    padding: 0.02rem 0.45rem;
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    font-size: 0.64rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .spk-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .spk-you {
+    font-size: 0.7rem;
+    color: var(--bone-3);
+    padding: 0.02rem 0.4rem;
+    border-radius: var(--radius-sm);
+    background: var(--ink-2);
+  }
+  .spk-btn {
+    padding: 0.22rem 0.55rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--hairline);
+    background: var(--ink-1);
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .spk-btn:hover {
+    color: var(--bone-0);
+    border-color: var(--hairline-hi);
+  }
+  .spk-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .spk-assign {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .spk-assign:hover {
+    background: var(--accent);
+    color: var(--ink-0);
+    border-color: var(--accent);
+  }
+  .spk-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.22rem 0.35rem;
+    color: var(--bone-3);
+  }
+  .spk-clear:hover {
+    color: var(--bone-0);
+  }
+
+  /* No-primary hint beneath the roster (soft, muted). */
+  .crm-empty {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--bone-3);
+  }
+
   .crm-status {
     padding: 0.5rem 0.7rem;
     font-size: 0.8rem;
     color: var(--bone-3);
-  }
-  .crm-nomatch {
-    line-height: 1.4;
-  }
-
-  .crm-option {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 0.6rem;
-    width: 100%;
-    padding: 0.4rem 0.7rem;
-    border: none;
-    background: transparent;
-    color: var(--bone-1);
-    text-align: left;
-    cursor: pointer;
-    font: inherit;
-    transition: background 0.15s, color 0.15s;
-  }
-  .crm-option:hover,
-  .crm-option.active {
-    background: var(--accent-soft);
-    color: var(--bone-0);
-  }
-  .crm-opt-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    min-width: 0;
-  }
-  .crm-opt-name {
-    font-size: 0.86rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .crm-opt-sec {
-    font-size: 0.72rem;
-    color: var(--bone-3);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   /* ── Contact card ── */
@@ -809,11 +834,6 @@
     flex-direction: column;
     gap: 0.4rem;
     animation: crm-fade-in 150ms ease-out both;
-  }
-  .crm-card:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: var(--radius-sm);
   }
   @media (prefers-reduced-motion: reduce) {
     .crm-card {
@@ -834,27 +854,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .crm-change {
-    margin-left: auto;
-    flex-shrink: 0;
-    background: transparent;
-    border: none;
-    padding: 0.2rem 0.3rem;
-    font: inherit;
-    font-size: 0.76rem;
-    color: var(--bone-3);
-    cursor: pointer;
-    transition: color 0.15s;
-  }
-  .crm-change:hover {
-    color: var(--accent);
-  }
-  .crm-change:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: var(--radius-sm);
-  }
-
   .crm-detail {
     margin: 0;
     font-size: 0.8rem;

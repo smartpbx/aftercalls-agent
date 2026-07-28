@@ -26,8 +26,13 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { LiveSegment, AskChip } from "@aftercalls/shared/types";
+  import type {
+    LiveSegment,
+    AskChip,
+    SpeakerIdentity,
+  } from "@aftercalls/shared/types";
   import type { AskAnswerState } from "$lib/stores/liveSession.svelte";
+  import { speakerIdentityKey } from "$lib/stores/liveSession.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
 
@@ -41,6 +46,10 @@
     askAnswer = null,
     askInFlight = null,
     highlighted = new Set<string>(),
+    // #646 (Phase 2) — per-speaker identity map (keyed `channel + speaker_label`).
+    // `labelFor` consults it so an assigned speaker re-labels ALL existing +
+    // future lines instantly (derived at render — no remount, BC-1 preserved).
+    speakerIdentities = new Map<string, SpeakerIdentity>(),
     onask = undefined,
     ondismissAsk = undefined,
     onhighlight = undefined,
@@ -51,6 +60,7 @@
     askAnswer?: AskAnswerState | null;
     askInFlight?: AskChip | null;
     highlighted?: Set<string>;
+    speakerIdentities?: Map<string, SpeakerIdentity>;
     onask?: (chip: AskChip) => void;
     ondismissAsk?: () => void;
     onhighlight?: (seg: LiveSegment, starred: boolean) => void;
@@ -78,9 +88,18 @@
   // (provisionals are drafts, not new lines).
   let finalCount = $derived(segments.reduce((n, s) => n + (s.provisional ? 0 : 1), 0));
 
+  // #646 (Phase 2) — an assigned identity wins the label for ALL of that
+  // speaker's lines (past + future), derived at render off the shared map so an
+  // assign re-labels the whole lane instantly with no remount. The lookup key is
+  // the CANONICAL diarization label — `s.speaker` when present, else the channel
+  // default ("You" mic / "Them" far). The merged far side (separation OFF)
+  // therefore keys on "Them", matching the roster row + the assign POST, so a
+  // "Them → contact" assignment (even pre-call) relabels the far lines the
+  // instant they arrive. Falls back to that same canonical label when unassigned.
   function labelFor(s: LiveSegment): string {
-    if (s.speaker) return s.speaker;
-    return s.channel === "mic" ? "You" : "Them";
+    const canonical = s.speaker || (s.channel === "mic" ? "You" : "Them");
+    const idn = speakerIdentities.get(speakerIdentityKey(s.channel, canonical));
+    return idn ? idn.display_name : canonical;
   }
 
   // ── Ask-chip row (ui.md §1) ─────────────────────────────────────────────
