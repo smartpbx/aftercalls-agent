@@ -106,6 +106,30 @@
   // the per-call override. Defaults to "sales" until the me bundle lands.
   let copilotDefaultMode = $state<CopilotMode>("sales");
 
+  // Co-pilot follow-ups (D) — call-end lifecycle. When a Call-mode recording stops the
+  // co-pilot panel swaps to a "Call ended" state (Open post-call / Dismiss)
+  // instead of lingering on the stale live dashboard until the next
+  // record-start. `sessionWasCall` is captured from the recorder START event
+  // (Rust emits mode "call" / "self_note"), so a mic-only self-note — even one
+  // started via the global hotkey while the panel is mounted — never trips the
+  // ended state. `callEnded` gates the ended panel; `copilotDismissed` hides the
+  // whole co-pilot region after an explicit Dismiss so it does NOT fall back to
+  // the stale ended dashboard (that would re-introduce the very "lingering" the
+  // fix removes). Both clear on the next record-start; navigating away unmounts
+  // this page, clearing them inherently (no blind N-second auto-hide timer). The
+  // finished call_id arrives seconds later via the `pipeline` event →
+  // `openableCallId`, which enables the "Open post-call" CTA.
+  let sessionWasCall = $state(false);
+  let callEnded = $state(false);
+  let copilotDismissed = $state(false);
+
+  function dismissCallEnded() {
+    // Close the ended card AND suppress the co-pilot region until the next
+    // record-start — never fall back to the stale ended live dashboard.
+    callEnded = false;
+    copilotDismissed = true;
+  }
+
   // #660 co-pilot P1 — ask-chip + one-click highlight (star) handlers. +page
   // owns the Tauri invokes + optimistic store writes; the derived state
   // (`liveSession.askAnswer` / `.askInFlight` / `.highlighted` / `.talkMetric`)
@@ -562,12 +586,27 @@
         // loopback doesn't capture it. Stop cue still plays on the
         // transition — no capture concern after the recorder has
         // stopped.
-        if (!recording && wasRecording) notifyRecordStop();
+        if (!recording && wasRecording) {
+          notifyRecordStop();
+          // Co-pilot follow-ups (D) — a Call-mode session just ended. Swap the co-pilot
+          // panel to the "Call ended" state instead of leaving it on the
+          // stale live dashboard. Gated on a real call session + copilot ON
+          // (a self-note never trips it); the pipeline event will surface the
+          // finished call_id (openableCallId) seconds later.
+          if (sessionWasCall && copilotEnabled) callEnded = true;
+        }
         if (recording) {
           pipelineStage = "";
           pipelineError = "";
           subGate = false;
           openableCallId = "";
+          // Co-pilot follow-ups (D) — remember whether THIS session is a call (Rust emits
+          // mode "call" / "self_note") and clear any prior ended/dismissed
+          // state: a fresh record-start closes the "Call ended" card and
+          // re-shows the live co-pilot.
+          sessionWasCall = evt.payload.mode === "call";
+          callEnded = false;
+          copilotDismissed = false;
           // #659 — the per-session live-draft reset (clear segments +
           // coaching, seed status) now lives in the layout's
           // recording-state handler via liveSession.resetForNewSession(),
@@ -1440,33 +1479,81 @@
        Copilot OFF preserves today's behavior exactly: the plain
        LiveAssistPanel renders when live_transcript is ON. -->
   {#if copilotEnabled && recordMode === "call"}
-    <CoPilotPanel
-      segments={liveSession.segments}
-      status={liveSession.status}
-      {recording}
-      isAdmin={copilotIsAdmin}
-      defaultMode={copilotDefaultMode}
-      {liveTranscriptEnabled}
-      coaching={liveSession.coaching}
-      cues={liveSession.liveCues}
-      checklist={liveSession.checklist}
-      sessionUuid={liveSession.sessionUuid}
-      {elapsedMs}
-      onToggleRecording={toggle}
-      onnotes={() => (sessionNotesOpen = true)}
-      askAnswer={liveSession.askAnswer}
-      askInFlight={liveSession.askInFlight}
-      knowledgeAnswer={liveSession.knowledgeAnswer}
-      knowledgeInFlight={liveSession.knowledgeInFlight}
-      highlighted={liveSession.highlighted}
-      talkMetric={liveSession.talkMetric}
-      onask={handleAsk}
-      ondismissAsk={handleDismissAsk}
-      onknowledge={handleKnowledge}
-      ondismissKnowledge={handleDismissKnowledge}
-      onhighlight={handleHighlight}
-      onpick={(id) => (contactHint = id)}
-    />
+    {#if callEnded}
+      <!-- Co-pilot follow-ups (D) — call-end state. Once a Call-mode recording stops the
+           co-pilot swaps to this ended panel (rather than lingering on the
+           stale live dashboard). While the finished call_id isn't known yet it
+           shows the pipeline progress; once `openableCallId` arrives the
+           primary "Open post-call" CTA is enabled. Dismiss closes it; a new
+           record-start / navigating away also clears it — never a blind timer.
+           Copy is vendor-opaque. -->
+      <section class="call-ended" style="--i: 2.5" aria-label="Call ended">
+        <div class="ce-head">
+          <span
+            class="ce-pip"
+            class:ready={!!openableCallId}
+            class:failed={pipelineStage === "failed"}
+            aria-hidden="true"
+          ></span>
+          <span class="ce-title">Call ended</span>
+          <button
+            type="button"
+            class="ce-dismiss"
+            aria-label="Dismiss"
+            title="Dismiss"
+            onclick={dismissCallEnded}
+          >
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        {#if openableCallId}
+          <p class="ce-body">Your call is ready to review.</p>
+          <div class="ce-actions">
+            <button type="button" class="ce-open" onclick={openCallInApp}>
+              Open post-call
+            </button>
+          </div>
+        {:else if pipelineStage === "failed"}
+          <p class="ce-body ce-body-muted">
+            We couldn't finish preparing this call. It'll appear in your calls
+            list if it becomes available.
+          </p>
+        {:else}
+          <p class="ce-body ce-body-muted" role="status" aria-live="polite">
+            {(pipelineStage && pipelineLabels[pipelineStage]) ||
+              "Preparing your call"}…
+          </p>
+        {/if}
+      </section>
+    {:else if !copilotDismissed}
+      <CoPilotPanel
+        segments={liveSession.segments}
+        status={liveSession.status}
+        {recording}
+        isAdmin={copilotIsAdmin}
+        defaultMode={copilotDefaultMode}
+        {liveTranscriptEnabled}
+        coaching={liveSession.coaching}
+        cues={liveSession.liveCues}
+        checklist={liveSession.checklist}
+        sessionUuid={liveSession.sessionUuid}
+        {elapsedMs}
+        onToggleRecording={toggle}
+        onnotes={() => (sessionNotesOpen = true)}
+        askAnswer={liveSession.askAnswer}
+        askInFlight={liveSession.askInFlight}
+        knowledgeAnswer={liveSession.knowledgeAnswer}
+        knowledgeInFlight={liveSession.knowledgeInFlight}
+        highlighted={liveSession.highlighted}
+        talkMetric={liveSession.talkMetric}
+        onask={handleAsk}
+        ondismissAsk={handleDismissAsk}
+        onknowledge={handleKnowledge}
+        ondismissKnowledge={handleDismissKnowledge}
+        onhighlight={handleHighlight}
+        onpick={(id) => (contactHint = id)}
+      />
+    {/if}
   {:else if liveTranscriptEnabled && (recording || liveSession.segments.length > 0 || liveSession.status === "error")}
     <LiveAssistPanel segments={liveSession.segments} status={liveSession.status} />
   {/if}
@@ -2339,6 +2426,108 @@
   .open-web:hover {
     color: var(--bone-0);
     border-color: var(--bone-2);
+  }
+
+  /* ── Co-pilot follow-ups (D) · Call-ended panel ────────────────────────────────────
+     The co-pilot region's post-stop state: a compact card that carries the
+     pipeline progress until the call is openable, then the primary
+     "Open post-call" CTA. Component-scoped (`.ce-*` live ONLY in this
+     route's <style>) — no app.css touch. */
+  .call-ended {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+    padding: 1rem 1.1rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--ink-1);
+  }
+  .ce-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .ce-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--sig);
+    flex-shrink: 0;
+    animation: pip-blink 1s infinite;
+  }
+  .ce-pip.ready {
+    background: var(--olive);
+    animation: none;
+  }
+  .ce-pip.failed {
+    background: var(--live);
+    animation: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ce-pip {
+      animation: none;
+    }
+  }
+  .ce-title {
+    font-size: 0.72rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--bone-2);
+  }
+  .ce-dismiss {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--bone-3);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .ce-dismiss:hover {
+    background: var(--ink-2);
+    color: var(--bone-0);
+  }
+  .ce-dismiss:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .ce-body {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.45;
+    color: var(--bone-0);
+  }
+  .ce-body-muted {
+    color: var(--bone-2);
+  }
+  .ce-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .ce-open {
+    padding: 0.45rem 0.95rem;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--accent);
+    color: var(--ink-0);
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ce-open:hover {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .ce-open:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .inline-error {

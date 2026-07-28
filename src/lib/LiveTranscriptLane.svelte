@@ -98,6 +98,58 @@
     action_items: "ACTION ITEMS",
   };
 
+  // ── List-aware ask answers ──────────────────────────────────────────────
+  // `action_items` + `what_did_they_ask` return a list-shaped answer, but the
+  // backend still sends ONE plain-text `answer` string (wire contract
+  // UNCHANGED). Parse it CLIENT-SIDE into discrete items so a list reads as a
+  // real, tidy `<ul>` instead of one cramped paragraph. Prose chips
+  // (`summarize` / `catch_me_up`) and the empty state keep the `<p>`. The item
+  // text stays plain text (Svelte `{item}` interpolation) — never `{@html}`.
+  const LIST_CHIPS = new Set<AskChip>(["action_items", "what_did_they_ask"]);
+
+  // Strip a leading list marker from a line: -, •, *, –, · bullets or 1./1)
+  // ordinals. Only a marker followed by whitespace is stripped, so a real
+  // hyphenated word ("follow-up") or a bare number is left intact.
+  function stripMarker(line: string): string {
+    return line.replace(/^\s*(?:[-•*–·]|\d{1,3}[.)])\s+/, "").trim();
+  }
+
+  // Parse a plain-text answer into list items. Handles the common shapes the
+  // model emits: newline-separated lines (with or without bullet/number
+  // prefixes) and a single line of bullet-glyph-separated items. Blank lines
+  // collapse. Returns [] when there is no real multi-item structure (a single
+  // line / no delimiters) so the caller keeps the prose `<p>` — never forces a
+  // one-item list.
+  function parseListItems(raw: string): string[] {
+    const text = (raw ?? "").trim();
+    if (!text) return [];
+    let lines = text
+      .split(/\r?\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    // One physical line carrying inline bullet glyphs (• / ·) → split it into
+    // items. We do NOT inline-split on spaced hyphens/dashes — too easily a
+    // real hyphenated word or a numeric range.
+    if (lines.length === 1 && /[•·]/.test(lines[0])) {
+      lines = lines[0]
+        .split(/\s*[•·]\s*/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+    }
+    const items = lines.map(stripMarker).filter(Boolean);
+    return items.length >= 2 ? items : [];
+  }
+
+  // Only a list chip with a real (non-empty) answer renders as a list;
+  // anything else (prose chip, empty state, single-line answer) falls back to
+  // the prose `<p>`.
+  let askItems = $derived(
+    askAnswer && !askAnswer.empty && LIST_CHIPS.has(askAnswer.chip)
+      ? parseListItems(askAnswer.answer)
+      : [],
+  );
+  let renderAsList = $derived(askItems.length > 0);
+
   // The ask surface is only meaningful with a live session to address and a
   // handler wired. Enabled once there's something to ask about (a live/ended
   // session with a uuid); disabled pre-recording / idle.
@@ -295,9 +347,21 @@
         </button>
       </div>
       <!-- tabindex so keyboard users can scroll a long answer in place
-           (ui.md §1c) — the body is the only scrollable region here. -->
+           (ui.md §1c) — the body is the only scrollable region here. List
+           chips (action_items / what_did_they_ask) with a real answer render
+           the client-parsed items as a tidy `<ul>`; prose chips + the empty
+           state keep the `<p>`. Item text is plain-text interpolation, never
+           `{@html}`. -->
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <p class="live-ask-answer-body" tabindex="0">{askAnswer.answer}</p>
+      {#if renderAsList}
+        <ul class="live-ask-answer-list" tabindex="0">
+          {#each askItems as item, i (i)}
+            <li>{item}</li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="live-ask-answer-body" tabindex="0">{askAnswer.answer}</p>
+      {/if}
     </div>
   {/if}
 
@@ -500,6 +564,35 @@
     overflow-y: auto;
   }
   .live-ask-answer-body:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  /* ── List-aware answer (list chips: action_items / what_did_they_ask) ───
+     A tidy, compact list — tight rows, a small left indent, muted markers —
+     for a list-shaped answer parsed client-side from the plain-text `answer`.
+     Component-scoped (reuses the shared `--bone-*` / `--accent` / `--radius-sm`
+     tokens); prose chips + the empty state keep `.live-ask-answer-body`. */
+  .live-ask-answer-list {
+    margin: 0.3rem 0 0;
+    padding-left: 1.15rem;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: var(--bone-1);
+    overflow-wrap: anywhere;
+    list-style: disc;
+    max-height: min(40vh, 14rem);
+    overflow-y: auto;
+  }
+  .live-ask-answer-list li {
+    margin: 0.15rem 0;
+    padding-left: 0.1rem;
+  }
+  .live-ask-answer-list li::marker {
+    color: var(--bone-3);
+  }
+  .live-ask-answer-list:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: var(--radius-sm);
