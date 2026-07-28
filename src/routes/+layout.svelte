@@ -16,6 +16,7 @@
   import OfflineBanner from "@aftercalls/shared/ui/OfflineBanner.svelte";
   import ReportIssueDialog from "$lib/ReportIssueDialog.svelte";
   import RecordingFloatingControl from "$lib/RecordingFloatingControl.svelte";
+  import ScreenSourceChooser from "$lib/ScreenSourceChooser.svelte";
   import ToastHost from "@aftercalls/shared/ui/ToastHost.svelte";
   import ShortcutsOverlay from "@aftercalls/shared/ui/ShortcutsOverlay.svelte";
   import CommandPalette from "@aftercalls/shared/ui/CommandPalette.svelte";
@@ -605,6 +606,11 @@
   // (auth, listeners, updater, tray) never runs in the overlay context —
   // the /overlay page owns its own minimal live-* listeners.
   let isOverlay = $derived(page.url.pathname === "/overlay");
+  // #302 follow-up — the Windows region drag-select overlay loads this same
+  // app at "/region-select" in a transparent second webview. Like /overlay it
+  // renders BARE (no chrome / nav / gates) and onMount bails early so the
+  // main window's heavy wiring never runs in that context.
+  let isRegionSelect = $derived(page.url.pathname === "/region-select");
 
   // #659 P4 — floating overlay lifecycle. Opt-in (overlay_enabled pref,
   // default OFF) + Call mode + live-transcript on (there must be a live feed
@@ -819,11 +825,16 @@
   }
 
   onMount(async () => {
-    // #659 P4 — the overlay webview loads this app at /overlay and renders
-    // bare. It must NOT run the main window's auth/ToS gates, global-shortcut
-    // registration, tray/updater wiring, or the live-store listeners — the
-    // /overlay route is fully self-contained. Bail before any of it.
-    if (page.url.pathname === "/overlay") return;
+    // #659 P4 / #302 — the overlay + region-select webviews load this app at
+    // /overlay and /region-select and render bare. They must NOT run the main
+    // window's auth/ToS gates, global-shortcut registration, tray/updater
+    // wiring, or the live-store listeners — those routes are self-contained.
+    // Bail before any of it.
+    if (
+      page.url.pathname === "/overlay" ||
+      page.url.pathname === "/region-select"
+    )
+      return;
     const appPrefs = await getAppPrefs();
     initSentry(appPrefs?.telemetry_enabled === true);
     // #282 — start the shared shortcut listener + register the
@@ -2383,11 +2394,12 @@
   );
 </script>
 
-<!-- #659 P4 — the overlay webview renders BARE: only the /overlay route's own
-     content, no chrome / nav / gates. Checked FIRST (before authResolved) so
-     it never flashes the booting placeholder or the login/ToS gates — the
-     overlay only ever opens for an already-authenticated, recording user. -->
-{#if isOverlay}
+<!-- #659 P4 / #302 — the overlay + region-select webviews render BARE: only
+     the route's own content, no chrome / nav / gates. Checked FIRST (before
+     authResolved) so they never flash the booting placeholder or the
+     login/ToS gates — both only ever open for an already-authenticated,
+     recording user. -->
+{#if isOverlay || isRegionSelect}
   {@render children()}
 <!-- Before auth resolves we render nothing so the login form doesn't flash
      behind the rail and vice versa. -->
@@ -3213,6 +3225,14 @@
      recording (issue dialog flow) and call / self-note recording.
      Renders nothing when no recording is in flight. -->
 <RecordingFloatingControl />
+
+<!-- #302 follow-up — per-call screen-source chooser. Global + non-modal;
+     surfaces only when Rust emits `screen-source-request` at record-start
+     (ask-each-call). Not mounted in the bare overlay / region-select
+     windows (those load the app at their own route). -->
+{#if !isOverlay && !isRegionSelect}
+  <ScreenSourceChooser />
+{/if}
 
 <style>
   .booting {

@@ -78,6 +78,10 @@ function createStore() {
    *  "Recording call + screen" + a SCREEN chip; the audio Stop halts both
    *  together on the Rust side. */
   let screenActive = $state(false);
+  /** #302 follow-up — the active capture's kind ("screen"/"window"/
+   *  "region"), or null when no screen capture is running. Makes the floater
+   *  label kind-aware ("Recording call + window"). */
+  let screenKind = $state<string | null>(null);
 
   let timerHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -133,6 +137,9 @@ function createStore() {
     get screenActive(): boolean {
       return screenActive;
     },
+    get screenKind(): string | null {
+      return screenKind;
+    },
 
     /** Transition into the live recording state. Called from the
      *  layout's `recording-state` listener when `recording=true`.
@@ -144,6 +151,7 @@ function createStore() {
       callId = "";
       errorMessage = "";
       screenActive = false;
+      screenKind = null;
       state = "recording";
       startTimer(seedAtMs);
     },
@@ -196,6 +204,16 @@ function createStore() {
     setScreenActive(active: boolean) {
       if (state !== "recording") return;
       screenActive = active;
+      if (!active) screenKind = null;
+    },
+
+    /** #302 follow-up — the floater's poll writes the active capture kind
+     *  (from `screen_capture_status().source_kind`). `null` = no capture
+     *  running (never picked, or it died mid-call), which drops the cue. */
+    setScreenSource(kind: string | null) {
+      if (state !== "recording") return;
+      screenKind = kind;
+      screenActive = kind !== null;
     },
 
     /** Called by the layout's auto-fade `setTimeout` after `done`.
@@ -210,6 +228,7 @@ function createStore() {
       callId = "";
       errorMessage = "";
       screenActive = false;
+      screenKind = null;
     },
 
     /** Floater calls this when the user clicks Stop. The Record page

@@ -57,8 +57,11 @@
           available: boolean;
           capturing: boolean;
           consented: boolean | null;
+          source_kind: string | null;
         }>("screen_capture_status");
-        if (!cancelled) callRecording.setScreenActive(st.capturing);
+        // #302 follow-up — source_kind is null when no capture is running
+        // (never picked, or it died mid-call) so the cue drops cleanly.
+        if (!cancelled) callRecording.setScreenSource(st.source_kind ?? null);
       } catch {
         // Advisory only — a failed probe never surfaces an error.
       }
@@ -78,6 +81,19 @@
       callRecording.mode === "call" &&
       callRecording.screenActive,
   );
+
+  // #302 follow-up — the captured source kind, as plain user-facing words
+  // (vendor-opaque). Widens the floater to "+ screen / + window / + area".
+  let screenKindLabel = $derived.by(() => {
+    switch (callRecording.screenKind) {
+      case "window":
+        return "window";
+      case "region":
+        return "area";
+      default:
+        return "screen";
+    }
+  });
 
   function fmtTime(ms: number): string {
     const total = Math.floor(ms / 1000);
@@ -107,7 +123,9 @@
   let callLabel = $derived.by(() => {
     if (callRecording.state === "recording") {
       if (callRecording.mode === "self_note") return "Self-note recording";
-      return screenCue ? "Recording call + screen" : "Recording call";
+      return screenCue
+        ? `Recording call + ${screenKindLabel}`
+        : "Recording call";
     }
     if (callRecording.state === "stopping") return "Wrapping up…";
     if (callRecording.state === "done") return "Saved";
@@ -194,7 +212,7 @@
     aria-label={callRecording.mode === "self_note"
       ? "Self-note recording in progress"
       : screenCue
-        ? "Call and screen recording in progress"
+        ? `Call and ${screenKindLabel} recording in progress`
         : "Call recording in progress"}
     aria-live="polite"
   >

@@ -185,6 +185,15 @@ pub struct Config {
     /// 4K video playback can't blow the storage budget).
     #[serde(default = "default_screen_capture_bitrate_kbps")]
     pub screen_capture_bitrate_kbps: u32,
+    /// #302 follow-up — when true (DEFAULT), record-start asks the user to
+    /// pick a screen / window / area for each call (the per-call source
+    /// chooser). When false, the call auto-captures the remembered
+    /// `screen_capture_display` (the historical Slice-B behaviour, now
+    /// opt-in). Remembered capture is Screen-only — window/area are
+    /// inherently per-call and never persisted. Serde default = true keeps
+    /// existing config.toml files loading with the ask-each-call default.
+    #[serde(default = "default_true")]
+    pub screen_capture_ask_each_call: bool,
 }
 
 fn default_true() -> bool {
@@ -273,6 +282,7 @@ impl Config {
                 screen_capture_fps: default_screen_capture_fps(),
                 screen_capture_resolution: default_screen_capture_resolution(),
                 screen_capture_bitrate_kbps: default_screen_capture_bitrate_kbps(),
+                screen_capture_ask_each_call: true,
             };
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).context("mkdir config dir")?;

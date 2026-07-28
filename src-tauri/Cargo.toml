@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.22.0"
+version = "0.23.0"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -98,6 +98,18 @@ windows = { version = "0.58", features = [
   "Win32_System_ProcessStatus",
   "Win32_System_Threading",
   "Win32_Foundation",
+  # #302 follow-up — Windows screen-source capture (gdigrab backend):
+  # monitor enumeration (EnumDisplayMonitors/GetMonitorInfoW), window
+  # enumeration (EnumWindows/GetWindowTextW/IsWindowVisible), and the
+  # Job Object that ties the ffmpeg child's lifetime to the agent
+  # (KILL_ON_JOB_CLOSE — the PDEATHSIG analog).
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_JobObjects",
+  # CreateJobObjectW is #[cfg(feature = "Win32_Security")]-gated in
+  # windows-0.58 and NOT implied by Win32_System_JobObjects; without this
+  # `cargo check --target x86_64-pc-windows-msvc` fails to resolve it.
+  "Win32_Security",
 ] }
 tauri-winrt-notification = "0.7"
 

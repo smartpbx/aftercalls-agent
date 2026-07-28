@@ -395,20 +395,30 @@ fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, l
     });
 }
 
-/// #302 Slice B — best-effort screen capture for a Call recording. Starts
-/// ONLY when every gate passes: Call mode (this is only ever called from
-/// `do_start`; self-notes take `do_start_self_note` and NEVER capture the
-/// screen), the org `screen_capture` feature is on (cached in auth.json),
-/// the per-user `screen_capture_enabled` opt-in is on, and the capture
-/// backend is available at runtime (binary present + a display). A `true`
-/// `screen_capture_enabled` implies the user completed the screen-capture
-/// consent ack when enabling it in Settings (Slice C gates enabling on the
-/// ack); the backend upload path is the authoritative consent backstop —
-/// it rejects `init` with `screen_capture_consent_required` and the
-/// uploader skips gracefully. This helper NEVER blocks or fails the audio
-/// recording: the ScreenRecorder degrades to "no video" internally and we
-/// ignore its boolean result.
-fn maybe_start_screen_capture(app: &AppHandle, session_dir: &std::path::Path) {
+/// Payload for the `screen-source-request` event — the global
+/// `ScreenSourceChooser` reads `sources` (the advertised kinds) to render
+/// only the buttons this platform can drive, and echoes `session_dir` back
+/// into `start_screen_source` so a stale request (call already stopped /
+/// restarted) is rejected.
+#[derive(serde::Serialize, Clone)]
+struct ScreenSourceRequest {
+    session_dir: String,
+    sources: Vec<String>,
+}
+
+/// #302 follow-up — at Call-mode record-start, EITHER ask the user to pick a
+/// screen / window / area for this call (ask-each-call, the default) OR
+/// auto-start the remembered screen (opt-in). Gates ONLY: Call mode (this is
+/// only ever called from `do_start`; self-notes take `do_start_self_note`
+/// and NEVER capture the screen), the org `screen_capture` feature (cached in
+/// auth.json), the per-user `screen_capture_enabled` opt-in, and a runtime-
+/// available backend advertising at least one source kind. A `true`
+/// `screen_capture_enabled` implies the user completed the consent ack; the
+/// backend upload path is the authoritative consent backstop. This helper
+/// NEVER blocks or fails the audio recording — it returns instantly (the
+/// ask-each-call path just emits an event; the actual capture starts later
+/// via `start_screen_source`).
+fn maybe_request_screen_source(app: &AppHandle, session_dir: &std::path::Path) {
     // Org feature flag (cached in auth.json). Absent / off → no capture.
     let feature_on = config::read_auth_file()
         .ok()
@@ -426,23 +436,43 @@ fn maybe_start_screen_capture(app: &AppHandle, session_dir: &std::path::Path) {
     if !cfg.screen_capture_enabled {
         return;
     }
+    // Backend availability + advertised kinds. Absent backend / empty kinds
+    // (e.g. macOS) → nothing to offer; skip silently.
+    let sources = screen_recorder::supported_source_kinds();
+    if sources.is_empty() || !app.state::<ScreenRecorder>().is_available() {
+        return;
+    }
+
+    if cfg.screen_capture_ask_each_call {
+        // Ask-each-call (default): hand the chooser the advertised kinds. The
+        // user's pick invokes `start_screen_source`; Cancel = audio-only.
+        let _ = app.emit(
+            "screen-source-request",
+            ScreenSourceRequest {
+                session_dir: session_dir.to_string_lossy().into_owned(),
+                sources: sources.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        return;
+    }
+
+    // Remembered-screen (opt-in): auto-start the saved display (Screen only —
+    // window/area are inherently per-call). Best-effort; the bool is advisory.
     let start_cfg = screen_recorder::StartConfig {
-        display: cfg.screen_capture_display.clone(),
         fps: cfg.screen_capture_fps,
         resolution: cfg.screen_capture_resolution.clone(),
         bitrate_kbps: cfg.screen_capture_bitrate_kbps,
     };
-    // Audio-start timestamp → the start-offset baseline. Falls back to now
-    // if the recorder hasn't stamped it (shouldn't happen — start() just
-    // succeeded before this call).
+    let source = screen_recorder::CaptureSource::Screen {
+        monitor: cfg.screen_capture_display.clone(),
+    };
     let audio_started_at_ms = app
         .state::<Recorder>()
         .started_at_ms()
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    // Best-effort — logs + degrades internally; the bool is advisory only.
     let _ = app
         .state::<ScreenRecorder>()
-        .start(session_dir, &start_cfg, audio_started_at_ms);
+        .start(session_dir, source, &start_cfg, audio_started_at_ms);
 }
 
 pub(crate) fn do_start(
@@ -509,10 +539,11 @@ pub(crate) fn do_start(
         write_live_session(&path, uuid);
     }
 
-    // #302 Slice B — best-effort screen capture (Call mode only). Started
-    // right after the audio so the start-offset stays small; NEVER blocks
-    // or fails the audio recording.
-    maybe_start_screen_capture(app, &path);
+    // #302 follow-up — best-effort per-call screen-source request (Call mode
+    // only). Emits the chooser event (ask-each-call) or auto-starts the
+    // remembered screen. Returns instantly; NEVER blocks or fails the audio
+    // recording.
+    maybe_request_screen_source(app, &path);
 
     emit_state(
         app,
@@ -2005,12 +2036,16 @@ fn list_displays() -> Vec<screen_recorder::DisplayInfo> {
 #[derive(serde::Serialize)]
 struct ScreenCapturePrefs {
     enabled: bool,
-    /// Saved monitor name; None = "use primary".
+    /// Saved monitor name; None = "use primary". Only used when
+    /// `ask_each_call == false` (remembered-screen capture).
     display: Option<String>,
     fps: u32,
     /// `"720p" | "1080p" | "native"`.
     resolution: Option<String>,
     bitrate_kbps: u32,
+    /// #302 follow-up — ask for a screen/window/area each call (default) vs
+    /// always auto-record the remembered `display`.
+    ask_each_call: bool,
 }
 
 #[tauri::command]
@@ -2022,6 +2057,7 @@ fn get_screen_capture_prefs() -> Result<ScreenCapturePrefs, String> {
         fps: cfg.screen_capture_fps,
         resolution: cfg.screen_capture_resolution,
         bitrate_kbps: cfg.screen_capture_bitrate_kbps,
+        ask_each_call: cfg.screen_capture_ask_each_call,
     })
 }
 
@@ -2037,6 +2073,7 @@ fn set_screen_capture_prefs(
     fps: u32,
     resolution: Option<String>,
     bitrate_kbps: u32,
+    ask_each_call: bool,
 ) -> Result<(), String> {
     let display = display
         .map(|s| s.trim().to_string())
@@ -2058,7 +2095,200 @@ fn set_screen_capture_prefs(
     cfg.screen_capture_fps = fps;
     cfg.screen_capture_resolution = resolution;
     cfg.screen_capture_bitrate_kbps = bitrate_kbps;
+    cfg.screen_capture_ask_each_call = ask_each_call;
     cfg.save().map_err(|e| e.to_string())
+}
+
+/// #302 follow-up — list visible top-level windows for the chooser's Window
+/// sub-list. Real titles on Windows; empty on Linux (the compositor's native
+/// picker owns window selection) + macOS (no capture surface).
+#[tauri::command]
+fn list_windows() -> Vec<screen_recorder::WindowInfo> {
+    screen_recorder::enumerate_windows()
+}
+
+/// #302 follow-up — resolve a drag-selected area to a canonical `WxH+X+Y`
+/// geometry. Linux drives the native region tool (`slurp`); `None` on
+/// ESC/cancel. Windows returns `None` — that platform uses the in-app
+/// `region-select` overlay window instead (see `ScreenSourceChooser`).
+#[tauri::command]
+fn pick_region() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        screen_recorder::resolve_region_via_slurp()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// #302 follow-up — the Windows `region-select` overlay window submits its
+/// result here. Closes the overlay and re-emits the outcome to the main
+/// window's chooser as `region-picked` (with the geometry) or
+/// `region-cancelled`. Routed through this app command (always permitted)
+/// so the overlay window needs no window/event ACL of its own.
+#[tauri::command]
+fn submit_region_selection(app: AppHandle, geometry: Option<String>) {
+    if let Some(w) = app.get_webview_window("region-select") {
+        let _ = w.close();
+    }
+    match geometry.filter(|g| !g.trim().is_empty()) {
+        Some(geo) => {
+            let _ = app.emit("region-picked", geo);
+        }
+        None => {
+            let _ = app.emit("region-cancelled", ());
+        }
+    }
+}
+
+/// #302 review — open the Windows drag-select overlay window FROM RUST
+/// (mirrors `open_overlay`). Creating the window server-side with a hardcoded
+/// `WebviewUrl::App` means the main window needs NO
+/// `core:webview:allow-create-webview-window` grant — an unscoped capability
+/// that let any script in `main` pop a chromeless window at an arbitrary URL.
+/// The transparent, always-on-top, decorationless `region-select` window is
+/// sized to the target monitor rect; `x`/`y` (the monitor origin) travel as
+/// query params so the overlay page maps client coords → absolute screen
+/// coords. Idempotent: refocus if already open. The overlay reports back
+/// through `submit_region_selection` (which closes it); `close_region_select`
+/// is the force-close counterpart.
+#[tauri::command]
+fn open_region_select(
+    app: AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    open_region_select_window(&app, x, y, width, height).map_err(|e| e.to_string())
+}
+
+fn open_region_select_window(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> tauri::Result<()> {
+    // Idempotent: if it's already open, refocus rather than stacking a second.
+    if let Some(w) = app.get_webview_window("region-select") {
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let url = format!("/region-select?x={x}&y={y}");
+    // Transparent is safe here: this window only ever opens on Windows (the
+    // chooser gates the invoke on `platform === "windows"`), so the Linux
+    // WEBKIT_DISABLE_COMPOSITING_MODE caveat that keeps the co-pilot overlay
+    // opaque does not apply — the region page needs alpha to show the screen
+    // through its dim.
+    WebviewWindowBuilder::new(app, "region-select", WebviewUrl::App(url.into()))
+        .title("Select area")
+        .transparent(true)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(true)
+        .position(x as f64, y as f64)
+        .inner_size(width as f64, height as f64)
+        .build()?;
+    Ok(())
+}
+
+/// #302 review — force-close the `region-select` overlay if present. No-op
+/// when absent. Called by the chooser when the call leaves the recording
+/// state mid-drag (mirrors `close_overlay`), so a stuck fullscreen
+/// always-on-top window can't survive the call ending;
+/// `submit_region_selection` already closes it on a normal pick / cancel.
+#[tauri::command]
+fn close_region_select(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("region-select") {
+        let _ = w.close();
+    }
+}
+
+/// #302 follow-up — start the per-call screen capture on the chosen source.
+/// Called by `ScreenSourceChooser` after the user picks (or the sub-list
+/// resolves a monitor/window/area). Guards against a stale request: the
+/// capture must still be the active recording AND the frontend's
+/// `session_dir` must match the recorder's, else the call was stopped /
+/// restarted and we return `cancelled` (no row). Best-effort — a spawn
+/// failure returns `unavailable` and the call proceeds audio-only. Returns
+/// one of `"started" | "cancelled" | "unavailable"`.
+#[tauri::command]
+fn start_screen_source(
+    app: AppHandle,
+    session_dir: String,
+    kind: String,
+    target: Option<String>,
+) -> String {
+    let recorder = app.state::<Recorder>();
+    if !recorder.is_active() {
+        return "cancelled".to_string();
+    }
+    // Stale-request race: the session dir the chooser was opened for must
+    // match the recorder's current session.
+    match recorder.session_dir() {
+        Some(active) if active.to_string_lossy() == session_dir => {}
+        _ => return "cancelled".to_string(),
+    }
+
+    // Defense-in-depth (#302 security review): re-assert the same gates
+    // `maybe_request_screen_source` applied — the org `screen_capture`
+    // feature (cached in auth.json) + the per-user opt-in — before starting
+    // capture. A flag/opt-in flip (or a stale / forged request) between the
+    // chooser event and the pick must not start capture. Silent audio-only
+    // fallback ("cancelled"), never an error.
+    let feature_on = config::read_auth_file()
+        .ok()
+        .flatten()
+        .map(|a| a.features.screen_capture)
+        .unwrap_or(false);
+    if !feature_on {
+        return "cancelled".to_string();
+    }
+
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(_) => return "unavailable".to_string(),
+    };
+    if !cfg.screen_capture_enabled {
+        return "cancelled".to_string();
+    }
+    let target = target.filter(|s| !s.trim().is_empty());
+    let source = match kind.as_str() {
+        "screen" => screen_recorder::CaptureSource::Screen { monitor: target },
+        "window" => screen_recorder::CaptureSource::Window { target },
+        "region" => match target {
+            Some(geo) => screen_recorder::CaptureSource::Region { geometry: geo },
+            // Region with no geometry = cancelled drag-select → audio-only.
+            None => return "cancelled".to_string(),
+        },
+        _ => return "unavailable".to_string(),
+    };
+
+    let start_cfg = screen_recorder::StartConfig {
+        fps: cfg.screen_capture_fps,
+        resolution: cfg.screen_capture_resolution.clone(),
+        bitrate_kbps: cfg.screen_capture_bitrate_kbps,
+    };
+    let audio_started_at_ms = recorder
+        .started_at_ms()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let session_path = std::path::PathBuf::from(&session_dir);
+    let started = app.state::<ScreenRecorder>().start(
+        &session_path,
+        source,
+        &start_cfg,
+        audio_started_at_ms,
+    );
+    if started {
+        "started".to_string()
+    } else {
+        "unavailable".to_string()
+    }
 }
 
 /// POST the screen-capture consent ack. The Settings toggle calls this
@@ -2106,6 +2336,13 @@ struct ScreenCaptureStatus {
     /// ("consent accepted on {date}"). None when there's no ack or it
     /// couldn't be determined.
     consented_at: Option<String>,
+    /// #302 follow-up — the source kinds this platform advertises
+    /// ("screen"/"window"/"region"). Empty hides the whole surface (macOS).
+    sources: Vec<String>,
+    /// #302 follow-up — the active capture's kind while it's running, else
+    /// None. Drives the floater's kind-aware label and drops the cue when a
+    /// capture dies mid-call (denied / closed / gdigrab exit).
+    source_kind: Option<String>,
 }
 
 /// Report screen-capture readiness for the Settings UI: backend
@@ -2116,6 +2353,11 @@ struct ScreenCaptureStatus {
 async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
     let available = app.state::<ScreenRecorder>().is_available();
     let capturing = app.state::<ScreenRecorder>().is_active();
+    let sources = screen_recorder::supported_source_kinds()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let source_kind = app.state::<ScreenRecorder>().active_source_kind();
     // Best-effort consent probe — outer None on any error (offline / no
     // backend). The ack GET returns `Some({ accepted_at })` when a row
     // exists, so we surface both the boolean and the raw `accepted_at`
@@ -2135,6 +2377,8 @@ async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
         capturing,
         consented,
         consented_at,
+        sources,
+        source_kind,
     }
 }
 
@@ -3788,6 +4032,17 @@ pub fn run() {
             screen_capture_ack,
             screen_capture_status,
             get_screen_recording,
+            // #302 follow-up — per-call screen-source chooser: window list,
+            // region drag-select (Linux slurp), the Windows region-overlay
+            // result sink, and the start-on-chosen-source command.
+            list_windows,
+            pick_region,
+            submit_region_selection,
+            // #302 review — Rust-managed region overlay (mirrors open/close_overlay)
+            // so the frontend drops the unscoped webview-create capability.
+            open_region_select,
+            close_region_select,
+            start_screen_source,
             // #659 P4 — floating always-on-top co-pilot overlay: open/close
             // the second webview + hydrate it from the cold-start snapshot
             // cache. Custom commands need no capability grant; the /overlay

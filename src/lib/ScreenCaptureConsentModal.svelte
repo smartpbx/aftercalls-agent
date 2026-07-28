@@ -94,12 +94,12 @@
 
     <div class="rn-body">
       <p class="ack-body ack-emph">
-        While a call is recording, aftercalls records your chosen display
-        as video — so whatever is on that screen (other apps, windows,
-        messages, or anything sensitive) is captured.
+        While a call is recording, aftercalls records the screen, window, or
+        area you choose as video — so whatever is shown there (other apps,
+        windows, messages, or anything sensitive) is captured.
       </p>
       <p class="ack-body">
-        Only the one display you pick is recorded. It records only while a
+        Only what you pick each call is recorded. It records only while a
         call is recording, and you can turn it off any time in Settings.
       </p>
       <p class="ack-body">

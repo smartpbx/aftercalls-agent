@@ -604,6 +604,11 @@
   type ScreenResolution = "720p" | "1080p" | "native";
 
   let scrEnabled = $state(false);
+  // #302 follow-up — ask for a screen/window/area each call (default) vs
+  // always auto-record the remembered display. `scrWhen` is the segmented
+  // control's string mirror.
+  let scrAskEachCall = $state(true);
+  let scrWhen = $state("ask");
   // null = "use primary display".
   let scrDisplay = $state<string | null>(null);
   let scrFps = $state("15");
@@ -645,6 +650,10 @@
     { value: "1080p", label: "1080p" },
     { value: "native", label: "Native" },
   ];
+  const scrWhenOptions = [
+    { value: "ask", label: "Ask me each call" },
+    { value: "remember", label: "Always record my screen" },
+  ];
 
   async function loadScreenCapture() {
     if (!me?.features?.screen_capture) return;
@@ -655,8 +664,11 @@
         fps: number;
         resolution: string | null;
         bitrate_kbps: number;
+        ask_each_call: boolean;
       }>("get_screen_capture_prefs");
       scrEnabled = prefs.enabled;
+      scrAskEachCall = prefs.ask_each_call;
+      scrWhen = prefs.ask_each_call ? "ask" : "remember";
       scrDisplay = prefs.display;
       // Snap a hand-edited fps to the nearest supported pill for display;
       // the actual value round-trips clamped [10,30] on the Rust side.
@@ -701,6 +713,7 @@
         fps: parseInt(scrFps, 10) || 15,
         resolution: scrResolution,
         bitrateKbps: Math.round(Number(scrBitrate) || 8000),
+        askEachCall: scrAskEachCall,
       });
       scrEnabled = enabled;
     } catch (e) {
@@ -2069,9 +2082,9 @@
         <div class="pref-label">
           <span class="pref-title">Record my screen during calls</span>
           <span class="pref-hint" id="scr-enable-hint">
-            Off by default. When on, your screen is recorded as video
-            while a call is recording, so you can review what was shown.
-            Never used for the AI summary.
+            Off by default. When on, you can record a screen, a window, or
+            an area as video while a call is recording, so you can review
+            what was shown. Never used for the AI summary.
           </span>
           {#if !scrAvailable}
             <span class="pref-hint scr-unavailable">
@@ -2100,29 +2113,54 @@
       {#if scrEnabled}
         <div class="pref-row">
           <div class="pref-label">
-            <span class="pref-title">Display</span>
-            <span class="pref-hint">Only the display you pick is recorded.</span>
+            <span class="pref-title">When a call starts</span>
+            <span class="pref-hint">
+              Ask each call lets you pick a screen, a window, or an area
+              every time. Always record my screen skips the prompt and
+              records the display you choose below.
+            </span>
           </div>
-          <select
-            class="input scr-display-select"
-            disabled={scrSaving || scrDisplays.length <= 1}
-            value={scrDisplay ?? ""}
-            onchange={(e) => {
-              const v = (e.currentTarget as HTMLSelectElement).value;
-              scrDisplay = v || null;
+          <Segmented
+            options={scrWhenOptions}
+            bind:value={scrWhen}
+            ariaLabel="When a call starts"
+            disabled={scrSaving}
+            onchange={(v) => {
+              scrAskEachCall = v === "ask";
               void persistScreenPrefs(scrEnabled);
             }}
-          >
-            <option value="">Primary display</option>
-            {#each scrDisplays as d (d.name)}
-              <option value={d.name}>
-                {d.name}{d.width
-                  ? ` (${d.width}×${d.height})`
-                  : ""}{d.is_primary ? " · primary" : ""}
-              </option>
-            {/each}
-          </select>
+          />
         </div>
+
+        {#if !scrAskEachCall}
+          <div class="pref-row">
+            <div class="pref-label">
+              <span class="pref-title">Display</span>
+              <span class="pref-hint">
+                Only the display you pick is recorded, every call.
+              </span>
+            </div>
+            <select
+              class="input scr-display-select"
+              disabled={scrSaving || scrDisplays.length <= 1}
+              value={scrDisplay ?? ""}
+              onchange={(e) => {
+                const v = (e.currentTarget as HTMLSelectElement).value;
+                scrDisplay = v || null;
+                void persistScreenPrefs(scrEnabled);
+              }}
+            >
+              <option value="">Primary display</option>
+              {#each scrDisplays as d (d.name)}
+                <option value={d.name}>
+                  {d.name}{d.width
+                    ? ` (${d.width}×${d.height})`
+                    : ""}{d.is_primary ? " · primary" : ""}
+                </option>
+              {/each}
+            </select>
+          </div>
+        {/if}
 
         <div class="pref-row">
           <div class="pref-label">
