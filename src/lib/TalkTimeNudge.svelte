@@ -1,53 +1,51 @@
 <!--
-  TalkTimeNudge — #660 co-pilot P1, self-only talk-time nudge.
+  TalkTimeNudge — co-pilot BI-revamp: the quiet-rail TALK-RATIO METER.
 
-  A subtle, dismissable, SELF-COACHING line fed the derived trailing You-run
-  metric from `liveSession.svelte.ts` (plan §5 / ui.md §4). When the rep (You)
-  has monologued past a threshold it surfaces one calm line inviting a question.
+  Reworked (BI-dashboard revamp) from the old dismissable monologue line into a
+  persistent, glanceable talk-share meter that lives in the reference rail. It
+  is a GAUGE, not an alarm: a two-segment bar (You / Them) + a bone readout,
+  shown whenever the call has produced any final turns. The monologue STATE is
+  surfaced here only as a subtle `--sig` tint on the You segment once the rep's
+  trailing run passes threshold — the actionable, worded "a question could open
+  things up" nudge now lives ONCE, as the ephemeral cue (IntelligenceLane), so
+  the alert isn't double-encoded.
 
-  VISUAL PRIVACY (critical, ui.md §4d): this line lives ONLY in the rep's own
-  agent window. The counterpart never sees the agent UI, so the nudge is
-  inherently private — self-coaching, verbal-only, on-device (derived from
-  segment DURATIONS, no backend, no affective/camera scoring). Nothing here is
-  shared to the other party or a manager.
+  VISUAL PRIVACY (unchanged): this lives ONLY in the rep's own agent window,
+  derived on-device from segment DURATIONS (no backend, no affective scoring).
+  Nothing is shared to the other party or a manager.
 
   HARD RULES honored:
-   - All chrome is component-scoped `.talk-nudge*` — NO app.css touch (HR#1).
-   - Copy is vendor-opaque, self-framed, non-judgmental (HR#2). Bone only — no
-     `--live`, no `--accent` fill, no pulse: it informs, it never alarms/shames.
+   - All chrome is component-scoped `.talk-*` — NO app.css touch (HR#1).
+   - Copy is vendor-opaque, self-framed (HR#2). Bone by default; the monologue
+     tint uses `--sig` ("heads up"), never `--live` — it informs, never shames.
 -->
 <script lang="ts">
   import { onMount } from "svelte";
 
   let {
-    /** Duration (ms) of the current unbroken trailing You-run. */
-    youRunMs = 0,
-    /** Optional talk-share readout (ui.md §4e — OPTIONAL, neutral). Rendered
-     *  only when both are provided; a high You% is NEVER colored (no shame). */
+    /** Talk-share readout — you / them percent of total final speech. Null
+     *  pre-first-final; a high You% is NEVER shamed with `--live`. */
     youPct = null,
     themPct = null,
-    /** Surface threshold — ~90s continuous per plan §5. */
+    /** Duration (ms) of the current unbroken trailing You-run; drives the
+     *  subtle monologue tint (the worded alert is the cue, not this tile). */
+    youRunMs = 0,
+    /** Monologue threshold — ~90s continuous per plan §5. */
     thresholdMs = 90_000,
   }: {
-    youRunMs?: number;
     youPct?: number | null;
     themPct?: number | null;
+    youRunMs?: number;
     thresholdMs?: number;
   } = $props();
 
-  // Dismiss latch, scoped to the CURRENT monologue run. Cleared when the run
-  // resets (the counterpart speaks → youRunMs drops back below threshold), so a
-  // fresh long You-run can surface the nudge again — but it never re-fires
-  // within the same unbroken monologue (ui.md §4c re-arm).
-  let dismissed = $state(false);
-  $effect(() => {
-    if (youRunMs < thresholdMs && dismissed) dismissed = false;
-  });
+  // Show the meter once the call has produced measurable speech on either side.
+  let hasData = $derived(
+    youPct !== null && themPct !== null && youPct + themPct > 0,
+  );
+  // Subtle "you've had the floor a while" gauge state (visual only, no words).
+  let mono = $derived(youRunMs >= thresholdMs);
 
-  let show = $derived(youRunMs >= thresholdMs && !dismissed);
-  let hasShare = $derived(youPct !== null && themPct !== null);
-
-  // Motion gate — the fade-in is CSS, but keep parity with the lane's posture.
   let reduceMotion = $state(false);
   onMount(() => {
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -58,109 +56,75 @@
   });
 </script>
 
-{#if show}
+{#if hasData}
   <div
-    class="talk-nudge"
-    class:reduce={reduceMotion}
-    role="status"
-    aria-live="polite"
+    class="talk"
+    class:mono
+    role="img"
+    aria-label={`Talk share: you ${youPct} percent, them ${themPct} percent${
+      mono ? ", you have had the floor a while" : ""
+    }.`}
   >
-    <span class="talk-nudge-glyph" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-    </span>
-    <span class="talk-nudge-text"
-      >You've been talking a while — a question could open things up.</span
-    >
-    {#if hasShare}
-      <span class="talk-nudge-share" aria-hidden="true"
-        >You {youPct}% · Them {themPct}%</span
-      >
-    {/if}
-    <button
-      type="button"
-      class="talk-nudge-dismiss"
-      aria-label="Dismiss"
-      onclick={() => (dismissed = true)}
-    >
-      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
+    <div class="talk-meter" aria-hidden="true">
+      <span
+        class="talk-seg talk-you"
+        class:instant={reduceMotion}
+        style={`width:${youPct}%`}
+      ></span>
+    </div>
+    <div class="talk-read" aria-hidden="true">
+      <span class="talk-read-you">You {youPct}%</span>
+      <span class="talk-read-them">Them {themPct}%</span>
+    </div>
   </div>
 {/if}
 
 <style>
-  /* Slim single line, ambient in the rep's peripheral vision. A faint top
-     hairline rule separates it from the stream above; bone only. */
-  .talk-nudge {
+  .talk {
     display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.5rem;
-    padding: 0.4rem 0.55rem;
-    border-top: 1px solid var(--hairline);
-    border-radius: var(--radius-sm);
-    background: var(--ink-2);
-    animation: talk-nudge-in 180ms ease-out both;
+    flex-direction: column;
+    gap: 0.35rem;
   }
-  .talk-nudge.reduce {
-    animation: none;
+  /* Two-segment bar: the You fill sits on a Them-toned track. */
+  .talk-meter {
+    position: relative;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--hairline-hi);
+    overflow: hidden;
   }
-  @media (prefers-reduced-motion: reduce) {
-    .talk-nudge {
-      animation: none;
-    }
+  .talk-seg {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    transition: width 260ms ease, background 200ms ease;
   }
-  @keyframes talk-nudge-in {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
+  .talk-you {
+    background: var(--accent);
   }
-
-  .talk-nudge-glyph {
-    display: inline-flex;
-    align-items: center;
-    color: var(--bone-3);
-    flex-shrink: 0;
+  .talk-seg.instant {
+    transition: none;
   }
-  .talk-nudge-text {
-    flex: 1 1 auto;
-    min-width: 0;
-    font-size: 0.8rem;
-    line-height: 1.35;
-    color: var(--bone-2);
-    overflow-wrap: anywhere;
+  /* Monologue gauge state — the You fill warms to the "heads up" hue. No
+     pulse, no words: the worded nudge is the ephemeral cue, not this gauge. */
+  .talk.mono .talk-you {
+    background: var(--sig);
   }
-  /* Optional share readout — neutral mono, never colored (a high You% is not
-     a shame signal). */
-  .talk-nudge-share {
-    flex-shrink: 0;
+  .talk-read {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
     font-family: var(--font-mono);
     font-size: 0.7rem;
+  }
+  .talk-read-you {
+    color: var(--bone-2);
+  }
+  .talk.mono .talk-read-you {
+    color: var(--sig);
+  }
+  .talk-read-them {
     color: var(--bone-3);
-  }
-  .talk-nudge-dismiss {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    width: 1.15rem;
-    height: 1.15rem;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: transparent;
-    color: var(--bone-3);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .talk-nudge-dismiss:hover {
-    background: var(--hairline);
-    color: var(--bone-1);
-  }
-  .talk-nudge-dismiss:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
 </style>

@@ -1,34 +1,40 @@
 <!--
-  CoPilotPanel — #653 in-call co-pilot surface, #662 dashboard + auto-mode.
+  CoPilotPanel — #653 in-call co-pilot surface, #662 dashboard + auto-mode,
+  reworked into the BI-dashboard revamp (three buckets, retiring the old
+  Transcript/Contact/Coaching 3-lane model).
 
-  Composes three lanes on the Record page (Call mode, copilot flag ON):
-  Transcript (verbatim Phase-1 draft), Contact (Zoho CRM context + "who are you
-  calling?" picker), and Coaching (live coaching + checklist + cues/KB).
+  The founder-approved revamp (competitor review: show only what a rep can act on
+  in the next ~30 seconds) restructures the panel into three buckets that share
+  ONE mounted set of live-state components (BC-1 "lanes render once" — CSS
+  repositions between compact / dashboard, never remounts):
 
-  #662 — two shapes, ONE set of lane instances:
-    • COMPACT (default): today's tabbed view — only the active lane is shown
-      (the others carry `display:none` + `hidden`), tab row + a QUIET mode chip
-      + an Expand (⤢) control.
-    • DASHBOARD: an in-app maximized layer (`position:fixed` below the topstrip)
-      showing all lanes at once in a 3-column grid under a slim command strip;
-      a Collapse (⤡) control returns to compact.
-  The layout switch is a PURE CSS restyle of the same mounted lanes — the lanes
-  NEVER unmount on toggle, so expand/collapse is instant and preserves the
-  picked contact, hydrated Deals/Cases, transcript scroll, and coaching
-  expand-overrides (zero re-fetch). This is why the body is always-mounted, not
-  `{#if activeTab}`.
+    1. QUIET REFERENCE RAIL (cap 3 tiles) — deal/CRM context (CrmContextLane),
+       a talk-ratio meter (TalkTimeNudge), the discovery checklist (LiveChecklist,
+       meter-only), plus ONE subtle sentiment indicator. Compact = a horizontal
+       3-cell strip; dashboard = a ~300px vertical left column.
+    2. EPHEMERAL CUE SLOT — a single one-at-a-time cue with an auto-dismiss drain
+       bar (IntelligenceLane): battlecard > monologue > coaching, higher preempts.
+    3. ON-DEMAND TRANSCRIPT DRAWER (collapsed by default) — LiveTranscriptLane +
+       a one-click "Catch me up" shortcut + (Support) the Knowledge affordance.
+
+  #662 — two shapes, ONE set of live-state instances:
+    • COMPACT (default): the in-page panel; rail strip + cue + collapsed drawer.
+    • DASHBOARD: an in-app maximized layer (`position:fixed`, portaled to <body>
+      so its z-index competes at the document root — the shipped full-screen fix)
+      under a slim command strip; rail column + cue + drawer.
+  The layout switch is a PURE CSS restyle of the SAME mounted components — they
+  NEVER unmount on toggle, so expand/collapse / drawer-open keep the picked
+  contact, hydrated Deals/Cases, transcript scroll, and the live cue's drain
+  (zero re-fetch). This is why the body is always-mounted, not `{#if layout}`.
 
   #662 — auto-mode: the persona (Sales/Support) is INFERRED here (single owner)
   from open Deals/Cases counts (raised by CrmContextLane's counts-only
-  `oncounts`, no PII) + the coach frame's `posture`. The prominent P5a segmented
-  pills are DEMOTED to a quiet indicator + a small override popover. A manual
-  pick freezes inference for the call; "Follow detection" resumes it.
+  `oncounts`, no PII) + the coach frame's `posture`. A quiet indicator + a small
+  override popover; a manual pick freezes inference for the call.
 
-  Mount/width are owned by +page.svelte (compact panel is width:100% inside the
-  widened `.page.copilot-active` column; the dashboard is its own fixed layer).
-  All chrome is component-scoped; the only shared classes are the transcript
-  lane's `.live-*` family (read-only) and `.avatar`. No app.css touch → hard-rule
-  #1 never engaged.
+  All chrome is component-scoped (`.cp-*`/`.cpd-*`); the only shared classes are
+  the transcript lane's `.live-*` family (read-only) and `.avatar`. No app.css
+  touch → hard-rule #1 never engaged.
 -->
 <script lang="ts" module>
   import type { CopilotMode, CoachingPosture } from "@aftercalls/shared/types";
@@ -74,10 +80,13 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { untrack } from "svelte";
   import LiveTranscriptLane from "$lib/LiveTranscriptLane.svelte";
   import CrmContextLane from "$lib/CrmContextLane.svelte";
   import IntelligenceLane from "$lib/IntelligenceLane.svelte";
+  import LiveChecklist from "$lib/LiveChecklist.svelte";
+  import TalkTimeNudge from "$lib/TalkTimeNudge.svelte";
+  import { portal } from "$lib/actions/portal";
   import type {
     LiveSegment,
     CoachingUpdate,
@@ -85,15 +94,14 @@
     ChecklistSnapshot,
     AskChip,
     KnowledgeAnswer,
+    CoachingSentimentLabel,
   } from "@aftercalls/shared/types";
-  import { liveSession } from "$lib/stores/liveSession.svelte";
   import type {
     AskAnswerState,
     TalkMetric,
   } from "$lib/stores/liveSession.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
-  type Tab = "transcript" | "contact" | "coaching";
   type Layout = "compact" | "dashboard";
 
   let {
@@ -107,15 +115,9 @@
     coaching = null,
     cues = [],
     checklist = null,
-    // #662 — command-strip record cluster (Stop/Start + mono timer). Threaded
-    // from +page (which owns the recorder toggle + elapsed clock).
     elapsedMs = 0,
     onToggleRecording = undefined,
     onnotes = undefined,
-    // #660 co-pilot P1 — ask/highlight/talk state + callbacks, threaded from
-    // +page (which owns the Tauri invokes + store writes) straight into the
-    // Transcript lane. All optional so the panel still mounts when the P1
-    // surfaces aren't wired.
     askAnswer = null,
     askInFlight = null,
     knowledgeAnswer = null,
@@ -137,36 +139,29 @@
      *  bias/fallback when auto-inference has no decision. */
     defaultMode?: CopilotMode;
     /** #654 — latest live coaching snapshot (null pre-first-update / cleared
-     *  on new session). Threaded straight into the Coaching lane; #662 also
+     *  on new session). Feeds the cue slot + the rail sentiment; #662 also
      *  reads `coaching.posture` for auto-mode inference. */
     coaching?: CoachingUpdate | null;
-    /** #659 (P2) — fast-lane cues (battlecards + deal-risk), threaded into the
-     *  Coaching lane's live-cue section above the reflective cards. */
+    /** #659 (P2) — fast-lane cues (battlecards); feed the ephemeral cue slot. */
     cues?: LiveCue[];
-    /** #659 (P3) — auto-checking agenda checklist, threaded into the Coaching
-     *  lane's pinned checklist section (above the cues). */
+    /** #659 (P3) — auto-checking agenda checklist; rendered in the rail. */
     checklist?: ChecklistSnapshot | null;
-    // Whether the org's live_transcript flag is ON. The Transcript lane is
-    // only meaningful when it is: the live relay is gated on that flag alone
-    // (backend lib.rs begin()), so with copilot ON + live_transcript OFF the
-    // lane would strand on "Listening…" forever. When false we drop the
-    // Transcript tab / column and never auto-advance to it.
+    /** Whether the org's live_transcript flag is ON. The transcript drawer is
+     *  only meaningful when it is (the relay is gated on that flag alone), so
+     *  with copilot ON + live_transcript OFF we drop the transcript. */
     liveTranscriptEnabled?: boolean;
     sessionUuid?: string | null;
     /** #662 — recorder elapsed clock (ms), formatted mono in the command
      *  strip. Ignored in compact. */
     elapsedMs?: number;
-    /** #662 — flip the recorder (Stop/Start) from the dashboard command strip.
-     *  When absent, the strip's Stop/Start control is hidden. */
+    /** #662 — flip the recorder (Stop/Start) from the dashboard command strip. */
     onToggleRecording?: () => void;
-    /** #662 — reach Notes from the command strip: collapses the dashboard and
-     *  asks +page to open the notes panel. When absent, the Notes control is
-     *  hidden. */
+    /** #662 — reach Notes from the command strip: collapses + opens notes. */
     onnotes?: () => void;
     askAnswer?: AskAnswerState | null;
     askInFlight?: AskChip | null;
     /** #659 P5b — Support-mode cited knowledge answer + its in-flight guard,
-     *  threaded into the Coaching lane. Rendered only in Support mode. */
+     *  rendered in the transcript drawer. */
     knowledgeAnswer?: KnowledgeAnswer | null;
     knowledgeInFlight?: boolean;
     highlighted?: Set<string>;
@@ -183,24 +178,44 @@
 
   // ── Layout (#662) ─────────────────────────────────────────────────────────
   // Panel-local, NOT persisted: default compact each session (expand is a
-  // deliberate "go big" gesture). Never `{#if}`-swap the lanes on toggle — a
-  // pure CSS restyle keeps every lane instance mounted (zero re-fetch, scroll +
-  // expand-override state preserved).
+  // deliberate "go big" gesture). Never `{#if}`-swap the buckets on toggle — a
+  // pure CSS restyle keeps every component instance mounted (zero re-fetch,
+  // scroll + drain + picked-contact state preserved).
   let layout = $state<Layout>("compact");
   let dashboard = $derived(layout === "dashboard");
   let expandBtnEl = $state<HTMLButtonElement | null>(null);
   let collapseBtnEl = $state<HTMLButtonElement | null>(null);
   let layerEl = $state<HTMLElement | null>(null);
 
+  // The dashboard layer is portaled to <body> (see `use:portal` below), so its
+  // top offset must clear the REAL app topstrip. `--topbar-h` (40px) is only the
+  // floor: the topstrip is `min-height` and GROWS when its pill cluster wraps on
+  // a narrow window. Measure the live topstrip while the layer is up and feed its
+  // height to the layer's `top` via a component-local `--cpd-top`.
+  let topOffset = $state<number | null>(null);
+  $effect(() => {
+    if (!dashboard) {
+      topOffset = null;
+      return;
+    }
+    const strip = document.querySelector<HTMLElement>(".topstrip");
+    if (!strip) return;
+    const measure = () => {
+      topOffset = Math.round(strip.getBoundingClientRect().height);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(strip);
+    return () => ro.disconnect();
+  });
+
   function expand() {
     layout = "dashboard";
-    // Move focus into the layer (the Collapse control) once it paints.
     queueMicrotask(() => collapseBtnEl?.focus());
   }
   function collapse() {
     layout = "compact";
     modeMenuOpen = false;
-    // Restore focus to the Expand control on the compact panel.
     queueMicrotask(() => expandBtnEl?.focus());
   }
   // Escape collapses (menu first if open); Tab is trapped within the layer.
@@ -234,27 +249,6 @@
     }
   }
 
-  // Display order: Transcript · Contact · Coaching. The Transcript tab/column
-  // is present only when live_transcript is ON (else the relay never starts and
-  // the lane is dead). Default active lane = Contact pre-call (the picker is the
-  // first action the flow needs), and it is always present.
-  const LABELS: Record<Tab, string> = {
-    transcript: "Transcript",
-    contact: "Contact",
-    coaching: "Coaching",
-  };
-  let TABS: Tab[] = $derived(
-    liveTranscriptEnabled
-      ? ["transcript", "contact", "coaching"]
-      : ["contact", "coaching"],
-  );
-  let activeTab = $state<Tab>("contact");
-  // A lane wrapper is hidden ONLY in compact when it isn't the active tab; in
-  // the dashboard every lane is shown at once.
-  function laneHidden(t: Tab): boolean {
-    return !dashboard && activeTab !== t;
-  }
-
   // ── Auto-mode brain (#662, single owner) ──────────────────────────────────
   const MODE_LABELS: Record<CopilotMode, string> = {
     sales: "Sales",
@@ -262,56 +256,43 @@
   };
   const MODE_OPTIONS: CopilotMode[] = ["sales", "support"];
 
-  // `modeOverride` is null until the user pins a persona (then `userSet`
-  // freezes inference for the call). `inferredMode` is the committed inferred
-  // value (null until the first decision). `effectiveMode` reads override →
-  // inferred → org default, and flows into BOTH lanes exactly as `mode` did.
   let modeOverride = $state<CopilotMode | null>(null);
   let userSet = $state(false);
   let inferredMode = $state<CopilotMode | null>(null);
   let effectiveMode = $derived<CopilotMode>(
     modeOverride ?? inferredMode ?? defaultMode,
   );
+  let isSupport = $derived(effectiveMode === "support");
 
-  // Counts-only CRM signal raised from CrmContextLane (NO PII). Available at
-  // contact-pick, pre-transcript — bootstraps the inference before any frame.
+  // Counts-only CRM signal raised from CrmContextLane (NO PII).
   let crmCounts = $state<CrmCounts | null>(null);
   function handleCounts(c: CrmCounts) {
     crmCounts = c;
   }
 
-  // Confirm-gate cursor for a posture-driven change. Plain (non-reactive) so
-  // writing it never re-triggers the inference effect.
   let pendingCandidate: CopilotMode | null = null;
 
-  // Inference effect — re-runs on the CRM counts OR a fresh coaching frame
-  // (posture may refine). Bootstraps immediately from CRM (pre-transcript);
-  // a posture-driven CHANGE away from the committed value requires TWO agreeing
-  // evaluations (~40s / two frames) before it flips; a manual override freezes
-  // the whole thing. CRM inventory is static after hydrate, so the practical
-  // flip source is posture — a single anomalous read can't swing the persona.
+  // Inference effect — re-runs on the CRM counts OR a fresh coaching frame.
   $effect(() => {
     const counts = crmCounts;
     const posture = coaching?.posture ?? null;
-    // Read `seq` so a same-VALUE posture on a NEW frame still ticks the gate.
     void coaching?.seq;
     untrack(() => {
-      if (userSet) return; // a manual choice sticks for the whole call
+      if (userSet) return;
       const candidate = inferOnce(counts, posture);
       if (candidate === null) {
-        pendingCandidate = null; // no decision — keep current, clear the gate
+        pendingCandidate = null;
         return;
       }
       if (inferredMode === null) {
-        inferredMode = candidate; // bootstrap immediately (first paint)
+        inferredMode = candidate;
         pendingCandidate = null;
         return;
       }
       if (candidate === inferredMode) {
-        pendingCandidate = null; // reaffirmed — clear any pending flip
+        pendingCandidate = null;
         return;
       }
-      // Change away from the committed value → 2-frame confirm.
       if (pendingCandidate === candidate) {
         inferredMode = candidate;
         pendingCandidate = null;
@@ -328,7 +309,6 @@
   let modeMenuEls: HTMLButtonElement[] = [];
   let modeMenuFocus = $state(0);
 
-  // Detection currently sees … (null when no clear signal / no contact yet).
   let detectedLabel = $derived(
     inferredMode ? MODE_LABELS[inferredMode] : "No clear signal",
   );
@@ -347,29 +327,21 @@
     queueMicrotask(() => modeBtnEl?.focus());
   }
   function setMode(m: CopilotMode) {
-    // A manual pick pins the persona and freezes inference for the call.
     modeOverride = m;
     userSet = true;
     pendingCandidate = null;
     closeModeMenu();
   }
   function followDetection() {
-    // Clear the override → back to auto; re-seed the inferred value now from
-    // the current signals so the indicator updates instantly (don't wait a
-    // coaching cycle).
     modeOverride = null;
     userSet = false;
     pendingCandidate = null;
     inferredMode = inferOnce(crmCounts, coaching?.posture ?? null);
     closeModeMenu();
   }
-  // Roving arrow-nav within the 3-item popover (Follow detection / Sales /
-  // Support); Enter/Space activate on the item's own onclick; Escape closes.
   function onModeMenuKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
-      // Don't let the layer's Escape handler ALSO collapse the dashboard —
-      // one Escape closes the menu only.
       e.stopPropagation();
       closeModeMenu();
       return;
@@ -385,7 +357,6 @@
       modeMenuEls[modeMenuFocus]?.focus();
     }
   }
-  // Capture-phase outside-click dismissal (mirrors CrmContextLane / ChipMenu).
   function onOutsidePointerDown(e: PointerEvent) {
     if (!modeMenuOpen) return;
     const t = e.target as Node | null;
@@ -399,8 +370,7 @@
       document.removeEventListener("pointerdown", onOutsidePointerDown, true);
   });
 
-  // Polite announcement of an auto- or manual mode change (single net-new live
-  // region for the whole panel; the lanes own their own regions).
+  // Polite announcement of an auto- or manual mode change.
   let modeAnnounce = $state("");
   let prevAnnouncedMode: CopilotMode | null = null;
   $effect(() => {
@@ -413,138 +383,63 @@
     });
   });
 
+  // ── Rail sentiment (ONE subtle indicator; de-duplicated from the old ~4) ──
+  const SENTIMENT_WORD: Record<CoachingSentimentLabel, string> = {
+    positive: "Positive",
+    neutral: "Neutral",
+    negative: "Negative",
+    mixed: "Mixed",
+  };
+  let sentiment = $derived(coaching?.sentiment ?? null);
+  let isEnded = $derived(status === "ended");
+  // Delta-only SR announce so the single indicator isn't spammed each frame.
+  let sentimentAnnounce = $state("");
+  let prevSentLabel: CoachingSentimentLabel | null = null;
+  $effect(() => {
+    const label = coaching?.sentiment.label ?? null;
+    untrack(() => {
+      if (label !== null && label !== prevSentLabel && prevSentLabel !== null) {
+        sentimentAnnounce = `Sentiment: ${label}.`;
+      }
+      prevSentLabel = label;
+    });
+  });
+
+  // ── Transcript drawer (collapsed by default) ───────────────────────────────
+  let drawerOpen = $state(false);
+  function toggleDrawer() {
+    drawerOpen = !drawerOpen;
+  }
+  // The drawer hosts the transcript (+ ask chips) and, in Support, Knowledge.
+  let hasDrawer = $derived(liveTranscriptEnabled || isSupport);
+  // Count of finals behind the collapsed drawer — a quiet "there's transcript".
+  let finalCount = $derived(
+    segments.reduce((n, s) => n + (s.provisional ? 0 : 1), 0),
+  );
+
+  // "Catch me up" one-click shortcut — reuses the ask-chip mechanism. Ready once
+  // there's a live session to address; opens the drawer so the answer shows.
+  let askReady = $derived(
+    !!onask &&
+      liveTranscriptEnabled &&
+      !!sessionUuid &&
+      status !== "idle" &&
+      status !== "error",
+  );
+  let askBusy = $derived(askInFlight !== null);
+  function catchMeUp() {
+    if (!askReady || askBusy) return;
+    onask?.("catch_me_up");
+    drawerOpen = true;
+  }
+
   // ── Notes (command strip) ──────────────────────────────────────────────────
   function openNotes() {
-    // Collapse to the record page so the existing NotesPanel is reachable.
     collapse();
     onnotes?.();
   }
 
-  // Contact-tab pip: filled once a contact is committed. Tracked here so the
-  // pip stays lit while the picker is re-opened via "Change".
-  let hasContact = $state(false);
-  function handlePick(contactId: string | null) {
-    hasContact = contactId !== null;
-    onpick(contactId);
-  }
-
-  // On the FIRST transition into recording, auto-select Transcript once
-  // (the live surface). Respect any manual switch thereafter — no repeated
-  // yanking (ui.md §2). Only when live_transcript is ON — otherwise there is
-  // no relay and no Transcript tab to advance to, so Contact stays put. Only
-  // matters in compact (the dashboard shows every lane at once).
-  let advancedOnce = $state(false);
-  $effect(() => {
-    if (liveTranscriptEnabled && recording && !advancedOnce) {
-      activeTab = "transcript";
-      advancedOnce = true;
-    }
-  });
-
-  let tabEls: Record<string, HTMLButtonElement | null> = {};
-
-  function selectTab(t: Tab) {
-    activeTab = t;
-  }
-
-  // Roving tabindex + arrow-key nav. Selection follows focus (automatic
-  // activation) — the lanes are cheap to switch, so there's no reason to
-  // require a separate Enter/Space to commit.
-  function onTabKeydown(e: KeyboardEvent, t: Tab) {
-    const idx = TABS.indexOf(t);
-    let next = -1;
-    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (idx + 1) % TABS.length;
-    else if (e.key === "ArrowLeft" || e.key === "ArrowUp")
-      next = (idx - 1 + TABS.length) % TABS.length;
-    else if (e.key === "Home") next = 0;
-    else if (e.key === "End") next = TABS.length - 1;
-    else return;
-    e.preventDefault();
-    const nt = TABS[next];
-    activeTab = nt;
-    tabEls[nt]?.focus();
-  }
-
-  // Transcript pip mirrors the live-status vocabulary.
-  let transcriptPip = $derived(
-    status === "error"
-      ? "err"
-      : status === "ended"
-        ? "done"
-        : status === "live"
-          ? "live"
-          : "idle",
-  );
-
-  // #654 — Coaching-tab pip. "This lane has content" (steady accent) once cards
-  // exist; a brief one-shot pulse on each fresh `seq` to pull attention when
-  // the user is on another tab; olive on ended (if cards). NO sentiment tint on
-  // the tab pip (that would over-alarm + collide with Transcript's red=error).
-  let coachingHasCards = $derived(!!coaching && coaching.cards.length > 0);
-  // #659 (P5c-F2) — EFFECTIVE checklist progress, so BOTH personas can light the
-  // pip. Discovery (auto-tick) uses the wire `covered_count`. Compliance is
-  // `confirm_required`, so its items ship as `"likely"` and the wire
-  // `covered_count` is ALWAYS 0 — count a model-suggested `"likely"` item OR one
-  // the rep confirmed (the `checklistConfirmed` overlay) as activity worth a
-  // glance. Reading the raw `covered_count` alone (the old check) meant a Support
-  // call's checklist never contributed to the pip.
-  let checklistProgress = $derived.by(() => {
-    if (!checklist) return 0;
-    if (!checklist.confirm_required) return checklist.covered_count;
-    const confirmed = liveSession.checklistConfirmed;
-    return checklist.items.filter(
-      (it) => it.state === "likely" || confirmed.has(it.id),
-    ).length;
-  });
-  // #659 (P2/P3/P5c) — the Coaching lane also hosts fast cues + the agenda
-  // checklist, so the tab pip lights on reflective cards, live cues, OR actual
-  // checklist progress (a covered/confirmed/likely item — an all-pending agenda
-  // alone doesn't count as "content worth glancing at").
-  let coachingLaneHasContent = $derived(
-    coachingHasCards || cues.length > 0 || checklistProgress > 0,
-  );
-  let coachPulse = $state(false);
-  let prevCoachSeq: number | null = null;
-  let coachPulseTimer = 0;
-  $effect(() => {
-    const seq = coaching?.seq ?? null;
-    if (seq === null) {
-      prevCoachSeq = null;
-      return;
-    }
-    if (seq !== prevCoachSeq) {
-      prevCoachSeq = seq;
-      coachPulse = true;
-      clearTimeout(coachPulseTimer);
-      coachPulseTimer = window.setTimeout(() => (coachPulse = false), 1400);
-    }
-  });
-  // #659 (P2) — a separate one-shot pulse when a FRESH fast cue arrives (a
-  // new id), so a battlecard that lands while the user is on another tab still
-  // pulls the eye. Tracks the newest cue id; a resend of the same id is inert.
-  let cuePulse = $state(false);
-  let prevTopCueId: string | null = null;
-  let cuePulseTimer = 0;
-  $effect(() => {
-    const topId = cues.length > 0 ? cues[cues.length - 1].id : null;
-    if (topId === null) {
-      prevTopCueId = null;
-      return;
-    }
-    if (topId !== prevTopCueId) {
-      prevTopCueId = topId;
-      cuePulse = true;
-      clearTimeout(cuePulseTimer);
-      cuePulseTimer = window.setTimeout(() => (cuePulse = false), 1400);
-    }
-  });
-  onDestroy(() => {
-    clearTimeout(coachPulseTimer);
-    clearTimeout(cuePulseTimer);
-  });
-
-  // Mono call timer for the command strip (compact panel keeps the record
-  // controls on the record page; only the dashboard strip renders this).
+  // Mono call timer for the command strip.
   function fmtTimer(ms: number): string {
     const s = Math.floor(ms / 1000);
     const h = Math.floor(s / 3600);
@@ -555,11 +450,7 @@
   }
 </script>
 
-<!-- ── Quiet mode indicator + override popover (shared by both layouts) ──────
-     A neutral label (compass glyph + persona word + caret + · auto/· manual),
-     NOT a segmented toggle. Activating opens a small popover: Follow detection
-     / Sales / Support. Reuses the ChipMenu/CrmContext popover vocabulary,
-     component-scoped. `variant` only tweaks the chrome (chip vs strip). -->
+<!-- ── Quiet mode indicator + override popover (shared by both layouts) ────── -->
 {#snippet modeControl(variant: "chip" | "strip")}
   <div class="cp-mode cp-mode-{variant}" bind:this={modeWrapEl}>
     <button
@@ -578,7 +469,7 @@
       </span>
       <span class="cp-mode-word">{MODE_LABELS[effectiveMode]}</span>
       <span class="cp-mode-src" aria-hidden="true"
-        >· {modeOverride === null ? "auto" : "manual"}</span
+        >{modeOverride === null ? "auto" : "manual"}</span
       >
       <svg
         class="cp-mode-caret"
@@ -640,119 +531,172 @@
   </div>
 {/snippet}
 
-<!-- ── Always-mounted lanes (ONE instance each; CSS repositions them) ────────
-     Compact = the active lane only (others display:none + hidden). Dashboard =
-     all three in the grid. The lanes NEVER unmount on layout toggle. -->
-{#snippet lanes()}
-  {#if liveTranscriptEnabled}
-    <section
-      class="cp-lane cp-lane-transcript"
-      class:dashboard
-      id="cp-panel-transcript"
-      role={dashboard ? "region" : "tabpanel"}
-      aria-label={dashboard ? "Transcript" : undefined}
-      aria-labelledby={dashboard ? undefined : "cp-tab-transcript"}
-      hidden={laneHidden("transcript")}
-    >
-      {#if dashboard}<div class="cpd-col-head">Transcript</div>{/if}
-      <LiveTranscriptLane
-        {segments}
-        {status}
+<!-- ── The three buckets — ONE mounted set (BC-1); CSS repositions them ─────
+     Rail (reference) · cue (ephemeral) · drawer (on-demand transcript). The
+     live-state components (CrmContextLane, LiveTranscriptLane, IntelligenceLane
+     cue) are mounted exactly once and NEVER cross an `{#if}` on layout/drawer,
+     so expand/collapse + drawer-open are pure CSS restyles (no remount). -->
+{#snippet buckets()}
+  <!-- 1 — Quiet reference rail (cap 3 tiles + a subtle sentiment read). -->
+  <aside class="cp-rail" class:dashboard aria-label="Reference">
+    <div class="cp-tile cp-tile-crm">
+      <CrmContextLane
+        {onpick}
+        oncounts={handleCounts}
         {sessionUuid}
-        {askAnswer}
-        {askInFlight}
-        {highlighted}
-        {talkMetric}
-        {onask}
-        {ondismissAsk}
-        {onhighlight}
+        {isAdmin}
+        mode={effectiveMode}
       />
-    </section>
-  {/if}
-  <section
-    class="cp-lane cp-lane-contact"
-    class:dashboard
-    id="cp-panel-contact"
-    role={dashboard ? "region" : "tabpanel"}
-    aria-label={dashboard ? "Contact" : undefined}
-    aria-labelledby={dashboard ? undefined : "cp-tab-contact"}
-    hidden={laneHidden("contact")}
-  >
-    {#if dashboard}<div class="cpd-col-head">Contact</div>{/if}
-    <CrmContextLane
-      onpick={handlePick}
-      oncounts={handleCounts}
-      {sessionUuid}
-      {isAdmin}
-      mode={effectiveMode}
-    />
-  </section>
-  <section
-    class="cp-lane cp-lane-coaching"
-    class:dashboard
-    id="cp-panel-coaching"
-    role={dashboard ? "region" : "tabpanel"}
-    aria-label={dashboard ? "Coaching" : undefined}
-    aria-labelledby={dashboard ? undefined : "cp-tab-coaching"}
-    hidden={laneHidden("coaching")}
-  >
-    {#if dashboard}<div class="cpd-col-head">Coaching</div>{/if}
-    <IntelligenceLane
-      {coaching}
-      {status}
-      {cues}
-      {checklist}
-      mode={effectiveMode}
-      {knowledgeAnswer}
-      {knowledgeInFlight}
-      {onknowledge}
-      ondismissKnowledge={ondismissKnowledge}
-    />
-  </section>
+    </div>
+    {#if talkMetric && talkMetric.youPct + talkMetric.themPct > 0}
+      <div class="cp-tile cp-tile-talk">
+        <div class="cp-tile-head">Talk share</div>
+        <TalkTimeNudge
+          youPct={talkMetric.youPct}
+          themPct={talkMetric.themPct}
+          youRunMs={talkMetric.youRunMs}
+        />
+      </div>
+    {/if}
+    {#if checklist}
+      <div class="cp-tile cp-tile-check">
+        <LiveChecklist {checklist} {status} />
+      </div>
+    {/if}
+    {#if sentiment}
+      <!-- ONE subtle sentiment indicator (founder-kept; de-duplicated). -->
+      <div
+        class="cp-sent"
+        aria-label={`Sentiment: ${SENTIMENT_WORD[sentiment.label]}`}
+      >
+        <span
+          class="cp-sent-dot"
+          class:pos={sentiment.label === "positive" && !isEnded}
+          class:neg={sentiment.label === "negative" && !isEnded}
+          class:done={isEnded}
+          aria-hidden="true"
+        ></span>
+        <span class="cp-sent-word">{SENTIMENT_WORD[sentiment.label]}</span>
+      </div>
+    {/if}
+  </aside>
+
+  <!-- 2 + 3 — cue slot (prominent) over the on-demand transcript drawer. -->
+  <div class="cp-main" class:dashboard>
+    <div class="cp-cue-host">
+      <IntelligenceLane {coaching} {status} {cues} {talkMetric} />
+    </div>
+
+    {#if hasDrawer}
+      <div class="cp-drawer" class:open={drawerOpen} class:dashboard>
+        <div class="cp-drawer-bar">
+          <button
+            type="button"
+            class="cp-drawer-toggle"
+            aria-expanded={drawerOpen}
+            aria-controls="cp-drawer-body"
+            onclick={toggleDrawer}
+          >
+            <svg
+              class="cp-drawer-chevron"
+              class:open={drawerOpen}
+              viewBox="0 0 24 24"
+              width="12"
+              height="12"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"><polyline points="9 6 15 12 9 18" /></svg
+            >
+            <span>Transcript</span>
+            {#if !drawerOpen && finalCount > 0}
+              <span class="cp-drawer-count">{finalCount}</span>
+            {/if}
+          </button>
+          {#if onask && liveTranscriptEnabled}
+            <button
+              type="button"
+              class="cp-catchup"
+              disabled={!askReady || askBusy}
+              title={askBusy ? "Give it a moment…" : "Catch me up on the last minute"}
+              onclick={catchMeUp}
+            >
+              Catch me up
+            </button>
+          {/if}
+        </div>
+
+        <div id="cp-drawer-body" class="cp-drawer-body" hidden={!drawerOpen}>
+          {#if liveTranscriptEnabled}
+            <LiveTranscriptLane
+              {segments}
+              {status}
+              {sessionUuid}
+              {askAnswer}
+              {askInFlight}
+              {highlighted}
+              {onask}
+              {ondismissAsk}
+              {onhighlight}
+            />
+          {/if}
+          {#if isSupport}
+            <!-- Support-mode grounded knowledge (rep-initiated pull). Vendor-
+                 opaque; answer + citations are LLM/org text → plain `{...}`. -->
+            <div class="cp-kb" role="group" aria-label="Knowledge answers">
+              <div class="cp-kb-head">
+                <span class="cp-kb-label">Knowledge</span>
+                <button
+                  type="button"
+                  class="cp-kb-ask"
+                  onclick={() => onknowledge?.()}
+                  disabled={knowledgeInFlight}
+                >
+                  {knowledgeInFlight ? "Searching…" : "Get an answer"}
+                </button>
+              </div>
+              {#if knowledgeAnswer}
+                <div class="cp-kb-answer">
+                  <button
+                    type="button"
+                    class="cp-kb-dismiss"
+                    aria-label="Dismiss answer"
+                    onclick={() => ondismissKnowledge?.()}>×</button
+                  >
+                  <p class="cp-kb-answer-text" aria-live="polite">
+                    {knowledgeAnswer.answer}
+                  </p>
+                  {#if knowledgeAnswer.sources.length > 0}
+                    <div class="cp-kb-sources">
+                      {#each knowledgeAnswer.sources as s (s.id)}
+                        <span class="cp-kb-source">{s.title}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </div>
+    {/if}
+  </div>
 {/snippet}
 
 <section class="copilot-panel" class:is-dashboard={dashboard} style="--i: 2.5">
-  <!-- One net-new polite region for the whole panel (mode change); the lanes
-       own their own live regions and must not be duplicated. -->
+  <!-- Net-new polite regions for the whole panel (mode + sentiment change);
+       the buckets own their own live regions and must not be duplicated. -->
   <span class="cp-sr" aria-live="polite">{modeAnnounce}</span>
+  <span class="cp-sr" aria-live="polite">{sentimentAnnounce}</span>
 
   {#if !dashboard}
-    <!-- COMPACT chrome — the tab row demotes the mode control to a quiet chip
-         and gains an Expand (⤢) affordance on the right. The lanes do NOT live
-         here; they're in the always-mounted shell below, so toggling layout is
+    <!-- COMPACT chrome — a slim header (quiet mode chip + Expand ⤢). The
+         buckets live in the always-mounted shell below, so toggling layout is
          a pure CSS restyle and never remounts them. -->
     <div class="copilot-tabrow">
-      <div class="copilot-tabs" role="tablist" aria-label="Co-pilot lanes">
-        {#each TABS as t (t)}
-          <button
-            bind:this={tabEls[t]}
-            type="button"
-            role="tab"
-            id="cp-tab-{t}"
-            class="lane-tab"
-            class:active={activeTab === t}
-            aria-selected={activeTab === t}
-            aria-controls="cp-panel-{t}"
-            tabindex={activeTab === t ? 0 : -1}
-            onclick={() => selectTab(t)}
-            onkeydown={(e) => onTabKeydown(e, t)}
-          >
-            <span
-              class="lane-pip"
-              class:live={t === "transcript" && transcriptPip === "live"}
-              class:err={t === "transcript" && transcriptPip === "err"}
-              class:done={(t === "transcript" && transcriptPip === "done") ||
-                (t === "coaching" && status === "ended" && coachingLaneHasContent)}
-              class:on={(t === "contact" && hasContact) ||
-                (t === "coaching" && coachingLaneHasContent && status !== "ended")}
-              class:coach-pulse={t === "coaching" && (coachPulse || cuePulse)}
-              aria-hidden="true"
-            ></span>
-            {LABELS[t]}
-          </button>
-        {/each}
-      </div>
-
+      <span class="cp-title">Co-pilot</span>
       <div class="copilot-tabrow-right">
         {@render modeControl("chip")}
         <button
@@ -767,23 +711,26 @@
         </button>
       </div>
     </div>
-
   {/if}
 
-  <!-- ── Persistent lane shell (#662 BC-1) ────────────────────────────────
-       ONE home for the lanes across BOTH layouts, OUTSIDE the layout `{#if}`.
+  <!-- ── Persistent lane shell (#662 BC-1 + shipped full-screen portal fix) ──
+       ONE home for the buckets across BOTH layouts, OUTSIDE the layout `{#if}`.
        Compact: a transparent passthrough (`display:contents`) so `.copilot-body`
-       renders inline exactly as a direct panel child. Dashboard: this SAME
-       element is promoted to the in-app maximized layer (`position:fixed` below
-       the topstrip; role=dialog + Escape/Tab trap + focus move/restore). Because
-       the lanes' single render site never crosses an if/else boundary,
-       expand/collapse keeps the SAME lane instances — picked contact, hydrated
-       Deals/Cases, coaching expand-overrides, and transcript scroll all survive
-       (zero re-fetch). -->
+       renders inline. Dashboard: this SAME element is portaled to <body>
+       (`use:portal={dashboard}`) and promoted to the in-app maximized layer
+       (`position:fixed`, `z-index:90` competing at document root — the fix),
+       with `--cpd-top` measured off the live topstrip. Because the buckets'
+       single render site never crosses an if/else boundary, expand/collapse
+       keeps the SAME instances (picked contact, hydrated Deals/Cases, cue drain,
+       transcript scroll all survive; zero re-fetch). -->
   <div
     class="lane-shell"
     class:dashboard
     bind:this={layerEl}
+    use:portal={dashboard}
+    style={dashboard && topOffset !== null
+      ? `--cpd-top:${topOffset}px`
+      : undefined}
     role={dashboard ? "dialog" : undefined}
     aria-modal={dashboard ? "true" : undefined}
     aria-label={dashboard ? "Co-pilot dashboard" : undefined}
@@ -791,7 +738,7 @@
     onkeydown={dashboard ? onLayerKeydown : undefined}
   >
     {#if dashboard}
-      <!-- DASHBOARD chrome — the slim command strip over the grid. -->
+      <!-- DASHBOARD chrome — the slim command strip over the buckets. -->
       <header class="cpd-strip">
         <div class="cpd-record">
           <span
@@ -820,7 +767,6 @@
         <div class="cpd-right">
           {#if onnotes}
             <button type="button" class="cpd-tool" onclick={openNotes}>
-              <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 2h10v10H2zM2 5h10M5 5v7" /></svg>
               Notes
             </button>
           {/if}
@@ -839,16 +785,11 @@
       </header>
     {/if}
 
-    <!-- ONE lane host — rendered exactly once; class toggles switch it between
-         the compact tabbed block and the dashboard 3-column grid. The lanes
-         inside are the SAME instances in both layouts (never remounted). -->
-    <div
-      class="copilot-body"
-      class:dashboard
-      class:cpd-grid={dashboard}
-      class:no-transcript={dashboard && !liveTranscriptEnabled}
-    >
-      {@render lanes()}
+    <!-- ONE bucket host — rendered exactly once; class toggles switch it between
+         the compact stacked block and the dashboard rail+main split. The
+         components inside are the SAME instances in both layouts. -->
+    <div class="copilot-body" class:dashboard>
+      {@render buckets()}
     </div>
   </div>
 </section>
@@ -860,19 +801,14 @@
     border-radius: var(--radius);
     background: var(--ink-1);
     /* NOT overflow:hidden — the CRM contact-search dropdown is absolutely
-       positioned and extends below the (short) Contact lane; clipping the
-       panel would hide it. Each lane manages its own scroll (transcript /
-       coaching), so the shell doesn't need to clip. */
+       positioned and extends below the (short) CRM tile; clipping would hide
+       it. Each scroll region manages its own overflow. */
     overflow: visible;
-    /* Establish a stacking context that beats the later reveal-animated
-       `.status` sibling below the panel, so the escaped dropdown paints
-       above it instead of the status text bleeding through. */
     position: relative;
     z-index: 5;
   }
   /* When the dashboard layer is up the compact shell has no visible content —
-     drop the border so the section doesn't paint a stray outline behind the
-     fixed layer. */
+     drop the border so the section doesn't paint a stray outline behind it. */
   .copilot-panel.is-dashboard {
     border-color: transparent;
     background: transparent;
@@ -891,19 +827,20 @@
     border: 0;
   }
 
-  /* ── Compact tab row (tabs · mode chip · Expand) ──────────────────────── */
+  /* ── Compact header (title · mode chip · Expand) ──────────────────────── */
   .copilot-tabrow {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.6rem 0.7rem;
+    padding: 0.55rem 0.7rem;
     border-bottom: 1px solid var(--hairline);
   }
-  .copilot-tabs {
-    display: flex;
-    gap: 0.3rem;
+  .cp-title {
+    font-size: 0.64rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--bone-3);
     min-width: 0;
-    flex-wrap: wrap;
   }
   .copilot-tabrow-right {
     display: flex;
@@ -911,82 +848,6 @@
     gap: 0.4rem;
     margin-left: auto;
     flex-shrink: 0;
-  }
-
-  /* Lane tab — the .scope-pill idiom (component-scoped per existing
-     per-route precedent), plus a leading state pip. */
-  .lane-tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.35rem 0.85rem;
-    border: 1px solid var(--hairline);
-    background: var(--ink-1);
-    color: var(--bone-2);
-    border-radius: 999px;
-    font: inherit;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: border-color 0.15s, color 0.15s, background 0.15s;
-  }
-  .lane-tab:hover:not(.active) {
-    color: var(--bone-0);
-    border-color: var(--hairline-hi);
-  }
-  .lane-tab.active {
-    border-color: var(--accent);
-    color: var(--accent-hi);
-    background: var(--accent-soft);
-  }
-  .lane-tab:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-
-  .lane-pip {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--bone-4);
-    flex-shrink: 0;
-  }
-  .lane-pip.on {
-    background: var(--accent);
-  }
-  .lane-pip.live {
-    background: var(--accent);
-    animation: cp-pip-pulse 1.4s ease-in-out infinite;
-  }
-  .lane-pip.err {
-    background: var(--live);
-  }
-  .lane-pip.done {
-    background: var(--olive);
-  }
-  /* #654 — one-shot attention pulse on a fresh coaching frame; settles to the
-     steady `.on` accent (the class is dropped after ~1.4s). */
-  .lane-pip.coach-pulse {
-    background: var(--accent);
-    animation: cp-pip-pulse 1.4s ease-in-out;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .lane-pip.coach-pulse {
-      animation: none;
-    }
-  }
-  @keyframes cp-pip-pulse {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 var(--accent-glow);
-    }
-    50% {
-      box-shadow: 0 0 0 5px rgba(0, 0, 0, 0);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .lane-pip.live {
-      animation: none;
-    }
   }
 
   /* ── Expand / collapse controls ───────────────────────────────────────── */
@@ -1049,7 +910,6 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
-  /* Neutral glyph — mode is a quiet label, not a semantic-hued state. */
   .cp-mode-glyph {
     display: inline-flex;
     align-items: center;
@@ -1085,8 +945,6 @@
     box-shadow: 0 14px 30px -10px rgba(0, 0, 0, 0.55);
     animation: cp-menu-in 100ms ease-out both;
   }
-  /* In the compact chip the menu opens under a right-aligned control; in the
-     strip it is centred, so anchor it under the indicator's left edge. */
   .cp-mode-strip .cp-mode-menu {
     right: auto;
     left: 0;
@@ -1146,63 +1004,29 @@
     color: var(--accent);
   }
 
-  /* ── Body (compact block; the dashboard grid restyles the SAME element) ── */
-  .copilot-body {
-    /* ≤120ms opacity cross-fade on lane switch — disciplined, not showy. */
-    animation: cp-body-fade 120ms ease-out both;
-  }
-  @keyframes cp-body-fade {
-    from {
-      opacity: 0.7;
-    }
-    to {
-      opacity: 1;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .copilot-body {
-      animation: none;
-    }
-  }
-
-  /* Lane wrapper — a plain block in compact; the grid column in dashboard. */
-  .cp-lane[hidden] {
-    display: none;
-  }
-
-  /* The transcript lane re-uses the shared `.live-panel` surface (its own
-     border + bg). Inside the co-pilot shell that would double-chrome, so
-     neutralize the outer border/bg contextually. Scoped to this component's
-     `.copilot-body` — the shared class is unchanged (no app.css edit); this
-     is a contextual override, same posture as any component-scoped tweak. */
-  .copilot-body :global(.live-panel) {
-    border: none;
-    border-radius: 0;
-    background: transparent;
-  }
-
-  /* ── Persistent lane shell (#662 BC-1) ────────────────────────────────────
-     ONE home for the lanes across both layouts. Compact: a transparent
-     passthrough (`display:contents`) so `.copilot-body` renders inline as a
-     direct panel child (no extra box, no layout change vs. the pre-BC-1 shape).
-     Dashboard: this SAME element is promoted to the in-app maximized layer.
-     The lanes live inside it in both layouts and NEVER remount on toggle. */
+  /* ── Persistent lane shell (#662 BC-1 + full-screen portal fix) ──────────
+     Compact: a transparent passthrough (`display:contents`). Dashboard: this
+     SAME element is portaled to <body> and promoted to the maximized layer. */
   .lane-shell {
     display: contents;
   }
   .lane-shell.dashboard {
     position: fixed;
-    /* Below the topstrip so the crumbs + window controls stay live. */
-    top: var(--topbar-h);
+    /* Below the topstrip so crumbs + window controls stay live. `--cpd-top`
+       is the MEASURED topstrip height; fall back to the token floor. */
+    top: var(--cpd-top, var(--topbar-h));
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 55; /* above ChipMenu (30) + note overlay (50); below app modals (60) + toasts (70) */
+    /* Portaled to <body> (see `use:portal={dashboard}`), so this z-index
+       competes at the document ROOT — out-ranking the recording floater (80)
+       and toasts/modals (60-70). This is the shipped full-screen fix; DO NOT
+       lower it or un-portal the layer. */
+    z-index: 90;
     display: flex;
     flex-direction: column;
     min-height: 0;
     background: var(--ink-0);
-    /* Fade + a gentle scale-up on open (reduced-motion → instant). */
     animation: cpd-layer-in 140ms ease-out both;
   }
   @keyframes cpd-layer-in {
@@ -1221,8 +1045,7 @@
     }
   }
 
-  /* Command strip — sticky, non-shrinking header over the grid. overflow
-     visible so the mode popover can escape it. */
+  /* Command strip — sticky, non-shrinking header over the buckets. */
   .cpd-strip {
     display: flex;
     align-items: center;
@@ -1331,103 +1154,399 @@
     outline-offset: 2px;
   }
 
-  /* Grid — 3 reading columns, each its own scroll container, hairline
-     dividers. The strip is the header; the grid fills the rest of the layer. */
-  .cpd-grid {
+  /* ── Bucket host — compact stacked block; dashboard rail+main split ────── */
+  .copilot-body {
+    display: flex;
+    flex-direction: column;
+  }
+  .copilot-body.dashboard {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns:
-      minmax(340px, 1.5fr)
-      minmax(300px, 1fr)
-      minmax(340px, 1.15fr);
+    grid-template-columns: 300px minmax(0, 1fr);
     gap: 0;
   }
-  .cpd-grid.no-transcript {
-    grid-template-columns: minmax(320px, 1fr) minmax(340px, 1.15fr);
+
+  /* The transcript lane re-uses the shared `.live-panel` surface (its own
+     border + bg). Inside the drawer that would double-chrome, so neutralize
+     the outer border/bg contextually (scoped :global — app.css untouched). */
+  .copilot-body :global(.live-panel) {
+    border: none;
+    border-radius: 0;
+    background: transparent;
   }
-  .cp-lane.dashboard {
+
+  /* ── 1 · Reference rail ───────────────────────────────────────────────── */
+  .cp-rail {
     display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.7rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .cp-rail.dashboard {
     flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
     min-height: 0;
-    min-width: 0;
     overflow-y: auto;
+    border-bottom: none;
     border-right: 1px solid var(--hairline);
   }
-  .cp-lane.dashboard:last-child {
-    border-right: none;
+  /* Compact strip: CRM takes the lead cell; talk + checklist share the rest.
+     Stretch the tile boxes to a common height per row so the compact strip
+     reads as an even row rather than ragged bottoms (the rail's own
+     `align-items` is flex-start compact / stretch dashboard; this override
+     keeps the tiles even in both, and leaves the sentiment read untouched). */
+  .cp-tile {
+    min-width: 0;
+    align-self: stretch;
   }
-  /* Column sub-head — the design's caps-label idiom, sticky at the column top. */
-  .cpd-col-head {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    padding: 0.55rem 0.9rem 0.45rem;
-    font-size: 0.64rem;
+  .cp-tile-crm {
+    flex: 2 1 15rem;
+  }
+  .cp-tile-talk,
+  .cp-tile-check {
+    flex: 1 1 11rem;
+  }
+  .cp-rail.dashboard .cp-tile {
+    flex: none;
+  }
+  .cp-tile-head {
+    font-size: 0.62rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--bone-3);
-    background: var(--ink-0);
-    border-bottom: 1px solid var(--hairline);
+    margin-bottom: 0.4rem;
+  }
+  .cp-tile-talk {
+    padding: 0.2rem 0.15rem;
+  }
+  .cp-rail.dashboard .cp-tile-talk {
+    padding: 0.2rem 0.75rem 0.6rem;
   }
 
-  /* Transcript = the spine: fill the column height and let the lane's own
-     stream scroll internally (ask-chips pinned at top, talk-time at foot),
-     rather than the column scrolling as a whole. Contextual `:global`
-     restyles only — no lane-internal change, no app.css touch. */
-  .cp-lane-transcript.dashboard {
+  /* Subtle sentiment — ONE quiet dot + word (founder-kept, de-duplicated). */
+  .cp-sent {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.15rem;
+  }
+  .cp-rail.dashboard .cp-sent {
+    margin-top: auto;
+    padding: 0.5rem 0.75rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .cp-sent-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--bone-3);
+    flex-shrink: 0;
+    transition: background 150ms ease;
+  }
+  .cp-sent-dot.pos {
+    background: var(--olive);
+  }
+  .cp-sent-dot.neg {
+    background: var(--live);
+    box-shadow: 0 0 0 3px var(--live-soft);
+  }
+  .cp-sent-dot.done {
+    background: var(--olive);
+  }
+  .cp-sent-word {
+    font-size: 0.74rem;
+    color: var(--bone-2);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cp-sent-dot {
+      transition: none;
+    }
+  }
+
+  /* ── 2 + 3 · Main (cue over drawer) ───────────────────────────────────── */
+  .cp-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .cp-main.dashboard {
+    min-height: 0;
     overflow: hidden;
   }
-  .cp-lane-transcript.dashboard :global(.live-panel) {
+  .cp-cue-host {
+    flex-shrink: 0;
+  }
+  /* Dashboard: with the drawer collapsed (or absent) the cue host absorbs the
+     leftover column height so a short/idle cue doesn't leave a dead gap beneath
+     it (the grid cell is as tall as the rail). An OPEN drawer takes the space
+     instead (`.cp-drawer.open { flex: 1 }` below), so revert the cue host to its
+     content size then. */
+  .cp-main.dashboard .cp-cue-host {
+    flex: 1;
+    min-height: 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .cp-main.dashboard:has(.cp-drawer.open) .cp-cue-host {
+    flex: 0 0 auto;
+  }
+
+  /* Drawer — collapsed by default; the transcript stays MOUNTED (the body is
+     hidden via the `hidden` attribute, not `{#if}`), so scroll/pin survive. */
+  .cp-drawer {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-top: 1px solid var(--hairline);
+  }
+  .cp-drawer-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.7rem;
+    flex-shrink: 0;
+  }
+  .cp-drawer-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.28rem 0.4rem;
+    border: none;
+    background: transparent;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s;
+  }
+  .cp-drawer-toggle:hover {
+    color: var(--bone-0);
+  }
+  .cp-drawer-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .cp-drawer-chevron {
+    color: var(--bone-3);
+    flex-shrink: 0;
+    transition: transform 150ms ease;
+  }
+  .cp-drawer-chevron.open {
+    transform: rotate(90deg);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cp-drawer-chevron {
+      transition: none;
+    }
+  }
+  .cp-drawer-count {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    color: var(--bone-3);
+    background: var(--ink-2);
+    border-radius: 999px;
+    padding: 0.02rem 0.4rem;
+  }
+  .cp-catchup {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.3rem 0.75rem;
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    font: inherit;
+    font-size: 0.76rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .cp-catchup:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .cp-catchup:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .cp-catchup:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .cp-drawer-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 0 0.4rem 0.5rem;
+  }
+  /* `hidden` must win over the flex display above (attribute selector out-ranks
+     the class), so the collapsed drawer keeps the transcript mounted but unseen. */
+  .cp-drawer-body[hidden] {
+    display: none;
+  }
+
+  /* Dashboard: an open drawer fills the remaining height and the transcript
+     stream scrolls internally (ask-chips pinned at top). Contextual :global
+     restyles only — no lane-internal change, no app.css touch. */
+  .cp-main.dashboard .cp-drawer.open {
+    flex: 1;
+    min-height: 0;
+  }
+  .cp-main.dashboard .cp-drawer.open .cp-drawer-body {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .cp-main.dashboard .cp-drawer.open :global(.live-panel) {
     flex: 1;
     min-height: 0;
     height: 100%;
   }
-  .cp-lane-transcript.dashboard :global(.live-stream-wrap) {
+  .cp-main.dashboard .cp-drawer.open :global(.live-stream-wrap) {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
   }
-  .cp-lane-transcript.dashboard :global(.live-stream) {
+  .cp-main.dashboard .cp-drawer.open :global(.live-stream) {
     flex: 1;
     min-height: 0;
     max-height: none;
   }
 
-  /* ── Responsive (ui.md §5) — the layer sizes to the agent window. Below the
-       3-col comfort width, drop to 2 columns (transcript spine + a stacked
-       Contact/Coaching right side), then a single stacked column. CSS-only
-       reflow; the compact panel stays the small-window home. ── */
-  @media (max-width: 900px) {
-    .cpd-grid,
-    .cpd-grid.no-transcript {
-      grid-template-columns: minmax(300px, 1.35fr) minmax(280px, 1fr);
-      grid-auto-rows: 1fr;
-    }
-    /* Coaching drops under Contact in the right column. */
-    .cpd-grid .cp-lane-coaching.dashboard {
-      grid-column: 2;
-    }
-    /* Transcript keeps the spine. */
-    .cpd-grid .cp-lane-transcript.dashboard {
-      grid-row: 1 / span 2;
-    }
+  /* ── Support-mode Knowledge (in the drawer) ───────────────────────────── */
+  .cp-kb {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.4rem 0.35rem 0.2rem;
   }
+  .cp-kb-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .cp-kb-label {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+  }
+  .cp-kb-ask {
+    margin-left: auto;
+    padding: 0.28rem 0.7rem;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+    border-radius: 999px;
+    font: inherit;
+    font-size: 0.74rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .cp-kb-ask:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .cp-kb-ask:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .cp-kb-ask:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .cp-kb-answer {
+    position: relative;
+    background: var(--ink-0);
+    border: 1px solid var(--hairline);
+    border-left: 2px solid var(--accent);
+    border-radius: var(--radius-sm);
+    padding: 0.55rem 1.6rem 0.6rem 0.7rem;
+  }
+  .cp-kb-dismiss {
+    position: absolute;
+    top: 0.3rem;
+    right: 0.35rem;
+    width: 1.2rem;
+    height: 1.2rem;
+    line-height: 1;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--bone-3);
+    font-size: 1rem;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .cp-kb-dismiss:hover {
+    color: var(--bone-0);
+  }
+  .cp-kb-dismiss:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .cp-kb-answer-text {
+    margin: 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: var(--bone-0);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .cp-kb-sources {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+  }
+  .cp-kb-source {
+    font-size: 0.72rem;
+    color: var(--bone-1);
+    background: var(--ink-2);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.08rem 0.5rem;
+    overflow-wrap: anywhere;
+  }
+
+  /* ── Responsive (≤680px) — both shapes converge to a single column ────── */
   @media (max-width: 680px) {
-    .cpd-grid,
-    .cpd-grid.no-transcript {
-      grid-template-columns: 1fr;
+    .copilot-body.dashboard {
+      display: flex;
+      flex-direction: column;
     }
-    .cpd-grid .cp-lane.dashboard {
-      grid-column: 1 !important;
-      grid-row: auto !important;
+    .cp-rail,
+    .cp-rail.dashboard {
+      flex-direction: column;
+      flex-wrap: nowrap;
+      align-items: stretch;
+      overflow-y: visible;
       border-right: none;
       border-bottom: 1px solid var(--hairline);
     }
-    /* On a single narrow column the transcript scrolls with the column too. */
-    .cp-lane-transcript.dashboard {
-      overflow-y: auto;
+    .cp-tile-crm,
+    .cp-tile-talk,
+    .cp-tile-check {
+      flex: none;
+    }
+    .cp-rail.dashboard .cp-sent {
+      margin-top: 0;
+    }
+    /* On a single narrow column the transcript scrolls with the drawer too. */
+    .cp-main.dashboard {
+      overflow: visible;
+    }
+    .cp-main.dashboard .cp-drawer.open :global(.live-stream) {
+      max-height: 50vh;
     }
   }
 </style>

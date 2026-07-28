@@ -444,13 +444,7 @@
         onkeydown={handleKeydown}
       />
 
-      {#if query.trim().length === 0}
-        <p class="crm-sub">
-          Search your Zoho contacts to see their open {mode === "support"
-            ? "cases"
-            : "deals"} during the call.
-        </p>
-      {:else if query.trim().length < 2}
+      {#if query.trim().length === 1}
         <p class="crm-hint">Keep typing…</p>
       {/if}
 
@@ -714,12 +708,6 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-color: var(--accent);
-  }
-  .crm-sub {
-    margin: 0;
-    font-size: 0.78rem;
-    line-height: 1.4;
-    color: var(--bone-3);
   }
   .crm-hint {
     margin: 0;

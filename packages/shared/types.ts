@@ -209,22 +209,16 @@ export type CoachingUpdate = {
  *  in the IntelligenceLane ABOVE the reflective coaching. Deliberately NOT part
  *  of the wholesale-replace `coaching` snapshot: cues arrive one at a time,
  *  carry their own stable `id`, and battlecards auto-expire via `ttl_ms`
- *  client-side (the store prunes). Two kinds:
- *    - `battlecard` — LLM, deal-grounded, time-critical (objection / pricing /
- *      competitor); TTL'd.
- *    - `risk` — a canned absence cue (pricing-not-mentioned / no-next-step);
- *      no TTL, stands until call end.
- *  `title` / `detail` are LLM- or canned-text → rendered as plain text, never
- *  `{@html}`. Old agents hit the `forward_incoming` default arm and ignore the
- *  unknown frame — additive + non-breaking. */
-export type LiveCueCategory =
-  | "objection"
-  | "pricing"
-  | "competitor"
-  | "pricing_gap"
-  | "next_step_gap";
+ *  client-side (the store prunes). One surviving kind (#662): `battlecard` —
+ *  LLM, deal-grounded, time-critical (objection / pricing / competitor); TTL'd.
+ *  The canned `risk` absence cues (pricing-not-mentioned / no-next-step) were
+ *  retired — the discovery checklist now carries that coverage.
+ *  `title` / `detail` are LLM-text → rendered as plain text, never `{@html}`.
+ *  Old agents hit the `forward_incoming` default arm and ignore the unknown
+ *  frame — additive + non-breaking. */
+export type LiveCueCategory = "objection" | "pricing" | "competitor";
 
-export type LiveCueKind = "battlecard" | "risk";
+export type LiveCueKind = "battlecard";
 
 export type LiveCue = {
   type: "live_cue";
@@ -233,10 +227,10 @@ export type LiveCue = {
   kind: LiveCueKind;
   /** Short label / the concern being handled. */
   title: string;
-  /** Ready-to-say line (battlecards); omitted by the backend for risk cues. */
+  /** Ready-to-say line for the battlecard. */
   detail?: string;
   priority: "high" | "normal";
-  /** Battlecards auto-expire after this many ms client-side; risk cues omit it. */
+  /** Battlecards auto-expire after this many ms client-side. */
   ttl_ms?: number;
   generated_at: string;
 };

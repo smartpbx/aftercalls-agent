@@ -4,14 +4,19 @@
   Started as a VERBATIM extract of LiveAssistPanel's transcript body (fold
   logic, labelFor, near-bottom autoscroll, role="log" / aria-live) on the
   byte-identical `.live-panel*` / `.live-stream` / `.live-seg*` classes from
-  app.css. #660 adds FOUR co-pilot surfaces, all COMPONENT-SCOPED (this lane
+  app.css. #660 adds co-pilot surfaces, all COMPONENT-SCOPED (this lane
   gains its first `<style>` block — HR#1 stays clean, the shared `.live-*`
   classes are reused read-only + only ever narrowed by higher-specificity
   scoped rules, never edited in app.css):
     1. an ask-chip row + single replace-in-place inline answer (ui.md §1);
     2. a per-turn star (highlight) affordance (plan item 4 / ui.md §5 boundary);
-    3. pin-to-read + jump-to-live on the stream (ui.md §3);
-    4. the self-only TalkTimeNudge mounted at the lane foot (ui.md §4).
+    3. pin-to-read + jump-to-live on the stream (ui.md §3).
+
+  BI-dashboard revamp: this lane is now the on-demand TRANSCRIPT DRAWER inside
+  CoPilotPanel (collapsed by default). The talk-ratio meter moved out to the
+  reference rail (CoPilotPanel mounts TalkTimeNudge there) and "Catch me up" is
+  promoted to a one-click shortcut beside the drawer toggle — the remaining ask
+  presets stay in the drawer here.
 
   All new copy is vendor-opaque (HR#2); the ask `answer` is LLM-derived and
   rendered as PLAIN TEXT ONLY (never `{@html}` — injection surface).
@@ -21,12 +26,8 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
-  import TalkTimeNudge from "$lib/TalkTimeNudge.svelte";
   import type { LiveSegment, AskChip } from "@aftercalls/shared/types";
-  import type {
-    AskAnswerState,
-    TalkMetric,
-  } from "$lib/stores/liveSession.svelte";
+  import type { AskAnswerState } from "$lib/stores/liveSession.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
 
@@ -40,7 +41,6 @@
     askAnswer = null,
     askInFlight = null,
     highlighted = new Set<string>(),
-    talkMetric = null,
     onask = undefined,
     ondismissAsk = undefined,
     onhighlight = undefined,
@@ -51,7 +51,6 @@
     askAnswer?: AskAnswerState | null;
     askInFlight?: AskChip | null;
     highlighted?: Set<string>;
-    talkMetric?: TalkMetric | null;
     onask?: (chip: AskChip) => void;
     ondismissAsk?: () => void;
     onhighlight?: (seg: LiveSegment, starred: boolean) => void;
@@ -85,8 +84,9 @@
   }
 
   // ── Ask-chip row (ui.md §1) ─────────────────────────────────────────────
+  // "Catch me up" is promoted to a one-click shortcut next to the drawer
+  // toggle (CoPilotPanel) — the remaining presets live here inside the drawer.
   const ASK_CHIPS: { chip: AskChip; label: string }[] = [
-    { chip: "catch_me_up", label: "Catch me up" },
     { chip: "summarize", label: "Summarize so far" },
     { chip: "what_did_they_ask", label: "What did they just ask?" },
     { chip: "action_items", label: "Action items so far" },
@@ -242,10 +242,8 @@
     <span class="live-panel-title">Live transcript</span>
     {#if status === "error"}
       <span class="live-status-note">Live unavailable</span>
-    {:else if status === "ended"}
-      <span class="live-status-note">Draft</span>
     {:else}
-      <span class="live-status-note">Draft — finalized after the call</span>
+      <span class="live-status-note">Draft</span>
     {/if}
   </div>
 
@@ -265,9 +263,6 @@
           title={askBusyAny ? "Give it a moment…" : undefined}
           onclick={() => fireAsk(chip)}
         >
-          {#if askInFlight === chip}
-            <span class="live-ask-pip" aria-hidden="true"></span>
-          {/if}
           {label}
         </button>
       {/each}
@@ -290,14 +285,6 @@
     >
       <div class="live-ask-answer-head">
         <span class="live-ask-answer-kind">{ASK_MICRO[askAnswer.chip]}</span>
-        {#if askAnswer.empty}
-          <span class="live-ask-answer-empty-tag">· nothing yet</span>
-        {/if}
-        {#if askAnswer.basedOnTurns !== null && askAnswer.basedOnTurns > 0}
-          <span class="live-ask-answer-turns"
-            >· {askAnswer.basedOnTurns} turns</span
-          >
-        {/if}
         <button
           type="button"
           class="live-ask-answer-dismiss"
@@ -405,16 +392,6 @@
       {/if}
     </div>
   {/if}
-
-  <!-- Self-only talk-time nudge — pinned at the lane foot, ambient (ui.md §4).
-       Renders null until the trailing You-run passes threshold. -->
-  {#if talkMetric && status === "live"}
-    <TalkTimeNudge
-      youRunMs={talkMetric.youRunMs}
-      youPct={talkMetric.youPct}
-      themPct={talkMetric.themPct}
-    />
-  {/if}
 </section>
 
 <style>
@@ -452,34 +429,6 @@
     opacity: 0.55;
     cursor: not-allowed;
   }
-  /* Busy chip stays labelled; a small leading accent pulse dot leads it
-     (reuse the cp-pip-pulse glow recipe). */
-  .live-ask-pip {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
-    flex-shrink: 0;
-    animation: live-ask-pulse 1.4s ease-in-out infinite;
-  }
-  .live-ask-chip.reduce .live-ask-pip {
-    animation: none;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .live-ask-pip {
-      animation: none;
-    }
-  }
-  @keyframes live-ask-pulse {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 var(--accent-glow);
-    }
-    50% {
-      box-shadow: 0 0 0 4px rgba(0, 0, 0, 0);
-    }
-  }
-
   /* ── Inline answer slot (ui.md §1c) ───────────────────────────────────
      A soft inset card; the fresh answer cross-fades in (≤120ms). */
   .live-ask-answer {
@@ -514,11 +463,6 @@
     font-size: 0.64rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: var(--bone-3);
-  }
-  .live-ask-answer-turns {
-    font-family: var(--font-mono);
-    font-size: 0.68rem;
     color: var(--bone-3);
   }
   .live-ask-answer-dismiss {
@@ -562,16 +506,9 @@
   }
 
   /* ── Empty-state treatment (#660 P1 §1d) ──────────────────────────────
-     An honest "nothing yet" is a VALID result, not a failure — render it
-     calm + muted and clearly distinct from the error/unavailable line:
-     no accent, a quiet "· nothing yet" tag by the micro-label, italic
-     muted body. The `based_on_turns` caption still rides so the rep sees
-     the model DID look. */
-  .live-ask-answer-empty-tag {
-    font-family: var(--font-mono);
-    font-size: 0.68rem;
-    color: var(--bone-3);
-  }
+     An honest "nothing yet" is a VALID result, not a failure — the calm,
+     muted italic body (no accent, never red) carries it, indistinguishable
+     from "hasn't generated yet". */
   .live-ask-answer.empty .live-ask-answer-body {
     color: var(--bone-3);
     font-style: italic;

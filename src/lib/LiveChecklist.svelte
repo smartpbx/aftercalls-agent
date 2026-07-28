@@ -148,28 +148,7 @@
       aria-controls="checklist-body"
       onclick={() => (collapsed = !collapsed)}
     >
-      <span class="checklist-glyph" aria-hidden="true">
-        <svg
-          viewBox="0 0 24 24"
-          width="13"
-          height="13"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <path d="M9 11l3 3L22 4" />
-          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-        </svg>
-      </span>
       <span class="checklist-label">{checklist.template_label}</span>
-      <span
-        class="checklist-count"
-        class:done={completeness === "complete" || isEnded}
-      >
-        {coveredCount}/{totalCount}
-      </span>
       <svg
         class="checklist-chevron"
         class:open={!collapsed}
@@ -249,11 +228,6 @@
           </li>
         {/each}
       </ul>
-      {#if isEnded}
-        <p class="checklist-final">
-          Covered {coveredCount} of {totalCount} agenda items.
-        </p>
-      {/if}
     {/if}
   </section>
 {/if}
@@ -289,15 +263,6 @@
     outline-offset: 2px;
     border-radius: var(--radius-sm);
   }
-  .checklist-glyph {
-    display: inline-flex;
-    align-items: center;
-    color: var(--accent);
-    flex-shrink: 0;
-  }
-  .checklist.complete .checklist-glyph {
-    color: var(--olive);
-  }
   .checklist-label {
     font-size: 0.72rem;
     letter-spacing: 0.04em;
@@ -308,18 +273,8 @@
     text-overflow: ellipsis;
     min-width: 0;
   }
-  .checklist-count {
-    margin-left: auto;
-    font-size: 0.78rem;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    color: var(--bone-1);
-    flex-shrink: 0;
-  }
-  .checklist-count.done {
-    color: var(--olive);
-  }
   .checklist-chevron {
+    margin-left: auto;
     color: var(--bone-3);
     flex-shrink: 0;
     transition: transform 150ms ease, color 150ms ease;
@@ -489,14 +444,6 @@
   .checklist-confirm.on .checklist-confirm-tag {
     color: var(--olive);
     border-color: var(--olive);
-  }
-
-  .checklist-final {
-    margin: 0.5rem 0 0;
-    padding-top: 0.4rem;
-    border-top: 1px solid var(--hairline);
-    font-size: 0.76rem;
-    color: var(--bone-2);
   }
 
   /* Visually-hidden text for screen readers (component-scoped — no app.css). */
