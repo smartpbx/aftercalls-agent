@@ -39,7 +39,9 @@
   } from "$lib/stores/liveSession.svelte";
   import type {
     CrmContext,
+    CrmContextDeal,
     CopilotMode,
+    LinkedDeal,
     SpeakerIdentity,
     SpeakerIdentityAssignArgs,
     SpeakerIdentityKind,
@@ -54,6 +56,9 @@
     sessionUuid = null,
     isAdmin = false,
     mode = "sales",
+    linkedDeal = null,
+    onlinkdeal = undefined,
+    onunlinkdeal = undefined,
   }: {
     // #646 (Phase 2) — the detected-speaker roster rows (mic recorder + the
     // distinct far-side speakers), derived by CoPilotPanel from the segments.
@@ -92,6 +97,14 @@
     // section swap, no re-fetch). Passed to `live_crm_context` so the backend
     // best-effort persists the active persona to `state.copilot.mode`.
     mode?: CopilotMode;
+    // Phase 3 — the ONE deal currently linked to this call (or null). Drives the
+    // per-deal "Link to call" / "Linked" affordance in the open-Deals list.
+    linkedDeal?: LinkedDeal | null;
+    // Phase 3 — raise a link (one deal at a time — a new link replaces the prior)
+    // / unlink to the parent, which owns the `live_linked_deal` invoke + store.
+    // Both are only surfaced mid-call (a session must exist to persist the link).
+    onlinkdeal?: (deal: CrmContextDeal) => void;
+    onunlinkdeal?: () => void;
   } = $props();
 
   // ── Hydration state ────────────────────────────────────────────────
@@ -356,6 +369,26 @@
     Math.max(0, (crm?.deals.items.length ?? 0) - DEAL_CAP),
   );
 
+  // ── Link-to-call (Phase 3) ─────────────────────────────────────────
+  // The "Link to call" affordance is a MID-CALL action, so it's only shown
+  // when a live session exists (`sessionUuid`); pre-call there's nothing to
+  // persist the link to and it would be wiped at record-start. One deal at a
+  // time — linking a new deal replaces the prior one (the parent + backend own
+  // that; here we only raise the intent).
+  let canLinkDeal = $derived(!!sessionUuid && !!onlinkdeal);
+  function isLinkedDeal(deal: CrmContextDeal): boolean {
+    return !!linkedDeal && linkedDeal.record_id === deal.id;
+  }
+  function toggleLinkDeal(deal: CrmContextDeal) {
+    if (isLinkedDeal(deal)) {
+      onunlinkdeal?.();
+      announce = `${deal.name} unlinked from this call.`;
+    } else {
+      onlinkdeal?.(deal);
+      announce = `${deal.name} linked to this call.`;
+    }
+  }
+
   // ── Cases helpers (#659 P5a, Support mode) ─────────────────────────
   const CASE_CAP = 5;
   let visibleCases = $derived(crm?.cases.items.slice(0, CASE_CAP) ?? []);
@@ -609,16 +642,37 @@
               <p class="crm-status">No open deals.</p>
             {:else}
               {#each visibleDeals as deal (deal.id)}
-                <div class="crm-deal">
-                  <button
-                    type="button"
-                    class="crm-deal-name"
-                    onclick={() => openDeal(deal.url)}
-                    title={deal.name}
-                  >
-                    <span class="crm-deal-name-text">{deal.name}</span>
-                    <span class="crm-deal-arrow" aria-hidden="true">↗</span>
-                  </button>
+                <div class="crm-deal" class:linked={isLinkedDeal(deal)}>
+                  <div class="crm-deal-top">
+                    <button
+                      type="button"
+                      class="crm-deal-name"
+                      onclick={() => openDeal(deal.url)}
+                      title={deal.name}
+                    >
+                      <span class="crm-deal-name-text">{deal.name}</span>
+                      <span class="crm-deal-arrow" aria-hidden="true">↗</span>
+                    </button>
+                    {#if canLinkDeal}
+                      <!-- Mid-call "Link to call" toggle — one deal at a time.
+                           Linking a new deal replaces the prior; clicking the
+                           linked deal unlinks. -->
+                      <button
+                        type="button"
+                        class="crm-deal-link"
+                        class:on={isLinkedDeal(deal)}
+                        aria-pressed={isLinkedDeal(deal)}
+                        onclick={() => toggleLinkDeal(deal)}
+                      >
+                        {#if isLinkedDeal(deal)}
+                          <span class="crm-deal-link-check" aria-hidden="true">✓</span>
+                          Linked to call
+                        {:else}
+                          Link to call
+                        {/if}
+                      </button>
+                    {/if}
+                  </div>
                   <div class="crm-deal-meta">
                     {#if deal.stage}
                       <span class="crm-stage">{deal.stage}</span>
@@ -895,6 +949,13 @@
     gap: 0.2rem;
     min-width: 0;
   }
+  /* Row holding the deal name (grows) + the "Link to call" toggle (right). */
+  .crm-deal-top {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+  }
   .crm-deal-name {
     display: flex;
     align-items: baseline;
@@ -909,7 +970,49 @@
     cursor: pointer;
     text-align: left;
     min-width: 0;
+    flex: 1 1 auto;
     transition: color 0.15s;
+  }
+  /* Link-to-call toggle — a subtle hairline pill at rest that flips to the
+     accent-tinted "linked" state. Accent IS a meaningful "this deal will
+     receive the call" signal (design.md §Semantic — not decorative). */
+  .crm-deal-link {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.16rem 0.5rem;
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .crm-deal-link:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .crm-deal-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .crm-deal-link.on {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .crm-deal-link.on:hover {
+    /* On hover a linked pill hints the unlink action (softens toward live). */
+    border-color: var(--live);
+    color: var(--live);
+    background: var(--live-soft);
+  }
+  .crm-deal-link-check {
+    font-size: 0.68rem;
+    line-height: 1;
   }
   .crm-deal-name-text {
     min-width: 0;

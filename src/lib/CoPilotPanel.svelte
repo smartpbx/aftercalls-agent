@@ -97,6 +97,8 @@
     CoachingSentimentLabel,
     SpeakerIdentity,
     SpeakerIdentityAssignArgs,
+    LinkedDeal,
+    CrmContextDeal,
   } from "@aftercalls/shared/types";
   import type {
     AskAnswerState,
@@ -135,6 +137,9 @@
     onhighlight = undefined,
     onassignSpeaker,
     onpick,
+    linkedDeal = null,
+    onlinkdeal = undefined,
+    onunlinkdeal = undefined,
   }: {
     segments?: LiveSegment[];
     status?: LiveStatus;
@@ -187,6 +192,15 @@
     ) => void;
     // Raised up from CrmContextLane; +page threads it into start_recording.
     onpick: (contactId: string | null) => void;
+    /** Phase 3 — the ONE deal linked to this call (or null), threaded into the
+     *  rail CRM tile so it can render the per-deal "Link to call" / "Linked"
+     *  state. */
+    linkedDeal?: LinkedDeal | null;
+    /** Phase 3 — link (one deal at a time) / unlink raised from the CRM tile;
+     *  +page owns the `live_linked_deal` invoke + the optimistic/reconcile store
+     *  write. */
+    onlinkdeal?: (deal: CrmContextDeal) => void;
+    onunlinkdeal?: () => void;
   } = $props();
 
   // #646 (Phase 2) — the distinct-speaker roster set, derived from the live
@@ -566,6 +580,9 @@
         {sessionUuid}
         {isAdmin}
         mode={effectiveMode}
+        {linkedDeal}
+        {onlinkdeal}
+        {onunlinkdeal}
       />
     </div>
     {#if talkMetric && talkMetric.youPct + talkMetric.themPct > 0}

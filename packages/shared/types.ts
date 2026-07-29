@@ -405,6 +405,51 @@ export type SpeakerIdentitiesResponse = {
   identities: SpeakerIdentity[];
 };
 
+/** Phase 3 — a Zoho Deal linked to the live call so the finished call can be
+ *  pushed to it at call-end (prompt or auto). Live capture writes it to
+ *  `state.copilot.linked_deal` (scalar JSONB) via `POST /v1/live/linked-deal`;
+ *  enrichment projects it into a durable `call_links` row. `module` is always
+ *  `"Deals"` today; `record_id` / `record_name` name the Zoho record; the
+ *  optional `stage` / `amount` / `url` mirror the deal's display fields so the
+ *  after-call surfaces render without a re-fetch. Every optional field decodes
+ *  cleanly from an older/absent backend. */
+export type LinkedDeal = {
+  module: string;
+  record_id: string;
+  record_name: string;
+  stage?: string;
+  amount?: string;
+  url?: string;
+};
+
+/** Phase 3 — arguments for the `live_linked_deal` Tauri command (backend
+ *  `POST /v1/live/linked-deal`). camelCase to match the invoke arg contract.
+ *  `clear: true` removes any linked deal on the session (the remaining fields
+ *  are then ignored). One linked deal at a time — a new link REPLACES the prior
+ *  scalar server-side. */
+export type LinkedDealAssignArgs = {
+  sessionUuid: string;
+  module: string;
+  recordId: string;
+  recordName: string;
+  stage?: string;
+  amount?: string;
+  clear?: boolean;
+};
+
+/** Phase 3 — response of `live_linked_deal`: the reconciled linked deal for the
+ *  session (or `null` after a clear). The store replaces its scalar wholesale so
+ *  a server-side reconcile stays consistent client-side. */
+export type LinkedDealResponse = {
+  linked_deal: LinkedDeal | null;
+};
+
+/** Phase 3 — per-user call-end CRM push mode. `"prompt"` (default) asks on the
+ *  call-ended card before pushing a linked deal; `"auto"` lets the pipeline push
+ *  it automatically. Mirrors the `users.zoho_autopush_mode` column; the
+ *  `me_zoho_autopush_get/patch` Tauri commands round-trip it. */
+export type ZohoAutopushMode = "prompt" | "auto";
+
 export type Me = {
   id?: string;
   user_id?: string;
@@ -502,6 +547,19 @@ export type ActionItemRow = {
 
 export type ActionItem = ActionItemRow;
 
+/** Phase 3 — the Zoho Deal this call was linked to mid-call, folded into the
+ *  call-detail payload (`GET /v1/calls/{id}`) so the after-call page can show a
+ *  "Linked to <Deal> ↗" line even when the prompt-mode push prompt was skipped
+ *  (i.e. no prior push exists). Distinct from the live-session `LinkedDeal`:
+ *  the after-call surface only needs the display name plus a deep link to the
+ *  Deal record. `zoho_url` is absent when the backend can't build it (no
+ *  connection / unparseable data centre). Optional on the wire so an older
+ *  backend that omits the field decodes cleanly. */
+export type CallLinkedDeal = {
+  record_name: string;
+  zoho_url?: string;
+};
+
 export type Call = CallListItem & {
   summary_text: string | null;
   action_items: ActionItemRow[];
@@ -519,6 +577,11 @@ export type Call = CallListItem & {
   // fields) don't blow up the type — UI treats `undefined` as
   // `"full"` (no chip).
   track_quality?: "full" | "degraded";
+  // Phase 3 — the Zoho Deal this call was linked to mid-call (from the durable
+  // `call_links` row), folded in by the backend so the after-call detail can
+  // surface it independently of any push. `null`/absent when the call has no
+  // linked Deal.
+  linked_deal?: CallLinkedDeal | null;
 };
 
 export type Highlight = {

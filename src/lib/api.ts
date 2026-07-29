@@ -26,6 +26,7 @@ import type {
   MyAccessLogPage,
   MyAccessLogRow,
   MyPrivacyBundle,
+  ZohoAutopushMode,
 } from "@aftercalls/shared/types";
 
 export type {
@@ -40,6 +41,7 @@ export type {
   MyAccessLogPage,
   MyAccessLogRow,
   MyPrivacyBundle,
+  ZohoAutopushMode,
 } from "@aftercalls/shared/types";
 
 // ── /settings/privacy bundle (#514, mirrored for #592) ──────────────
@@ -232,6 +234,26 @@ export const mySummaryStyle = {
     invoke<MySummaryStyle>("me_summary_style_get"),
   patch: (style: SummaryStyle | null): Promise<MySummaryStyle> =>
     invoke<MySummaryStyle>("me_summary_style_patch", { style }),
+};
+
+// ── Phase 3 — per-user call-end CRM push mode ───────────────────────
+//
+// Mirror of the portal's zoho-autopush client. `mode` is the user's
+// call-end behaviour for a call that had a Zoho deal linked mid-call:
+//   - `"prompt"` (default) — ask on the call-ended card before pushing.
+//   - `"auto"`             — the pipeline pushes the linked deal for you.
+// PATCH strict-parses; an unknown value rejects 400 at the backend
+// boundary, surfaced as a PortalError. Wire shape matches the summary-
+// style client (the IPC layer just routes the JSON through
+// `/v1/me/zoho-autopush`).
+
+export type MeZohoAutopush = { mode: ZohoAutopushMode };
+
+export const zohoAutopush = {
+  get: (): Promise<MeZohoAutopush> =>
+    invoke<MeZohoAutopush>("me_zoho_autopush_get"),
+  patch: (mode: ZohoAutopushMode): Promise<MeZohoAutopush> =>
+    invoke<MeZohoAutopush>("me_zoho_autopush_patch", { mode }),
 };
 
 // ── #634 — per-user unread call state ───────────────────────────────

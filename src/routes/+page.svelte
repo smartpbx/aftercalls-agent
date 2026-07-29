@@ -26,11 +26,17 @@
   import { openBilling } from "$lib/billing";
   import { liveSession } from "$lib/stores/liveSession.svelte";
   import type {
+    SzmPriorPush,
+    SzmPushResponse,
+  } from "@aftercalls/shared/ui/SendToZohoModal.svelte";
+  import type {
     AskChip,
     AskAnswer,
     KnowledgeAnswer,
     LiveSegment,
     CopilotMode,
+    CrmContextDeal,
+    LinkedDealResponse,
     SpeakerIdentityAssignArgs,
     SpeakerIdentitiesResponse,
   } from "@aftercalls/shared/types";
@@ -280,6 +286,144 @@
       // matches persisted state. No error surface (a star is advisory).
       liveSession.setHighlighted(seg.channel, seg.start_ms, !starred);
     }
+  }
+
+  /** Phase 3 — link a Zoho deal to this call (mid-call). One deal at a time —
+   *  linking a new deal replaces the prior scalar. Optimistic: set the store
+   *  immediately so the CRM tile + the ended card reflect it, then invoke
+   *  `live_linked_deal` and RECONCILE from the response (the backend is the
+   *  source of truth). No session (belt + braces — the affordance is
+   *  session-gated in the tile) → the optimistic value stands. A failed write
+   *  leaves the optimistic value in place; the ended-card [Push] still targets
+   *  it. Never a red surface — a link is advisory. */
+  async function handleLinkDeal(deal: CrmContextDeal) {
+    liveSession.setLinkedDeal({
+      module: "Deals",
+      record_id: deal.id,
+      record_name: deal.name,
+      stage: deal.stage,
+      amount: deal.amount,
+      url: deal.url,
+    });
+    const su = liveSession.sessionUuid;
+    if (!su) return;
+    try {
+      const res = (await invoke("live_linked_deal", {
+        sessionUuid: su,
+        module: "Deals",
+        recordId: deal.id,
+        recordName: deal.name,
+        stage: deal.stage,
+        amount: deal.amount,
+      })) as LinkedDealResponse;
+      liveSession.setLinkedDeal(res?.linked_deal ?? null);
+    } catch {
+      // Optimistic label stands — a later link/unlink reconciles.
+    }
+  }
+
+  /** Phase 3 — unlink the call's deal. Optimistic clear, then a best-effort
+   *  `clear: true` write reconciled from the response. */
+  async function handleUnlinkDeal() {
+    const prev = liveSession.linkedDeal;
+    liveSession.setLinkedDeal(null);
+    const su = liveSession.sessionUuid;
+    if (!su || !prev) return;
+    try {
+      const res = (await invoke("live_linked_deal", {
+        sessionUuid: su,
+        module: prev.module,
+        recordId: prev.record_id,
+        recordName: prev.record_name,
+        clear: true,
+      })) as LinkedDealResponse;
+      liveSession.setLinkedDeal(res?.linked_deal ?? null);
+    } catch {
+      // Optimistic clear stands.
+    }
+  }
+
+  // Phase 3 — call-end CRM push state. ONE prior-push probe fires once the call
+  // is `done` + openable; it drives BOTH the prompt-mode "Push this call?" ask
+  // AND the "Pushed to <Deal>" confirmation (auto mode already pushed
+  // backend-side, so the probe finds it — the client never needs to know the
+  // mode). Best-effort: a missing/failed probe degrades to "no prior push" (the
+  // [Push] prompt still shows when a deal was linked), never a red panel.
+  let endedPriorPush = $state<SzmPriorPush | null>(null);
+  let endedPushLoaded = $state(false);
+  let endedPushing = $state(false);
+  let endedSkipped = $state(false);
+  // Non-reactive guard so the probe fires once per finished call.
+  let endedPushProbedFor = "";
+
+  async function probeEndedPriorPush(callId: string) {
+    try {
+      const p = (await invoke("zoho_prior_push", { callId })) as
+        | SzmPriorPush
+        | null;
+      endedPriorPush = p ?? null;
+    } catch {
+      // Degrade to "no prior push" — the ended card falls back to the [Push]
+      // prompt when a deal was linked, never surfaces an error.
+      endedPriorPush = null;
+    } finally {
+      endedPushLoaded = true;
+    }
+  }
+
+  // Fire the probe on the transcribed→done edge, once the call is openable.
+  // `pipelineStage==='done'` gates it so the prompt/confirmation only appears
+  // when the summary is ready (a still-processing call shows plain progress).
+  $effect(() => {
+    const ready = callEnded && !!openableCallId && pipelineStage === "done";
+    const cid = openableCallId;
+    if (!ready) return;
+    if (endedPushProbedFor === cid) return;
+    endedPushProbedFor = cid;
+    endedPriorPush = null;
+    endedPushLoaded = false;
+    endedSkipped = false;
+    void probeEndedPriorPush(cid);
+  });
+
+  /** [Push] on the ended card — push the finished call to the linked deal,
+   *  reusing the existing manual push path pre-targeted. On success, flip to the
+   *  "Pushed to <Deal>" confirmation. Best-effort: a failure leaves the [Push]
+   *  prompt in place (retryable), never a red panel. */
+  async function pushEndedCall() {
+    const deal = liveSession.linkedDeal;
+    if (!openableCallId || !deal || endedPushing) return;
+    endedPushing = true;
+    try {
+      const resp = (await invoke("zoho_push_call", {
+        callId: openableCallId,
+        body: {
+          module: deal.module,
+          record_id: deal.record_id,
+          record_name: deal.record_name,
+        },
+      })) as SzmPushResponse;
+      endedPriorPush = {
+        module: deal.module,
+        record_id: deal.record_id,
+        record_name: deal.record_name,
+        pushed_at: new Date().toISOString(),
+        zoho_url: resp.zoho_url,
+      };
+    } catch {
+      // Best-effort — leave the [Push] prompt available (retryable).
+    } finally {
+      endedPushing = false;
+    }
+  }
+
+  /** [Skip] — dismiss the push prompt (keeps the rest of the ended card). */
+  function skipEndedPush() {
+    endedSkipped = true;
+  }
+
+  function openZohoUrl(url: string) {
+    void openUrl(url).catch((e) => console.warn("openUrl failed", e));
   }
 
   /** True when a failed-pipeline error string carries the backend's
@@ -666,6 +810,13 @@
           sessionWasCall = evt.payload.mode === "call";
           callEnded = false;
           copilotDismissed = false;
+          // Phase 3 — reset the call-end CRM push surface so a fresh call never
+          // inherits the previous call's push prompt/confirmation. (The store's
+          // `linkedDeal` is reset in `resetForNewSession` on the layout side.)
+          endedPriorPush = null;
+          endedPushLoaded = false;
+          endedSkipped = false;
+          endedPushProbedFor = "";
           // #659 — the per-session live-draft reset (clear segments +
           // coaching, seed status) now lives in the layout's
           // recording-state handler via liveSession.resetForNewSession(),
@@ -1572,6 +1723,55 @@
               Open post-call
             </button>
           </div>
+          <!-- Phase 3 — call-end CRM push. One prior-push probe (fired once
+               `done`) drives BOTH states: a prior push (auto mode fired it, or a
+               manual push) → the "Pushed to <Deal>" confirmation; else a deal
+               linked this call → the "Push this call?" prompt. No linked deal +
+               no prior push → nothing (the Phase-1 card is unchanged). Copy is
+               vendor-opaque — "Zoho" is the sanctioned name. -->
+          {#if pipelineStage === "done" && endedPushLoaded}
+            {#if endedPriorPush}
+              <div class="ce-crm" role="status" aria-live="polite">
+                <span class="ce-crm-pip" aria-hidden="true"></span>
+                <span class="ce-crm-text">
+                  Pushed to {endedPriorPush.record_name ?? "your CRM"}
+                </span>
+                {#if endedPriorPush.zoho_url}
+                  <button
+                    type="button"
+                    class="ce-crm-link"
+                    onclick={() => openZohoUrl(endedPriorPush!.zoho_url!)}
+                  >
+                    View in Zoho ↗
+                  </button>
+                {/if}
+              </div>
+            {:else if liveSession.linkedDeal && !endedSkipped}
+              <div class="ce-crm ce-crm-prompt">
+                <span class="ce-crm-text">
+                  Push this call to {liveSession.linkedDeal.record_name}?
+                </span>
+                <div class="ce-crm-actions">
+                  <button
+                    type="button"
+                    class="ce-crm-push"
+                    disabled={endedPushing}
+                    onclick={pushEndedCall}
+                  >
+                    {endedPushing ? "Pushing…" : "Push"}
+                  </button>
+                  <button
+                    type="button"
+                    class="ce-crm-skip"
+                    disabled={endedPushing}
+                    onclick={skipEndedPush}
+                  >
+                    Skip
+                  </button>
+                </div>
+              </div>
+            {/if}
+          {/if}
         {:else if pipelineStage === "failed"}
           <p class="ce-body ce-body-muted">
             We couldn't finish preparing this call. It'll appear in your calls
@@ -1613,6 +1813,9 @@
         onhighlight={handleHighlight}
         onassignSpeaker={handleAssignSpeaker}
         onpick={(id) => (contactHint = id)}
+        linkedDeal={liveSession.linkedDeal}
+        onlinkdeal={handleLinkDeal}
+        onunlinkdeal={handleUnlinkDeal}
       />
     {/if}
   {:else if liveTranscriptEnabled && (recording || liveSession.segments.length > 0 || liveSession.status === "error")}
@@ -2587,6 +2790,111 @@
     border-color: var(--accent-hi);
   }
   .ce-open:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* ── Phase 3 · Call-end CRM push (prompt + confirmation) ───────────────────
+     A quiet sub-block under the "Open post-call" action. The confirmation reads
+     as saved (olive pip, per design.md §Semantic — "complete/saved"); the prompt
+     is a plain ask with an accent Push CTA + a subordinate Skip. Component-scoped
+     (`.ce-crm-*` live ONLY in this route's <style>) — no app.css touch. */
+  .ce-crm {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.7rem;
+    margin-top: 0.1rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .ce-crm-prompt {
+    justify-content: space-between;
+  }
+  .ce-crm-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--olive);
+    box-shadow: 0 0 5px rgba(143, 175, 114, 0.5);
+    flex-shrink: 0;
+  }
+  .ce-crm-text {
+    font-size: 0.85rem;
+    color: var(--bone-1);
+    min-width: 0;
+  }
+  .ce-crm-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--accent-hi);
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .ce-crm-link:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-hi);
+  }
+  .ce-crm-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .ce-crm-actions {
+    display: flex;
+    gap: 0.4rem;
+    flex-shrink: 0;
+  }
+  .ce-crm-push {
+    padding: 0.35rem 0.85rem;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--accent);
+    color: var(--ink-0);
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .ce-crm-push:hover:not(:disabled) {
+    background: var(--accent-hi);
+    border-color: var(--accent-hi);
+  }
+  .ce-crm-push:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .ce-crm-push:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .ce-crm-skip {
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--bone-2);
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .ce-crm-skip:hover:not(:disabled) {
+    border-color: var(--hairline-hi);
+    color: var(--bone-0);
+  }
+  .ce-crm-skip:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .ce-crm-skip:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }

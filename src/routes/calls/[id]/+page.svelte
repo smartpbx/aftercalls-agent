@@ -360,9 +360,32 @@
       }
     }
     call = { ...call, tags: merged };
+    // Phase 3 — refresh the prior-push record so the after-call surface (the
+    // "Pushed to <Deal>" line + the modal's Step-0 card) reflects the fresh
+    // push without a reload.
+    void loadPriorPush();
   }
 
-  const zohoPriorPush: SzmPriorPush | null = null;
+  // Phase 3 — most-recent successful push for this call. Was hardcoded null;
+  // now wired to the real `GET /v1/calls/{id}/zoho/prior-push` (via the Tauri
+  // `zoho_prior_push` shim) so the SendToZohoModal opens at its Step-0
+  // "already pushed" card AND the detail header can surface the linked deal +
+  // push status. Best-effort: a 404 / missing shim / transport error decodes to
+  // null (no surface) — never an error panel.
+  let zohoPriorPush = $state<SzmPriorPush | null>(null);
+
+  async function loadPriorPush() {
+    const id = page.params.id;
+    if (!id) return;
+    try {
+      zohoPriorPush =
+        ((await invoke("zoho_prior_push", { callId: id })) as
+          | SzmPriorPush
+          | null) ?? null;
+    } catch {
+      zohoPriorPush = null;
+    }
+  }
 
   // ── Share call (#35 / #243) ─────────────────────────────────────
   // The portal's call-detail page mounts ShareCallModal with a fetch-
@@ -1753,6 +1776,9 @@
     // down) and reports `connected: false`.
     zohoStore.ensureCrossTabListener();
     zohoStore.refresh();
+    // Phase 3 — surface any prior CRM push for this call (linked deal + status).
+    // Best-effort; a 404 / missing shim decodes to null and shows nothing.
+    void loadPriorPush();
     // Live-refresh while the call is still being processed. Users
     // land here as soon as the transcript is in; summary + action
     // items pop in reactively as the backend finishes them. Stops
@@ -3722,6 +3748,46 @@
           >
             {deleting ? "Deleting…" : "Delete"}
           </button>
+          <!-- Phase 3 — after-call CRM push status: the linked deal + a deep
+               link to it in Zoho. Wraps to its own line under the action row
+               (`.head-actions` is flex-wrap). "Zoho" is the sanctioned name. -->
+          {#if zohoFeatureEnabled && zohoPriorPush}
+            <div class="crm-pushed-note" role="status">
+              <span class="pip done crm-pushed-pip" aria-hidden="true"></span>
+              <span class="crm-pushed-text">
+                Pushed to {zohoPriorPush.record_name ?? "your CRM"}
+              </span>
+              {#if zohoPriorPush.zoho_url}
+                <button
+                  type="button"
+                  class="crm-pushed-link"
+                  onclick={() => openZohoUrl(zohoPriorPush!.zoho_url!)}
+                >
+                  View in Zoho ↗
+                </button>
+              {/if}
+            </div>
+          {:else if zohoFeatureEnabled && call.linked_deal}
+            <!-- Phase 3 (reviewer must-fix #2) — a Deal was linked mid-call but
+                 never pushed (prompt mode, prompt skipped). Surface the link so
+                 the after-call record still shows the association + a deep link.
+                 Only shown when there's NO prior push (the `{:else}` above
+                 already covers the pushed case). -->
+            <div class="crm-pushed-note" role="status">
+              <span class="crm-pushed-text">
+                Linked to {call.linked_deal.record_name}
+              </span>
+              {#if call.linked_deal.zoho_url}
+                <button
+                  type="button"
+                  class="crm-pushed-link"
+                  onclick={() => openZohoUrl(call!.linked_deal!.zoho_url!)}
+                >
+                  View in Zoho ↗
+                </button>
+              {/if}
+            </div>
+          {/if}
         </div>
       </div>
     </header>
@@ -5201,6 +5267,45 @@
   }
   .head-action.send-crm .crm-pip {
     margin-left: 0.4rem;
+  }
+
+  /* Phase 3 — after-call CRM push status. Full-width flex item so it wraps to
+     its own line under the right-aligned action cluster; reads as saved (olive
+     pip, per design.md §Semantic — "complete/saved"). Component-scoped — no
+     app.css touch. */
+  .crm-pushed-note {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.45rem;
+    margin-top: 0.15rem;
+  }
+  .crm-pushed-pip {
+    flex-shrink: 0;
+  }
+  .crm-pushed-text {
+    font-size: 0.76rem;
+    color: var(--bone-2);
+  }
+  .crm-pushed-link {
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--accent-hi);
+    font: inherit;
+    font-size: 0.76rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .crm-pushed-link:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .crm-pushed-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .delete {

@@ -1545,6 +1545,32 @@ async fn me_summary_style_patch(
     portal::me_summary_style_patch(backend, style.as_deref()).await
 }
 
+/// Phase 3 — GET `/v1/me/zoho-autopush`. Returns the caller's stored
+/// call-end push mode (`"prompt"` | `"auto"`), feeding the "Push to CRM"
+/// Settings card.
+#[tauri::command]
+async fn me_zoho_autopush_get() -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_zoho_autopush_get(backend).await
+}
+
+/// Phase 3 — PATCH `/v1/me/zoho-autopush`. `mode` is `"prompt"` |
+/// `"auto"`; unknown values reject with a backend 400 surfaced as
+/// `PortalError`.
+#[tauri::command]
+async fn me_zoho_autopush_patch(
+    mode: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::me_zoho_autopush_patch(backend, &mode).await
+}
+
 // ── #634 — per-user unread call state ────────────────────────────────
 //
 // Three IPC shims for the webview's mark-as-read flow + a tiny tray-
@@ -3094,6 +3120,41 @@ async fn live_speaker_identity(
     .await
 }
 
+/// POST /v1/live/linked-deal — Phase 3 link (or clear, `clear=true`) the
+/// call's Zoho Deal mid-call. Writes the scalar `state.copilot.linked_deal`;
+/// enrichment projects it onto `call_links` + the call-end auto-push reads
+/// it. Returns `{ linked_deal }` (the stored object or JSON null) so the
+/// frontend reconciles its optimistic set. Copilot- + impersonation-write-
+/// gated; best-effort (fire-and-forget). Mirrors the `live_speaker_identity`
+/// shim.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn live_linked_deal(
+    session_uuid: String,
+    module: String,
+    record_id: String,
+    record_name: String,
+    stage: Option<String>,
+    amount: Option<String>,
+    clear: bool,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_linked_deal(
+        backend,
+        &session_uuid,
+        &module,
+        &record_id,
+        &record_name,
+        stage.as_deref(),
+        amount.as_deref(),
+        clear,
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
 /// activity linked to the picked record (#186). Body is forwarded
 /// verbatim from the SendToZohoModal Step-3 review state.
@@ -3107,6 +3168,22 @@ async fn zoho_push_call(
         message: "no backend configured".into(),
     })?;
     portal::zoho_push_call(backend, &call_id, &body).await
+}
+
+/// GET /v1/calls/{id}/zoho/prior-push — the most-recent successful CRM push
+/// for this call, or `null` when none (404 → calm absence). Drives the
+/// auto-mode "Pushed to <Deal>" confirmation on the call-ended card + the
+/// after-call detail surface. JSON is passed through as-is; the frontend
+/// maps `{ pushed?, record_name, zoho_url, module, pushed_at } | null`.
+#[tauri::command]
+async fn zoho_prior_push(
+    call_id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_prior_push(backend, &call_id).await
 }
 
 
@@ -4145,6 +4222,10 @@ pub fn run() {
             // new "AI summary style" Settings card.
             me_summary_style_get,
             me_summary_style_patch,
+            // Phase 3 — per-user Zoho call-end auto-push preference. Backs
+            // the agent's "Push to CRM" Settings card (prompt | auto).
+            me_zoho_autopush_get,
+            me_zoho_autopush_patch,
             // #634 — per-user unread-call state + tray badge. Three
             // shims around the new backend endpoints + one helper that
             // pushes the live count into the tray tooltip from the
@@ -4186,10 +4267,16 @@ pub fn run() {
             // #663 Phase 2 — per-speaker identity assignment (live rename →
             // after-call continuity). REST, off the audio WS; copilot-gated.
             live_speaker_identity,
+            // Phase 3 — link a Zoho Deal to the live call (→ call_links +
+            // call-end auto-push). REST, off the audio WS; copilot-gated.
+            live_linked_deal,
             // #659 P5b — Support-mode cited knowledge answer over the org's
             // own knowledge base. REST, off the audio WS; copilot-gated.
             live_knowledge,
             zoho_push_call,
+            // Phase 3 — most-recent successful CRM push for a call (404 →
+            // null). Drives the ended-card confirmation + after-call detail.
+            zoho_prior_push,
             notes::save_notes,
             notes::load_notes,
             notes::save_title,

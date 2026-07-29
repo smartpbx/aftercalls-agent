@@ -1163,6 +1163,41 @@ pub async fn live_speaker_identity(
     .await
 }
 
+/// POST /v1/live/linked-deal — Phase 3 link (or clear, `clear=true`) the
+/// call's Zoho Deal mid-call. Writes the scalar `state.copilot.linked_deal`;
+/// post-call enrichment projects it onto the durable `call_links` table and
+/// the call-end auto-push reads it. Returns `{ linked_deal }` — the stored
+/// object echoed back, or JSON `null` when cleared — so the agent reconciles
+/// its optimistic UI. Copilot-gated + impersonation-write-gated; best-effort
+/// (fire-and-forget), so a `PortalError` here never fails the call. Mirrors
+/// the `live_speaker_identity` `post_json_typed` transport.
+#[allow(clippy::too_many_arguments)]
+pub async fn live_linked_deal(
+    backend: &Backend,
+    session_uuid: &str,
+    module: &str,
+    record_id: &str,
+    record_name: &str,
+    stage: Option<&str>,
+    amount: Option<&str>,
+    clear: bool,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/linked-deal",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "module": module,
+            "record_id": record_id,
+            "record_name": record_name,
+            "stage": stage,
+            "amount": amount,
+            "clear": clear,
+        }),
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
 /// `body` is forwarded verbatim; frontend pre-shapes
 /// `{module, record_id, record_name, extra_tags?}`. (#186)
@@ -1177,6 +1212,25 @@ pub async fn zoho_push_call(
         body.clone(),
     )
     .await
+}
+
+/// GET /v1/calls/{id}/zoho/prior-push — the most-recent successful CRM push
+/// for this call. Drives the auto-mode "Pushed to <Deal>" confirmation on the
+/// call-ended card AND the after-call detail surface. 200 → the prior-push
+/// JSON passed through as-is (snake_case; the frontend maps it); 404 → JSON
+/// `null` (calm absence — a call that was never pushed is not an error). Other
+/// non-2xx surface as a typed `PortalError`. Read-only (no impersonation
+/// write). (#186 / #372)
+pub async fn zoho_prior_push(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Value, PortalError> {
+    match get_json_typed(backend, &format!("/v1/calls/{call_id}/zoho/prior-push")).await {
+        Ok(v) => Ok(v),
+        // Never pushed → 404 collapses to a calm `null`, not an error.
+        Err(PortalError::NotFound) => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
 }
 
 // ── Share call (#35 / #243) ─────────────────────────────────────────
@@ -1704,6 +1758,25 @@ pub async fn me_summary_style_patch(
 ) -> std::result::Result<Value, PortalError> {
     let body = serde_json::json!({ "style": style });
     patch_json_typed(backend, "/v1/me/summary-style", body).await
+}
+
+// ── Phase 3 — per-user Zoho call-end auto-push preference ─────────────
+//
+// Backs the agent's "Push to CRM" Settings card. Wire shape matches the
+// backend's `me_zoho_autopush` handler:
+//   - GET returns `{ mode: "prompt"|"auto" }`.
+//   - PATCH accepts `{ "mode": "prompt"|"auto" }`; unknown values reject 400.
+
+pub async fn me_zoho_autopush_get(backend: &Backend) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, "/v1/me/zoho-autopush").await
+}
+
+pub async fn me_zoho_autopush_patch(
+    backend: &Backend,
+    mode: &str,
+) -> std::result::Result<Value, PortalError> {
+    let body = serde_json::json!({ "mode": mode });
+    patch_json_typed(backend, "/v1/me/zoho-autopush", body).await
 }
 
 // ── #634 — per-user unread-call state ────────────────────────────────

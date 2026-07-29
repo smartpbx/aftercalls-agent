@@ -27,6 +27,7 @@ import type {
   AskChip,
   KnowledgeAnswer,
   SpeakerIdentity,
+  LinkedDeal,
 } from "@aftercalls/shared/types";
 
 export type LiveSessionStatus = "idle" | "live" | "ended" | "error";
@@ -241,6 +242,15 @@ function createStore() {
   // assigns POST directly and never touch this buffer.
   let pendingIdentities = $state<Map<string, SpeakerIdentity>>(new Map());
 
+  // Phase 3 — the ONE Zoho deal linked to this call (mid-call), driving the
+  // call-end push prompt/confirmation. A single scalar (one linked deal at a
+  // time — a new link replaces it). Set OPTIMISTICALLY the instant the rep links
+  // a deal, then RECONCILED from the `live_linked_deal` response (the backend is
+  // the source of truth). Cleared on a new session (`resetForNewSession`) — the
+  // ended card reads it BEFORE the next record-start, the acknowledged
+  // prompt-mode envelope (auto mode is backend-driven, reset-independent).
+  let linkedDeal = $state<LinkedDeal | null>(null);
+
   // #660 — talk-share + trailing-monologue metric, derived from FINAL
   // segments only (provisionals are drafts). Per-channel durations for the
   // share; a same-channel trailing delta for the You-run.
@@ -318,6 +328,9 @@ function createStore() {
     },
     get speakerIdentities(): Map<string, SpeakerIdentity> {
       return speakerIdentities;
+    },
+    get linkedDeal(): LinkedDeal | null {
+      return linkedDeal;
     },
     get talkMetric(): TalkMetric {
       return talkMetric;
@@ -538,6 +551,16 @@ function createStore() {
       speakerIdentities = next;
     },
 
+    /** Phase 3 — set (or clear with `null`) the call's linked Zoho deal. Used
+     *  both for the OPTIMISTIC set the instant the rep links/unlinks a deal and
+     *  for the RECONCILE from the `live_linked_deal` response (the backend is the
+     *  source of truth; the endpoint returns the reconciled scalar, or `null`
+     *  after a clear). One linked deal at a time — a new value replaces the prior
+     *  scalar wholesale. */
+    setLinkedDeal(deal: LinkedDeal | null) {
+      linkedDeal = deal;
+    },
+
     /** #646 (Phase 2) — STAGE a PRE-CALL assignment (no session yet) for replay
      *  at record-start. Mirrors `setSpeakerIdentity`'s single-primary strip so
      *  the staged set never carries two primaries. */
@@ -612,6 +635,9 @@ function createStore() {
       // never inherits the previous call's battlecards or risk reminders.
       liveCues = [];
       stopCuePruneTimer();
+      // Phase 3 — drop the previous call's linked Zoho deal so a fresh call
+      // never inherits it (the ended card reads it before this reset fires).
+      linkedDeal = null;
     },
   };
 }

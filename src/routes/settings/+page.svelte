@@ -109,6 +109,54 @@
     }
   }
 
+  // ── Phase 3 — per-user call-end CRM push mode ──────────────────────
+  // When you link a Zoho deal during a call, this picks what happens at
+  // call-end: `prompt` (ask on the call-ended card before pushing) or
+  // `auto` (push the linked deal automatically). Mirrors the AI-summary-
+  // style card — inline save on `onchange`, no save button. Default is
+  // `prompt` until the fetch lands. Zoho is the sanctioned vendor name.
+  let zohoAutopushMode = $state<api.ZohoAutopushMode>("prompt");
+  let zohoAutopushSaving = $state(false);
+  let zohoAutopushErr = $state("");
+  let zohoAutopushNetwork = $state(false);
+  const zohoAutopushOptions: { value: api.ZohoAutopushMode; label: string }[] = [
+    { value: "prompt", label: "Ask me each time" },
+    { value: "auto", label: "Push automatically" },
+  ];
+
+  async function loadZohoAutopush() {
+    zohoAutopushErr = "";
+    zohoAutopushNetwork = false;
+    try {
+      const r = await api.zohoAutopush.get();
+      zohoAutopushMode = r.mode;
+    } catch (e: unknown) {
+      zohoAutopushErr = "Couldn't load push-to-CRM setting.";
+      zohoAutopushNetwork = true;
+      console.warn("loadZohoAutopush failed", e);
+    }
+  }
+
+  async function onZohoAutopushChange(v: api.ZohoAutopushMode) {
+    if (zohoAutopushSaving || v === zohoAutopushMode) return;
+    const previous = zohoAutopushMode;
+    zohoAutopushMode = v;
+    zohoAutopushSaving = true;
+    zohoAutopushErr = "";
+    zohoAutopushNetwork = false;
+    try {
+      const updated = await api.zohoAutopush.patch(v);
+      zohoAutopushMode = updated.mode;
+    } catch (e: unknown) {
+      zohoAutopushErr = "Couldn't save preference. Try again.";
+      zohoAutopushNetwork = true;
+      zohoAutopushMode = previous;
+      console.warn("patchZohoAutopush failed", e);
+    } finally {
+      zohoAutopushSaving = false;
+    }
+  }
+
   // ── #602 / WS-G — subscription / trial indicator ───────────────────
   // Fresh reach-around read of `/v1/auth/me`'s `subscription` block. The
   // app never manages billing — the "Manage billing" button opens the
@@ -1014,6 +1062,10 @@
     // surface so we don't gate the rest of the page on this fetch.
     await loadSummaryStyle();
 
+    // Phase 3 — per-user call-end CRM push mode. Same posture as the
+    // summary-style card: renders regardless, owns its own error surface.
+    void loadZohoAutopush();
+
     // #602/WS-G — subscription snapshot for the Subscription card.
     // Best-effort: a null result hides the card, so we don't await-gate
     // anything else on it.
@@ -1289,6 +1341,45 @@
             type="button"
             class="inline-btn"
             onclick={loadSummaryStyle}
+          >Retry</button>
+        {/if}
+      </p>
+    {/if}
+  </section>
+
+  <!-- Phase 3 — per-user call-end push-to-CRM mode. Mirrors the AI summary
+       style card: a two-option Segmented saved inline on change. Zoho is the
+       sanctioned vendor name. -->
+  <section class="card" style="--i: 1.35">
+    <div class="card-head">
+      <div>
+        <h2>Push to CRM</h2>
+        <p class="hint">
+          When you link a Zoho deal during a call, choose what happens once
+          the call is ready.
+        </p>
+      </div>
+    </div>
+    <Segmented
+      options={zohoAutopushOptions}
+      bind:value={zohoAutopushMode}
+      ariaLabel="Push to CRM"
+      disabled={zohoAutopushSaving}
+      onchange={onZohoAutopushChange}
+    />
+    <p class="hint">
+      {zohoAutopushMode === "auto"
+        ? "We'll push the finished call to the linked deal automatically."
+        : "We'll ask before pushing the finished call to the linked deal."}
+    </p>
+    {#if zohoAutopushErr}
+      <p class="err" role="alert">
+        {zohoAutopushErr}
+        {#if zohoAutopushNetwork}
+          <button
+            type="button"
+            class="inline-btn"
+            onclick={loadZohoAutopush}
           >Retry</button>
         {/if}
       </p>
