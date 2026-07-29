@@ -24,6 +24,7 @@ import type {
   CoachingUpdate,
   LiveCue,
   ChecklistSnapshot,
+  QuestionsSnapshot,
   AskChip,
   KnowledgeAnswer,
   SpeakerIdentity,
@@ -176,6 +177,14 @@ function createStore() {
   // `"likely"` (the SAFE direction: never a false "done").
   let checklistConfirmed = $state<Set<string>>(new Set());
 
+  // Phase 4 (live↔after-call continuity) — the latest auto-extracted questions
+  // snapshot (full replace per frame, like `checklist`). Rendered in the
+  // transcript drawer (`LiveQuestions`) with an open-count badge on the drawer
+  // toggle. Session-sticky ON THE BACKEND (a question never un-answers once
+  // answered); the agent just mirrors the newest snapshot. Retained through
+  // `ended` (frozen final list); cleared on the next session start.
+  let questions = $state<QuestionsSnapshot | null>(null);
+
   // #659 (P2) — the fast-lane cue list (battlecards + deal-risk cues), rendered
   // in the IntelligenceLane ABOVE the reflective coaching. A single interval
   // prunes expired battlecards; it runs only while a TTL'd cue is present and
@@ -304,6 +313,9 @@ function createStore() {
     },
     get checklistConfirmed(): Set<string> {
       return checklistConfirmed;
+    },
+    get questions(): QuestionsSnapshot | null {
+      return questions;
     },
     get liveCues(): LiveCueEntry[] {
       return liveCues;
@@ -434,6 +446,15 @@ function createStore() {
       if (next.has(id)) next.delete(id);
       else next.add(id);
       checklistConfirmed = next;
+    },
+
+    /** Phase 4 (live↔after-call continuity) — store the latest FULL questions
+     *  snapshot verbatim; `LiveQuestions` renders it wholesale. Answers are
+     *  sticky on the backend (a question never un-answers), so a later snapshot
+     *  only ever gains answers. Retained through `ended` (frozen final list);
+     *  cleared on the next session start. */
+    setQuestions(next: QuestionsSnapshot | null) {
+      questions = next;
     },
 
     /** #660 — record the live session_uuid surfaced from Rust. Called by
@@ -617,6 +638,9 @@ function createStore() {
       checklist = null;
       // #659 (P5c) — and its compliance-confirmation overlay.
       checklistConfirmed = new Set();
+      // Phase 4 — drop the previous call's extracted questions so a new call
+      // starts from an empty ledger.
+      questions = null;
       status = liveEnabled ? "live" : "idle";
       sessionUuid = null;
       askAnswer = null;

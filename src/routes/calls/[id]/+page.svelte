@@ -4661,6 +4661,71 @@
       </section>
     {/if}
 
+    <!-- ── Questions (Phase 4 · live↔after-call continuity) ─────────────────
+         The persisted questions extracted during the call: open (still
+         unanswered) first, then answered — checked off with the captured
+         answer. Both sides attributed to who asked (`asker_display`). Question
+         + answer are transcript-derived → plain `{...}`, never `{@html}`.
+         Rendered only when the call carried questions (additive; `[]`/absent
+         on older backends → nothing shows). Scoped `.aq-*`. -->
+    {#if call.questions && call.questions.length > 0}
+      {@const openQs = call.questions.filter((q) => q.status === "open")}
+      {@const answeredQs = call.questions.filter(
+        (q) => q.status === "answered",
+      )}
+      <section class="block" style="--i: 4.5">
+        <div class="block-head">
+          <h2>Questions</h2>
+        </div>
+        <ul class="aq-list">
+          {#each openQs as q, i (`open-${i}`)}
+            <li class="aq-item open">
+              <span class="aq-tick" aria-hidden="true">
+                <span class="aq-dot"></span>
+              </span>
+              <div class="aq-body">
+                <p class="aq-q">
+                  <span class="aq-asker" class:you={q.asker_side === "you"}
+                    >{q.asker_display}</span
+                  >
+                  <span class="aq-text">{q.question_text}</span>
+                </p>
+              </div>
+            </li>
+          {/each}
+          {#each answeredQs as q, i (`answered-${i}`)}
+            <li class="aq-item answered">
+              <span class="aq-tick" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="12"
+                  height="12"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  ><polyline points="20 6 9 17 4 12" /></svg
+                >
+              </span>
+              <div class="aq-body">
+                <p class="aq-q">
+                  <span class="aq-asker" class:you={q.asker_side === "you"}
+                    >{q.asker_display}</span
+                  >
+                  <span class="aq-text">{q.question_text}</span>
+                  <span class="aq-sr">answered</span>
+                </p>
+                {#if q.answer_text}
+                  <p class="aq-answer">{q.answer_text}</p>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+
     <section class="block" style="--i: 5">
       <div class="block-head">
         <h2>Transcript</h2>
@@ -6247,6 +6312,94 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.45rem;
+  }
+
+  /* ── Questions (Phase 4) ───────────────────────────────────────────────
+     Open-first list; answered rows check off with the captured answer. Mirrors
+     the live `LiveQuestions` idiom (olive check = answered, hollow dot = open,
+     asker chip). Component-scoped `.aq-*`. */
+  .aq-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .aq-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+  .aq-tick {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 1.4em; /* align the tick with the first question line */
+    color: var(--bone-4);
+    flex-shrink: 0;
+  }
+  .aq-item.answered .aq-tick {
+    color: var(--olive);
+  }
+  .aq-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid currentColor;
+  }
+  .aq-body {
+    flex: 1;
+    min-width: 0;
+  }
+  .aq-q {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.4;
+    color: var(--bone-0);
+    overflow-wrap: anywhere;
+  }
+  .aq-item.answered .aq-q {
+    color: var(--bone-2);
+  }
+  .aq-asker {
+    display: inline;
+    margin-right: 0.4rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--bone-2);
+    background: var(--ink-2);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.04rem 0.45rem;
+    white-space: nowrap;
+  }
+  .aq-asker.you {
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .aq-answer {
+    margin: 0.3rem 0 0;
+    font-size: 0.86rem;
+    line-height: 1.4;
+    color: var(--bone-1);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .aq-sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   /* ── Transcript ────────────────────────────────────────────────────── */

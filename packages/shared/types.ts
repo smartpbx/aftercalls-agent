@@ -292,6 +292,54 @@ export type ChecklistSnapshot = {
   total_count: number;
 };
 
+/** Phase 4 (live↔after-call continuity) — one tracked question in the live
+ *  co-pilot's session-sticky question ledger. Pushed over the live WS inside a
+ *  `{"type":"questions", …}` frame (backend `live_questions`) and surfaced in
+ *  the transcript drawer via `LiveQuestions`. Both sides count: a question the
+ *  rep OR the counterpart asks that should get answered. `asker_side` is
+ *  resolved at capture against the live identity map so no live↔final re-map is
+ *  needed; `asker_display` is the already-resolved label to render ("You", or
+ *  the counterpart's assigned name / diarization label). `text` + `answer_text`
+ *  are transcript-derived → rendered as plain text, NEVER `{@html}`. An answered
+ *  question is sticky (first answer wins — the never-un-answer analog of the
+ *  checklist's never-un-tick). Mirrors `ChecklistItem`: built from a stable id +
+ *  a full-snapshot render, the agent does not reconcile deltas client-side. */
+export type LiveQuestion = {
+  id: string;
+  /** The question, as captured from the transcript. */
+  text: string;
+  /** Which party asked: the rep (`"you"`) or the counterpart (`"them"`). */
+  asker_side: "you" | "them";
+  /** The raw diarization/transcript label the model saw (debug/trace only). */
+  asker_label?: string;
+  /** The resolved display label the UI renders ("You" / assigned name / label). */
+  asker_display: string;
+  status: "open" | "answered";
+  /** The captured answer once the transcript answers the question. */
+  answer_text?: string;
+  asked_at?: string;
+  answered_at?: string;
+};
+
+/** Phase 4 — auto-extracted questions snapshot pushed over the live WS as a
+ *  `{"type":"questions", …}` frame (backend `live_questions`), emitted to the
+ *  agent as a `live-questions` Tauri event and surfaced in the transcript
+ *  drawer. Each frame is a FULL snapshot — the lane replaces its list wholesale
+ *  (`seq` is a monotonic per-session ordinal; the agent replaces wholesale and
+ *  does not currently consume it). Session-sticky on the backend (a question
+ *  never un-answers once answered), so a later snapshot only ever gains answers.
+ *  `open_count` / `total_count` are computed backend-side (the drawer badge
+ *  reads `open_count` directly). Old agents hit the `forward_incoming` default
+ *  arm and ignore the unknown frame — additive + non-breaking. Mirrors
+ *  `ChecklistSnapshot`. */
+export type QuestionsSnapshot = {
+  type: "questions";
+  seq: number;
+  questions: LiveQuestion[];
+  open_count: number;
+  total_count: number;
+};
+
 /** #660 co-pilot P1 — on-demand ask-chip preset. One tap generates an
  *  inline answer server-side over the live-transcript window. Wire values
  *  match the backend `AskChip` (`POST /v1/live/ask`); vendor-opaque labels
@@ -560,6 +608,21 @@ export type CallLinkedDeal = {
   zoho_url?: string;
 };
 
+/** Phase 4 (live↔after-call continuity) — a durable question projected from the
+ *  live ledger at enrichment, folded into the call-detail payload
+ *  (`GET /v1/calls/{id}`) so the after-call page renders the same open/answered
+ *  list the live drawer showed. Distinct from the live `LiveQuestion`: the
+ *  after-call surface only needs who asked (`asker_display`), the question, its
+ *  status, and (when answered) the answer. `question_text` / `answer_text` are
+ *  transcript-derived → rendered as plain text, NEVER `{@html}`. */
+export type CallQuestion = {
+  asker_side: "you" | "them";
+  asker_display: string;
+  question_text: string;
+  status: "open" | "answered";
+  answer_text?: string;
+};
+
 export type Call = CallListItem & {
   summary_text: string | null;
   action_items: ActionItemRow[];
@@ -582,6 +645,12 @@ export type Call = CallListItem & {
   // surface it independently of any push. `null`/absent when the call has no
   // linked Deal.
   linked_deal?: CallLinkedDeal | null;
+  // Phase 4 (live↔after-call continuity) — the questions extracted during the
+  // call (projected from the live ledger into the durable `call_questions`
+  // table at enrichment), folded into the detail payload so the after-call page
+  // renders the open/answered list. Additive: absent on older backends and `[]`
+  // when the call has none, so the after-call section simply renders nothing.
+  questions?: CallQuestion[];
 };
 
 export type Highlight = {

@@ -558,10 +558,11 @@ fn ws_url_from_base(base: &str) -> String {
 
 /// Forward a backend text frame to the webview. `segment` → `live-segment`,
 /// `session` → `live-session`, `coaching` → `live-coaching`, `live_cue` →
-/// `live-cue`, `checklist` → `live-checklist`; the raw JSON rides through so the
-/// UI type stays the single wire-shape authority. Unknown types are ignored
-/// (older agents drop the #654 `coaching` + #659-P2 `live_cue` + #659-P3
-/// `checklist` frames — additive, non-breaking).
+/// `live-cue`, `checklist` → `live-checklist`, `questions` → `live-questions`;
+/// the raw JSON rides through so the UI type stays the single wire-shape
+/// authority. Unknown types are ignored (older agents drop the #654 `coaching`
+/// + #659-P2 `live_cue` + #659-P3 `checklist` + Phase-4 `questions` frames —
+/// additive, non-breaking).
 fn forward_incoming(app: &AppHandle, text: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
@@ -599,6 +600,12 @@ fn forward_incoming(app: &AppHandle, text: &str) {
         // IntelligenceLane's checklist section.
         Some("checklist") => {
             let _ = app.emit("live-checklist", v);
+        }
+        // Phase 4 — live Questions snapshot (open + answered, both parties) for
+        // the transcript-drawer Questions section. Read-only, server-pushed —
+        // no Tauri command; the raw JSON rides through to the UI type.
+        Some("questions") => {
+            let _ = app.emit("live-questions", v);
         }
         _ => {}
     }

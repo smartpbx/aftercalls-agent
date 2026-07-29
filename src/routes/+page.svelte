@@ -1795,6 +1795,7 @@
         coaching={liveSession.coaching}
         cues={liveSession.liveCues}
         checklist={liveSession.checklist}
+        questions={liveSession.questions}
         sessionUuid={liveSession.sessionUuid}
         {elapsedMs}
         onToggleRecording={toggle}

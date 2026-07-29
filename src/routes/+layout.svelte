@@ -39,6 +39,7 @@
     CoachingUpdate,
     LiveCue,
     ChecklistSnapshot,
+    QuestionsSnapshot,
   } from "@aftercalls/shared/types";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
@@ -156,6 +157,10 @@
   // lifetime so checklist snapshots land in the persistent store regardless of
   // the mounted route.
   let unlistenLiveChecklist: UnlistenFn | null = null;
+  // Phase 4 (live↔after-call continuity) — auto-extracted questions stream.
+  // Same layout-owned lifetime so question snapshots land in the persistent
+  // store regardless of the mounted route.
+  let unlistenLiveQuestions: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
   let unlistenAutoDetect: UnlistenFn | null = null;
@@ -1068,6 +1073,16 @@
         liveSession.setChecklist(evt.payload);
       },
     );
+    // Phase 4 (live↔after-call continuity) — a `live-questions` frame carries a
+    // FULL questions snapshot (answers are sticky on the backend, so it never
+    // regresses). Stored wholesale in the persistent store, mirrored by
+    // `LiveQuestions` in the transcript drawer.
+    unlistenLiveQuestions = await listen<QuestionsSnapshot>(
+      "live-questions",
+      (evt) => {
+        liveSession.setQuestions(evt.payload);
+      },
+    );
     unlistenPipeline = await listen<{
       stage: string;
       call_id?: string;
@@ -1963,6 +1978,7 @@
     unlistenLiveCoaching?.();
     unlistenLiveCue?.();
     unlistenLiveChecklist?.();
+    unlistenLiveQuestions?.();
     unlistenTray?.();
     unlistenUpdatePoll?.();
     unlistenAutoDetect?.();

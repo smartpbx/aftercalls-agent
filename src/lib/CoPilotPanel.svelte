@@ -85,6 +85,7 @@
   import CrmContextLane from "$lib/CrmContextLane.svelte";
   import IntelligenceLane from "$lib/IntelligenceLane.svelte";
   import LiveChecklist from "$lib/LiveChecklist.svelte";
+  import LiveQuestions from "$lib/LiveQuestions.svelte";
   import TalkTimeNudge from "$lib/TalkTimeNudge.svelte";
   import { portal } from "$lib/actions/portal";
   import type {
@@ -92,6 +93,7 @@
     CoachingUpdate,
     LiveCue,
     ChecklistSnapshot,
+    QuestionsSnapshot,
     AskChip,
     KnowledgeAnswer,
     CoachingSentimentLabel,
@@ -120,6 +122,7 @@
     coaching = null,
     cues = [],
     checklist = null,
+    questions = null,
     elapsedMs = 0,
     onToggleRecording = undefined,
     onnotes = undefined,
@@ -156,6 +159,10 @@
     cues?: LiveCue[];
     /** #659 (P3) — auto-checking agenda checklist; rendered in the rail. */
     checklist?: ChecklistSnapshot | null;
+    /** Phase 4 (live↔after-call continuity) — auto-extracted questions;
+     *  rendered at the TOP of the transcript drawer, with the open count
+     *  surfaced on the drawer toggle. */
+    questions?: QuestionsSnapshot | null;
     /** Whether the org's live_transcript flag is ON. The transcript drawer is
      *  only meaningful when it is (the relay is gated on that flag alone), so
      *  with copilot ON + live_transcript OFF we drop the transcript. */
@@ -447,6 +454,10 @@
   let finalCount = $derived(
     segments.reduce((n, s) => n + (s.provisional ? 0 : 1), 0),
   );
+  // Phase 4 — open (unanswered) questions count, surfaced on the drawer toggle
+  // ("Transcript · N open") so the rep sees there's something to answer without
+  // opening the drawer. Reads the backend's authoritative `open_count`.
+  let openQuestionCount = $derived(questions?.open_count ?? 0);
 
   // "Catch me up" one-click shortcut — reuses the ask-chip mechanism. Ready once
   // there's a live session to address; opens the drawer so the answer shows.
@@ -648,6 +659,12 @@
               aria-hidden="true"><polyline points="9 6 15 12 9 18" /></svg
             >
             <span>Transcript</span>
+            {#if openQuestionCount > 0}
+              <!-- Phase 4 — open-question badge: the reason to open the drawer.
+                   Accent-tinted (there's something unanswered), always shown
+                   when >0 (open or closed). -->
+              <span class="cp-drawer-open-q">{openQuestionCount} open</span>
+            {/if}
             {#if !drawerOpen && finalCount > 0}
               <span class="cp-drawer-count">{finalCount}</span>
             {/if}
@@ -666,6 +683,9 @@
         </div>
 
         <div id="cp-drawer-body" class="cp-drawer-body" hidden={!drawerOpen}>
+          <!-- Phase 4 — auto-extracted questions, pinned at the TOP of the
+               drawer (open-first). Renders nothing until a snapshot arrives. -->
+          <LiveQuestions {questions} {status} />
           {#if liveTranscriptEnabled}
             <LiveTranscriptLane
               {segments}
@@ -1389,6 +1409,18 @@
     background: var(--ink-2);
     border-radius: 999px;
     padding: 0.02rem 0.4rem;
+  }
+  /* Phase 4 — open-question badge on the drawer toggle. Accent-tinted (there's
+     something unanswered), distinct from the neutral final-count chip. */
+  .cp-drawer-open-q {
+    font-size: 0.66rem;
+    font-weight: 600;
+    color: var(--accent-hi);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 0.02rem 0.45rem;
+    white-space: nowrap;
   }
   .cp-catchup {
     margin-left: auto;
