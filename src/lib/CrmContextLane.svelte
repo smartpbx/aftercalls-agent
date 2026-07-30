@@ -40,8 +40,10 @@
   import type {
     CrmContext,
     CrmContextDeal,
+    CrmContextTicket,
     CopilotMode,
     LinkedDeal,
+    LinkedTicket,
     SpeakerIdentity,
     SpeakerIdentityAssignArgs,
     SpeakerIdentityKind,
@@ -59,6 +61,10 @@
     linkedDeal = null,
     onlinkdeal = undefined,
     onunlinkdeal = undefined,
+    zohoDesk = false,
+    linkedTicket = null,
+    onlinkticket = undefined,
+    onunlinkticket = undefined,
   }: {
     // #646 (Phase 2) — the detected-speaker roster rows (mic recorder + the
     // distinct far-side speakers), derived by CoPilotPanel from the segments.
@@ -105,6 +111,19 @@
     // Both are only surfaced mid-call (a session must exist to persist the link).
     onlinkdeal?: (deal: CrmContextDeal) => void;
     onunlinkdeal?: () => void;
+    // Zoho Desk — whether `features.zoho_desk` is on. Gates the whole Tickets
+    // section (rendered BESIDE Deals/Cases, NOT swapped by the mode toggle). Off
+    // → no ticket chrome at all, byte-identical to the pre-Desk lane.
+    zohoDesk?: boolean;
+    // Zoho Desk — the ONE ticket currently linked to this call (or null). Drives
+    // the per-ticket "Link to call" / "Linked" affordance. Coexists with a
+    // linked deal.
+    linkedTicket?: LinkedTicket | null;
+    // Zoho Desk — raise a link (one ticket at a time — a new link replaces the
+    // prior) / unlink to the parent, which owns the `live_linked_ticket` invoke
+    // + store. Only surfaced mid-call (a session must exist to persist the link).
+    onlinkticket?: (ticket: CrmContextTicket) => void;
+    onunlinkticket?: () => void;
   } = $props();
 
   // ── Hydration state ────────────────────────────────────────────────
@@ -400,6 +419,39 @@
   // only (the backend never writes it into AI-grounding state).
   function caseTitle(c: { subject?: string; case_number?: string }): string {
     return c.subject || (c.case_number ? `Case #${c.case_number}` : "(untitled case)");
+  }
+
+  // ── Tickets helpers (Zoho Desk) ────────────────────────────────────
+  // The Tickets section renders BESIDE Deals/Cases (NOT swapped by the mode
+  // toggle) when `zohoDesk` is on AND the envelope carries a tickets section.
+  const TICKET_CAP = 5;
+  let visibleTickets = $derived(crm?.tickets?.items.slice(0, TICKET_CAP) ?? []);
+  let extraTickets = $derived(
+    Math.max(0, (crm?.tickets?.items.length ?? 0) - TICKET_CAP),
+  );
+  // A ticket's display title: the Subject when present, else the Ticket Number,
+  // else a plain fallback. Subject may carry PII — it renders in the lane only
+  // (the backend never writes it into AI-grounding state).
+  function ticketTitle(t: { subject?: string; ticket_number?: string }): string {
+    return (
+      t.subject ||
+      (t.ticket_number ? `Ticket #${t.ticket_number}` : "(untitled ticket)")
+    );
+  }
+  // Mid-call "Link to call" is session-gated (same as deals). One ticket at a
+  // time — linking a new ticket replaces the prior (parent + backend own that).
+  let canLinkTicket = $derived(!!sessionUuid && !!onlinkticket);
+  function isLinkedTicket(ticket: CrmContextTicket): boolean {
+    return !!linkedTicket && linkedTicket.ticket_id === ticket.id;
+  }
+  function toggleLinkTicket(ticket: CrmContextTicket) {
+    if (isLinkedTicket(ticket)) {
+      onunlinkticket?.();
+      announce = `${ticketTitle(ticket)} unlinked from this call.`;
+    } else {
+      onlinkticket?.(ticket);
+      announce = `${ticketTitle(ticket)} linked to this call.`;
+    }
   }
 
   function fmtClose(s?: string): string {
@@ -702,6 +754,82 @@
             {/if}
           </div>
         {/if}
+
+        <!-- Zoho Desk — Open Tickets, rendered BESIDE Deals/Cases (independent
+             of the Sales/Support mode toggle). Gated on `zohoDesk` + the
+             envelope carrying a tickets section; each open ticket gets the same
+             "Link to call" affordance as a deal (one linked ticket at a time,
+             coexisting with a linked deal). Subject may carry PII — lane-only.
+             "Zoho" is the sanctioned name; the deep-link uses the Desk web_url. -->
+        {#if zohoDesk && crm.tickets}
+          <div class="crm-tickets" aria-live="polite">
+            <div class="crm-section-head">Support tickets</div>
+            {#if crm.tickets.status === "unavailable"}
+              <div class="crm-error-row">
+                <span>Tickets didn't load.</span>
+                <button type="button" class="ghost-btn" onclick={retryHydrate}>
+                  Retry
+                </button>
+              </div>
+            {:else if crm.tickets.status === "empty"}
+              <p class="crm-status">No open tickets.</p>
+            {:else}
+              {#each visibleTickets as t (t.id)}
+                <div class="crm-deal" class:linked={isLinkedTicket(t)}>
+                  <div class="crm-deal-top">
+                    <button
+                      type="button"
+                      class="crm-deal-name"
+                      onclick={() => openDeal(t.web_url)}
+                      title={ticketTitle(t)}
+                    >
+                      <span class="crm-deal-name-text">{ticketTitle(t)}</span>
+                      <span class="crm-deal-arrow" aria-hidden="true">↗</span>
+                    </button>
+                    {#if canLinkTicket}
+                      <!-- Mid-call "Link to call" toggle — one ticket at a time.
+                           Linking a new ticket replaces the prior; clicking the
+                           linked ticket unlinks. Independent of the linked deal. -->
+                      <button
+                        type="button"
+                        class="crm-deal-link"
+                        class:on={isLinkedTicket(t)}
+                        aria-pressed={isLinkedTicket(t)}
+                        onclick={() => toggleLinkTicket(t)}
+                      >
+                        {#if isLinkedTicket(t)}
+                          <span class="crm-deal-link-check" aria-hidden="true">✓</span>
+                          Linked to call
+                        {:else}
+                          Link to call
+                        {/if}
+                      </button>
+                    {/if}
+                  </div>
+                  <div class="crm-deal-meta">
+                    {#if t.ticket_number}
+                      <span class="crm-stage">#{t.ticket_number}</span>
+                    {/if}
+                    {#if t.status}
+                      <span class="crm-stage">{t.status}</span>
+                    {/if}
+                    {#if t.priority}
+                      <span class="crm-stage">{t.priority}</span>
+                    {/if}
+                    {#if t.created_time}
+                      <span class="crm-close">{fmtClose(t.created_time)}</span>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+              {#if extraTickets > 0}
+                <p class="crm-more crm-more-plain">
+                  +{extraTickets} more open tickets
+                </p>
+              {/if}
+            {/if}
+          </div>
+        {/if}
       {/if}
     </div>
   {/if}
@@ -942,6 +1070,30 @@
     margin-top: 0.25rem;
     max-height: 240px;
     overflow-y: auto;
+  }
+
+  /* ── Tickets (Zoho Desk) — same list treatment as .crm-deals, but its own
+     section so it can sit BESIDE Deals/Cases with a distinguishing caps
+     label. Reuses the .crm-deal* row classes (name/meta/link toggle). ── */
+  .crm-tickets {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--hairline);
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  /* Section caps label — distinguishes the Tickets list from the Deals/Cases
+     list above it. Neutral bone, NOT a semantic-colour signal (design.md
+     §Never-do-this palette rule). */
+  .crm-section-head {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+    margin-bottom: 0.1rem;
   }
   .crm-deal {
     display: flex;

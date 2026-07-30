@@ -101,6 +101,8 @@
     SpeakerIdentityAssignArgs,
     LinkedDeal,
     CrmContextDeal,
+    LinkedTicket,
+    CrmContextTicket,
   } from "@aftercalls/shared/types";
   import type {
     AskAnswerState,
@@ -143,6 +145,10 @@
     linkedDeal = null,
     onlinkdeal = undefined,
     onunlinkdeal = undefined,
+    zohoDesk = false,
+    linkedTicket = null,
+    onlinkticket = undefined,
+    onunlinkticket = undefined,
   }: {
     segments?: LiveSegment[];
     status?: LiveStatus;
@@ -208,6 +214,17 @@
      *  write. */
     onlinkdeal?: (deal: CrmContextDeal) => void;
     onunlinkdeal?: () => void;
+    /** Zoho Desk — whether `features.zoho_desk` is on, threaded into the rail
+     *  CRM tile so it renders the Tickets section BESIDE Deals/Cases. */
+    zohoDesk?: boolean;
+    /** Zoho Desk — the ONE ticket linked to this call (or null), threaded into
+     *  the rail CRM tile for the per-ticket "Link to call" / "Linked" state.
+     *  Coexists with `linkedDeal`. */
+    linkedTicket?: LinkedTicket | null;
+    /** Zoho Desk — link (one ticket at a time) / unlink raised from the CRM
+     *  tile; +page owns the `live_linked_ticket` invoke + the store write. */
+    onlinkticket?: (ticket: CrmContextTicket) => void;
+    onunlinkticket?: () => void;
   } = $props();
 
   // #646 (Phase 2) — the distinct-speaker roster set, derived from the live
@@ -594,6 +611,10 @@
         {linkedDeal}
         {onlinkdeal}
         {onunlinkdeal}
+        {zohoDesk}
+        {linkedTicket}
+        {onlinkticket}
+        {onunlinkticket}
       />
     </div>
     {#if talkMetric && talkMetric.youPct + talkMetric.themPct > 0}

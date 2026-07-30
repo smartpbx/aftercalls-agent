@@ -1198,6 +1198,40 @@ pub async fn live_linked_deal(
     .await
 }
 
+/// POST /v1/live/linked-ticket — Zoho Desk link (or clear, `clear=true`) the
+/// call's support Ticket mid-call. Writes the scalar `state.copilot.linked_ticket`;
+/// post-call enrichment projects it onto the durable `call_links` table
+/// (`kind='desk_ticket'`) and the call-end auto-push reads it. Returns
+/// `{ linked_ticket }` — the stored object echoed back, or JSON `null` when
+/// cleared — so the agent reconciles its optimistic UI. A linked Ticket
+/// coexists with a linked Deal (independent scalars). Desk-gated +
+/// impersonation-write-gated; best-effort (fire-and-forget), so a `PortalError`
+/// here never fails the call. Mirrors the `live_linked_deal` `post_json_typed`
+/// transport.
+pub async fn live_linked_ticket(
+    backend: &Backend,
+    session_uuid: &str,
+    ticket_id: &str,
+    ticket_number: Option<&str>,
+    subject: Option<&str>,
+    web_url: Option<&str>,
+    clear: bool,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/linked-ticket",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "ticket_id": ticket_id,
+            "ticket_number": ticket_number,
+            "subject": subject,
+            "web_url": web_url,
+            "clear": clear,
+        }),
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
 /// `body` is forwarded verbatim; frontend pre-shapes
 /// `{module, record_id, record_name, extra_tags?}`. (#186)
@@ -1210,6 +1244,25 @@ pub async fn zoho_push_call(
         backend,
         &format!("/v1/calls/{call_id}/zoho/push"),
         body.clone(),
+    )
+    .await
+}
+
+/// POST /v1/calls/{id}/zoho-desk/push — Zoho Desk push a finished call to a
+/// linked support Ticket as a private internal note. Mirrors `zoho_push_call`'s
+/// gates + transport; the body is the single `{ticket_id}` (the backend pulls
+/// the summary + action-items text itself). Returns the push envelope; the
+/// ended-card confirmation deep-links from the linked ticket's `web_url`, so it
+/// never depends on the response shape.
+pub async fn zoho_desk_push_call(
+    backend: &Backend,
+    call_id: &str,
+    ticket_id: &str,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        &format!("/v1/calls/{call_id}/zoho-desk/push"),
+        serde_json::json!({ "ticket_id": ticket_id }),
     )
     .await
 }

@@ -242,6 +242,10 @@
   // when `me.features.zoho` is false. Backend double-checks via 404
   // on every Zoho route, so this is purely UX.
   let zohoFeatureEnabled = $derived(!!me?.features?.zoho);
+  // Zoho Desk — gates the after-call "Linked to ticket #N ↗" line. Separate
+  // opt-in from CRM, so it's its own flag (a call can carry both a linked Deal
+  // and a linked Ticket).
+  let zohoDeskFeatureEnabled = $derived(!!me?.features?.zoho_desk);
   let zohoFallbackOwnerName = $derived(zohoStore.connectedByDisplayName);
   let zohoModalOpen = $state(false);
   let zohoPushed = $derived(
@@ -3782,6 +3786,29 @@
                   type="button"
                   class="crm-pushed-link"
                   onclick={() => openZohoUrl(call!.linked_deal!.zoho_url!)}
+                >
+                  View in Zoho ↗
+                </button>
+              {/if}
+            </div>
+          {/if}
+          <!-- Zoho Desk — the support Ticket this call was linked to mid-call.
+               Independent of the linked Deal above (a call can carry both), so
+               it's its own line. Wraps under the action row (`.head-actions` is
+               flex-wrap). "Zoho" is the sanctioned name; the deep-link uses the
+               Desk web_url. -->
+          {#if zohoDeskFeatureEnabled && call.linked_ticket}
+            <div class="crm-pushed-note" role="status">
+              <span class="crm-pushed-text">
+                Linked to {call.linked_ticket.ticket_number
+                  ? `ticket #${call.linked_ticket.ticket_number}`
+                  : "ticket"}
+              </span>
+              {#if call.linked_ticket.web_url}
+                <button
+                  type="button"
+                  class="crm-pushed-link"
+                  onclick={() => openZohoUrl(call!.linked_ticket!.web_url!)}
                 >
                   View in Zoho ↗
                 </button>

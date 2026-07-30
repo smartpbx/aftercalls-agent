@@ -29,6 +29,7 @@ import type {
   KnowledgeAnswer,
   SpeakerIdentity,
   LinkedDeal,
+  LinkedTicket,
 } from "@aftercalls/shared/types";
 
 export type LiveSessionStatus = "idle" | "live" | "ended" | "error";
@@ -260,6 +261,15 @@ function createStore() {
   // prompt-mode envelope (auto mode is backend-driven, reset-independent).
   let linkedDeal = $state<LinkedDeal | null>(null);
 
+  // Zoho Desk — the ONE support Ticket linked to this call (mid-call), driving
+  // the call-end "Add to ticket" prompt/confirmation. A single scalar (one
+  // linked ticket at a time — a new link replaces it), INDEPENDENT of
+  // `linkedDeal`: a call can carry both. Set OPTIMISTICALLY the instant the rep
+  // links a ticket, then RECONCILED from the `live_linked_ticket` response.
+  // Cleared on a new session (`resetForNewSession`) — the ended card reads it
+  // BEFORE the next record-start.
+  let linkedTicket = $state<LinkedTicket | null>(null);
+
   // #660 — talk-share + trailing-monologue metric, derived from FINAL
   // segments only (provisionals are drafts). Per-channel durations for the
   // share; a same-channel trailing delta for the You-run.
@@ -343,6 +353,9 @@ function createStore() {
     },
     get linkedDeal(): LinkedDeal | null {
       return linkedDeal;
+    },
+    get linkedTicket(): LinkedTicket | null {
+      return linkedTicket;
     },
     get talkMetric(): TalkMetric {
       return talkMetric;
@@ -582,6 +595,16 @@ function createStore() {
       linkedDeal = deal;
     },
 
+    /** Zoho Desk — set (or clear with `null`) the call's linked support Ticket.
+     *  Used both for the OPTIMISTIC set the instant the rep links/unlinks a
+     *  ticket and for the RECONCILE from the `live_linked_ticket` response (the
+     *  backend is the source of truth; the endpoint returns the reconciled
+     *  scalar, or `null` after a clear). One linked ticket at a time — a new
+     *  value replaces the prior scalar wholesale. Independent of `linkedDeal`. */
+    setLinkedTicket(ticket: LinkedTicket | null) {
+      linkedTicket = ticket;
+    },
+
     /** #646 (Phase 2) — STAGE a PRE-CALL assignment (no session yet) for replay
      *  at record-start. Mirrors `setSpeakerIdentity`'s single-primary strip so
      *  the staged set never carries two primaries. */
@@ -662,6 +685,8 @@ function createStore() {
       // Phase 3 — drop the previous call's linked Zoho deal so a fresh call
       // never inherits it (the ended card reads it before this reset fires).
       linkedDeal = null;
+      // Zoho Desk — likewise drop the previous call's linked support Ticket.
+      linkedTicket = null;
     },
   };
 }

@@ -37,6 +37,9 @@
     CopilotMode,
     CrmContextDeal,
     LinkedDealResponse,
+    CrmContextTicket,
+    LinkedTicketResponse,
+    ZohoDeskPushResponse,
     SpeakerIdentityAssignArgs,
     SpeakerIdentitiesResponse,
   } from "@aftercalls/shared/types";
@@ -109,6 +112,11 @@
   let copilotEnabled = $state(false);
   let copilotIsAdmin = $state(false);
   let contactHint = $state<string | null>(null);
+  // Zoho Desk — org flag gating the whole in-call Tickets surface (the CRM
+  // tile's Tickets section + link-a-ticket + the call-end "Add to ticket"
+  // prompt). Read from /auth/me alongside the copilot flag; OFF → no ticket
+  // chrome anywhere, byte-identical to the pre-Desk flow.
+  let zohoDeskEnabled = $state(false);
   // #659 P5a — the org's default co-pilot persona (Sales / Support), read
   // from /auth/me. Seeds the CoPilotPanel mode toggle; the panel then owns
   // the per-call override. Defaults to "sales" until the me bundle lands.
@@ -343,6 +351,56 @@
     }
   }
 
+  /** Zoho Desk — link a support Ticket to this call (mid-call). One ticket at a
+   *  time — linking a new ticket replaces the prior scalar (independent of the
+   *  linked Deal — a call can carry both). Mirrors `handleLinkDeal`: optimistic
+   *  set, then `live_linked_ticket` reconciled from the response. Never a red
+   *  surface — a link is advisory. */
+  async function handleLinkTicket(ticket: CrmContextTicket) {
+    liveSession.setLinkedTicket({
+      ticket_id: ticket.id,
+      ticket_number: ticket.ticket_number,
+      subject: ticket.subject,
+      web_url: ticket.web_url,
+    });
+    const su = liveSession.sessionUuid;
+    if (!su) return;
+    try {
+      const res = (await invoke("live_linked_ticket", {
+        sessionUuid: su,
+        ticketId: ticket.id,
+        ticketNumber: ticket.ticket_number,
+        subject: ticket.subject,
+        webUrl: ticket.web_url,
+      })) as LinkedTicketResponse;
+      liveSession.setLinkedTicket(res?.linked_ticket ?? null);
+    } catch {
+      // Optimistic label stands — a later link/unlink reconciles.
+    }
+  }
+
+  /** Zoho Desk — unlink the call's ticket. Optimistic clear, then a best-effort
+   *  `clear: true` write reconciled from the response. */
+  async function handleUnlinkTicket() {
+    const prev = liveSession.linkedTicket;
+    liveSession.setLinkedTicket(null);
+    const su = liveSession.sessionUuid;
+    if (!su || !prev) return;
+    try {
+      const res = (await invoke("live_linked_ticket", {
+        sessionUuid: su,
+        ticketId: prev.ticket_id,
+        ticketNumber: prev.ticket_number,
+        subject: prev.subject,
+        webUrl: prev.web_url,
+        clear: true,
+      })) as LinkedTicketResponse;
+      liveSession.setLinkedTicket(res?.linked_ticket ?? null);
+    } catch {
+      // Optimistic clear stands.
+    }
+  }
+
   // Phase 3 — call-end CRM push state. ONE prior-push probe fires once the call
   // is `done` + openable; it drives BOTH the prompt-mode "Push this call?" ask
   // AND the "Pushed to <Deal>" confirmation (auto mode already pushed
@@ -383,6 +441,9 @@
     endedPriorPush = null;
     endedPushLoaded = false;
     endedSkipped = false;
+    // Zoho Desk — reset the ticket prompt state for the fresh finished call too.
+    endedTicketAdded = false;
+    endedTicketSkipped = false;
     void probeEndedPriorPush(cid);
   });
 
@@ -420,6 +481,41 @@
   /** [Skip] — dismiss the push prompt (keeps the rest of the ended card). */
   function skipEndedPush() {
     endedSkipped = true;
+  }
+
+  // Zoho Desk — call-end ticket-push state, INDEPENDENT of the deal prompt (a
+  // call can carry both). There's no desk prior-push read, so auto-mode
+  // "already added" isn't detected here (see report — the backend idempotency
+  // guard makes an accidental [Add] harmless); the prompt shows whenever a
+  // ticket was linked, and [Add] flips it to a local confirmation.
+  let endedTicketAdding = $state(false);
+  let endedTicketAdded = $state(false);
+  let endedTicketSkipped = $state(false);
+
+  /** [Add] on the ended card — add the finished call to the linked ticket as a
+   *  private internal note. On success, flip to the "Added to ticket #N ↗"
+   *  confirmation (deep-linked from the ticket's own web_url). Best-effort: a
+   *  failure leaves the [Add] prompt in place (retryable), never a red panel. */
+  async function addEndedTicket() {
+    const ticket = liveSession.linkedTicket;
+    if (!openableCallId || !ticket || endedTicketAdding) return;
+    endedTicketAdding = true;
+    try {
+      (await invoke("zoho_desk_push_call", {
+        callId: openableCallId,
+        ticketId: ticket.ticket_id,
+      })) as ZohoDeskPushResponse;
+      endedTicketAdded = true;
+    } catch {
+      // Best-effort — leave the [Add] prompt available (retryable).
+    } finally {
+      endedTicketAdding = false;
+    }
+  }
+
+  /** [Skip] — dismiss the ticket prompt (keeps the rest of the ended card). */
+  function skipEndedTicket() {
+    endedTicketSkipped = true;
   }
 
   function openZohoUrl(url: string) {
@@ -873,7 +969,11 @@
         recording_acknowledged?: boolean;
         role?: string;
         copilot_default_mode?: CopilotMode;
-        features?: { live_transcript?: boolean; copilot?: boolean };
+        features?: {
+          live_transcript?: boolean;
+          copilot?: boolean;
+          zoho_desk?: boolean;
+        };
       } | null>("current_user");
       ackCached = !!u?.recording_acknowledged;
       // #live — gate the whole panel on the org feature flag.
@@ -881,6 +981,8 @@
       // #653 — co-pilot gate + admin capability for the CRM lane's no-Zoho
       // prompt. Admin roles can connect Zoho from the portal; members can't.
       copilotEnabled = !!u?.features?.copilot;
+      // Zoho Desk — gate the in-call Tickets surface.
+      zohoDeskEnabled = !!u?.features?.zoho_desk;
       copilotIsAdmin =
         u?.role === "admin" ||
         u?.role === "owner" ||
@@ -901,12 +1003,17 @@
       recording_acknowledged?: boolean;
       role?: string;
       copilot_default_mode?: CopilotMode;
-      features?: { live_transcript?: boolean; copilot?: boolean };
+      features?: {
+        live_transcript?: boolean;
+        copilot?: boolean;
+        zoho_desk?: boolean;
+      };
     }>("refresh_current_user")
       .then((u) => {
         ackCached = !!u?.recording_acknowledged;
         liveTranscriptEnabled = !!u?.features?.live_transcript;
         copilotEnabled = !!u?.features?.copilot;
+        zohoDeskEnabled = !!u?.features?.zoho_desk;
         copilotIsAdmin =
           u?.role === "admin" ||
           u?.role === "owner" ||
@@ -1772,6 +1879,60 @@
               </div>
             {/if}
           {/if}
+          <!-- Zoho Desk — call-end ticket push, INDEPENDENT of the deal prompt
+               above (a call can carry both). [Add] adds the finished call to the
+               linked ticket as a private internal note → the "Added to ticket #N
+               ↗" confirmation (deep-linked from the ticket's own web_url). No
+               desk prior-push read, so auto-mode "already added" isn't detected
+               here (the backend guard makes an accidental [Add] harmless). "Zoho"
+               is the sanctioned name. -->
+          {#if pipelineStage === "done" && liveSession.linkedTicket}
+            {#if endedTicketAdded}
+              <div class="ce-crm" role="status" aria-live="polite">
+                <span class="ce-crm-pip" aria-hidden="true"></span>
+                <span class="ce-crm-text">
+                  Added to {liveSession.linkedTicket.ticket_number
+                    ? `ticket #${liveSession.linkedTicket.ticket_number}`
+                    : "the ticket"}
+                </span>
+                {#if liveSession.linkedTicket.web_url}
+                  <button
+                    type="button"
+                    class="ce-crm-link"
+                    onclick={() => openZohoUrl(liveSession.linkedTicket!.web_url!)}
+                  >
+                    View in Zoho ↗
+                  </button>
+                {/if}
+              </div>
+            {:else if !endedTicketSkipped}
+              <div class="ce-crm ce-crm-prompt">
+                <span class="ce-crm-text">
+                  Add to {liveSession.linkedTicket.ticket_number
+                    ? `ticket #${liveSession.linkedTicket.ticket_number}`
+                    : "this ticket"}?
+                </span>
+                <div class="ce-crm-actions">
+                  <button
+                    type="button"
+                    class="ce-crm-push"
+                    disabled={endedTicketAdding}
+                    onclick={addEndedTicket}
+                  >
+                    {endedTicketAdding ? "Adding…" : "Add"}
+                  </button>
+                  <button
+                    type="button"
+                    class="ce-crm-skip"
+                    disabled={endedTicketAdding}
+                    onclick={skipEndedTicket}
+                  >
+                    Skip
+                  </button>
+                </div>
+              </div>
+            {/if}
+          {/if}
         {:else if pipelineStage === "failed"}
           <p class="ce-body ce-body-muted">
             We couldn't finish preparing this call. It'll appear in your calls
@@ -1817,6 +1978,10 @@
         linkedDeal={liveSession.linkedDeal}
         onlinkdeal={handleLinkDeal}
         onunlinkdeal={handleUnlinkDeal}
+        zohoDesk={zohoDeskEnabled}
+        linkedTicket={liveSession.linkedTicket}
+        onlinkticket={handleLinkTicket}
+        onunlinkticket={handleUnlinkTicket}
       />
     {/if}
   {:else if liveTranscriptEnabled && (recording || liveSession.segments.length > 0 || liveSession.status === "error")}

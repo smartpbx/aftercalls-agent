@@ -28,6 +28,13 @@ export type Features = {
    *  default-off. Optional so an older backend / auth.json decodes as
    *  OFF. The video is stored/displayed only — never fed to the AI. */
   screen_capture?: boolean;
+  /** Zoho Desk — a SEPARATE opt-in connection from CRM (its own OAuth +
+   *  org connection). Gates the whole in-call Tickets surface (the
+   *  CrmContextLane Tickets section, link-a-ticket, the call-end "Add to
+   *  ticket" prompt, and the after-call linked-ticket line). Raw staff
+   *  toggle, default-off. Optional so an older backend / auth.json decodes
+   *  cleanly as OFF. */
+  zoho_desk?: boolean;
 };
 
 /** #302 (Slice A) — lifecycle of the per-call screen VIDEO asset.
@@ -111,6 +118,24 @@ export type CrmContextCase = {
   url: string;
 };
 
+/** Zoho Desk — one open support Ticket row, surfaced BESIDE Deals/Cases when
+ *  `features.zoho_desk` is on. `subject` may carry the customer's worded
+ *  complaint (PII) — it renders in the lane only and is NEVER written into
+ *  AI-grounding state (same posture as `CrmContextCase.subject`). Every field
+ *  but `id`/`web_url` is optional (Desk omits blanks). `web_url` deep-links to
+ *  the ticket on the org's OWN Desk host (a different host from the CRM
+ *  `url`). */
+export type CrmContextTicket = {
+  id: string;
+  ticket_number?: string;
+  subject?: string;
+  status?: string;
+  priority?: string;
+  created_time?: string;
+  /** Deep link to the ticket on the org's OWN Zoho Desk host. */
+  web_url: string;
+};
+
 export type CrmContext = {
   contact: {
     id: string;
@@ -132,6 +157,16 @@ export type CrmContext = {
   cases: {
     status: "ok" | "empty" | "unavailable";
     items: CrmContextCase[];
+  };
+  /** Zoho Desk — the contact's open Tickets, surfaced BESIDE Deals/Cases (NOT
+   *  swapped by the Sales/Support mode toggle). Same per-section degrade
+   *  posture as `deals`/`cases`; `"unavailable"` covers a Desk fetch that
+   *  failed or a contact that couldn't be cross-resolved into Desk. Optional
+   *  on the wire so a backend/proxy that predates the field decodes cleanly —
+   *  the lane simply renders no Tickets section. */
+  tickets?: {
+    status: "ok" | "empty" | "unavailable";
+    items: CrmContextTicket[];
   };
   zoho: "connected" | "not_connected";
   fetched_at: string;
@@ -492,6 +527,55 @@ export type LinkedDealResponse = {
   linked_deal: LinkedDeal | null;
 };
 
+/** Zoho Desk — a support Ticket linked to the live call so the finished call
+ *  can be pushed to it at call-end (prompt or auto) as an internal note. Live
+ *  capture writes it to `state.copilot.linked_ticket` (scalar JSONB) via
+ *  `POST /v1/live/linked-ticket`; enrichment projects it into a durable
+ *  `call_links` row (`kind='desk_ticket'`). A linked Deal AND a linked Ticket
+ *  coexist on one call (independent scalars, pushed independently). `ticket_id`
+ *  names the Desk record; the optional `ticket_number` / `subject` / `web_url`
+ *  mirror the ticket's display fields so the after-call surfaces render without
+ *  a re-fetch. Every optional field decodes cleanly from an older/absent
+ *  backend. */
+export type LinkedTicket = {
+  ticket_id: string;
+  ticket_number?: string;
+  subject?: string;
+  web_url?: string;
+};
+
+/** Zoho Desk — arguments for the `live_linked_ticket` Tauri command (backend
+ *  `POST /v1/live/linked-ticket`). camelCase to match the invoke arg contract.
+ *  `clear: true` removes any linked ticket on the session (the remaining fields
+ *  are then ignored). One linked ticket at a time — a new link REPLACES the
+ *  prior scalar server-side (independent of the linked Deal). */
+export type LinkedTicketAssignArgs = {
+  sessionUuid: string;
+  ticketId: string;
+  ticketNumber?: string;
+  subject?: string;
+  webUrl?: string;
+  clear?: boolean;
+};
+
+/** Zoho Desk — response of `live_linked_ticket`: the reconciled linked ticket
+ *  for the session (or `null` after a clear). The store replaces its scalar
+ *  wholesale so a server-side reconcile stays consistent client-side. */
+export type LinkedTicketResponse = {
+  linked_ticket: LinkedTicket | null;
+};
+
+/** Zoho Desk — response of `zoho_desk_push_call` (backend
+ *  `POST /v1/calls/{id}/zoho-desk/push`): the finished call was added to the
+ *  ticket as a private internal note. Every field is optional so an older
+ *  backend decodes cleanly — the ended-card confirmation deep-links from the
+ *  linked ticket's `web_url`, so it never depends on this shape. */
+export type ZohoDeskPushResponse = {
+  push_id?: string;
+  comment_id?: string;
+  web_url?: string;
+};
+
 /** Phase 3 — per-user call-end CRM push mode. `"prompt"` (default) asks on the
  *  call-ended card before pushing a linked deal; `"auto"` lets the pipeline push
  *  it automatically. Mirrors the `users.zoho_autopush_mode` column; the
@@ -608,6 +692,20 @@ export type CallLinkedDeal = {
   zoho_url?: string;
 };
 
+/** Zoho Desk — the support Ticket this call was linked to mid-call, folded into
+ *  the call-detail payload (`GET /v1/calls/{id}`) so the after-call page can
+ *  show a "Linked to ticket #N ↗" line even when the call-end "Add to ticket"
+ *  prompt was skipped. Distinct from the live-session `LinkedTicket`: the
+ *  after-call surface only needs the ticket number (#N) plus a deep link.
+ *  `web_url` is absent when the backend can't build it. Optional on the wire so
+ *  an older backend that omits the field decodes cleanly. Coexists with
+ *  `CallLinkedDeal` — a call can carry both. */
+export type CallLinkedTicket = {
+  ticket_number?: string;
+  subject?: string;
+  web_url?: string;
+};
+
 /** Phase 4 (live↔after-call continuity) — a durable question projected from the
  *  live ledger at enrichment, folded into the call-detail payload
  *  (`GET /v1/calls/{id}`) so the after-call page renders the same open/answered
@@ -645,6 +743,12 @@ export type Call = CallListItem & {
   // surface it independently of any push. `null`/absent when the call has no
   // linked Deal.
   linked_deal?: CallLinkedDeal | null;
+  // Zoho Desk — the support Ticket this call was linked to mid-call (from the
+  // durable `call_links` row, `kind='desk_ticket'`), folded in by the backend
+  // so the after-call detail can surface a "Linked to ticket #N ↗" line
+  // independently of any push. `null`/absent when the call has no linked
+  // Ticket; coexists with `linked_deal`.
+  linked_ticket?: CallLinkedTicket | null;
   // Phase 4 (live↔after-call continuity) — the questions extracted during the
   // call (projected from the live ledger into the durable `call_questions`
   // table at enrichment), folded into the detail payload so the after-call page

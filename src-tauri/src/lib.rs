@@ -3155,6 +3155,40 @@ async fn live_linked_deal(
     .await
 }
 
+/// POST /v1/live/linked-ticket — Zoho Desk link (or clear, `clear=true`) the
+/// call's support Ticket mid-call. Writes the scalar
+/// `state.copilot.linked_ticket`; enrichment projects it onto `call_links`
+/// (`kind='desk_ticket'`) + the call-end auto-push reads it. Returns
+/// `{ linked_ticket }` (the stored object or JSON null) so the frontend
+/// reconciles its optimistic set. Coexists with a linked Deal. Desk- +
+/// impersonation-write-gated; best-effort (fire-and-forget). Mirrors the
+/// `live_linked_deal` shim.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn live_linked_ticket(
+    session_uuid: String,
+    ticket_id: String,
+    ticket_number: Option<String>,
+    subject: Option<String>,
+    web_url: Option<String>,
+    clear: bool,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_linked_ticket(
+        backend,
+        &session_uuid,
+        &ticket_id,
+        ticket_number.as_deref(),
+        subject.as_deref(),
+        web_url.as_deref(),
+        clear,
+    )
+    .await
+}
+
 /// POST /v1/calls/{id}/zoho/push — push a call to Zoho as a Call
 /// activity linked to the picked record (#186). Body is forwarded
 /// verbatim from the SendToZohoModal Step-3 review state.
@@ -3168,6 +3202,22 @@ async fn zoho_push_call(
         message: "no backend configured".into(),
     })?;
     portal::zoho_push_call(backend, &call_id, &body).await
+}
+
+/// POST /v1/calls/{id}/zoho-desk/push — Zoho Desk push a finished call to a
+/// linked support Ticket as a private internal note. Mirrors the `zoho_push_call`
+/// shim; the body is the single `{ticket_id}` (the backend builds the note
+/// text). Drives the ended-card "Add to ticket" [Add] action.
+#[tauri::command]
+async fn zoho_desk_push_call(
+    call_id: String,
+    ticket_id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::zoho_desk_push_call(backend, &call_id, &ticket_id).await
 }
 
 /// GET /v1/calls/{id}/zoho/prior-push — the most-recent successful CRM push
@@ -4270,10 +4320,17 @@ pub fn run() {
             // Phase 3 — link a Zoho Deal to the live call (→ call_links +
             // call-end auto-push). REST, off the audio WS; copilot-gated.
             live_linked_deal,
+            // Zoho Desk — link a support Ticket to the live call (→ call_links
+            // `kind='desk_ticket'` + call-end auto-push). Coexists with a
+            // linked Deal. REST, off the audio WS; desk-gated.
+            live_linked_ticket,
             // #659 P5b — Support-mode cited knowledge answer over the org's
             // own knowledge base. REST, off the audio WS; copilot-gated.
             live_knowledge,
             zoho_push_call,
+            // Zoho Desk — push a finished call to a linked Ticket as a private
+            // internal note. Drives the ended-card "Add to ticket" action.
+            zoho_desk_push_call,
             // Phase 3 — most-recent successful CRM push for a call (404 →
             // null). Drives the ended-card confirmation + after-call detail.
             zoho_prior_push,
