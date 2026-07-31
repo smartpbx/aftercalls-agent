@@ -1,16 +1,20 @@
 //! Post-recording orchestration. Steps:
 //!
-//! 1. Mix mic + system into mixed.wav (best-effort)
-//! 2. Compress mic + system to .opus (AssemblyAI consumes Opus directly)
-//! 3. Create a pending call row on the backend, collect upload URLs
-//! 4. PUT the audio tracks to Spaces via the upload URLs
-//! 5. Ask backend to transcribe — AssemblyAI runs server-side, backend
+//! 1. Ensure a per-channel `.opus` exists for mic + system. The rolling
+//!    encoder (rolling_encode.rs) produces these DURING the call, so this
+//!    is usually a no-op; the SAFETY NET compresses the raw WAV here only
+//!    when the rolling `.opus` is absent/partial. `mixed` is NOT produced
+//!    — the backend regenerates it server-side post-transcribe.
+//! 2. Create a pending call row on the backend, collect upload URLs
+//! 3. Upload mic + system via the audio S3-multipart contract, falling
+//!    back to the single PUT (create_call URL) per track on any failure
+//! 4. Ask backend to transcribe — the vendor runs server-side, backend
 //!    persists utterances, returns the merged transcript
-//! 6. Ask backend to summarize — OpenAI runs server-side, backend
-//!    persists title/summary/action_items, returns the summary
-//! 7. Write the local Obsidian vault note with the transcript + summary
-//! 8. Attach note path back to the call row
-//! 9. Fire-and-forget peaks generation
+//! 5. Ask backend to summarize — runs server-side, backend persists
+//!    title/summary/action_items, returns the summary
+//! 6. Write the local Obsidian vault note with the transcript + summary
+//! 7. Attach note path back to the call row
+//! 8. Fire-and-forget peaks generation (also regenerates mixed server-side)
 //!
 //! Transcription and summarization used to run locally against per-user
 //! API keys; now only the backend has the keys.
@@ -276,30 +280,40 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     // ONCE and subsequent steps coast on the freshened bundle.
     let guard = RetryGuard::new();
 
-    // Steps 1–2: mix + compress. Both are best-effort; the pipeline can
-    // still upload + transcribe with whichever tracks landed.
-    if let Err(e) = mix_tracks(session_dir).await {
-        eprintln!("aftercalls: mix failed: {e:#}");
-    }
-    compress_for_upload(&session_dir.join("mic.wav")).await.ok();
-    compress_for_upload(&session_dir.join("system.wav")).await.ok();
-    // Previously mixed was uploaded as raw WAV — turned every call
-    // into a multi-MB upload long after mic/system had already
-    // landed. Opus-compress it the same way; upload.rs falls back
-    // to the wav if ffmpeg is missing (Windows stock).
-    compress_for_upload(&session_dir.join("mixed.wav")).await.ok();
+    // Steps 1–2 (chunked-upload): the mic + system `.opus` are produced
+    // by the rolling encoder DURING the call (rolling_encode.rs), so the
+    // expensive whole-file encodes are OFF the end-of-call path. SAFETY
+    // NET: if a track's rolling `.opus` is absent or empty (rolling
+    // encode disabled, spawn failed, crashed mid-call, or an
+    // orphan-resume with only the raw WAV on disk), fall back to today's
+    // whole-WAV Opus compress here so a usable `.opus` always exists for
+    // upload. `mixed` is intentionally NOT produced or uploaded — the
+    // backend regenerates it server-side post-transcribe
+    // (mix::ensure_mixed_audio) for playback + peaks.
+    ensure_track_opus(session_dir, "mic").await;
+    ensure_track_opus(session_dir, "system").await;
 
     // Step 3: create the call row so we get upload URLs. Retries the
     // create_call POST through retry_http (idempotent server-side).
     emit(app, PipelineEvent::Uploading);
     let created = upload::create_call(backend, session_dir, 0, &guard, session_telemetry).await?;
 
-    // Step 4: PUT audio to Spaces. Returns per-track outcomes — partial
-    // success keeps the pipeline running so the surviving tracks still
-    // get transcribed. The sentinel + telemetry are managed inside
+    // Step 4: upload mic + system. The rolling `.opus` go up via the
+    // audio S3-multipart contract; a track whose `.opus` is missing or
+    // whose multipart fails falls back to the unchanged single PUT
+    // (create_call URL). Returns per-track outcomes — partial success
+    // keeps the pipeline running so the surviving tracks still get
+    // transcribed. The sentinel + telemetry are managed inside
     // upload_audio.
-    let track_outcomes =
-        upload::upload_audio(session_dir, &created.upload_urls, &guard, session_telemetry).await?;
+    let track_outcomes = upload::upload_audio(
+        session_dir,
+        &created.upload_urls,
+        backend,
+        &created.call_id,
+        &guard,
+        session_telemetry,
+    )
+    .await?;
     let any_uploaded = track_outcomes.iter().any(|o| o.uploaded);
     let any_failed = track_outcomes.iter().any(|o| !o.uploaded);
     if !any_uploaded && !track_outcomes.is_empty() {
@@ -624,33 +638,25 @@ pub fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Com
     cmd
 }
 
-async fn mix_tracks(session_dir: &Path) -> Result<()> {
-    let mic = session_dir.join("mic.wav");
-    let system = session_dir.join("system.wav");
-    let mixed = session_dir.join("mixed.wav");
-    if !mic.exists() || !system.exists() {
-        return Ok(());
+/// SAFETY NET for the rolling-encode optimization (chunked-upload):
+/// guarantee a usable `<track>.opus` exists before upload. When the
+/// rolling encoder already produced one (present + non-empty) this is a
+/// no-op — the encode stays off the end-of-call path. Otherwise fall
+/// back to the whole-WAV Opus compress right here (today's behavior).
+/// Best-effort: a missing WAV (track never recorded) or an ffmpeg
+/// failure just leaves no `.opus`, and the upload step skips that track
+/// exactly as it does today.
+async fn ensure_track_opus(session_dir: &Path, track: &str) {
+    let opus = session_dir.join(format!("{track}.opus"));
+    if let Ok(meta) = tokio::fs::metadata(&opus).await {
+        if meta.len() > 0 {
+            return; // rolling encode already delivered a usable track
+        }
     }
-    let mut cmd = tokio::process::Command::new(ffmpeg_binary());
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(&mic)
-        .arg("-i")
-        .arg(&system)
-        .arg("-filter_complex")
-        .arg("[0:a][1:a]amix=inputs=2:duration=longest:normalize=0")
-        .arg("-c:a")
-        .arg("pcm_s16le")
-        .arg(&mixed)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    no_console(&mut cmd);
-    let status = cmd.status().await?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg amix failed: {status}");
+    let wav = session_dir.join(format!("{track}.wav"));
+    if let Err(e) = compress_for_upload(&wav).await {
+        eprintln!("aftercalls: fallback compress for {track} failed: {e:#}");
     }
-    Ok(())
 }
 
 /// 16 kHz mono Opus @ 32kbps — ~15× smaller than the raw WAV with no

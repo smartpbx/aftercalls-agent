@@ -17,7 +17,9 @@ use crate::screen_recorder::{ScreenRecordingMeta, SCREEN_SUBDIR};
 pub struct UploadUrls {
     pub mic: Option<String>,
     pub system: Option<String>,
-    pub mixed: Option<String>,
+    // The backend still mints a `mixed` presigned PUT URL in its
+    // response, but the agent no longer uploads a mixed track (it's
+    // regenerated server-side). serde ignores the unread field.
 }
 
 #[derive(Deserialize, Debug)]
@@ -285,6 +287,8 @@ fn write_pending_uploads(session_dir: &Path, pending: &PendingUploads) {
 pub async fn upload_audio(
     session_dir: &Path,
     urls: &UploadUrls,
+    backend: &Backend,
+    call_id: &str,
     guard: &RetryGuard,
     session_id_for_telemetry: Option<&str>,
 ) -> Result<Vec<TrackOutcome>> {
@@ -292,16 +296,17 @@ pub async fn upload_audio(
 
     // If a sentinel from a previous failed run is present, narrow this
     // attempt to ONLY the tracks it lists — tracks that already landed
-    // at Spaces don't need re-PUTting. A missing/corrupt sentinel
-    // falls through to "attempt all three" (conservative re-upload).
+    // at Spaces don't need re-uploading. A missing/corrupt sentinel
+    // falls through to "attempt both" (conservative re-upload).
     let pending = read_pending_uploads(session_dir);
     let allowed: Option<Vec<String>> = pending.as_ref().map(|p| p.tracks.clone());
 
-    // Each entry: (track-name, presigned URL, the content-type the
-    // backend signed the URL with, preferred-then-fallback source
-    // paths). The first existing source file gets uploaded with the
-    // signed content-type.
-    let candidates: [(&'static str, Option<&str>, &str, [PathBuf; 2]); 3] = [
+    // Each entry: (track-name, single-PUT presigned URL, the content-type
+    // the backend signed that URL with, preferred-then-fallback source
+    // paths). `mixed` is intentionally absent — the agent no longer
+    // produces or uploads it; the backend regenerates it server-side
+    // (mix::ensure_mixed_audio) for playback + peaks.
+    let candidates: [(&'static str, Option<&str>, &str, [PathBuf; 2]); 2] = [
         (
             "mic",
             urls.mic.as_deref(),
@@ -314,27 +319,79 @@ pub async fn upload_audio(
             "audio/ogg",
             [session_dir.join("system.opus"), session_dir.join("system.wav")],
         ),
-        (
-            "mixed",
-            urls.mixed.as_deref(),
-            "audio/ogg",
-            [session_dir.join("mixed.opus"), session_dir.join("mixed.wav")],
-        ),
     ];
 
-    let mut outcomes: Vec<TrackOutcome> = Vec::with_capacity(3);
+    let mut outcomes: Vec<TrackOutcome> = Vec::with_capacity(2);
 
     for (track, url, content_type, sources) in &candidates {
         // Skip if a previous run's sentinel restricts the set and
         // this track is NOT in the resume list — it already landed
-        // and re-PUTting would just rewrite the same object.
+        // and re-uploading would just rewrite the same object.
         if let Some(allowed_tracks) = &allowed {
             if !allowed_tracks.iter().any(|s| s == track) {
                 continue;
             }
         }
+
+        // Optimized path (chunked-upload): upload the rolling `.opus` via
+        // the audio S3-multipart contract. `complete` assembles it into
+        // the exact `audio_key(id, track)` transcribe HEAD-checks. Only
+        // attempted when a usable `.opus` is on disk (the rolling encoder
+        // or the pipeline's fallback compress produced it).
+        let opus_path = &sources[0];
+        let opus_ready = tokio::fs::metadata(opus_path)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if opus_ready {
+            match upload_audio_track_multipart(
+                backend,
+                guard,
+                session_id_for_telemetry,
+                call_id,
+                track,
+                opus_path,
+            )
+            .await
+            {
+                Ok(()) => {
+                    outcomes.push(TrackOutcome {
+                        track,
+                        uploaded: true,
+                        failure_class: None,
+                        final_error: None,
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    // Multipart failed (e.g. an older backend without the
+                    // audio-upload routes, or a mid-upload error). Fall
+                    // back to the unchanged single PUT below — a pure
+                    // optimization must never be the thing that loses a
+                    // track. Info-level breadcrumb; not a user-facing
+                    // failure.
+                    eprintln!(
+                        "aftercalls: audio multipart for {track} failed, falling back to single PUT: {e:#}"
+                    );
+                    crate::telemetry::log(
+                        "info",
+                        "pipeline::audio_multipart_fallback",
+                        format!("audio {track} multipart failed; falling back to single PUT"),
+                        Some(serde_json::json!({
+                            "track": track,
+                            "final_error": format!("{e:#}"),
+                        })),
+                        session_id_for_telemetry.map(|s| s.to_string()),
+                    );
+                }
+            }
+        }
+
+        // Single-PUT fallback (unchanged path). Needs the create_call
+        // presigned URL + the first non-empty source (prefers `.opus`,
+        // falls back to the raw `.wav`).
         let Some(url) = url else { continue };
-        let Some(path) = sources.iter().find(|p| p.exists()) else {
+        let Some(path) = first_nonempty_source(sources).await else {
             continue;
         };
 
@@ -1015,4 +1072,262 @@ fn screen_http_client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(600))
         .user_agent(user_agent())
         .build()?)
+}
+
+// ── Per-channel audio — resumable multipart upload (chunked-upload) ────
+//
+// mic / system are rolling-encoded to `.opus` DURING the call
+// (rolling_encode.rs). Here we upload the finished `.opus` at stop via
+// the backend's audio S3-multipart contract (the same shape as the
+// screen video, reusing the authed-POST + part-PUT helpers above):
+//
+//   init  → POST /v1/calls/{id}/audio/upload/init      { track }
+//   part  → POST /v1/calls/{id}/audio/upload/part      { track, upload_id, part_number } → presigned PUT url
+//           PUT the part bytes to the url, read the ETag response header
+//   done  → POST /v1/calls/{id}/audio/upload/complete  { track, upload_id, parts, byte_size }
+//   fail  → POST /v1/calls/{id}/audio/upload/abort     { track, upload_id }  (best-effort, no leaked parts)
+//
+// `complete` assembles the parts into `audio_key(id, track)` — the exact
+// key transcribe HEAD-checks. This is a pure optimization: `upload_audio`
+// falls back to the unchanged single PUT (create_call URL) whenever this
+// path can't land a track, so nothing here can lose a recording.
+
+#[derive(Serialize)]
+struct AudioInitBody {
+    track: &'static str,
+}
+
+#[derive(Deserialize)]
+struct AudioInitResponse {
+    upload_id: String,
+    /// Part size the agent uses for every part except the last.
+    /// `key` / `min_part_size` are also on the wire but unused (serde skips).
+    part_size: usize,
+}
+
+#[derive(Serialize)]
+struct AudioSignPartBody {
+    track: &'static str,
+    upload_id: String,
+    part_number: i32,
+}
+
+#[derive(Deserialize)]
+struct AudioSignPartResponse {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct AudioCompletePartRef {
+    part_number: i32,
+    etag: String,
+}
+
+#[derive(Serialize)]
+struct AudioCompleteBody {
+    track: &'static str,
+    upload_id: String,
+    parts: Vec<AudioCompletePartRef>,
+    byte_size: Option<i64>,
+}
+
+/// First source path that exists AND is non-empty (prefers `.opus`, then
+/// the raw `.wav`). Guards the single-PUT fallback against uploading a
+/// 0-byte artifact — a track with no usable audio is simply skipped.
+async fn first_nonempty_source(sources: &[PathBuf]) -> Option<PathBuf> {
+    for p in sources {
+        if let Ok(m) = tokio::fs::metadata(p).await {
+            if m.len() > 0 {
+                return Some(p.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Multipart-upload one already-encoded `.opus` to `audio_key(id, track)`.
+/// Bubbles on the first exhausted retry so the caller can fall back to a
+/// single PUT. Aborts a partially-uploaded multipart on any failure so
+/// parts don't leak on the bucket.
+async fn upload_audio_track_multipart(
+    backend: &Backend,
+    guard: &RetryGuard,
+    session_id_for_telemetry: Option<&str>,
+    call_id: &str,
+    track: &'static str,
+    opus_path: &Path,
+) -> Result<()> {
+    let byte_size = tokio::fs::metadata(opus_path)
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    if byte_size == 0 {
+        anyhow::bail!("{track}.opus missing or empty");
+    }
+
+    // init — open the multipart upload.
+    let init_path = format!("/v1/calls/{call_id}/audio/upload/init");
+    let init_body = serde_json::to_value(AudioInitBody { track }).context("serialize audio init body")?;
+    let init: AudioInitResponse = retry_http(
+        backend,
+        guard,
+        "audio_init",
+        4,
+        session_id_for_telemetry,
+        |_attempt| {
+            let body = init_body.clone();
+            let path = init_path.clone();
+            async move { screen_post_json::<AudioInitResponse>(backend, &path, body).await }
+        },
+    )
+    .await?;
+
+    match audio_upload_parts_and_complete(
+        backend,
+        guard,
+        session_id_for_telemetry,
+        call_id,
+        track,
+        opus_path,
+        &init,
+        byte_size,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort abort so already-uploaded parts don't leak, then
+            // bubble for the caller's single-PUT fallback.
+            let abort_path = format!("/v1/calls/{call_id}/audio/upload/abort");
+            let abort_body = serde_json::json!({ "track": track, "upload_id": init.upload_id });
+            if let Err(ae) = screen_post_nop(backend, &abort_path, abort_body).await {
+                eprintln!("aftercalls: audio multipart abort failed: {ae:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Sign + PUT every part in order, collecting `(part_number, etag)`, then
+/// finalize with `complete`. Bubbles on the first exhausted retry so the
+/// caller can abort + fall back.
+#[allow(clippy::too_many_arguments)]
+async fn audio_upload_parts_and_complete(
+    backend: &Backend,
+    guard: &RetryGuard,
+    session_id_for_telemetry: Option<&str>,
+    call_id: &str,
+    track: &'static str,
+    opus_path: &Path,
+    init: &AudioInitResponse,
+    byte_size: i64,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let part_size = init.part_size.max(1);
+    let client = screen_http_client()?;
+
+    let mut file = tokio::fs::File::open(opus_path)
+        .await
+        .with_context(|| format!("open {}", opus_path.display()))?;
+
+    let mut parts: Vec<AudioCompletePartRef> = Vec::new();
+    let mut part_number: i32 = 1;
+    loop {
+        // Read up to one full part (handles short reads).
+        let mut buf = vec![0u8; part_size];
+        let mut filled = 0usize;
+        while filled < part_size {
+            let n = file
+                .read(&mut buf[filled..])
+                .await
+                .context("read audio part")?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break; // clean EOF on a part boundary
+        }
+        buf.truncate(filled);
+
+        // Sign this part's PUT URL.
+        let sign_path = format!("/v1/calls/{call_id}/audio/upload/part");
+        let sign_body = serde_json::to_value(AudioSignPartBody {
+            track,
+            upload_id: init.upload_id.clone(),
+            part_number,
+        })
+        .context("serialize audio sign-part body")?;
+        let signed: AudioSignPartResponse = retry_http(
+            backend,
+            guard,
+            "audio_sign_part",
+            4,
+            session_id_for_telemetry,
+            |_attempt| {
+                let body = sign_body.clone();
+                let path = sign_path.clone();
+                async move { screen_post_json::<AudioSignPartResponse>(backend, &path, body).await }
+            },
+        )
+        .await?;
+
+        // PUT the bytes to object storage; read the ETag back. Reuses the
+        // screen part-PUT helper (no content-type header — the UploadPart
+        // presign signs only host).
+        let put_url = signed.url.clone();
+        let etag = retry_http(
+            backend,
+            guard,
+            "audio_put_part",
+            4,
+            session_id_for_telemetry,
+            |_attempt| {
+                let client = client.clone();
+                let url = put_url.clone();
+                let bytes = buf.clone();
+                async move { put_screen_part(&client, &url, bytes).await }
+            },
+        )
+        .await?;
+
+        parts.push(AudioCompletePartRef { part_number, etag });
+
+        // A short read means we just handled the final part.
+        if filled < part_size {
+            break;
+        }
+        part_number += 1;
+    }
+
+    if parts.is_empty() {
+        anyhow::bail!("audio {track} produced no parts");
+    }
+
+    // complete — assemble the parts into audio_key(id, track).
+    let complete_path = format!("/v1/calls/{call_id}/audio/upload/complete");
+    let complete_body = serde_json::to_value(AudioCompleteBody {
+        track,
+        upload_id: init.upload_id.clone(),
+        parts,
+        byte_size: Some(byte_size),
+    })
+    .context("serialize audio complete body")?;
+    retry_http(
+        backend,
+        guard,
+        "audio_complete",
+        4,
+        session_id_for_telemetry,
+        |_attempt| {
+            let body = complete_body.clone();
+            let path = complete_path.clone();
+            async move { screen_post_nop(backend, &path, body).await }
+        },
+    )
+    .await?;
+
+    Ok(())
 }

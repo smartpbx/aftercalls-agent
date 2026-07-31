@@ -711,9 +711,12 @@ export type CallLinkedTicket = {
  *  (`GET /v1/calls/{id}`) so the after-call page renders the same open/answered
  *  list the live drawer showed. Distinct from the live `LiveQuestion`: the
  *  after-call surface only needs who asked (`asker_display`), the question, its
- *  status, and (when answered) the answer. `question_text` / `answer_text` are
+ *  status, and (when answered) the answer. `id` is the row's stable UUID — the
+ *  target for the manual-edit CRUD (add/edit/toggle/delete); it's also the
+ *  return shape of those mutations. `question_text` / `answer_text` are
  *  transcript-derived → rendered as plain text, NEVER `{@html}`. */
 export type CallQuestion = {
+  id: string;
   asker_side: "you" | "them";
   asker_display: string;
   question_text: string;

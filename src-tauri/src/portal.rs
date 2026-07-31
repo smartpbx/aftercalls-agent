@@ -880,6 +880,68 @@ pub async fn add_action_item(
     .await
 }
 
+/// POST /v1/calls/{id}/questions — manual-add a call Question (Phase 4
+/// follow-up). `body` carries `{question_text, asker_side?, asker_display?,
+/// status?, answer_text?}`. Backend returns 201 with the created row
+/// (`{id, asker_side, asker_display, question_text, status, answer_text}`).
+/// Errors arrive as a structured `PortalError` (#124).
+pub async fn add_call_question(
+    backend: &Backend,
+    call_id: &str,
+    body: &Value,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        &format!("/v1/calls/{call_id}/questions"),
+        body.clone(),
+    )
+    .await
+}
+
+/// PATCH /v1/calls/{id}/questions/{qid} — edit a call Question: wording,
+/// answer (tri-state), status toggle, or attribution. Any edit flips the row
+/// to `source='manual'` server-side so re-enrichment won't wipe it. Returns
+/// the updated row; errors as `PortalError` (#124).
+pub async fn patch_call_question(
+    backend: &Backend,
+    call_id: &str,
+    qid: &str,
+    body: &Value,
+) -> std::result::Result<Value, PortalError> {
+    patch_json_typed(
+        backend,
+        &format!("/v1/calls/{call_id}/questions/{qid}"),
+        body.clone(),
+    )
+    .await
+}
+
+/// DELETE /v1/calls/{id}/questions/{qid} — hard delete a call Question.
+/// Backend returns 204 on success, 404 when the row is already gone; we map
+/// 404 to Ok(()) so the frontend's optimistic removal isn't disturbed by an
+/// already-gone row (same posture as `delete_action_item`). Every other
+/// non-2xx surfaces as a structured `PortalError` (#124).
+pub async fn delete_call_question(
+    backend: &Backend,
+    call_id: &str,
+    qid: &str,
+) -> std::result::Result<(), PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/calls/{call_id}/questions/{qid}",
+        backend.url.trim_end_matches('/'),
+    );
+    let resp = c.delete(&url).header("authorization", auth).send().await?;
+    let status = resp.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
 /// GET /v1/me/action-items — Phase 4 (#105) me-scoped list for the
 /// /actions page. Query params are passed opaquely so the shape stays
 /// in sync with the portal helper automatically; the frontend builds

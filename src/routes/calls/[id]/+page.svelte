@@ -63,6 +63,7 @@
   import type {
     ActionItemRow,
     Call,
+    CallQuestion,
     Highlight,
     Me,
     OrgMember,
@@ -1197,6 +1198,202 @@
       togglingItemIds = new Set(
         [...togglingItemIds].filter((id) => id !== payload.item.id),
       );
+    }
+  }
+
+  // ── Manual editing of Questions (Phase 4 follow-up) ──────────────
+  //
+  // Add / edit wording + answer / toggle answered / delete, calling the
+  // backend CRUD via the `*_call_question` Tauri shims. Optimistic local
+  // update reconciled with the server's returned row (mirrors the
+  // action-item handlers); no full call refetch. A manual add is
+  // `source='manual'` server-side; editing an auto row flips it to manual so
+  // re-enrichment never wipes the edit (backend `populate_call_questions`
+  // deletes only `source='auto'` rows).
+  let addingQuestion = $state(false);
+  let qAddText = $state("");
+  let qAddSide = $state<"you" | "them">("you");
+  let qAddAnswer = $state("");
+  let addingQuestionSaving = $state(false);
+
+  let editingQuestionId = $state<string | null>(null);
+  let qEditText = $state("");
+  let qEditAnswer = $state("");
+  let savingQuestionIds = $state<Set<string>>(new Set());
+  let confirmingQuestionDeleteId = $state<string | null>(null);
+  let deletingQuestionId = $state<string | null>(null);
+
+  function markQuestionSaving(id: string, on: boolean) {
+    const next = new Set(savingQuestionIds);
+    if (on) next.add(id);
+    else next.delete(id);
+    savingQuestionIds = next;
+  }
+
+  function openAddQuestion() {
+    if (!canEditSummary) return;
+    // Close any in-progress row edit so only one composer is open.
+    editingQuestionId = null;
+    qAddText = "";
+    qAddSide = "you";
+    qAddAnswer = "";
+    addingQuestion = true;
+  }
+
+  function cancelAddQuestion() {
+    addingQuestion = false;
+    qAddText = "";
+    qAddAnswer = "";
+  }
+
+  async function saveAddQuestion() {
+    if (!call || addingQuestionSaving) return;
+    const text = qAddText.trim();
+    if (!text) return;
+    addingQuestionSaving = true;
+    try {
+      const answer = qAddAnswer.trim();
+      const created = (await invoke("add_call_question", {
+        callId: call.id,
+        body: {
+          question_text: text,
+          asker_side: qAddSide,
+          ...(answer
+            ? { answer_text: answer, status: "answered" }
+            : { status: "open" }),
+        },
+      })) as CallQuestion;
+      call = {
+        ...call,
+        questions: [...(call.questions ?? []), created],
+      };
+      addingQuestion = false;
+      qAddText = "";
+      qAddAnswer = "";
+    } catch (e: unknown) {
+      const msg = isPortalError(e)
+        ? portalErrorToText(e)
+        : "Couldn't add the question. Try again.";
+      toast.error(msg);
+      console.warn("add question failed", e);
+    } finally {
+      addingQuestionSaving = false;
+    }
+  }
+
+  function openEditQuestion(q: CallQuestion) {
+    if (!canEditSummary) return;
+    addingQuestion = false;
+    editingQuestionId = q.id;
+    qEditText = q.question_text;
+    qEditAnswer = q.answer_text ?? "";
+  }
+
+  function cancelEditQuestion() {
+    editingQuestionId = null;
+    qEditText = "";
+    qEditAnswer = "";
+  }
+
+  async function saveEditQuestion(q: CallQuestion) {
+    if (!call || savingQuestionIds.has(q.id)) return;
+    const text = qEditText.trim();
+    if (!text) return;
+    markQuestionSaving(q.id, true);
+    try {
+      const answer = qEditAnswer.trim();
+      // Sending an answer on an open question also marks it answered; clearing
+      // the answer on an answered question leaves the status (an explicit
+      // "answered but no recorded answer" is valid). The status toggle is a
+      // separate affordance.
+      const body: Record<string, unknown> = {
+        question_text: text,
+        answer_text: answer ? answer : null,
+      };
+      if (answer && q.status === "open") body.status = "answered";
+      const updated = (await invoke("patch_call_question", {
+        callId: call.id,
+        qid: q.id,
+        body,
+      })) as CallQuestion;
+      call = {
+        ...call,
+        questions: (call.questions ?? []).map((row) =>
+          row.id === updated.id ? updated : row,
+        ),
+      };
+      editingQuestionId = null;
+      qEditText = "";
+      qEditAnswer = "";
+    } catch (e: unknown) {
+      const msg = isPortalError(e)
+        ? portalErrorToText(e)
+        : "Couldn't save the question. Try again.";
+      toast.error(msg);
+      console.warn("edit question failed", e);
+    } finally {
+      markQuestionSaving(q.id, false);
+    }
+  }
+
+  async function toggleQuestionAnswered(q: CallQuestion) {
+    if (!call || savingQuestionIds.has(q.id)) return;
+    const nextStatus = q.status === "answered" ? "open" : "answered";
+    markQuestionSaving(q.id, true);
+    const prev = call.questions ?? [];
+    // Optimistic flip.
+    call = {
+      ...call,
+      questions: prev.map((row) =>
+        row.id === q.id ? { ...row, status: nextStatus } : row,
+      ),
+    };
+    try {
+      const updated = (await invoke("patch_call_question", {
+        callId: call.id,
+        qid: q.id,
+        body: { status: nextStatus },
+      })) as CallQuestion;
+      call = {
+        ...call,
+        questions: (call.questions ?? []).map((row) =>
+          row.id === updated.id ? updated : row,
+        ),
+      };
+    } catch (e: unknown) {
+      // Roll back the optimistic flip.
+      call = { ...call, questions: prev };
+      toast.error("Couldn't update the question. Try again.");
+      console.warn("toggle question failed", e);
+    } finally {
+      markQuestionSaving(q.id, false);
+    }
+  }
+
+  function requestDeleteQuestion(q: CallQuestion) {
+    if (deletingQuestionId) return;
+    confirmingQuestionDeleteId = q.id;
+  }
+  function cancelDeleteQuestion(q: CallQuestion) {
+    if (deletingQuestionId === q.id) return;
+    if (confirmingQuestionDeleteId === q.id) confirmingQuestionDeleteId = null;
+  }
+  async function confirmDeleteQuestion(q: CallQuestion) {
+    if (!call || deletingQuestionId) return;
+    deletingQuestionId = q.id;
+    try {
+      // The Rust shim maps 404 → Ok, so "already gone" is silent success.
+      await invoke("delete_call_question", { callId: call.id, qid: q.id });
+      call = {
+        ...call,
+        questions: (call.questions ?? []).filter((row) => row.id !== q.id),
+      };
+      confirmingQuestionDeleteId = null;
+    } catch (e: unknown) {
+      toast.error("Couldn't delete the question. Try again.");
+      console.warn("delete question failed", e);
+    } finally {
+      deletingQuestionId = null;
     }
   }
 
@@ -4693,63 +4890,301 @@
          unanswered) first, then answered — checked off with the captured
          answer. Both sides attributed to who asked (`asker_display`). Question
          + answer are transcript-derived → plain `{...}`, never `{@html}`.
-         Rendered only when the call carried questions (additive; `[]`/absent
-         on older backends → nothing shows). Scoped `.aq-*`. -->
-    {#if call.questions && call.questions.length > 0}
-      {@const openQs = call.questions.filter((q) => q.status === "open")}
-      {@const answeredQs = call.questions.filter(
-        (q) => q.status === "answered",
-      )}
+         Manual editing (Phase 4 follow-up): add / edit wording + answer /
+         toggle answered / delete, via the `*_call_question` CRUD shims. A
+         manual add is `source='manual'`; editing an auto row flips it to manual
+         server-side so re-enrichment (delete-and-reinsert of `source='auto'`
+         rows only) never wipes the edit. Section shows whenever the call has
+         questions OR editing is allowed (so a missed question can be added on a
+         call the model flagged none). Scoped `.aq-*`. -->
+    {#snippet questionRow(q: CallQuestion)}
+      <li
+        class="aq-item"
+        class:open={q.status === "open"}
+        class:answered={q.status === "answered"}
+        class:editing={editingQuestionId === q.id}
+      >
+        {#if canEditSummary}
+          <button
+            type="button"
+            class="aq-tick aq-tick-btn"
+            onclick={() => toggleQuestionAnswered(q)}
+            disabled={savingQuestionIds.has(q.id) || editingQuestionId === q.id}
+            aria-label={q.status === "answered"
+              ? "Mark as unanswered"
+              : "Mark as answered"}
+            title={q.status === "answered"
+              ? "Mark as unanswered"
+              : "Mark as answered"}
+          >
+            {#if q.status === "answered"}
+              <svg
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"><polyline points="20 6 9 17 4 12" /></svg
+              >
+            {:else}
+              <span class="aq-dot"></span>
+            {/if}
+          </button>
+        {:else}
+          <span class="aq-tick" aria-hidden="true">
+            {#if q.status === "answered"}
+              <svg
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg
+              >
+            {:else}
+              <span class="aq-dot"></span>
+            {/if}
+          </span>
+        {/if}
+
+        <div class="aq-body">
+          {#if editingQuestionId === q.id}
+            <textarea
+              class="aq-edit-q"
+              bind:value={qEditText}
+              rows="2"
+              placeholder="Question"
+              aria-label="Edit question"
+            ></textarea>
+            <textarea
+              class="aq-edit-a"
+              bind:value={qEditAnswer}
+              rows="2"
+              placeholder="Answer (optional)"
+              aria-label="Edit answer"
+            ></textarea>
+            <div class="aq-edit-actions">
+              <button
+                type="button"
+                class="aq-btn aq-btn-primary"
+                onclick={() => saveEditQuestion(q)}
+                disabled={savingQuestionIds.has(q.id) || !qEditText.trim()}
+              >
+                {savingQuestionIds.has(q.id) ? "Saving…" : "Save"}
+              </button>
+              <button
+                type="button"
+                class="aq-btn"
+                onclick={cancelEditQuestion}
+                disabled={savingQuestionIds.has(q.id)}
+              >
+                Cancel
+              </button>
+            </div>
+          {:else}
+            <p class="aq-q">
+              <span class="aq-asker" class:you={q.asker_side === "you"}
+                >{q.asker_display}</span
+              >
+              <span class="aq-text">{q.question_text}</span>
+              {#if q.status === "answered"}
+                <span class="aq-sr">answered</span>
+              {/if}
+            </p>
+            {#if q.answer_text}
+              <p class="aq-answer">{q.answer_text}</p>
+            {/if}
+          {/if}
+        </div>
+
+        {#if canEditSummary && editingQuestionId !== q.id}
+          <div class="aq-actions">
+            {#if confirmingQuestionDeleteId === q.id}
+              <span class="aq-confirm-label">Delete?</span>
+              <button
+                type="button"
+                class="aq-btn aq-btn-danger"
+                onclick={() => confirmDeleteQuestion(q)}
+                disabled={deletingQuestionId === q.id}
+              >
+                {deletingQuestionId === q.id ? "…" : "Yes"}
+              </button>
+              <button
+                type="button"
+                class="aq-btn"
+                onclick={() => cancelDeleteQuestion(q)}
+                disabled={deletingQuestionId === q.id}
+              >
+                No
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="aq-icon-btn"
+                onclick={() => openEditQuestion(q)}
+                aria-label="Edit question"
+                title="Edit"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 20h9" />
+                  <path
+                    d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"
+                  />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="aq-icon-btn"
+                onclick={() => requestDeleteQuestion(q)}
+                aria-label="Delete question"
+                title="Delete"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M8 6V4h8v2" />
+                  <path d="M6 6l1 14h10l1-14" />
+                </svg>
+              </button>
+            {/if}
+          </div>
+        {/if}
+      </li>
+    {/snippet}
+
+    {#if (call.questions && call.questions.length > 0) || canEditSummary}
+      {@const allQs = call.questions ?? []}
+      {@const openQs = allQs.filter((q) => q.status === "open")}
+      {@const answeredQs = allQs.filter((q) => q.status === "answered")}
       <section class="block" style="--i: 4.5">
         <div class="block-head">
           <h2>Questions</h2>
-        </div>
-        <ul class="aq-list">
-          {#each openQs as q, i (`open-${i}`)}
-            <li class="aq-item open">
-              <span class="aq-tick" aria-hidden="true">
-                <span class="aq-dot"></span>
-              </span>
-              <div class="aq-body">
-                <p class="aq-q">
-                  <span class="aq-asker" class:you={q.asker_side === "you"}
-                    >{q.asker_display}</span
-                  >
-                  <span class="aq-text">{q.question_text}</span>
-                </p>
-              </div>
-            </li>
-          {/each}
-          {#each answeredQs as q, i (`answered-${i}`)}
-            <li class="aq-item answered">
-              <span class="aq-tick" aria-hidden="true">
+          {#if canEditSummary}
+            <div class="block-head-actions">
+              <button
+                type="button"
+                class="add-item-btn"
+                onclick={openAddQuestion}
+                disabled={addingQuestion}
+                aria-label="Add question"
+              >
                 <svg
-                  viewBox="0 0 24 24"
                   width="12"
                   height="12"
+                  viewBox="0 0 16 16"
                   fill="none"
                   stroke="currentColor"
-                  stroke-width="2.6"
+                  stroke-width="1.5"
                   stroke-linecap="round"
                   stroke-linejoin="round"
-                  ><polyline points="20 6 9 17 4 12" /></svg
+                  aria-hidden="true"
+                  class="add-item-ico"
                 >
-              </span>
-              <div class="aq-body">
-                <p class="aq-q">
-                  <span class="aq-asker" class:you={q.asker_side === "you"}
-                    >{q.asker_display}</span
-                  >
-                  <span class="aq-text">{q.question_text}</span>
-                  <span class="aq-sr">answered</span>
-                </p>
-                {#if q.answer_text}
-                  <p class="aq-answer">{q.answer_text}</p>
-                {/if}
+                  <path d="M8 3.5v9" />
+                  <path d="M3.5 8h9" />
+                </svg>
+                Add question
+              </button>
+            </div>
+          {/if}
+        </div>
+
+        {#if allQs.length === 0 && !addingQuestion}
+          <p class="aq-empty">No questions were flagged on this call.</p>
+        {/if}
+
+        {#if allQs.length > 0}
+          <ul class="aq-list">
+            {#each openQs as q (q.id)}
+              {@render questionRow(q)}
+            {/each}
+            {#each answeredQs as q (q.id)}
+              {@render questionRow(q)}
+            {/each}
+          </ul>
+        {/if}
+
+        {#if addingQuestion}
+          <div class="aq-composer">
+            <textarea
+              class="aq-edit-q"
+              bind:value={qAddText}
+              rows="2"
+              placeholder="Add a question the call missed…"
+              aria-label="New question"
+            ></textarea>
+            <div class="aq-composer-meta">
+              <span class="aq-composer-lbl">Asked by</span>
+              <div class="aq-side-toggle" role="group" aria-label="Who asked">
+                <button
+                  type="button"
+                  class="aq-side-opt"
+                  class:active={qAddSide === "you"}
+                  onclick={() => (qAddSide = "you")}
+                >
+                  You
+                </button>
+                <button
+                  type="button"
+                  class="aq-side-opt"
+                  class:active={qAddSide === "them"}
+                  onclick={() => (qAddSide = "them")}
+                >
+                  Them
+                </button>
               </div>
-            </li>
-          {/each}
-        </ul>
+            </div>
+            <textarea
+              class="aq-edit-a"
+              bind:value={qAddAnswer}
+              rows="2"
+              placeholder="Answer (optional — marks it answered)"
+              aria-label="Answer for the new question"
+            ></textarea>
+            <div class="aq-edit-actions">
+              <button
+                type="button"
+                class="aq-btn aq-btn-primary"
+                onclick={saveAddQuestion}
+                disabled={addingQuestionSaving || !qAddText.trim()}
+              >
+                {addingQuestionSaving ? "Adding…" : "Add"}
+              </button>
+              <button
+                type="button"
+                class="aq-btn"
+                onclick={cancelAddQuestion}
+                disabled={addingQuestionSaving}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {/if}
       </section>
     {/if}
 
@@ -6427,6 +6862,214 @@
     clip: rect(0 0 0 0);
     white-space: nowrap;
     border: 0;
+  }
+
+  /* ── Questions manual editing (Phase 4 follow-up) ─────────────────────
+     Add / edit / toggle-answered / delete affordances. All component-scoped
+     `.aq-*` (no app.css touch — HR#1). */
+  /* The tick becomes a click target to toggle answered when editing is
+     allowed. Reuses the tick geometry; just makes it a button. */
+  .aq-tick-btn {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    border-radius: 999px;
+    transition:
+      color 0.12s ease,
+      transform 0.08s ease;
+  }
+  .aq-tick-btn:hover:not(:disabled) {
+    color: var(--olive);
+  }
+  .aq-tick-btn:disabled {
+    cursor: default;
+  }
+  .aq-tick-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* Trailing per-row action cluster (Edit / Delete). Quiet until the row is
+     hovered or a control inside it is focused, so the list stays calm. */
+  .aq-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .aq-item:hover .aq-actions,
+  .aq-actions:focus-within {
+    opacity: 1;
+  }
+  .aq-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--bone-3);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .aq-icon-btn:hover {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    border-color: var(--hairline);
+  }
+  .aq-icon-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  /* Small text buttons shared by the row editor, delete confirm, and the
+     add composer. */
+  .aq-btn {
+    font: inherit;
+    font-size: 0.78rem;
+    line-height: 1;
+    padding: 0.32rem 0.6rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--hairline-hi);
+    background: var(--ink-2);
+    color: var(--bone-1);
+    cursor: pointer;
+    transition:
+      background 0.12s ease,
+      border-color 0.12s ease,
+      color 0.12s ease;
+  }
+  .aq-btn:hover:not(:disabled) {
+    background: var(--ink-3);
+    color: var(--bone-0);
+  }
+  .aq-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .aq-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .aq-btn-primary {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-hi);
+  }
+  .aq-btn-primary:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--ink-0);
+  }
+  .aq-btn-danger {
+    background: transparent;
+    border-color: var(--live);
+    color: var(--live);
+  }
+  .aq-btn-danger:hover:not(:disabled) {
+    background: var(--live);
+    color: var(--ink-0);
+  }
+  .aq-confirm-label {
+    font-size: 0.78rem;
+    color: var(--bone-2);
+    margin-right: 0.15rem;
+  }
+
+  /* Inline editor + add composer textareas. */
+  .aq-edit-q,
+  .aq-edit-a {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    color: var(--bone-0);
+    background: var(--ink-0);
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius-sm);
+    padding: 0.4rem 0.5rem;
+    resize: vertical;
+  }
+  .aq-edit-a {
+    margin-top: 0.4rem;
+    color: var(--bone-1);
+  }
+  .aq-edit-q:focus,
+  .aq-edit-a:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .aq-edit-actions {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+  }
+  .aq-item.editing {
+    align-items: stretch;
+  }
+
+  .aq-empty {
+    margin: 0.2rem 0 0;
+    font-size: 0.86rem;
+    color: var(--bone-3);
+  }
+
+  .aq-composer {
+    margin-top: 0.6rem;
+    padding: 0.6rem;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
+    background: var(--ink-1);
+  }
+  .aq-composer-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.45rem;
+  }
+  .aq-composer-lbl {
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--bone-3);
+  }
+  .aq-side-toggle {
+    display: inline-flex;
+    border: 1px solid var(--hairline-hi);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .aq-side-opt {
+    font: inherit;
+    font-size: 0.76rem;
+    padding: 0.24rem 0.6rem;
+    background: var(--ink-2);
+    color: var(--bone-2);
+    border: 0;
+    cursor: pointer;
+    transition:
+      background 0.12s ease,
+      color 0.12s ease;
+  }
+  .aq-side-opt + .aq-side-opt {
+    border-left: 1px solid var(--hairline-hi);
+  }
+  .aq-side-opt:hover {
+    color: var(--bone-0);
+  }
+  .aq-side-opt.active {
+    background: var(--accent-soft);
+    color: var(--accent-hi);
   }
 
   /* ── Transcript ────────────────────────────────────────────────────── */

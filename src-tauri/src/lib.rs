@@ -14,6 +14,7 @@ mod pipeline;
 mod portal;
 mod recorder;
 mod recovery;
+mod rolling_encode;
 mod screen_recorder;
 mod summary;
 mod support;
@@ -25,6 +26,7 @@ mod vault;
 use auto_recorder::AutoRecorder;
 use detector::{Detector, UserDecision};
 use recorder::Recorder;
+use rolling_encode::RollingEncoder;
 use screen_recorder::ScreenRecorder;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -539,6 +541,12 @@ pub(crate) fn do_start(
         write_live_session(&path, uuid);
     }
 
+    // chunked-upload — start the rolling per-channel Opus encode so the
+    // mic + system `.opus` are ready at stop (encode off the end-of-call
+    // path). Best-effort: a failure just means the pipeline compresses
+    // the WAVs at stop, exactly as before.
+    app.state::<RollingEncoder>().start(&path);
+
     // #302 follow-up — best-effort per-call screen-source request (Call mode
     // only). Emits the chooser event (ask-each-call) or auto-starts the
     // remembered screen. Returns instantly; NEVER blocks or fails the audio
@@ -622,6 +630,13 @@ pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, Strin
     // #live — flush + close the live relay (best-effort; no-op when idle).
     app.state::<live::LiveRelay>().end();
     emit_state(app, false, None, None, None);
+    // chunked-upload — finalize the rolling per-channel `.opus` (drain the
+    // WAV tail, close ffmpeg's stdin, wait for a clean flush) BEFORE the
+    // pipeline spawns so it sees complete files. Runs after emit_state so
+    // the UI shows "stopped" immediately; bounded so a wedged encoder
+    // can't hang the stop path — an unfinalized track just falls back to
+    // the pipeline's compress-at-stop. No-op when no rolling encode ran.
+    app.state::<RollingEncoder>().stop_and_persist(&path);
     let session_dir = path.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -2942,6 +2957,60 @@ async fn delete_action_item(
     portal::delete_action_item(backend, &call_id, &item_id).await
 }
 
+// ── Call Questions manual-edit shims (Phase 4 follow-up) ─────────────
+//
+// Three IPC commands wrapping the backend's manual-edit CRUD on the durable
+// `call_questions` rows. The after-call page invokes these; the body is
+// forwarded verbatim so the TS side stays the authoritative shape. Errors flow
+// as the structured `PortalError` shape (#124). A manual add is
+// `source='manual'`; editing an auto row flips it to manual server-side so
+// re-enrichment never wipes the user's edit.
+
+/// POST /v1/calls/{id}/questions — manual-add. Body:
+///   {question_text, asker_side?, asker_display?, status?, answer_text?}
+/// Backend returns 201 with the created row.
+#[tauri::command]
+async fn add_call_question(
+    call_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::add_call_question(backend, &call_id, &body).await
+}
+
+/// PATCH /v1/calls/{id}/questions/{qid} — edit wording / answer / status /
+/// attribution. Returns the updated row. Errors arrive as `PortalError` (#124).
+#[tauri::command]
+async fn patch_call_question(
+    call_id: String,
+    qid: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::patch_call_question(backend, &call_id, &qid, &body).await
+}
+
+/// DELETE /v1/calls/{id}/questions/{qid}. 404 is converted to Ok(()) on the
+/// portal helper side so the frontend's optimistic removal matches the
+/// "silent success on already-gone" behaviour. Errors arrive as `PortalError`.
+#[tauri::command]
+async fn delete_call_question(
+    call_id: String,
+    qid: String,
+) -> Result<(), error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::delete_call_question(backend, &call_id, &qid).await
+}
+
 /// GET /v1/org/zoho/status — Zoho connection probe (#186). Used by
 /// the call-detail page on mount to gate the "Send to CRM" button.
 /// Failure (env-disabled, network down) is the caller's concern;
@@ -4125,6 +4194,10 @@ pub fn run() {
         // do_start / do_stop reach the same in-flight capture via
         // app.state, exactly like the audio Recorder.
         .manage(ScreenRecorder::new())
+        // chunked-upload — rolling per-channel Opus encoder. Process-scoped
+        // so do_start / do_stop reach the same in-flight encode via
+        // app.state, exactly like the audio Recorder + ScreenRecorder.
+        .manage(RollingEncoder::new())
         // #live — live-transcript relay controller (Phase 1). Process-scoped
         // so do_start / do_stop reach the same session via app.state.
         .manage(live::LiveRelay::new())
@@ -4243,6 +4316,10 @@ pub fn run() {
             add_client_allowlist_entry,
             add_action_item,
             delete_action_item,
+            // Call Questions manual-edit shims (Phase 4 follow-up).
+            add_call_question,
+            patch_call_question,
+            delete_call_question,
             list_me_action_items,
             // #243 — share-call CRUD shims (mirrors the portal's
             // `api.calls.{create,list,revoke}Share`). All three return
