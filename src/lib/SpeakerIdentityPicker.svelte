@@ -81,6 +81,10 @@
 
   function scheduleSearch() {
     clearTimeout(searchTimer);
+    // Invalidate an already-running request on EVERY query transition,
+    // including the important "back below two characters" transition.
+    // Otherwise that older response can repopulate a now-empty picker.
+    searchSeq += 1;
     searchError = false;
     activeIdx = -1;
     const q = query.trim();
@@ -93,9 +97,12 @@
   }
 
   async function runSearch() {
-    const q = query.trim();
-    if (q.length < 2) return;
     const seq = ++searchSeq;
+    const q = query.trim();
+    if (q.length < 2 || source !== "contact") {
+      searching = false;
+      return;
+    }
     searching = true;
     searchError = false;
     try {
@@ -126,21 +133,33 @@
   // ── Teammate roster (loaded once, filtered locally) ─────────────────────
   let roster = $state<OrgMember[]>([]);
   let rosterLoaded = $state(false);
+  let rosterLoading = $state(false);
   let rosterError = $state(false);
   async function loadRoster() {
-    if (rosterLoaded || roster.length > 0) return;
+    if (rosterLoading || rosterLoaded) return;
+    rosterLoading = true;
+    rosterError = false;
     try {
       roster = (await invoke<OrgMember[]>("org_members")) ?? [];
+      rosterLoaded = true;
       rosterError = false;
     } catch {
       rosterError = true;
     } finally {
-      rosterLoaded = true;
+      rosterLoading = false;
     }
+  }
+
+  function retryRoster() {
+    rosterError = false;
+    void loadRoster();
   }
 
   function setSource(next: Source) {
     if (source === next) return;
+    clearTimeout(searchTimer);
+    searchSeq += 1;
+    searching = false;
     source = next;
     activeIdx = -1;
     if (next === "team") void loadRoster();
@@ -355,10 +374,17 @@
           Retry
         </button>
       </div>
-    {:else if source === "team" && !rosterLoaded}
+    {:else if source === "team" && rosterLoading}
       <div class="sip-hint">Loading teammates…</div>
     {:else if source === "team" && rosterError}
-      <div class="sip-hint sip-hint-err">Couldn't load teammates.</div>
+      <div class="sip-error-row">
+        <span>Couldn't load teammates.</span>
+        <button type="button" class="sip-retry" onclick={retryRoster}>
+          Retry
+        </button>
+      </div>
+    {:else if source === "team" && !rosterLoaded}
+      <div class="sip-hint">Loading teammates…</div>
     {:else if rows.length === 0}
       <div class="sip-hint">
         {#if source === "contact" && query.trim().length < 2}
@@ -520,9 +546,6 @@
     font-size: 0.78rem;
     color: var(--bone-3);
     line-height: 1.4;
-  }
-  .sip-hint-err {
-    color: var(--bone-2);
   }
   .sip-error-row {
     display: flex;

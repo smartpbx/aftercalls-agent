@@ -21,7 +21,6 @@
 
   import { onDestroy, onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { screenRecording } from "$lib/stores/recording.svelte";
@@ -523,20 +522,17 @@
     if (attachments.length >= MAX_ATTACHMENTS) return;
     try {
       const remaining = MAX_ATTACHMENTS - attachments.length;
-      const result = await openDialog({
-        multiple: true,
-        filters: [
-          {
-            name: "Images",
-            extensions: ["png", "jpg", "jpeg", "webp", "gif"],
-          },
-        ],
-      });
-      if (!result) return;
-      const paths = Array.isArray(result) ? result : [result];
-      const slice = paths.slice(0, remaining);
-      for (const p of slice) {
-        await stageFromPath(p);
+      const selected = await invoke<
+        Array<{
+          path: string;
+          filename: string;
+          mime: string;
+          size_bytes: number;
+          preview_data_url: string | null;
+        }>
+      >("select_support_attachments", { maxFiles: remaining });
+      for (const meta of selected) {
+        stageSelectedAttachment(meta);
       }
     } catch (e) {
       console.warn("ReportIssueDialog: file picker error", e);
@@ -549,42 +545,34 @@
    * upload — the Rust-side submit reads the file directly when it's
    * time to PUT to the presigned URL.
    */
-  async function stageFromPath(path: string) {
-    try {
-      const meta = await invoke<{
-        path: string;
-        filename: string;
-        mime: string;
-        size_bytes: number;
-        preview_data_url: string | null;
-      }>("inspect_support_attachment", { path });
+  function stageSelectedAttachment(meta: {
+    path: string;
+    filename: string;
+    mime: string;
+    size_bytes: number;
+    preview_data_url: string | null;
+  }) {
+    const sizeError =
+      meta.size_bytes > MAX_SCREENSHOT_BYTES ? "Too large (max 25 MB)" : null;
+    const mimeError = ALLOWED_MIME.includes(meta.mime)
+      ? null
+      : "Not an image — skipped";
+    const error = sizeError ?? mimeError;
 
-      const sizeError =
-        meta.size_bytes > MAX_SCREENSHOT_BYTES
-          ? "Too large (max 25 MB)"
-          : null;
-      const mimeError = ALLOWED_MIME.includes(meta.mime)
-        ? null
-        : "Not an image — skipped";
-      const error = sizeError ?? mimeError;
-
-      attachments = [
-        ...attachments,
-        {
-          localId: crypto.randomUUID(),
-          filePath: meta.path,
-          filename: meta.filename,
-          mime: meta.mime,
-          sizeBytes: meta.size_bytes,
-          previewUrl: meta.preview_data_url,
-          error,
-          kind: "screenshot",
-          blob: null,
-        },
-      ];
-    } catch (e) {
-      console.warn("ReportIssueDialog: inspect failed for", path, e);
-    }
+    attachments = [
+      ...attachments,
+      {
+        localId: crypto.randomUUID(),
+        filePath: meta.path,
+        filename: meta.filename,
+        mime: meta.mime,
+        sizeBytes: meta.size_bytes,
+        previewUrl: meta.preview_data_url,
+        error,
+        kind: "screenshot",
+        blob: null,
+      },
+    ];
   }
 
   // #628: opt-in attach of the user's most recent recording session.
@@ -797,8 +785,9 @@
     }
   }
 
-  // Drag-and-drop (v1-optional). Accepts dropped files exactly the
-  // same way as the file picker — same validation, same chips.
+  // A browser drop exposes raw path strings without the native dialog's
+  // authorization boundary. Treat it as a request to open the approved
+  // picker instead of forwarding those paths to Rust.
   let dragHover = $state(false);
   function onDragOver(e: DragEvent) {
     if (submitting || succeeded) return;
@@ -813,17 +802,7 @@
     dragHover = false;
     if (submitting || succeeded) return;
     e.preventDefault();
-    const files = e.dataTransfer?.files;
-    if (!files || files.length === 0) return;
-    const remaining = MAX_ATTACHMENTS - attachments.length;
-    const slice = Array.from(files).slice(0, remaining);
-    // Tauri exposes a path on the File via a non-standard property.
-    // Fall back to skipping if we can't get one (the picker path is
-    // still the primary entry point).
-    for (const f of slice) {
-      const p = (f as unknown as { path?: string }).path;
-      if (p) await stageFromPath(p);
-    }
+    if ((e.dataTransfer?.files.length ?? 0) > 0) await addAttachments();
   }
 
   const remainingSlots = $derived(MAX_ATTACHMENTS - attachments.length);

@@ -1,9 +1,8 @@
 //! In-agent "Report an issue" IPC commands (#183, #203).
 //!
 //! Three commands:
-//!   * `inspect_support_attachment(path)` — returns a small file-meta
-//!     record suitable for the chip thumbnail. Avoids piping bytes
-//!     through the JS bridge for the full upload.
+//!   * `select_support_attachments()` — opens a native image picker and
+//!     returns small file-meta records. The webview cannot nominate a path.
 //!   * `stage_support_video(bytes, filename)` — writes an in-memory
 //!     webm blob (produced by the webview's MediaRecorder) to a temp
 //!     file under `<temp>/aftercalls-support/<uuid>/`, returns the
@@ -39,7 +38,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tauri::State;
+use tauri_plugin_dialog::DialogExt;
 
+use crate::ipc_security::{IpcSecurity, PathPurpose};
 use crate::portal::build_auth_header;
 
 // ── Constants (mirror backend caps) ─────────────────────────────────
@@ -65,8 +67,50 @@ const ALLOWED_LOG_MIMES: &[&str] = &["application/zip"];
 /// two concurrent stages don't collide.
 const STAGE_DIR_NAME: &str = "aftercalls-support";
 
-fn stage_parent() -> PathBuf {
-    std::env::temp_dir().join(STAGE_DIR_NAME)
+fn resolve_stage_root(create: bool) -> Result<PathBuf> {
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .context("resolve operating-system temp directory")?;
+    let parent = temp.join(STAGE_DIR_NAME);
+    match parent.symlink_metadata() {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!("support stage root is not a real directory");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir(&parent)
+                .with_context(|| format!("create support stage root {}", parent.display()))?;
+        }
+        Err(error) => return Err(error).context("inspect support stage root"),
+    }
+    crate::session_fs::enforce_private_dir(&parent)?;
+    let canonical = parent
+        .canonicalize()
+        .context("resolve support stage root")?;
+    if canonical.parent() != Some(temp.as_path()) {
+        anyhow::bail!("support stage root escaped the operating-system temp directory");
+    }
+    Ok(canonical)
+}
+
+fn allocate_stage_dir() -> Result<PathBuf> {
+    let parent = resolve_stage_root(true)?;
+    for _ in 0..8 {
+        let subdir = parent.join(uuid::Uuid::new_v4().simple().to_string());
+        match std::fs::create_dir(&subdir) {
+            Ok(()) => {
+                crate::session_fs::enforce_private_dir(&subdir)?;
+                return Ok(subdir);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create support stage {}", subdir.display()))
+            }
+        }
+    }
+    anyhow::bail!("could not allocate a unique support stage directory")
 }
 
 /// Resolve per-kind upload limits. Mirrors the backend's
@@ -81,7 +125,7 @@ fn limits_for_kind(kind: &str) -> Option<(&'static [&'static str], u64)> {
     }
 }
 
-// ── inspect_support_attachment ─────────────────────────────────────
+// ── select_support_attachments ────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct AttachmentInspect {
@@ -110,37 +154,58 @@ fn mime_from_extension(p: &Path) -> &'static str {
     }
 }
 
-#[tauri::command]
-pub fn inspect_support_attachment(path: String) -> Result<AttachmentInspect, String> {
-    inspect_inner(&path).map_err(|e| e.to_string())
-}
-
-fn inspect_inner(path: &str) -> Result<AttachmentInspect> {
-    let p = Path::new(path);
-    let meta = std::fs::metadata(p)
-        .with_context(|| format!("stat {path}"))?;
+fn inspect_inner(path: &Path) -> Result<AttachmentInspect> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
     if !meta.is_file() {
-        return Err(anyhow!("not a file: {path}"));
+        return Err(anyhow!("not a file: {}", path.display()));
     }
     let size_bytes = meta.len();
-    let filename = p
+    let filename = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("attachment")
         .to_string();
-    let mime = mime_from_extension(p);
+    let mime = mime_from_extension(path);
 
     // Inline preview is intentionally None — generating one requires
     // either a base64 dep or piping bytes through the JS bridge, both
     // of which add weight for a 24×24 thumbnail. The chip falls back
     // to a placeholder rect with the filename visible.
     Ok(AttachmentInspect {
-        path: path.to_string(),
+        path: path.to_string_lossy().into_owned(),
         filename,
         mime: mime.to_string(),
         size_bytes: size_bytes as i64,
         preview_data_url: None,
     })
+}
+
+#[tauri::command]
+pub async fn select_support_attachments(
+    app: tauri::AppHandle,
+    security: State<'_, IpcSecurity>,
+    max_files: u8,
+) -> Result<Vec<AttachmentInspect>, String> {
+    if max_files == 0 {
+        return Ok(Vec::new());
+    }
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+        .blocking_pick_files()
+        .unwrap_or_default();
+    let mut attachments = Vec::new();
+    for picked in picked.into_iter().take(usize::from(max_files.min(5))) {
+        let path = picked
+            .into_path()
+            .map_err(|e| format!("resolve selected attachment: {e}"))?;
+        let canonical = crate::ipc_security::canonical_existing_file(&path.to_string_lossy())?;
+        security.approve_path(PathPurpose::SupportAttachment, canonical.clone());
+        attachments.push(inspect_inner(&canonical).map_err(|e| e.to_string())?);
+    }
+    Ok(attachments)
 }
 
 // ── stage_support_video ────────────────────────────────────────────
@@ -179,20 +244,9 @@ fn stage_support_video_inner(
         anyhow::bail!("recording exceeds 100 MB cap");
     }
     let safe = sanitise_filename(&filename);
-    // Use a simple random identifier (nanos + rand-ish fallback) to
-    // keep this module dependency-free — we already avoid pulling a
-    // separate uuid crate for the agent.
-    let id_hi = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let id_lo = std::process::id() as u128;
-    let stage_id = format!("{:032x}", id_hi.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(id_lo));
-    let subdir = stage_parent().join(&stage_id);
-    std::fs::create_dir_all(&subdir)
-        .with_context(|| format!("create stage dir {}", subdir.display()))?;
+    let subdir = allocate_stage_dir()?;
     let full = subdir.join(&safe);
-    std::fs::write(&full, &bytes)
+    crate::session_fs::write_private_file(&full, &bytes)
         .with_context(|| format!("write staged video {}", full.display()))?;
     Ok(StagedAttachment {
         path: full.to_string_lossy().into_owned(),
@@ -272,20 +326,7 @@ fn bundle_latest_session_inner(app: &tauri::AppHandle) -> Result<StagedAttachmen
 
     // Stage under the same temp tree the video pipeline uses so
     // sweep_stage_dir() and the existing submit cleanup catch it.
-    let id_hi = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let id_lo = std::process::id() as u128;
-    let stage_id = format!(
-        "{:032x}",
-        id_hi
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(id_lo)
-    );
-    let subdir = stage_parent().join(&stage_id);
-    std::fs::create_dir_all(&subdir)
-        .with_context(|| format!("create stage dir {}", subdir.display()))?;
+    let subdir = allocate_stage_dir()?;
 
     let zip_filename = format!("aftercalls-session-{session_name}.zip");
     let zip_path = subdir.join(&zip_filename);
@@ -312,7 +353,10 @@ fn pick_latest_session(recordings_root: &Path) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
         let meta = match entry.metadata() {
@@ -336,7 +380,7 @@ fn pick_latest_session(recordings_root: &Path) -> Option<PathBuf> {
 fn write_session_zip(session_dir: &Path, zip_path: &Path) -> Result<Vec<SessionFileMeta>> {
     use std::io::{Read, Write};
 
-    let file = std::fs::File::create(zip_path)
+    let file = crate::session_fs::create_private_file(zip_path)
         .with_context(|| format!("create {}", zip_path.display()))?;
     let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(file));
     let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
@@ -348,7 +392,10 @@ fn write_session_zip(session_dir: &Path, zip_path: &Path) -> Result<Vec<SessionF
         .with_context(|| format!("read_dir {}", session_dir.display()))?;
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
             continue;
         }
         let name = match path.file_name().and_then(|s| s.to_str()) {
@@ -458,10 +505,20 @@ fn detect_os_version() -> String {
 /// than 24 h so a crashed submit from yesterday doesn't leak bytes
 /// forever.
 pub fn sweep_stage_dir() {
-    let parent = stage_parent();
+    let Ok(parent) = resolve_stage_root(false) else { return };
     let Ok(read) = std::fs::read_dir(&parent) else { return };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
     for entry in read.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else { continue };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         if modified < cutoff {
@@ -488,6 +545,94 @@ fn default_kind() -> String {
     "screenshot".to_string()
 }
 
+fn trusted_staged_file(input: &str) -> Result<(PathBuf, PathBuf)> {
+    let canonical = crate::ipc_security::canonical_existing_file(input)
+        .map_err(|error| anyhow!(error))?;
+    let root = resolve_stage_root(false)?;
+    let relative = canonical
+        .strip_prefix(&root)
+        .map_err(|_| anyhow!("attachment is outside the private support stage"))?;
+    let components: Vec<_> = relative.components().collect();
+    if components.len() != 2 {
+        anyhow::bail!("staged attachment must be one file under one stage directory");
+    }
+    let stage_id = match components[0] {
+        std::path::Component::Normal(value) => value,
+        _ => anyhow::bail!("invalid support stage path"),
+    };
+    let stage_id_text = stage_id
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid support stage identifier"))?;
+    uuid::Uuid::parse_str(stage_id_text).context("invalid support stage identifier")?;
+    let stage_dir = root.join(stage_id);
+    let stage_metadata = stage_dir
+        .symlink_metadata()
+        .context("inspect support stage directory")?;
+    if stage_metadata.file_type().is_symlink() || !stage_metadata.is_dir() {
+        anyhow::bail!("support stage directory is not a real directory");
+    }
+    let canonical_stage = stage_dir
+        .canonicalize()
+        .context("resolve support stage directory")?;
+    if canonical.parent() != Some(canonical_stage.as_path()) {
+        anyhow::bail!("staged attachment escaped its private directory");
+    }
+    Ok((canonical, canonical_stage))
+}
+
+fn expected_mime(path: &Path, kind: &str) -> &'static str {
+    match kind {
+        "screenshot" => mime_from_extension(path),
+        "video" if path.extension().and_then(|value| value.to_str()) == Some("webm") => {
+            "video/webm"
+        }
+        "log" if path.extension().and_then(|value| value.to_str()) == Some("zip") => {
+            "application/zip"
+        }
+        _ => "application/octet-stream",
+    }
+}
+
+fn validate_attachment_paths(
+    security: &IpcSecurity,
+    attachments: &mut [AttachmentSubmit],
+) -> Result<Vec<PathBuf>> {
+    let mut staged_dirs = Vec::new();
+    for attachment in attachments {
+        let canonical = if attachment.kind == "screenshot" {
+            security
+                .require_approved_file(PathPurpose::SupportAttachment, &attachment.path)
+                .map_err(|error| anyhow!(error))?
+        } else {
+            let (canonical, stage_dir) = trusted_staged_file(&attachment.path)?;
+            if !staged_dirs.contains(&stage_dir) {
+                staged_dirs.push(stage_dir);
+            }
+            canonical
+        };
+        let filename = canonical
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("attachment filename is not valid UTF-8"))?;
+        if filename != attachment.filename {
+            anyhow::bail!("attachment filename does not match the selected file");
+        }
+        let actual_mime = expected_mime(&canonical, &attachment.kind);
+        if actual_mime != attachment.mime {
+            anyhow::bail!("attachment type does not match its file extension");
+        }
+        let actual_size = canonical
+            .metadata()
+            .context("inspect attachment size")?
+            .len();
+        if attachment.size_bytes < 0 || actual_size != attachment.size_bytes as u64 {
+            anyhow::bail!("attachment size changed after it was selected");
+        }
+        attachment.path = canonical.to_string_lossy().into_owned();
+    }
+    Ok(staged_dirs)
+}
+
 #[derive(Deserialize, Serialize)]
 struct CreateReportResponse {
     id: String,
@@ -503,29 +648,17 @@ struct CreateReportAttachment {
 
 #[tauri::command]
 pub async fn submit_support_report(
+    security: State<'_, IpcSecurity>,
     title: String,
     body: String,
     metadata: Value,
-    attachments: Vec<AttachmentSubmit>,
+    mut attachments: Vec<AttachmentSubmit>,
 ) -> Result<String, String> {
-    // Collect staged paths BEFORE handing off — `submit_inner` may
-    // bail part-way, and we still want the temp bytes gone. A staged
-    // video sits under `<temp>/aftercalls-support/<id>/recording.webm`
-    // so we remove the parent per-stage subdir rather than the file
-    // alone (keeps inode hygiene consistent with how we wrote it).
-    let staged_dirs: Vec<PathBuf> = attachments
-        .iter()
-        .filter_map(|a| {
-            let path = Path::new(&a.path);
-            let parent = path.parent()?;
-            let grandparent = parent.parent()?;
-            if grandparent.file_name().and_then(|s| s.to_str()) == Some(STAGE_DIR_NAME) {
-                Some(parent.to_path_buf())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Resolve and fence every path before the network request. In particular,
+    // cleanup directories are derived only from validated private stage paths;
+    // an IPC string can never nominate an arbitrary directory for deletion.
+    let staged_dirs = validate_attachment_paths(&security, &mut attachments)
+        .map_err(|error| error.to_string())?;
 
     let result = submit_inner(title, body, metadata, attachments)
         .await
@@ -595,6 +728,7 @@ async fn submit_inner(
 
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("http client build")?;
 
@@ -638,6 +772,8 @@ async fn submit_inner(
     // in the same order we submitted, but we match defensively in
     // case the backend ever permutes (it doesn't today).
     for (i, slot) in created.attachments.iter().enumerate() {
+        crate::media_upload::validate_signed_url(&slot.presigned_put_url)
+            .context("reject unsafe support upload URL")?;
         let local = attachments
             .get(i)
             .ok_or_else(|| anyhow!("create response had unexpected attachment count"))?;
@@ -692,4 +828,65 @@ async fn submit_inner(
     }
 
     Ok(created.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aftercalls-support-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn screenshot_submit_requires_the_exact_native_selected_file() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("evidence.png");
+        std::fs::write(&path, b"not-a-real-png-but-path-validation-is-exact").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let security = IpcSecurity::default();
+        security.approve_path(PathPurpose::SupportAttachment, canonical.clone());
+
+        let mut attachments = vec![AttachmentSubmit {
+            path: canonical.to_string_lossy().into_owned(),
+            filename: "evidence.png".into(),
+            mime: "image/png".into(),
+            size_bytes: canonical.metadata().unwrap().len() as i64,
+            kind: "screenshot".into(),
+        }];
+        assert!(validate_attachment_paths(&security, &mut attachments).is_ok());
+
+        attachments[0].filename = "other.png".into();
+        assert!(validate_attachment_paths(&security, &mut attachments).is_err());
+    }
+
+    #[test]
+    fn unapproved_screenshot_path_is_rejected() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("secret.png");
+        std::fs::write(&path, b"private").unwrap();
+        let mut attachments = vec![AttachmentSubmit {
+            path: path.to_string_lossy().into_owned(),
+            filename: "secret.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 7,
+            kind: "screenshot".into(),
+        }];
+        assert!(validate_attachment_paths(&IpcSecurity::default(), &mut attachments).is_err());
+    }
 }

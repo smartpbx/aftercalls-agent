@@ -30,6 +30,8 @@
     y: number;
   };
   type WindowInfo = { title: string };
+  type RegionPicked = { request_token: string; geometry: string };
+  type RegionCancelled = { request_token: string };
   type Mode =
     | "hidden"
     | "choosing"
@@ -47,43 +49,103 @@
   let errorLine = $state("");
   let platform = $state("");
   let busy = $state(false);
+  // Every request/close advances this token. Async list/picker/listener work
+  // captures it and must still match after each await before touching UI or
+  // invoking capture, preventing a stopped/restarted call from resurrecting
+  // an old chooser or region overlay.
+  let operationGeneration = 0;
+  let requestWasRecording = false;
+  let requestArmingTimer: ReturnType<typeof setTimeout> | null = null;
 
   let unlistenRequest: UnlistenFn | null = null;
   let unlistenPicked: UnlistenFn | null = null;
   let unlistenCancelled: UnlistenFn | null = null;
+  let componentDestroyed = false;
 
   const hasKind = (k: string) => sources.includes(k);
 
   onMount(async () => {
     try {
-      platform = await invoke<string>("platform_os");
-    } catch {
-      platform = "";
-    }
-    unlistenRequest = await listen<{ session_dir: string; sources: string[] }>(
-      "screen-source-request",
-      (e) => {
+      const unlisten = await listen<{
+        session_dir: string;
+        sources: string[];
+      }>("screen-source-request", (e) => {
+        operationGeneration += 1;
+        clearRequestArmingTimer();
+        cleanupRegionListeners();
+        // A replacement request owns a new session. Ensure an older area
+        // overlay cannot remain above it.
+        void invoke("close_region_select").catch(() => {});
         sessionDir = e.payload.session_dir;
         sources = e.payload.sources ?? [];
         displays = [];
         windowsList = [];
         errorLine = "";
         busy = false;
+        requestWasRecording = isActiveSession(sessionDir);
         // Nothing to offer → stay hidden (audio-only).
         mode = sources.length > 0 ? "choosing" : "hidden";
-      },
-    );
+        // Backward-compatible safety net if events ever arrive out of order:
+        // give recording-state one turn to correlate, then discard a request
+        // that never became the active session.
+        if (mode !== "hidden" && !requestWasRecording) {
+          const generation = operationGeneration;
+          requestArmingTimer = setTimeout(() => {
+            requestArmingTimer = null;
+            if (
+              generation === operationGeneration &&
+              mode !== "hidden" &&
+              !isActiveSession(sessionDir)
+            ) {
+              close();
+            }
+          }, 500);
+        }
+      });
+      if (componentDestroyed) {
+        unlisten();
+        return;
+      }
+      unlistenRequest = unlisten;
+    } catch {
+      return;
+    }
+    try {
+      const detected = await invoke<string>("platform_os");
+      if (!componentDestroyed) platform = detected;
+    } catch {
+      if (!componentDestroyed) platform = "";
+    }
   });
 
   onDestroy(() => {
+    componentDestroyed = true;
     unlistenRequest?.();
+    clearRequestArmingTimer();
+    operationGeneration += 1;
     cleanupRegionListeners();
   });
 
   // Force-close if the call leaves the recording state while the chooser is
   // still open (stop / restart mid-choice) — audio-only, no orphaned card.
   $effect(() => {
-    if (callRecording.state !== "recording" && mode !== "hidden") {
+    const state = callRecording.state;
+    const activeDir = callRecording.sessionDir;
+    if (mode === "hidden") return;
+    if (state === "recording" && activeDir === sessionDir) {
+      requestWasRecording = true;
+      clearRequestArmingTimer();
+      return;
+    }
+    // A different active session is always stale. Once this request has been
+    // observed recording, any non-recording state is a real stop. During the
+    // narrow legacy out-of-order start window (`idle`, never armed), the
+    // bounded arming timer above decides instead of instantly dismissing.
+    if (
+      (state === "recording" && activeDir !== sessionDir) ||
+      requestWasRecording ||
+      state !== "idle"
+    ) {
       // If a region-select overlay is mid-drag, force it closed too, else a
       // stuck fullscreen always-on-top window survives the call ending.
       // Mirrors +layout.svelte's scheduleOverlayClose() → close_overlay.
@@ -99,14 +161,63 @@
     unlistenCancelled = null;
   }
 
+  function clearRequestArmingTimer() {
+    if (requestArmingTimer) {
+      clearTimeout(requestArmingTimer);
+      requestArmingTimer = null;
+    }
+  }
+
+  function isActiveSession(expectedSession: string): boolean {
+    return (
+      callRecording.state === "recording" &&
+      callRecording.sessionDir === expectedSession
+    );
+  }
+
+  function isCurrent(
+    generation: number,
+    expectedSession: string,
+  ): boolean {
+    return (
+      generation === operationGeneration &&
+      mode !== "hidden" &&
+      sessionDir === expectedSession &&
+      isActiveSession(expectedSession)
+    );
+  }
+
+  async function resolvePlatform(
+    generation: number,
+    expectedSession: string,
+  ): Promise<string | null> {
+    if (platform) return platform;
+    try {
+      const detected = await invoke<string>("platform_os");
+      if (!isCurrent(generation, expectedSession)) return null;
+      platform = detected;
+      return detected;
+    } catch {
+      if (isCurrent(generation, expectedSession)) {
+        errorLine = "Couldn't determine which screen picker is available.";
+        mode = "error";
+      }
+      return null;
+    }
+  }
+
   function close() {
+    operationGeneration += 1;
+    clearRequestArmingTimer();
     mode = "hidden";
+    sessionDir = "";
     sources = [];
     displays = [];
     windowsList = [];
     errorLine = "";
     resolvingLabel = "";
     busy = false;
+    requestWasRecording = false;
     cleanupRegionListeners();
   }
 
@@ -118,18 +229,25 @@
   }
 
   function justAudio() {
+    void invoke("close_region_select").catch(() => {});
     close();
   }
 
-  async function startSource(kind: string, target: string | null) {
-    if (busy) return;
+  async function startSource(
+    kind: string,
+    target: string | null,
+    generation = operationGeneration,
+    expectedSession = sessionDir,
+  ) {
+    if (busy || !isCurrent(generation, expectedSession)) return;
     busy = true;
     try {
       const res = await invoke<string>("start_screen_source", {
-        sessionDir,
+        sessionDir: expectedSession,
         kind,
         target,
       });
+      if (!isCurrent(generation, expectedSession)) return;
       if (res === "started") {
         close();
       } else if (res === "unavailable") {
@@ -140,24 +258,38 @@
         close();
       }
     } catch {
+      if (!isCurrent(generation, expectedSession)) return;
       errorLine = "Couldn't start screen recording.";
       mode = "error";
     } finally {
-      busy = false;
+      if (isCurrent(generation, expectedSession)) busy = false;
     }
   }
 
   // ── Screen ──────────────────────────────────────────────────────────
   async function chooseScreen() {
+    // The latest chooser interaction wins if two pointer events arrive before
+    // Svelte has painted the next mode.
+    const generation = ++operationGeneration;
+    const expectedSession = sessionDir;
+    if (!isCurrent(generation, expectedSession)) return;
+    let next: DisplayInfo[] = [];
     try {
-      displays = await invoke<DisplayInfo[]>("list_displays");
+      next = await invoke<DisplayInfo[]>("list_displays");
     } catch {
-      displays = [];
+      next = [];
     }
+    if (!isCurrent(generation, expectedSession)) return;
+    displays = next;
     if (displays.length > 1) {
       mode = "screen-list";
     } else {
-      await startSource("screen", displays[0]?.name ?? null);
+      await startSource(
+        "screen",
+        displays[0]?.name ?? null,
+        generation,
+        expectedSession,
+      );
     }
   }
 
@@ -171,25 +303,38 @@
 
   // ── Window ──────────────────────────────────────────────────────────
   async function chooseWindow() {
-    if (platform === "windows") {
+    const generation = ++operationGeneration;
+    const expectedSession = sessionDir;
+    if (!isCurrent(generation, expectedSession)) return;
+    const currentPlatform = await resolvePlatform(generation, expectedSession);
+    if (!currentPlatform || !isCurrent(generation, expectedSession)) return;
+    if (currentPlatform === "windows") {
+      let next: WindowInfo[] = [];
       try {
-        windowsList = await invoke<WindowInfo[]>("list_windows");
+        next = await invoke<WindowInfo[]>("list_windows");
       } catch {
-        windowsList = [];
+        next = [];
       }
+      if (!isCurrent(generation, expectedSession)) return;
+      windowsList = next;
       mode = "window-list";
     } else {
       // Linux hands off to the compositor's native window picker.
       resolvingLabel = "Choose a window to record…";
       mode = "resolving";
-      await startSource("window", null);
+      await startSource("window", null, generation, expectedSession);
     }
   }
 
   // ── Region (area) ───────────────────────────────────────────────────
   async function chooseRegion() {
-    if (platform === "windows") {
-      await openRegionOverlay();
+    const generation = ++operationGeneration;
+    const expectedSession = sessionDir;
+    if (!isCurrent(generation, expectedSession)) return;
+    const currentPlatform = await resolvePlatform(generation, expectedSession);
+    if (!currentPlatform || !isCurrent(generation, expectedSession)) return;
+    if (currentPlatform === "windows") {
+      await openRegionOverlay(generation, expectedSession);
     } else {
       // Linux drives the native drag-select tool.
       resolvingLabel = "Select an area on your screen…";
@@ -200,8 +345,9 @@
       } catch {
         geo = null;
       }
+      if (!isCurrent(generation, expectedSession)) return;
       if (geo) {
-        await startSource("region", geo);
+        await startSource("region", geo, generation, expectedSession);
       } else {
         // Cancelled the drag-select → back to the choices.
         mode = "choosing";
@@ -209,7 +355,10 @@
     }
   }
 
-  async function openRegionOverlay() {
+  async function openRegionOverlay(
+    generation: number,
+    expectedSession: string,
+  ) {
     // Size/position the transparent overlay to the primary monitor rect so
     // client coords map cleanly to screen coords (page adds the origin).
     let d: DisplayInfo | undefined;
@@ -219,31 +368,85 @@
     } catch {
       d = undefined;
     }
-    const x = d?.x ?? 0;
-    const y = d?.y ?? 0;
-    const width = d?.width ?? 1920;
-    const height = d?.height ?? 1080;
+    if (!isCurrent(generation, expectedSession)) return;
+    if (!d || d.width === 0 || d.height === 0) {
+      errorLine = "Couldn't find a screen for the area selector.";
+      mode = "error";
+      return;
+    }
+    const { x, y, width, height } = d;
 
     resolvingLabel = "Select an area on your screen…";
     mode = "resolving";
+    let requestToken = "";
+    try {
+      requestToken = crypto.randomUUID();
+    } catch {
+      if (isCurrent(generation, expectedSession)) {
+        errorLine = "Couldn't open the area selector.";
+        mode = "error";
+      }
+      return;
+    }
 
     cleanupRegionListeners();
-    unlistenPicked = await listen<string>("region-picked", async (e) => {
-      cleanupRegionListeners();
-      await startSource("region", e.payload);
-    });
-    unlistenCancelled = await listen("region-cancelled", () => {
-      cleanupRegionListeners();
-      mode = "choosing";
-    });
-
-    // Rust creates the overlay window (mirrors the co-pilot overlay's
-    // open_overlay command), so no webview-create capability is needed. The
-    // window submits its result via `submit_region_selection`, which closes
-    // it and re-emits `region-picked` / `region-cancelled`.
     try {
-      await invoke("open_region_select", { x, y, width, height });
+      const picked = await listen<RegionPicked>("region-picked", async (e) => {
+        if (
+          e.payload.request_token !== requestToken ||
+          !isCurrent(generation, expectedSession)
+        )
+          return;
+        cleanupRegionListeners();
+        await startSource(
+          "region",
+          e.payload.geometry,
+          generation,
+          expectedSession,
+        );
+      });
+      if (!isCurrent(generation, expectedSession)) {
+        picked();
+        return;
+      }
+      unlistenPicked = picked;
+
+      const cancelled = await listen<RegionCancelled>(
+        "region-cancelled",
+        (e) => {
+          if (
+            e.payload.request_token !== requestToken ||
+            !isCurrent(generation, expectedSession)
+          )
+            return;
+          cleanupRegionListeners();
+          mode = "choosing";
+        },
+      );
+      if (!isCurrent(generation, expectedSession)) {
+        cancelled();
+        cleanupRegionListeners();
+        return;
+      }
+      unlistenCancelled = cancelled;
+
+      // Rust creates the overlay window (mirrors the co-pilot overlay's
+      // open_overlay command), so no webview-create capability is needed. The
+      // window submits its result via `submit_region_selection`, which closes
+      // it and re-emits `region-picked` / `region-cancelled`.
+      await invoke("open_region_select", {
+        sessionDir: expectedSession,
+        requestToken,
+        x,
+        y,
+        width,
+        height,
+      });
+      if (!isCurrent(generation, expectedSession)) {
+        void invoke("close_region_select").catch(() => {});
+      }
     } catch {
+      if (!isCurrent(generation, expectedSession)) return;
       cleanupRegionListeners();
       errorLine = "Couldn't open the area selector.";
       mode = "error";

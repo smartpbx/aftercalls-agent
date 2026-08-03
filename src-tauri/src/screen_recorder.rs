@@ -48,9 +48,14 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+#[cfg(target_os = "linux")]
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Relative filename of the raw capture inside `<session_dir>/screen/`.
 pub const RECORDING_FILENAME: &str = "recording.mp4";
@@ -172,11 +177,32 @@ pub struct ScreenRecorder {
     active: Mutex<Option<Active>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenStopReport {
+    pub attempted: bool,
+    pub published: bool,
+    pub path: Option<PathBuf>,
+    pub error: Option<String>,
+}
+
+impl ScreenStopReport {
+    fn idle() -> Self {
+        Self {
+            attempted: false,
+            published: false,
+            path: None,
+            error: None,
+        }
+    }
+}
+
 struct Active {
+    generation: u64,
     backend: Box<dyn CaptureBackend>,
     session_dir: PathBuf,
     output_path: PathBuf,
     started_at: Instant,
+    audio_started_at_ms: i64,
     start_offset_ms: i64,
     fps: u32,
     dims: Option<(u32, u32)>,
@@ -197,9 +223,12 @@ impl ScreenRecorder {
         }
     }
 
-    /// Whether a capture is currently in flight.
-    pub fn is_active(&self) -> bool {
-        self.active.lock().unwrap().is_some()
+    pub fn active_generation(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|active| active.generation)
     }
 
     /// Whether the platform capture backend is available on this machine
@@ -232,10 +261,15 @@ impl ScreenRecorder {
     pub fn start(
         &self,
         session_dir: &Path,
+        generation: u64,
         source: CaptureSource,
         cfg: &StartConfig,
         audio_started_at_ms: i64,
     ) -> bool {
+        if generation == 0 {
+            eprintln!("aftercalls: screen capture skipped — invalid lifecycle generation");
+            return false;
+        }
         let mut guard = self.active.lock().unwrap();
         if guard.is_some() {
             eprintln!("aftercalls: screen capture already active — skipping");
@@ -243,7 +277,7 @@ impl ScreenRecorder {
         }
 
         let screen_dir = session_dir.join(SCREEN_SUBDIR);
-        if let Err(e) = std::fs::create_dir_all(&screen_dir) {
+        if let Err(e) = crate::session_fs::ensure_private_dir(&screen_dir) {
             eprintln!("aftercalls: screen capture skipped — mkdir failed: {e}");
             return false;
         }
@@ -264,10 +298,12 @@ impl ScreenRecorder {
                     output_path.display()
                 );
                 *guard = Some(Active {
+                    generation,
                     backend,
                     session_dir: session_dir.to_path_buf(),
                     output_path,
                     started_at: Instant::now(),
+                    audio_started_at_ms,
                     start_offset_ms,
                     fps: clamp_fps(cfg.fps),
                     dims,
@@ -284,43 +320,97 @@ impl ScreenRecorder {
         }
     }
 
-    /// Stop + finalize the active capture and persist
-    /// `screen/recording.json` for the uploader. No-op when idle. Fully
-    /// best-effort: a finalize error is logged, never surfaced — the call
-    /// still saves.
-    pub fn stop_and_persist(&self, session_dir: &Path) {
-        let active = {
-            let mut guard = self.active.lock().unwrap();
-            guard.take()
-        };
+    /// Stop + finalize the active capture and persist metadata only after a
+    /// clean producer exit. The call remains audio-usable on failure, but the
+    /// failure is explicit so the aggregate Stop report can retain/retry it.
+    pub fn stop_and_persist(
+        &self,
+        expected_generation: Option<u64>,
+        expected_session_dir: Option<&Path>,
+    ) -> ScreenStopReport {
+        let mut guard = self.active.lock().unwrap();
+        if let Some(active) = guard.as_ref() {
+            let generation_mismatch = expected_generation
+                .map(|expected| expected != active.generation)
+                .unwrap_or(false);
+            let session_mismatch = expected_session_dir
+                .map(|expected| expected != active.session_dir)
+                .unwrap_or(false);
+            if generation_mismatch || session_mismatch {
+                return ScreenStopReport {
+                    attempted: false,
+                    published: false,
+                    path: None,
+                    error: Some(format!(
+                        "stale screen stop rejected (active generation {} at {}, requested generation {:?} at {:?})",
+                        active.generation,
+                        active.session_dir.display(),
+                        expected_generation,
+                        expected_session_dir
+                    )),
+                };
+            }
+        }
+        let active = guard.take();
+        drop(guard);
         let Some(mut active) = active else {
-            return;
+            return ScreenStopReport::idle();
         };
-        // Defensive: if a session mismatch somehow occurs (a stop for a
-        // different dir than the active capture) we still finalize the
-        // capture we actually own, and persist next to it.
-        if active.session_dir != session_dir {
-            eprintln!(
-                "aftercalls: screen stop session mismatch (active {:?} vs {:?}); finalizing active",
-                active.session_dir, session_dir
-            );
-        }
 
-        let duration_ms = active.started_at.elapsed().as_millis() as i64;
+        let stop_requested_at_ms = chrono::Utc::now().timestamp_millis();
+        let fallback_duration_ms = active.started_at.elapsed().as_millis() as i64;
         if let Err(e) = active.backend.finalize() {
-            eprintln!("aftercalls: screen capture finalize failed: {e:#}");
-            // Fall through and still write the sidecar — the mp4 may be
-            // partially usable and the uploader remux is best-effort too.
+            let error = format!("screen capture finalize failed: {e:#}");
+            eprintln!("aftercalls: {error}");
+            return ScreenStopReport {
+                attempted: true,
+                published: false,
+                path: Some(active.output_path),
+                error: Some(error),
+            };
         }
 
-        // Only persist metadata if the capture actually produced a file.
-        if !active.output_path.exists() {
-            eprintln!(
-                "aftercalls: screen capture produced no file at {} — nothing to upload",
+        let byte_size = std::fs::metadata(&active.output_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if byte_size == 0 {
+            let error = format!(
+                "screen capture produced no usable file at {}",
                 active.output_path.display()
             );
-            return;
+            eprintln!("aftercalls: {error}");
+            return ScreenStopReport {
+                attempted: true,
+                published: false,
+                path: Some(active.output_path),
+                error: Some(error),
+            };
         }
+
+        if let Err(error) = crate::media_manifest::enforce_private_file(&active.output_path) {
+            let error = format!("protect finalized screen capture: {error:#}");
+            eprintln!("aftercalls: {error}");
+            return ScreenStopReport {
+                attempted: true,
+                published: false,
+                path: Some(active.output_path),
+                error: Some(error),
+            };
+        }
+
+        // Portal window selection occurs inside the child after spawn. Use
+        // the finalized container duration to recover the true first-frame
+        // offset instead of counting the user's picker delay as video time.
+        let duration_ms = probe_media_duration_ms(&active.output_path)
+            .ok()
+            .filter(|duration| *duration > 0)
+            .unwrap_or(fallback_duration_ms);
+        let corrected_offset = corrected_start_offset_ms(
+            active.audio_started_at_ms,
+            stop_requested_at_ms,
+            duration_ms,
+        );
+        let start_offset_ms = active.start_offset_ms.max(corrected_offset);
 
         let (width, height) = match active.dims {
             Some((w, h)) => (Some(w as i32), Some(h as i32)),
@@ -328,7 +418,7 @@ impl ScreenRecorder {
         };
         let meta = ScreenRecordingMeta {
             file: RECORDING_FILENAME.to_string(),
-            start_offset_ms: active.start_offset_ms,
+            start_offset_ms,
             duration_ms,
             fps: active.fps as i32,
             width,
@@ -336,13 +426,43 @@ impl ScreenRecorder {
             codec: VIDEO_CODEC.to_string(),
         };
         let meta_path = active.session_dir.join(SCREEN_SUBDIR).join(META_FILENAME);
-        match serde_json::to_string_pretty(&meta) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&meta_path, json) {
-                    eprintln!("aftercalls: write {} failed: {e}", meta_path.display());
-                }
-            }
-            Err(e) => eprintln!("aftercalls: serialize screen recording meta failed: {e}"),
+        let staged_meta =
+            meta_path.with_file_name(format!("{META_FILENAME}.part.{}", uuid::Uuid::new_v4()));
+        let persisted = (|| -> Result<()> {
+            let json =
+                serde_json::to_vec_pretty(&meta).context("serialize screen recording metadata")?;
+            let _stage_guard = crate::media_manifest::reserve_private_stage(&staged_meta)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&staged_meta)
+                .with_context(|| format!("create {}", staged_meta.display()))?;
+            file.write_all(&json)
+                .with_context(|| format!("write {}", staged_meta.display()))?;
+            file.write_all(b"\n")
+                .with_context(|| format!("finish {}", staged_meta.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", staged_meta.display()))?;
+            drop(file);
+            crate::media_manifest::atomic_replace_file(&staged_meta, &meta_path)?;
+            crate::media_manifest::mark_screen_published(&active.session_dir, &active.output_path)?;
+            Ok(())
+        })();
+        if let Err(e) = persisted {
+            let error = format!("persist screen capture checkpoint: {e:#}");
+            eprintln!("aftercalls: {error}");
+            return ScreenStopReport {
+                attempted: true,
+                published: false,
+                path: Some(active.output_path),
+                error: Some(error),
+            };
+        }
+        ScreenStopReport {
+            attempted: true,
+            published: true,
+            path: Some(active.output_path),
+            error: None,
         }
     }
 }
@@ -359,6 +479,66 @@ trait CaptureBackend: Send {
     /// Non-blocking liveness probe (`try_wait`). Lets `status` drop the cue
     /// for a capture that died mid-call (denied / closed / gdigrab exit).
     fn is_running(&mut self) -> bool;
+}
+
+fn wait_capture_child(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => anyhow::bail!("screen capture child exited with {status}"),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                child.wait().context("reap timed-out screen capture")?;
+                anyhow::bail!(
+                    "screen capture did not finalize within {}s; killed and reaped",
+                    timeout.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(poll_error) => {
+                let _ = child.kill();
+                let reap = child.wait();
+                return match reap {
+                    Ok(_) => Err(poll_error)
+                        .context("poll screen capture child (child killed and reaped)"),
+                    Err(reap_error) => anyhow::bail!(
+                        "poll screen capture child failed: {poll_error}; kill/reap also failed: {reap_error}"
+                    ),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_capture_stderr_drain<R>(mut stderr: R) -> JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        const CAP: usize = crate::media_process::STDERR_LIMIT_BYTES;
+        let mut kept = Vec::with_capacity(4096);
+        let mut buf = [0u8; 4096];
+        let mut truncated = false;
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = CAP.saturating_sub(kept.len());
+                    let take = room.min(n);
+                    kept.extend_from_slice(&buf[..take]);
+                    truncated |= take < n;
+                }
+                Err(_) => break,
+            }
+        }
+        let mut message = String::from_utf8_lossy(&kept).trim().to_string();
+        if truncated {
+            message.push_str(" [truncated]");
+        }
+        message
+    })
 }
 
 // ── Linux backend — gpu-screen-recorder subprocess ───────────────────
@@ -430,6 +610,8 @@ fn spawn_capture(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        // Drain concurrently and retain a bounded diagnostic. An unread pipe
+        // can fill and deadlock finalization; /dev/null hid the root cause.
         .stderr(Stdio::piped());
 
     // Tie the recorder's lifetime to the agent: if the agent is SIGKILL'd
@@ -438,37 +620,117 @@ fn spawn_capture(
     // Identical to the `parec` children in recorder.rs.
     unsafe {
         use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
+        let parent_pid = std::process::id() as libc::pid_t;
+        command.pre_exec(move || {
+            libc::umask(0o077);
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "screen recorder parent exited before child exec",
+                ));
             }
             Ok(())
         });
     }
 
-    let child = command.spawn().context("spawn gpu-screen-recorder")?;
-    Ok((Box::new(GpuScreenRecorder { child }), out_dims))
+    let mut child = command.spawn().context("spawn gpu-screen-recorder")?;
+    let stderr_join = child.stderr.take().map(spawn_capture_stderr_drain);
+    Ok((
+        Box::new(GpuScreenRecorder { child, stderr_join }),
+        out_dims,
+    ))
 }
 
 #[cfg(target_os = "linux")]
 struct GpuScreenRecorder {
     child: std::process::Child,
+    stderr_join: Option<JoinHandle<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuScreenRecorder {
+    fn drop(&mut self) {
+        // A backend dropped outside the normal Stop path must not leave a
+        // privacy-sensitive capture process behind. Normal finalization has
+        // already reaped the child, making this branch a cheap no-op.
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+        if let Some(join) = self.stderr_join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl CaptureBackend for GpuScreenRecorder {
     fn finalize(&mut self) -> Result<()> {
+        // `status()` may already have reaped a child that exited early.
+        // Never signal a stale/reusable PID in that case.
+        match self.child.try_wait() {
+            Ok(Some(status)) if status.success() => return self.finish_with_stderr(Ok(())),
+            Ok(Some(status)) => {
+                return self.finish_with_stderr(Err(anyhow::anyhow!(
+                    "screen capture child exited with {status}"
+                )))
+            }
+            Ok(None) => {}
+            Err(poll_error) => {
+                let _ = self.child.kill();
+                let reap = self.child.wait();
+                let result = match reap {
+                    Ok(_) => Err(poll_error)
+                        .context("poll screen capture before stop (child killed and reaped)"),
+                    Err(reap_error) => Err(anyhow::anyhow!(
+                        "poll screen capture before stop failed: {poll_error}; kill/reap also failed: {reap_error}"
+                    )),
+                };
+                return self.finish_with_stderr(result);
+            }
+        }
         // SIGINT → gpu-screen-recorder writes the trailing moov atom and
         // exits cleanly. `kill`+`wait` mirrors `recorder.rs::stop_child_gracefully`.
-        unsafe {
-            libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+        if unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) } != 0 {
+            let signal_error = std::io::Error::last_os_error();
+            // The process may have exited between try_wait and kill. Polling
+            // through the bounded helper safely distinguishes that race from
+            // a genuinely wedged producer and still guarantees collection.
+            let result = wait_capture_child(&mut self.child, Duration::from_secs(8)).with_context(
+                || format!("signal screen capture child failed first: {signal_error}"),
+            );
+            return self.finish_with_stderr(result);
         }
-        self.child.wait().context("wait gpu-screen-recorder")?;
-        Ok(())
+        let result = wait_capture_child(&mut self.child, Duration::from_secs(8));
+        self.finish_with_stderr(result)
     }
 
     fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GpuScreenRecorder {
+    fn finish_with_stderr(&mut self, result: Result<()>) -> Result<()> {
+        let diagnostic = self
+            .stderr_join
+            .take()
+            .and_then(|join| join.join().ok())
+            .unwrap_or_default();
+        match (result, diagnostic.is_empty()) {
+            (Ok(()), _) => Ok(()),
+            (Err(error), true) => Err(error),
+            (Err(error), false) => {
+                Err(error).context(format!("screen capture stderr: {diagnostic}"))
+            }
+        }
     }
 }
 
@@ -514,8 +776,6 @@ impl Drop for FfmpegGdigrabRecorder {
 impl CaptureBackend for FfmpegGdigrabRecorder {
     fn finalize(&mut self) -> Result<()> {
         use std::io::Write;
-        use std::time::Duration;
-
         // Graceful ffmpeg stop: `q` on stdin → finalize the mp4 (trailing
         // moov atom, same faststart-remux fixup as the Linux path).
         if let Some(stdin) = self.child.stdin.as_mut() {
@@ -530,18 +790,40 @@ impl CaptureBackend for FfmpegGdigrabRecorder {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(status)) => {
+                    self.close_job();
+                    anyhow::bail!("screen ffmpeg exited with {status}");
+                }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        break;
+                        let kill_error = self.child.kill().err();
+                        // Closing the kill-on-close job is a second, exact
+                        // termination mechanism if Child::kill itself fails.
+                        self.close_job();
+                        self.child.wait().context("reap timed-out screen ffmpeg")?;
+                        match kill_error {
+                            Some(error) => anyhow::bail!(
+                                "screen ffmpeg did not finalize within 8s; job-close killed and reaped it after Child::kill failed: {error}"
+                            ),
+                            None => anyhow::bail!(
+                                "screen ffmpeg did not finalize within 8s; killed and reaped"
+                            ),
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(_) => {
+                Err(poll_error) => {
                     let _ = self.child.kill();
-                    break;
+                    self.close_job();
+                    let reap = self.child.wait();
+                    return match reap {
+                        Ok(_) => Err(poll_error)
+                            .context("poll screen ffmpeg (child killed and reaped)"),
+                        Err(reap_error) => anyhow::bail!(
+                            "poll screen ffmpeg failed: {poll_error}; kill/reap also failed: {reap_error}"
+                        ),
+                    };
                 }
             }
         }
@@ -563,29 +845,84 @@ fn spawn_capture(
     use std::process::{Command, Stdio};
 
     let bin = crate::pipeline::ffmpeg_binary();
-    let encoder =
-        pick_h264_encoder().context("no H.264 encoder available in the media sidecar")?;
+    let encoders = probed_h264_encoders();
+    if encoders.is_empty() {
+        anyhow::bail!("no runtime-usable H.264 encoder available in the media sidecar");
+    }
 
-    let (args, dims) =
-        build_gdigrab_capture(source, cfg, encoder, &output_path.to_string_lossy())?;
+    // A compiled encoder can still fail against the real gdigrab input
+    // (driver reset, device contention, unsupported frame shape). Try every
+    // runtime-proven candidate and require it to survive the bounded startup
+    // window before publishing the backend.
+    let mut failures = Vec::new();
+    for &encoder in encoders {
+        let (args, dims) =
+            build_gdigrab_capture(source, cfg, encoder, &output_path.to_string_lossy())?;
+        let mut command = Command::new(&bin);
+        command
+            .args(&args)
+            // stdin piped so `finalize` can write `q` for a graceful mp4 finish.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // learning #91 — suppress the transient console window Windows would
+        // otherwise flash for a console-subsystem child.
+        no_console_std(&mut command);
 
-    let mut command = Command::new(&bin);
-    command
-        .args(&args)
-        // stdin piped so `finalize` can write `q` for a graceful mp4 finish.
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // learning #91 — suppress the transient console window Windows would
-    // otherwise flash for a console-subsystem child. Same CREATE_NO_WINDOW
-    // flag as `pipeline::no_console` (that helper is for the async tokio
-    // Command; this backend uses a sync std Command like the Linux path).
-    no_console_std(&mut command);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                failures.push(format!("{encoder}: spawn failed: {error}"));
+                continue;
+            }
+        };
+        // Tie the child's lifetime to the agent (PDEATHSIG analog). This is a
+        // privacy boundary, not an optimization: if the Job Object cannot be
+        // configured and assigned, kill/reap the child and reject capture.
+        let job = match assign_kill_on_close_job(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                failures.push(format!("{encoder}: bind kill-on-close job failed: {error:#}"));
+                let _ = std::fs::remove_file(output_path);
+                continue;
+            }
+        };
+        let mut recorder = FfmpegGdigrabRecorder { child, job };
+        match require_capture_startup(&mut recorder.child, Duration::from_millis(900)) {
+            Ok(()) => return Ok((Box::new(recorder), dims)),
+            Err(error) => {
+                failures.push(format!("{encoder}: {error:#}"));
+                recorder.close_job();
+                let _ = std::fs::remove_file(output_path);
+            }
+        }
+    }
+    anyhow::bail!(
+        "all runtime-usable H.264 encoders failed capture startup: {}",
+        failures.join("; ")
+    )
+}
 
-    let child = command.spawn().context("spawn media sidecar (gdigrab)")?;
-    // Tie the child's lifetime to the agent (PDEATHSIG analog).
-    let job = assign_kill_on_close_job(&child);
-    Ok((Box::new(FfmpegGdigrabRecorder { child, job }), dims))
+#[cfg(windows)]
+fn require_capture_startup(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => anyhow::bail!("capture exited during startup with {status}"),
+            Ok(None) if Instant::now() >= deadline => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("poll capture during startup");
+            }
+        }
+    }
 }
 
 /// Resolve a [`CaptureSource`] → the gdigrab argv + best-effort dims.
@@ -597,6 +934,7 @@ fn build_gdigrab_capture(
     output: &str,
 ) -> Result<(Vec<String>, Option<(u32, u32)>)> {
     let fps = clamp_fps(cfg.fps);
+    let cap = resolution_cap_box(cfg.resolution.as_deref());
     match source {
         CaptureSource::Window { target } => {
             let title = target
@@ -605,9 +943,24 @@ fn build_gdigrab_capture(
                 .context("window capture requires a window title on Windows")?;
             let input = GdigrabInput::Window { title };
             Ok((
-                build_gdigrab_args(&input, fps, cfg.bitrate_kbps, encoder, output),
+                build_gdigrab_args(
+                    &input,
+                    fps,
+                    cfg.bitrate_kbps,
+                    encoder,
+                    Some(match cap {
+                        Some((width, height)) => {
+                            GdigrabScale::FitWithin { width, height }
+                        }
+                        // A dynamically-sized window can be odd. Native still
+                        // needs even yuv420p dimensions.
+                        None => GdigrabScale::Even,
+                    }),
+                    output,
+                ),
                 // Window size is dynamic (gdigrab captures the current
-                // rect); leave dims unknown.
+                // rect); the filter caps each frame but exact dims remain
+                // unknown until capture.
                 None,
             ))
         }
@@ -622,9 +975,21 @@ fn build_gdigrab_capture(
                 width: w,
                 height: h,
             };
+            let output_dims = fit_within((w, h), cap);
+            let scale = (output_dims != (w, h)).then_some(GdigrabScale::Exact {
+                width: output_dims.0,
+                height: output_dims.1,
+            });
             Ok((
-                build_gdigrab_args(&input, fps, cfg.bitrate_kbps, encoder, output),
-                Some((w, h)),
+                build_gdigrab_args(
+                    &input,
+                    fps,
+                    cfg.bitrate_kbps,
+                    encoder,
+                    scale,
+                    output,
+                ),
+                Some(output_dims),
             ))
         }
         CaptureSource::Region { geometry } => {
@@ -637,9 +1002,21 @@ fn build_gdigrab_capture(
                 width: w,
                 height: h,
             };
+            let output_dims = fit_within((w, h), cap);
+            let scale = (output_dims != (w, h)).then_some(GdigrabScale::Exact {
+                width: output_dims.0,
+                height: output_dims.1,
+            });
             Ok((
-                build_gdigrab_args(&input, fps, cfg.bitrate_kbps, encoder, output),
-                Some((w, h)),
+                build_gdigrab_args(
+                    &input,
+                    fps,
+                    cfg.bitrate_kbps,
+                    encoder,
+                    scale,
+                    output,
+                ),
+                Some(output_dims),
             ))
         }
     }
@@ -654,10 +1031,11 @@ fn no_console_std(cmd: &mut std::process::Command) {
 }
 
 /// Create a Job Object with `KILL_ON_JOB_CLOSE`, assign the child to it, and
-/// return the raw handle value (kept open for the child's lifetime; 0 on any
-/// failure — best-effort, never fatal).
+/// return the raw handle value kept open for the child's lifetime. Any failure
+/// is fatal to this capture attempt: running a screen recorder without a
+/// parent-death boundary could continue recording after the agent exits.
 #[cfg(windows)]
-fn assign_kill_on_close_job(child: &std::process::Child) -> isize {
+fn assign_kill_on_close_job(child: &std::process::Child) -> Result<isize> {
     use std::os::windows::io::AsRawHandle;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -668,26 +1046,25 @@ fn assign_kill_on_close_job(child: &std::process::Child) -> isize {
     };
 
     unsafe {
-        let job = match CreateJobObjectW(None, PCWSTR::null()) {
-            Ok(h) => h,
-            Err(_) => return 0,
-        };
+        let job = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let set_ok = SetInformationJobObject(
+        let set_result = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .is_ok();
-        let child_handle = HANDLE(child.as_raw_handle());
-        let assigned = AssignProcessToJobObject(job, child_handle).is_ok();
-        if !set_ok || !assigned {
+        );
+        if let Err(error) = set_result {
             let _ = CloseHandle(job);
-            return 0;
+            return Err(error).context("SetInformationJobObject(KILL_ON_JOB_CLOSE)");
         }
-        job.0 as isize
+        let child_handle = HANDLE(child.as_raw_handle());
+        if let Err(error) = AssignProcessToJobObject(job, child_handle) {
+            let _ = CloseHandle(job);
+            return Err(error).context("AssignProcessToJobObject");
+        }
+        Ok(job.0 as isize)
     }
 }
 
@@ -707,6 +1084,50 @@ fn spawn_capture(
 }
 
 // ── Pure helpers (unit-tested) ───────────────────────────────────────
+
+fn probe_media_duration_ms(path: &Path) -> Result<i64> {
+    let mut command = std::process::Command::new(crate::pipeline::ffmpeg_binary());
+    command.arg("-hide_banner").arg("-i").arg(path);
+    let output = crate::media_process::run_bounded(
+        command,
+        Duration::from_secs(5),
+        crate::media_process::STDERR_LIMIT_BYTES,
+    )
+    .context("probe finalized screen duration")?;
+    parse_ffmpeg_duration_ms(&String::from_utf8_lossy(&output.stderr))
+        .context("media probe did not report a duration")
+}
+
+fn parse_ffmpeg_duration_ms(stderr: &str) -> Option<i64> {
+    let marker = "Duration: ";
+    let value = stderr.split(marker).nth(1)?.split(',').next()?.trim();
+    if value == "N/A" {
+        return None;
+    }
+    let mut parts = value.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
+        || !hours.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
+        || hours < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+    {
+        return None;
+    }
+    Some(((hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0).round() as i64)
+}
+
+fn corrected_start_offset_ms(
+    audio_started_at_ms: i64,
+    stop_requested_at_ms: i64,
+    media_duration_ms: i64,
+) -> i64 {
+    (stop_requested_at_ms - audio_started_at_ms - media_duration_ms).max(0)
+}
 
 /// video-start minus audio-start, floored at 0 (the video subprocess
 /// always spawns AFTER the audio recorder, so the delta is a small
@@ -785,6 +1206,32 @@ pub fn parse_region_geometry(geo: &str) -> Option<(u32, u32, i32, i32)> {
     Some((w, h, x, y))
 }
 
+/// Require a region to fit wholly inside one currently enumerated physical
+/// monitor. Used at the Windows IPC boundary so a forged geometry cannot ask
+/// gdigrab to read an arbitrary/overflowing virtual-desktop rectangle.
+pub fn region_within_any_display(geo: &str, displays: &[DisplayInfo]) -> bool {
+    let Some((width, height, x, y)) = parse_region_geometry(geo) else {
+        return false;
+    };
+    let left = i64::from(x);
+    let top = i64::from(y);
+    let right = left + i64::from(width);
+    let bottom = top + i64::from(height);
+    displays.iter().any(|display| {
+        if display.width == 0 || display.height == 0 {
+            return false;
+        }
+        let display_left = i64::from(display.x);
+        let display_top = i64::from(display.y);
+        let display_right = display_left + i64::from(display.width);
+        let display_bottom = display_top + i64::from(display.height);
+        left >= display_left
+            && top >= display_top
+            && right <= display_right
+            && bottom <= display_bottom
+    })
+}
+
 /// Construct the `gpu-screen-recorder` argv (excluding argv[0]). Pure so
 /// the exact flag set is unit-testable.
 ///
@@ -856,6 +1303,17 @@ pub enum GdigrabInput {
     Window { title: String },
 }
 
+/// Optional Windows output scaling. Fixed desktop/region inputs use `Exact`
+/// after `fit_within` so persisted metadata matches the encoded dimensions.
+/// Window capture is dynamic, so `FitWithin` bounds every frame without
+/// stretching or upscaling it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdigrabScale {
+    Exact { width: u32, height: u32 },
+    FitWithin { width: u32, height: u32 },
+    Even,
+}
+
 /// Construct the Windows `gdigrab` ffmpeg argv (excluding argv[0]). Pure so
 /// the exact flag set is unit-testable on any host.
 ///
@@ -869,6 +1327,7 @@ pub fn build_gdigrab_args(
     fps: u32,
     bitrate_kbps: u32,
     encoder: &str,
+    scale: Option<GdigrabScale>,
     output: &str,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec![
@@ -898,6 +1357,26 @@ pub fn build_gdigrab_args(
             a.push(format!("title={title}"));
         }
     }
+    if let Some(scale) = scale {
+        let filter = match scale {
+            GdigrabScale::Exact { width, height } => {
+                format!("scale={width}:{height}")
+            }
+            GdigrabScale::FitWithin { width, height } => format!(
+                concat!(
+                    "scale=w=min({}\\,iw):h=min({}\\,ih):",
+                    "force_original_aspect_ratio=decrease:force_divisible_by=2"
+                ),
+                width,
+                height,
+            ),
+            GdigrabScale::Even => {
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string()
+            }
+        };
+        a.push("-vf".into());
+        a.push(filter);
+    }
     a.push("-c:v".into());
     a.push(encoder.to_string());
     if encoder == "libx264" {
@@ -923,16 +1402,39 @@ pub fn build_gdigrab_args(
 /// build ships no usable H.264 encoder → Windows advertises unavailable.
 /// Pure so the ordering is unit-tested without a Windows host.
 pub fn choose_h264_encoder(encoders_output: &str) -> Option<&'static str> {
-    const PREFERRED: [&str; 5] = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"];
+    listed_h264_encoders(encoders_output).into_iter().next()
+}
+
+/// Return listed candidates in deterministic preference order. The listing is
+/// only discovery; production separately runtime-probes every returned codec.
+pub fn listed_h264_encoders(encoders_output: &str) -> Vec<&'static str> {
+    const PREFERRED: [&str; 5] =
+        ["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"];
+    let mut listed = Vec::new();
     for name in PREFERRED {
         if encoders_output
             .split(|c: char| c.is_whitespace())
             .any(|tok| tok == name)
         {
-            return Some(name);
+            listed.push(name);
         }
     }
-    None
+    listed
+}
+
+/// Filter the listing through an injected runtime probe. Kept pure/injectable
+/// so fallback ordering is deterministic in non-Windows unit tests.
+pub fn usable_h264_encoders_from<F>(
+    encoders_output: &str,
+    mut usable: F,
+) -> Vec<&'static str>
+where
+    F: FnMut(&str) -> bool,
+{
+    listed_h264_encoders(encoders_output)
+        .into_iter()
+        .filter(|encoder| usable(encoder))
+        .collect()
 }
 
 /// Pick the capture-target monitor name. Prefers the user's saved name when
@@ -991,8 +1493,78 @@ fn resolve_display(preferred: Option<&str>, displays: &[DisplayInfo]) -> Option<
 /// when the sidecar ships no usable encoder.
 #[cfg(windows)]
 pub fn pick_h264_encoder() -> Option<&'static str> {
-    static ENC: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *ENC.get_or_init(|| win_encoders_text().and_then(|t| choose_h264_encoder(&t)))
+    probed_h264_encoders().first().copied()
+}
+
+#[cfg(windows)]
+fn probed_h264_encoders() -> &'static [&'static str] {
+    static ENCODERS: std::sync::OnceLock<Vec<&'static str>> =
+        std::sync::OnceLock::new();
+    ENCODERS
+        .get_or_init(|| {
+            win_encoders_text()
+                .map(|text| usable_h264_encoders_from(&text, probe_h264_encoder))
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
+/// A codec listed by `-encoders` may only be compiled in; hardware backends
+/// commonly fail at initialization on machines without the matching driver.
+/// Encode one synthetic frame with a hard deadline to prove initialization.
+#[cfg(windows)]
+fn probe_h264_encoder(encoder: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    let bin = crate::pipeline::ffmpeg_binary();
+    let mut command = Command::new(&bin);
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:r=1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            encoder,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    no_console_std(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    // One 64×64 frame should initialize almost immediately; two seconds is
+    // deliberately generous while keeping the five-candidate preflight
+    // bounded to a tolerable worst case.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Run `ffmpeg -hide_banner -encoders` on the sidecar, returning stdout.
@@ -1199,8 +1771,9 @@ pub fn capture_available() -> bool {
 #[cfg(windows)]
 pub fn capture_available() -> bool {
     // The sidecar exposes gdigrab AND ships a usable H.264 encoder. Both
-    // probes are cached (one ffmpeg spawn each, first call only). A failure
-    // hides the whole surface exactly like the Linux binary-absent path.
+    // probes are cached on first use. Encoder discovery runtime-initializes
+    // each listed candidate with a bounded one-frame encode; a failure hides
+    // the whole surface exactly like the Linux binary-absent path.
     win_has_gdigrab() && pick_h264_encoder().is_some()
 }
 
@@ -1367,6 +1940,18 @@ fn hyprctl_monitors() -> Vec<DisplayInfo> {
 mod tests {
     use super::*;
 
+    struct NeverFinalize;
+
+    impl CaptureBackend for NeverFinalize {
+        fn finalize(&mut self) -> Result<()> {
+            panic!("stale stop must not finalize the active backend")
+        }
+
+        fn is_running(&mut self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn start_offset_is_video_minus_audio() {
         // Video spawns 420 ms after audio → offset 420.
@@ -1378,6 +1963,45 @@ mod tests {
         // A clock hiccup can't produce a negative offset.
         assert_eq!(compute_start_offset_ms(2_000, 1_500), 0);
         assert_eq!(compute_start_offset_ms(1_000, 1_000), 0);
+    }
+
+    #[test]
+    fn finalized_duration_recovers_portal_picker_delay() {
+        // Audio ran 30s, but the selected window produced only 20s of video.
+        assert_eq!(corrected_start_offset_ms(1_000, 31_000, 20_000), 10_000);
+    }
+
+    #[test]
+    fn ffmpeg_duration_parser_is_bounded_and_precise() {
+        assert_eq!(
+            parse_ffmpeg_duration_ms("Duration: 01:02:03.45, start: 0.0"),
+            Some(3_723_450)
+        );
+        assert_eq!(parse_ffmpeg_duration_ms("Duration: N/A, start: 0.0"), None);
+        assert_eq!(parse_ffmpeg_duration_ms("Duration: 00:99:00.00"), None);
+    }
+
+    #[test]
+    fn stale_stop_does_not_take_new_screen_generation() {
+        let recorder = ScreenRecorder::new();
+        *recorder.active.lock().unwrap() = Some(Active {
+            generation: 2,
+            backend: Box::new(NeverFinalize),
+            session_dir: PathBuf::from("/recordings/new"),
+            output_path: PathBuf::from("/recordings/new/screen/recording.mp4"),
+            started_at: Instant::now(),
+            audio_started_at_ms: 0,
+            start_offset_ms: 0,
+            fps: 15,
+            dims: None,
+            source_kind: "screen",
+        });
+        let report = recorder.stop_and_persist(
+            Some(1),
+            Some(Path::new("/recordings/old")),
+        );
+        assert!(report.error.unwrap().contains("stale screen stop rejected"));
+        assert_eq!(recorder.active_generation(), Some(2));
     }
 
     #[test]
@@ -1401,8 +2025,11 @@ mod tests {
     fn fit_within_downscales_preserving_aspect() {
         // 4K → fit within 1080p keeps 16:9 (even dims).
         assert_eq!(fit_within((3840, 2160), Some((1920, 1080))), (1920, 1080));
+        // The same source at the 720p preference.
+        assert_eq!(fit_within((3840, 2160), Some((1280, 720))), (1280, 720));
         // Ultrawide 3840x1080 fit within 1920x1080 clamps on width.
         assert_eq!(fit_within((3840, 1080), Some((1920, 1080))), (1920, 540));
+        assert_eq!(fit_within((3840, 1080), Some((1280, 720))), (1280, 360));
     }
 
     #[test]
@@ -1477,7 +2104,8 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        let args = build_gdigrab_args(&input, 15, 3000, "h264_mf", "/o.mp4");
+        let args =
+            build_gdigrab_args(&input, 15, 3000, "h264_mf", None, "/o.mp4");
         // gdigrab input with the monitor crop.
         assert_eq!(&args[0..4], &["-f", "gdigrab", "-framerate", "15"]);
         let ox = args.iter().position(|a| a == "-offset_x").unwrap();
@@ -1505,7 +2133,8 @@ mod tests {
         let input = GdigrabInput::Window {
             title: "Zoom Meeting".to_string(),
         };
-        let args = build_gdigrab_args(&input, 24, 4000, "libx264", "/o.mp4");
+        let args =
+            build_gdigrab_args(&input, 24, 4000, "libx264", None, "/o.mp4");
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[i + 1], "title=Zoom Meeting");
         // No desktop-crop flags on the window path.
@@ -1532,6 +2161,79 @@ mod tests {
         assert_eq!(choose_h264_encoder(" V..... libx264rgb  rgb"), None);
     }
 
+    #[test]
+    fn h264_encoder_runtime_probe_falls_back_in_listing_order() {
+        let full = " V....D h264_nvenc NVIDIA\n V....D h264_qsv Intel\n V....D h264_mf MF\n V..... libx264 x264";
+        let usable =
+            usable_h264_encoders_from(full, |name| name == "h264_mf" || name == "libx264");
+        assert_eq!(usable, vec!["h264_mf", "libx264"]);
+    }
+
+    #[test]
+    fn gdigrab_exact_scale_caps_desktop_without_changing_input_crop() {
+        let input = GdigrabInput::Desktop {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+        };
+        let args = build_gdigrab_args(
+            &input,
+            15,
+            3000,
+            "h264_mf",
+            Some(GdigrabScale::Exact {
+                width: 1280,
+                height: 720,
+            }),
+            "/o.mp4",
+        );
+        let input_size = args.iter().position(|a| a == "-video_size").unwrap();
+        assert_eq!(args[input_size + 1], "3840x2160");
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(args[vf + 1], "scale=1280:720");
+    }
+
+    #[test]
+    fn gdigrab_window_scale_is_fit_within_and_no_upscale() {
+        let input = GdigrabInput::Window {
+            title: "Support call".to_string(),
+        };
+        let args = build_gdigrab_args(
+            &input,
+            15,
+            3000,
+            "h264_mf",
+            Some(GdigrabScale::FitWithin {
+                width: 1920,
+                height: 1080,
+            }),
+            "/o.mp4",
+        );
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(
+            args[vf + 1],
+            "scale=w=min(1920\\,iw):h=min(1080\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2"
+        );
+    }
+
+    #[test]
+    fn gdigrab_native_window_still_normalizes_odd_dimensions() {
+        let input = GdigrabInput::Window {
+            title: "Odd-sized window".to_string(),
+        };
+        let args = build_gdigrab_args(
+            &input,
+            15,
+            3000,
+            "h264_mf",
+            Some(GdigrabScale::Even),
+            "/o.mp4",
+        );
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(args[vf + 1], "scale=trunc(iw/2)*2:trunc(ih/2)*2");
+    }
+
     // ── Region geometry parsing ────────────────────────────────────
 
     #[test]
@@ -1552,6 +2254,46 @@ mod tests {
         assert_eq!(parse_region_geometry("800x600+100"), None); // missing Y
         assert_eq!(parse_region_geometry("800x600+1+2+3"), None); // trailing
         assert_eq!(parse_region_geometry("0x600+0+0"), None); // zero dim
+    }
+
+    #[test]
+    fn region_geometry_must_fit_one_physical_display() {
+        let displays = vec![
+            DisplayInfo {
+                name: "left".to_string(),
+                width: 1920,
+                height: 1080,
+                is_primary: false,
+                x: -1920,
+                y: 0,
+            },
+            DisplayInfo {
+                name: "main".to_string(),
+                width: 2560,
+                height: 1440,
+                is_primary: true,
+                x: 0,
+                y: 0,
+            },
+        ];
+        assert!(region_within_any_display(
+            "800x600+-1800+100",
+            &displays
+        ));
+        assert!(region_within_any_display(
+            "2560x1440+0+0",
+            &displays
+        ));
+        // Spans the monitor seam rather than fitting wholly in either.
+        assert!(!region_within_any_display(
+            "400x500+-200+100",
+            &displays
+        ));
+        assert!(!region_within_any_display(
+            "100x100+2500+1400",
+            &displays
+        ));
+        assert!(!region_within_any_display("malformed", &displays));
     }
 
     #[test]
@@ -1596,5 +2338,19 @@ mod tests {
             source_kind_str(&CaptureSource::Region { geometry: "1x1+0+0".into() }),
             "region"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_finalize_handles_an_already_reaped_clean_child() {
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut recorder = GpuScreenRecorder {
+            child,
+            stderr_join: None,
+        };
+        recorder.child.wait().unwrap();
+        recorder
+            .finalize()
+            .expect("must not signal a stale PID after status reaped the child");
     }
 }

@@ -12,16 +12,38 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use reqwest::header::HeaderMap;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::config::{
     read_auth_file, write_auth_file, AuthFile, Backend, FeatureFlags, PendingTos, Subscription,
 };
 use crate::error::{from_status, parse_retry_after, PortalError};
+
+fn paid_action_store() -> Result<crate::app_observations::AppObservations> {
+    crate::app_observations::AppObservations::open(crate::app_observations::agent_db_path()?)
+}
+
+fn paid_action_operation_key(backend: &Backend, route: &str, id: &str) -> Result<String> {
+    let user_id = read_auth_file()?
+        .map(|auth| auth.user_id)
+        .unwrap_or_else(|| "legacy-static-token".to_owned());
+    let mut digest = Sha256::new();
+    digest.update(backend.url.trim_end_matches('/').as_bytes());
+    digest.update([0]);
+    digest.update(user_id.as_bytes());
+    digest.update([0]);
+    digest.update(route.as_bytes());
+    digest.update([0]);
+    digest.update(id.as_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
 
 /// #179 — explicit User-Agent so backend logs can attribute requests to
 /// a specific agent build + OS without relying on reqwest's default
@@ -767,7 +789,10 @@ pub async fn update_call_tags(
 /// the frontend can surface the retry window without sniffing a
 /// stringified error (#124). Other backend statuses map through
 /// `from_status` to their structured variants.
-pub async fn resummarize_call(backend: &Backend, id: &str) -> std::result::Result<Value, PortalError> {
+pub async fn resummarize_call(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
     // Same 600s ceiling as transcribe/summarize: the LLM call can
     // take a minute or two on a real call, and an agent user that
     // triggered the regenerate shouldn't see an IPC timeout before
@@ -776,19 +801,50 @@ pub async fn resummarize_call(backend: &Backend, id: &str) -> std::result::Resul
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .user_agent(user_agent())
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let url = format!(
         "{}/v1/calls/{id}/resummarize",
         backend.url.trim_end_matches('/'),
     );
-    let resp = c.post(&url).header("authorization", auth).send().await?;
+    let operation_key = paid_action_operation_key(backend, "resummarize", id)?;
+    let operation_store = paid_action_store()?;
+    let operation_id = operation_store.paid_action_operation_id(&operation_key)?;
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .header("idempotency-key", operation_id.to_string())
+        .send()
+        .await?;
     let status = resp.status();
     if status.is_success() {
         let text = resp.text().await.map_err(PortalError::from)?;
-        return serde_json::from_str(&text).map_err(PortalError::from);
+        let decoded = serde_json::from_str(&text).map_err(PortalError::from)?;
+        operation_store.clear_paid_action_operation_id(&operation_key)?;
+        return Ok(decoded);
     }
     let retry_header = parse_retry_after(resp.headers());
-    let body = resp.text().await.unwrap_or_default();
+    // A body-read failure is transport-ambiguous just like a lost response:
+    // retain the durable id and let the same logical operation replay.
+    let body = resp.text().await.map_err(PortalError::from)?;
+    let conflict_code = (status == StatusCode::CONFLICT)
+        .then(|| serde_json::from_str::<Value>(&body).ok())
+        .flatten()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned));
+    // A malformed/empty 409 cannot prove this was a terminal business
+    // conflict; it may be an in-progress replay whose body was altered by an
+    // intermediary. Retain the id unless the backend supplied a different,
+    // explicit conflict code.
+    let conflict_is_ambiguous = status == StatusCode::CONFLICT
+        && conflict_code
+            .as_deref()
+            .map_or(true, |code| code == "operation_in_progress");
+    if status.is_client_error()
+        && status != StatusCode::REQUEST_TIMEOUT
+        && !conflict_is_ambiguous
+    {
+        operation_store.clear_paid_action_operation_id(&operation_key)?;
+    }
     Err(from_status(status, body, retry_header))
 }
 
@@ -880,22 +936,92 @@ pub async fn add_action_item(
     .await
 }
 
+// Question proxy path/body guards. Tauri command arguments are first-party,
+// but validating before URL construction prevents a compromised webview from
+// turning UUID path segments into an authenticated same-host path traversal.
+fn question_uuid_segment(raw: &str, label: &str) -> std::result::Result<String, PortalError> {
+    uuid::Uuid::parse_str(raw)
+        .map(|value| value.to_string())
+        .map_err(|_| PortalError::BadRequest {
+            message: format!("invalid {label}"),
+        })
+}
+
+fn call_questions_path(call_id: &str) -> std::result::Result<String, PortalError> {
+    let call_id = question_uuid_segment(call_id, "call id")?;
+    Ok(format!("/v1/calls/{call_id}/questions"))
+}
+
+fn call_question_path(call_id: &str, qid: &str) -> std::result::Result<String, PortalError> {
+    let call_id = question_uuid_segment(call_id, "call id")?;
+    let qid = question_uuid_segment(qid, "question id")?;
+    Ok(format!("/v1/calls/{call_id}/questions/{qid}"))
+}
+
+fn validate_question_patch_body(body: &Value) -> std::result::Result<(), PortalError> {
+    const MUTABLE: &[&str] = &[
+        "question_text",
+        "asker_side",
+        "asker_display",
+        "status",
+        "answer_text",
+    ];
+    let object = body.as_object().ok_or_else(|| PortalError::BadRequest {
+        message: "question patch body must be an object".into(),
+    })?;
+    match object.get("revision").and_then(Value::as_i64) {
+        Some(revision) if revision > 0 => {}
+        _ => {
+            return Err(PortalError::BadRequest {
+                message: "question patch requires a positive integer revision".into(),
+            })
+        }
+    }
+    if !MUTABLE.iter().any(|key| object.contains_key(*key)) {
+        return Err(PortalError::BadRequest {
+            message: "question patch requires at least one mutable field".into(),
+        });
+    }
+    if let Some(key) = object
+        .keys()
+        .find(|key| key.as_str() != "revision" && !MUTABLE.contains(&key.as_str()))
+    {
+        return Err(PortalError::BadRequest {
+            message: format!("unsupported question patch field: {key}"),
+        });
+    }
+    Ok(())
+}
+
+fn call_question_delete_path(
+    call_id: &str,
+    qid: &str,
+    revision: i64,
+) -> std::result::Result<String, PortalError> {
+    if revision <= 0 {
+        return Err(PortalError::BadRequest {
+            message: "question delete requires a positive integer revision".into(),
+        });
+    }
+    Ok(format!(
+        "{}?revision={revision}",
+        call_question_path(call_id, qid)?
+    ))
+}
+
 /// POST /v1/calls/{id}/questions — manual-add a call Question (Phase 4
 /// follow-up). `body` carries `{question_text, asker_side?, asker_display?,
 /// status?, answer_text?}`. Backend returns 201 with the created row
-/// (`{id, asker_side, asker_display, question_text, status, answer_text}`).
+/// (`{id, revision, asker_side, asker_display, question_text, status,
+/// answer_text}`).
 /// Errors arrive as a structured `PortalError` (#124).
 pub async fn add_call_question(
     backend: &Backend,
     call_id: &str,
     body: &Value,
 ) -> std::result::Result<Value, PortalError> {
-    post_json_typed(
-        backend,
-        &format!("/v1/calls/{call_id}/questions"),
-        body.clone(),
-    )
-    .await
+    let path = call_questions_path(call_id)?;
+    post_json_typed(backend, &path, body.clone()).await
 }
 
 /// PATCH /v1/calls/{id}/questions/{qid} — edit a call Question: wording,
@@ -908,38 +1034,90 @@ pub async fn patch_call_question(
     qid: &str,
     body: &Value,
 ) -> std::result::Result<Value, PortalError> {
-    patch_json_typed(
-        backend,
-        &format!("/v1/calls/{call_id}/questions/{qid}"),
-        body.clone(),
-    )
-    .await
+    let path = call_question_path(call_id, qid)?;
+    validate_question_patch_body(body)?;
+    patch_json_typed(backend, &path, body.clone()).await
 }
 
-/// DELETE /v1/calls/{id}/questions/{qid} — hard delete a call Question.
-/// Backend returns 204 on success, 404 when the row is already gone; we map
-/// 404 to Ok(()) so the frontend's optimistic removal isn't disturbed by an
-/// already-gone row (same posture as `delete_action_item`). Every other
-/// non-2xx surfaces as a structured `PortalError` (#124).
+/// DELETE /v1/calls/{id}/questions/{qid}?revision=N — hard delete a call
+/// Question with optimistic concurrency. Every non-2xx, including an
+/// already-gone row, surfaces so the frontend can refresh canonical state.
 pub async fn delete_call_question(
     backend: &Backend,
     call_id: &str,
     qid: &str,
+    revision: i64,
 ) -> std::result::Result<(), PortalError> {
+    let path = call_question_delete_path(call_id, qid, revision)?;
     let auth = build_auth_header(backend).await?;
     let c = client().map_err(PortalError::from)?;
-    let url = format!(
-        "{}/v1/calls/{call_id}/questions/{qid}",
-        backend.url.trim_end_matches('/'),
-    );
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
     let resp = c.delete(&url).header("authorization", auth).send().await?;
     let status = resp.status();
-    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+    if status.is_success() {
         return Ok(());
     }
     let retry = parse_retry_after(resp.headers());
     let body = resp.text().await.unwrap_or_default();
     Err(from_status(status, body, retry))
+}
+
+#[cfg(test)]
+mod question_proxy_contract_tests {
+    use super::*;
+
+    const CALL_ID: &str = "8f4b7853-3d26-4bf1-9914-15e8529ab2da";
+    const QUESTION_ID: &str = "0d0a5b34-5c76-4f49-822e-e5f539541b47";
+
+    #[test]
+    fn question_paths_canonicalize_uuid_segments() {
+        assert_eq!(
+            call_questions_path(&CALL_ID.to_uppercase()).unwrap(),
+            format!("/v1/calls/{CALL_ID}/questions")
+        );
+        assert_eq!(
+            call_question_path(CALL_ID, &QUESTION_ID.to_uppercase()).unwrap(),
+            format!("/v1/calls/{CALL_ID}/questions/{QUESTION_ID}")
+        );
+    }
+
+    #[test]
+    fn question_paths_reject_non_uuid_segments() {
+        assert!(call_questions_path("../auth/me").is_err());
+        assert!(call_question_path(CALL_ID, "../action-items").is_err());
+    }
+
+    #[test]
+    fn patch_requires_revision_and_a_mutable_field() {
+        assert!(validate_question_patch_body(&serde_json::json!({
+            "revision": 2,
+            "status": "open",
+        }))
+        .is_ok());
+        assert!(validate_question_patch_body(&serde_json::json!({
+            "status": "open",
+        }))
+        .is_err());
+        assert!(validate_question_patch_body(&serde_json::json!({
+            "revision": 2,
+        }))
+        .is_err());
+        assert!(validate_question_patch_body(&serde_json::json!({
+            "revision": 2,
+            "status": "open",
+            "unexpected": true,
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn delete_path_requires_revision_query() {
+        assert_eq!(
+            call_question_delete_path(CALL_ID, QUESTION_ID, 7).unwrap(),
+            format!("/v1/calls/{CALL_ID}/questions/{QUESTION_ID}?revision=7")
+        );
+        assert!(call_question_delete_path(CALL_ID, QUESTION_ID, 0).is_err());
+    }
 }
 
 /// GET /v1/me/action-items — Phase 4 (#105) me-scoped list for the
@@ -1294,18 +1472,126 @@ pub async fn live_linked_ticket(
     .await
 }
 
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPushIntegration {
+    Crm,
+    Desk,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPushState {
+    Pending,
+    Sending,
+    Uncertain,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPushRetryGuidance {
+    Poll,
+    Complete,
+    NewRequestAfterCorrection,
+    ContactAdminForReconciliation,
+    NewRequest,
+    ContactSupport,
+}
+
+/// Durable external-push state returned by the backend's call-scoped status
+/// endpoint. UUID path components are never accepted from a server-provided
+/// URL: callers provide the call and attempt IDs independently and this module
+/// constructs the one allowed endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExternalPushStatus {
+    pub attempt_id: String,
+    pub integration: ExternalPushIntegration,
+    pub state: ExternalPushState,
+    pub attempt_count: u32,
+    pub remote_id: Option<String>,
+    pub remote_url: Option<String>,
+    pub error_code: Option<String>,
+    pub retry_guidance: ExternalPushRetryGuidance,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn client_uuid(value: &str, field: &str) -> std::result::Result<Uuid, PortalError> {
+    Uuid::parse_str(value).map_err(|_| PortalError::BadRequest {
+        message: format!("{field} must be a UUID"),
+    })
+}
+
+fn decode_external_push_response(
+    status: StatusCode,
+    body: String,
+    retry_after: Option<u64>,
+) -> std::result::Result<Value, PortalError> {
+    match status {
+        // 200 is the legacy synchronous success contract. 202 is the durable
+        // queue admission contract. Preserve either JSON body verbatim so the
+        // caller can distinguish the two wire shapes.
+        StatusCode::OK | StatusCode::ACCEPTED => {
+            if body.is_empty() {
+                Ok(Value::Null)
+            } else {
+                serde_json::from_str(&body).map_err(PortalError::from)
+            }
+        }
+        status if status.is_success() => Err(PortalError::Other {
+            message: format!("unexpected external push status {status}"),
+        }),
+        status => Err(from_status(status, body, retry_after)),
+    }
+}
+
+async fn post_external_push(
+    backend: &Backend,
+    path: &str,
+    body: &Value,
+    idempotency_key: Uuid,
+) -> std::result::Result<Value, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(user_agent())
+        .build()?;
+    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .header(IDEMPOTENCY_KEY_HEADER, idempotency_key.to_string())
+        .json(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let retry_after = parse_retry_after(resp.headers());
+    let body = resp.text().await.map_err(PortalError::from)?;
+    decode_external_push_response(status, body, retry_after)
+}
+
 /// POST /v1/calls/{id}/zoho/push — Step 3+4 of SendToZohoModal.
 /// `body` is forwarded verbatim; frontend pre-shapes
-/// `{module, record_id, record_name, extra_tags?}`. (#186)
+/// `{module, record_id, record_name, extra_tags?}`. The caller supplies one
+/// UUID idempotency key for the whole logical push action. (#186)
 pub async fn zoho_push_call(
     backend: &Backend,
     call_id: &str,
     body: &Value,
+    idempotency_key: &str,
 ) -> std::result::Result<Value, PortalError> {
-    post_json_typed(
+    let call_id = client_uuid(call_id, "call_id")?;
+    let idempotency_key = client_uuid(idempotency_key, "idempotency_key")?;
+    post_external_push(
         backend,
         &format!("/v1/calls/{call_id}/zoho/push"),
-        body.clone(),
+        body,
+        idempotency_key,
     )
     .await
 }
@@ -1320,13 +1606,60 @@ pub async fn zoho_desk_push_call(
     backend: &Backend,
     call_id: &str,
     ticket_id: &str,
+    idempotency_key: &str,
 ) -> std::result::Result<Value, PortalError> {
-    post_json_typed(
+    let call_id = client_uuid(call_id, "call_id")?;
+    let idempotency_key = client_uuid(idempotency_key, "idempotency_key")?;
+    let body = serde_json::json!({ "ticket_id": ticket_id });
+    post_external_push(
         backend,
         &format!("/v1/calls/{call_id}/zoho-desk/push"),
-        serde_json::json!({ "ticket_id": ticket_id }),
+        &body,
+        idempotency_key,
     )
     .await
+}
+
+fn decode_external_push_status(
+    value: Value,
+    expected_attempt_id: Uuid,
+) -> std::result::Result<ExternalPushStatus, PortalError> {
+    let status: ExternalPushStatus = serde_json::from_value(value).map_err(PortalError::from)?;
+    let response_attempt_id =
+        Uuid::parse_str(&status.attempt_id).map_err(|_| PortalError::Other {
+            message: "backend returned an invalid external push attempt_id".into(),
+        })?;
+    if response_attempt_id != expected_attempt_id {
+        return Err(PortalError::Other {
+            message: "backend returned a mismatched external push attempt_id".into(),
+        });
+    }
+    Ok(status)
+}
+
+fn external_push_status_path(
+    call_id: &str,
+    attempt_id: &str,
+) -> std::result::Result<(String, Uuid), PortalError> {
+    let call_id = client_uuid(call_id, "call_id")?;
+    let attempt_id = client_uuid(attempt_id, "attempt_id")?;
+    Ok((
+        format!("/v1/calls/{call_id}/external-pushes/{attempt_id}"),
+        attempt_id,
+    ))
+}
+
+/// GET /v1/calls/{call_id}/external-pushes/{attempt_id} — poll one durable
+/// CRM/Desk delivery. Both identifiers are validated and canonicalized before
+/// this fixed path is constructed; no caller- or server-supplied URL is used.
+pub async fn external_push_status(
+    backend: &Backend,
+    call_id: &str,
+    attempt_id: &str,
+) -> std::result::Result<ExternalPushStatus, PortalError> {
+    let (path, attempt_id) = external_push_status_path(call_id, attempt_id)?;
+    let value = get_json_typed(backend, &path).await?;
+    decode_external_push_status(value, attempt_id)
 }
 
 /// GET /v1/calls/{id}/zoho/prior-push — the most-recent successful CRM push
@@ -1620,14 +1953,10 @@ pub async fn post_screen_capture_ack(
     .await
 }
 
-/// `GET /v1/calls/{id}/screen` → screen-recording metadata (Slice A).
+/// `GET /v1/calls/{id}/screen` → stable screen-recording metadata (Slice A).
 /// `Some(json)` when a row exists, `None` on 404 (org flag off OR no
-/// recording — the call-detail player renders nothing). The JSON passes
-/// straight through to the frontend, which types it as
-/// `@aftercalls/shared/types → ScreenRecording`. When `status='ready'`
-/// the payload carries a short-lived presigned `url` the `<video>` binds
-/// directly (Spaces serves Range natively — no proxy needed). Mirrors the
-/// `get_screen_capture_ack` GET shape verbatim.
+/// recording — the call-detail player renders nothing). Playback credentials
+/// are fetched separately and only after the user expands a ready recording.
 pub async fn get_screen_recording(
     backend: &Backend,
     call_id: &str,
@@ -1663,6 +1992,41 @@ pub async fn get_screen_recording(
     let text = resp.text().await.map_err(PortalError::from)?;
     let v: Value = serde_json::from_str(&text).map_err(PortalError::from)?;
     Ok(Some(v))
+}
+
+/// Mint a short-lived URL for the backend's current validated immutable
+/// screen generation. The JSON includes `generation_id`; the webview must
+/// correlate it with the metadata response before attaching the URL.
+pub async fn create_screen_playback_url(
+    backend: &Backend,
+    call_id: &str,
+) -> std::result::Result<Value, PortalError> {
+    let path = screen_playback_path(call_id)?;
+    post_json_typed(backend, &path, serde_json::json!({})).await
+}
+
+fn screen_playback_path(call_id: &str) -> std::result::Result<String, PortalError> {
+    let call_id = Uuid::parse_str(call_id).map_err(|_| PortalError::Other {
+        message: "invalid call id".into(),
+    })?;
+    Ok(format!("/v1/calls/{call_id}/screen/playback-url"))
+}
+
+#[cfg(test)]
+mod screen_playback_contract_tests {
+    use super::screen_playback_path;
+
+    #[test]
+    fn playback_path_canonicalizes_and_rejects_untrusted_segments() {
+        let id = "8F4B7853-3D26-4BF1-9914-15E8529AB2DA";
+        assert_eq!(
+            screen_playback_path(id).unwrap(),
+            "/v1/calls/8f4b7853-3d26-4bf1-9914-15e8529ab2da/screen/playback-url"
+        );
+        for invalid in ["../auth/me", "not-a-uuid", ""] {
+            assert!(screen_playback_path(invalid).is_err());
+        }
+    }
 }
 
 // ── Terms of Service / Privacy gate (#320) ───────────────────────────
@@ -2704,6 +3068,129 @@ where
     // Shouldn't be reachable — the inner branches return on success or
     // bubble after the final attempt — but keep a defensive fallback.
     Err(last_err.unwrap_or_else(|| anyhow!("{step} failed after {max_attempts} attempts")))
+}
+
+#[cfg(test)]
+mod external_push_transport_tests {
+    use super::*;
+
+    const CALL_ID: &str = "01912cb4-ae68-7cf2-a6a2-3894acfab31d";
+    const ATTEMPT_ID: &str = "018f4ca6-49c7-7d35-9f2b-f2fd4d8c29f0";
+
+    #[test]
+    fn malformed_client_uuids_are_rejected_before_transport() {
+        assert!(matches!(
+            client_uuid("../../auth/me", "call_id"),
+            Err(PortalError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            client_uuid("not-a-key", "idempotency_key"),
+            Err(PortalError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            external_push_status_path(CALL_ID, "../other"),
+            Err(PortalError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            external_push_status_path("/v1/auth/me", ATTEMPT_ID),
+            Err(PortalError::BadRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn status_path_is_fixed_and_canonical() {
+        let (path, attempt_id) = external_push_status_path(CALL_ID, ATTEMPT_ID).unwrap();
+        assert_eq!(
+            path,
+            format!("/v1/calls/{CALL_ID}/external-pushes/{ATTEMPT_ID}")
+        );
+        assert_eq!(attempt_id.to_string(), ATTEMPT_ID);
+    }
+
+    #[test]
+    fn legacy_200_body_is_preserved() {
+        let body = serde_json::json!({
+            "push_id": "legacy-push",
+            "zoho_call_record_id": "4815162342",
+            "zoho_url": "https://crm.example/call/4815162342",
+            "tags_added": [],
+        });
+        let decoded = decode_external_push_response(
+            StatusCode::OK,
+            serde_json::to_string(&body).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn durable_202_admission_body_is_preserved() {
+        let body = serde_json::json!({
+            "attempt_id": ATTEMPT_ID,
+            "status": "pending",
+            "status_url":
+                format!("/v1/calls/{CALL_ID}/external-pushes/{ATTEMPT_ID}"),
+        });
+        let decoded = decode_external_push_response(
+            StatusCode::ACCEPTED,
+            serde_json::to_string(&body).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn terminal_status_schema_deserializes_and_passes_through() {
+        let expected_attempt_id = Uuid::parse_str(ATTEMPT_ID).unwrap();
+        let decoded = decode_external_push_status(
+            serde_json::json!({
+                "attempt_id": ATTEMPT_ID,
+                "integration": "crm",
+                "state": "succeeded",
+                "attempt_count": 1,
+                "remote_id": "4815162342",
+                "remote_url": "https://crm.example/call/4815162342",
+                "error_code": null,
+                "retry_guidance": "complete",
+                "created_at": "2026-07-30T12:00:00Z",
+                "updated_at": "2026-07-30T12:00:01Z",
+            }),
+            expected_attempt_id,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.attempt_id, ATTEMPT_ID);
+        assert_eq!(decoded.integration, ExternalPushIntegration::Crm);
+        assert_eq!(decoded.state, ExternalPushState::Succeeded);
+        assert_eq!(decoded.attempt_count, 1);
+        assert_eq!(decoded.retry_guidance, ExternalPushRetryGuidance::Complete);
+        assert_eq!(decoded.remote_id.as_deref(), Some("4815162342"));
+        assert!(decoded.error_code.is_none());
+    }
+
+    #[test]
+    fn status_response_cannot_switch_attempts() {
+        let expected_attempt_id = Uuid::parse_str(ATTEMPT_ID).unwrap();
+        let result = decode_external_push_status(
+            serde_json::json!({
+                "attempt_id": "123e4567-e89b-42d3-a456-426614174000",
+                "integration": "desk",
+                "state": "failed",
+                "attempt_count": 2,
+                "remote_id": null,
+                "remote_url": null,
+                "error_code": "provider_rejected",
+                "retry_guidance": "new_request_after_correction",
+                "created_at": "2026-07-30T12:00:00Z",
+                "updated_at": "2026-07-30T12:00:01Z",
+            }),
+            expected_attempt_id,
+        );
+
+        assert!(matches!(result, Err(PortalError::Other { .. })));
+    }
 }
 
 #[cfg(test)]

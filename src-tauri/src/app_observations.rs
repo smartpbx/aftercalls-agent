@@ -9,8 +9,9 @@
 //! machinery), is chmod'd 0600 on first create, and is never copied off
 //! the machine.
 //!
-//! Schema is a single table plus a meta-version sentinel so future
-//! schema bumps can branch on `schema_meta.version`. The opening API
+//! Schema contains the observed-app table, an opaque paid-action operation
+//! ledger, and a meta-version sentinel so future schema bumps can branch on
+//! `schema_meta.version`. The opening API
 //! takes a path (so tests can pass `:memory:` or a tempdir) and returns
 //! a thin handle that's `Send + Sync` via `Mutex<Connection>` — agent
 //! callers (the auto-recorder, the IPC commands) all live on tauri's
@@ -164,6 +165,12 @@ impl AppObservations {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS paid_action_operations (
+                operation_key TEXT PRIMARY KEY,
+                operation_id  TEXT NOT NULL,
+                created_at    TEXT NOT NULL
+            ) WITHOUT ROWID;
             "#,
         )
         .context("bootstrap schema")?;
@@ -211,6 +218,55 @@ impl AppObservations {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Get the UUID for an unresolved paid API action, inserting it durably
+    /// before the HTTP request is allowed to start. The row survives agent
+    /// restarts so an ambiguous timeout cannot mint a second provider action.
+    pub fn paid_action_operation_id(&self, operation_key: &str) -> Result<uuid::Uuid> {
+        if operation_key.len() != 64
+            || !operation_key
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(anyhow!("invalid paid action operation key"));
+        }
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let candidate = uuid::Uuid::new_v4().hyphenated().to_string();
+        conn.execute(
+            r#"
+            INSERT INTO paid_action_operations (operation_key, operation_id, created_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(operation_key) DO NOTHING
+            "#,
+            params![operation_key, candidate, Utc::now().to_rfc3339()],
+        )
+        .context("persist paid action operation id")?;
+        let stored: String = conn
+            .query_row(
+                "SELECT operation_id FROM paid_action_operations WHERE operation_key = ?1",
+                params![operation_key],
+                |row| row.get(0),
+            )
+            .context("read paid action operation id")?;
+        let operation_id =
+            uuid::Uuid::parse_str(&stored).context("parse persisted paid action operation id")?;
+        if operation_id.is_nil() {
+            return Err(anyhow!("persisted paid action operation id is nil"));
+        }
+        Ok(operation_id)
+    }
+
+    /// Forget an operation only after the backend produced a definitive
+    /// terminal result. Network, timeout, and in-progress errors retain it.
+    pub fn clear_paid_action_operation_id(&self, operation_key: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "DELETE FROM paid_action_operations WHERE operation_key = ?1",
+            params![operation_key],
+        )
+        .context("clear paid action operation id")?;
         Ok(())
     }
 
@@ -677,6 +733,46 @@ mod tests {
         assert!(!store.is_silenced("zoom").unwrap());
         store.set_mode("zoom", AppMode::Never).unwrap();
         assert!(store.is_silenced("zoom").unwrap());
+    }
+
+    #[test]
+    fn paid_action_operation_id_survives_reopen_until_terminal_clear() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aftercalls-paid-operation-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("agent.db");
+        let operation_key = "a".repeat(64);
+
+        let first = {
+            let store = AppObservations::open(&path).unwrap();
+            store.paid_action_operation_id(&operation_key).unwrap()
+        };
+        let second = {
+            let store = AppObservations::open(&path).unwrap();
+            let value = store.paid_action_operation_id(&operation_key).unwrap();
+            store
+                .clear_paid_action_operation_id(&operation_key)
+                .unwrap();
+            value
+        };
+        let third = {
+            let store = AppObservations::open(&path).unwrap();
+            store.paid_action_operation_id(&operation_key).unwrap()
+        };
+
+        assert_eq!(
+            first, second,
+            "ambiguous retries must reuse the durable UUID"
+        );
+        assert_ne!(
+            second, third,
+            "a terminal clear permits a fresh logical action"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 
     #[test]

@@ -8,9 +8,9 @@
 //! (`pipeline.rs` → `transcribe` → `summarize`) remains the source of truth;
 //! nothing here feeds the AI summary. The relay must never add latency to or
 //! drop samples from the WAV writer — only this live tap is allowed to lose
-//! audio (bounded, drop-oldest). On any connect/stream failure it degrades
-//! silently (a `session`-`error` event → soft "live unavailable" in the UI)
-//! and never crashes the recording.
+//! audio (bounded, drop-oldest/drop-newest). Transient transport failures
+//! reconnect with the same session UUID and fresh bearer; terminal auth
+//! failures degrade to a `session`-`error` event and never crash recording.
 //!
 //! Ladder note: the `LocalStt` trait is the seam for future Tier-0 on-device
 //! engines. Phase 1 ships exactly one impl, [`Tier1Relay`], which forwards
@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -41,6 +42,12 @@ const FRAME_MS: usize = 200;
 /// Bounded live-tap ring depth. Drop-OLDEST past this. A few hundred ms of
 /// device callbacks; live loss is acceptable, WAV loss is not.
 const RING_CAP: usize = 64;
+/// Second lossy bound between the resampler and socket writer. A stalled
+/// network may drop live-draft audio but can never accumulate recording-long
+/// PCM in memory.
+const RELAY_OUTBOUND_CAP: usize = 16;
+const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which capture lane a chunk came from. mic → "You", system → "Them".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +138,10 @@ pub trait LocalStt: Send {
 }
 
 /// Phase-1 engine: encodes each PCM chunk as a `[tag][pcm-le]` binary frame
-/// and hands it to the WS writer task via an unbounded channel. Segments come
+/// and hands it to the WS writer task via a bounded lossy channel. Segments come
 /// back over the same socket and are emitted by the reader task.
 pub struct Tier1Relay {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
     // Read by `health()` (part of the ladder seam) — updated in Phase 1 but
     // only consumed by a later-phase fallback watchdog.
     #[allow(dead_code)]
@@ -149,7 +156,7 @@ impl LocalStt for Tier1Relay {
             buf.extend_from_slice(&s.to_le_bytes());
         }
         // Best-effort: if the writer task is gone the session is ending.
-        let _ = self.out.send(buf);
+        let _ = self.out.try_send(buf);
     }
     fn health(&self) -> SttHealth {
         SttHealth::from_u8(self.health.load(Ordering::Relaxed))
@@ -201,6 +208,7 @@ impl LiveTap {
 }
 
 struct ActiveLive {
+    generation: u64,
     stop_tx: watch::Sender<bool>,
 }
 
@@ -231,6 +239,7 @@ impl LiveRelay {
         app: AppHandle,
         api_base: String,
         session_uuid: String,
+        generation: u64,
         contact_hint: Option<String>,
     ) -> LiveTap {
         let inner = Arc::new(RingInner {
@@ -247,7 +256,10 @@ impl LiveRelay {
             if let Some(prev) = guard.take() {
                 let _ = prev.stop_tx.send(true);
             }
-            *guard = Some(ActiveLive { stop_tx });
+            *guard = Some(ActiveLive {
+                generation,
+                stop_tx,
+            });
         }
         tauri::async_runtime::spawn(run_relay(
             app,
@@ -260,11 +272,28 @@ impl LiveRelay {
         tap
     }
 
-    /// Signal the active session (if any) to flush + close. No-op when idle.
-    pub fn end(&self) {
-        if let Some(active) = self.active.lock().unwrap().take() {
+    /// Signal exactly the expected session generation to flush + close. A
+    /// stale generation or an idle relay is a no-op and returns false.
+    pub fn end(&self, expected_generation: u64) -> bool {
+        let mut guard = self.active.lock().unwrap();
+        if !guard
+            .as_ref()
+            .is_some_and(|active| active.generation == expected_generation)
+        {
+            return false;
+        }
+        if let Some(active) = guard.take() {
             let _ = active.stop_tx.send(true);
         }
+        true
+    }
+
+    pub fn active_generation(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|active| active.generation)
     }
 }
 
@@ -274,20 +303,120 @@ impl Default for LiveRelay {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("live authentication rejected")]
+struct LiveAuthRejected;
+
+#[derive(Debug, thiserror::Error)]
+#[error("live session rejected by backend (HTTP {status})")]
+struct LiveTerminalRejected {
+    status: u16,
+}
+
+impl LiveTerminalRejected {
+    fn client_message(&self) -> &'static str {
+        match self.status {
+            402 => "Live transcription requires an active subscription.",
+            403 => "Live transcription is not allowed for this account.",
+            404 => "Live transcription is not available on this server.",
+            _ => "Live transcription is unavailable.",
+        }
+    }
+}
+
+fn is_terminal_live_status(status: u16) -> bool {
+    matches!(status, 402 | 403 | 404)
+}
+
+async fn force_refresh_live_auth() -> Result<()> {
+    let cfg = crate::config::Config::load().context("load config for live auth refresh")?;
+    let backend = cfg
+        .backend
+        .ok_or_else(|| anyhow!("no backend configured"))?;
+    crate::portal::force_refresh_auth(&backend).await
+}
+
 async fn run_relay(
     app: AppHandle,
     api_base: String,
     session_uuid: String,
     contact_hint: Option<String>,
     ring: Arc<RingInner>,
-    stop_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
-    match run_relay_inner(&app, &api_base, &session_uuid, contact_hint, ring, stop_rx).await {
-        Ok(()) => emit_session(&app, "ended", None),
-        Err(e) => {
-            // Vendor-opaque + detail-free to the UI; full context to stderr.
-            eprintln!("aftercalls: live relay unavailable: {e:#}");
+    let mut consecutive_failures: usize = 0;
+    let mut refreshed_after_rejection = false;
+    loop {
+        if *stop_rx.borrow() {
+            emit_session(&app, "ended", None);
+            return;
+        }
+        let attempt_started = std::time::Instant::now();
+        let result = run_relay_inner(
+            &app,
+            &api_base,
+            &session_uuid,
+            contact_hint.clone(),
+            ring.clone(),
+            stop_rx.clone(),
+        )
+        .await;
+        if *stop_rx.borrow() {
+            emit_session(&app, "ended", None);
+            return;
+        }
+        if attempt_started.elapsed() >= Duration::from_secs(30) {
+            consecutive_failures = 0;
+            refreshed_after_rejection = false;
+        }
+        let error = match result {
+            Ok(()) => anyhow!("live transport ended unexpectedly"),
+            Err(error) => error,
+        };
+        if error.downcast_ref::<LiveAuthRejected>().is_some() {
+            if refreshed_after_rejection {
+                eprintln!("aftercalls: live relay auth rejected after refresh");
+                emit_session(&app, "error", None);
+                return;
+            }
+            let refresh = tokio::select! {
+                result = force_refresh_live_auth() => result,
+                _ = stop_rx.changed() => {
+                    emit_session(&app, "ended", None);
+                    return;
+                }
+            };
+            match refresh {
+                Ok(()) => {
+                    refreshed_after_rejection = true;
+                    continue;
+                }
+                Err(refresh_error) => {
+                    eprintln!("aftercalls: live relay auth refresh failed: {refresh_error:#}");
+                    emit_session(&app, "error", None);
+                    return;
+                }
+            }
+        }
+        if let Some(rejection) = error.downcast_ref::<LiveTerminalRejected>() {
+            eprintln!("aftercalls: {rejection}");
+            emit_session(&app, "error", Some(rejection.client_message()));
+            return;
+        }
+        eprintln!("aftercalls: live relay reconnecting: {error:#}");
+        if consecutive_failures == 0 {
+            // Keep retrying in the background, but never leave the UI frozen
+            // in a stale "live" state while the transport is unavailable.
             emit_session(&app, "error", None);
+        }
+        let backoff_secs = [1_u64, 2, 5, 10, 20, 30][consecutive_failures.min(5)];
+        consecutive_failures = consecutive_failures.saturating_add(1);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+            _ = stop_rx.changed() => {
+                emit_session(&app, "ended", None);
+                return;
+            }
         }
     }
 }
@@ -309,7 +438,10 @@ async fn run_relay_inner(
     let backend = cfg
         .backend
         .ok_or_else(|| anyhow!("no backend configured"))?;
-    let bearer = crate::portal::build_auth_header(&backend).await?;
+    let bearer = tokio::select! {
+        result = crate::portal::build_auth_header(&backend) => result?,
+        _ = stop_rx.changed() => return Ok(()),
+    };
 
     let ws_url = ws_url_from_base(api_base);
     let mut req = ws_url
@@ -321,9 +453,33 @@ async fn run_relay_inner(
         HeaderValue::from_str(&bearer).context("bearer header")?,
     );
 
-    let (ws, _resp) = tokio_tungstenite::connect_async(req)
-        .await
-        .context("open live ws")?;
+    let connect = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(req),
+    );
+    let connect_result = tokio::select! {
+        result = connect => result,
+        _ = stop_rx.changed() => return Ok(()),
+    };
+    let (ws, _resp) = match connect_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
+            let status = response.status();
+            if status == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED {
+                return Err(LiveAuthRejected.into());
+            }
+            if is_terminal_live_status(status.as_u16()) {
+                return Err(LiveTerminalRejected {
+                    status: status.as_u16(),
+                }
+                .into());
+            }
+            return Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                .context("open live ws");
+        }
+        Ok(Err(error)) => return Err(error).context("open live ws"),
+        Err(_) => return Err(anyhow!("open live ws timed out")),
+    };
     let (mut write, mut read) = ws.split();
 
     // start frame. #653 — attach the pre-picked Zoho contact id when the
@@ -338,13 +494,21 @@ async fn run_relay_inner(
     if let Some(hint) = &contact_hint {
         start["contact_hint"] = serde_json::Value::String(hint.clone());
     }
-    write
-        .send(Message::text(start.to_string()))
-        .await
-        .context("send start frame")?;
+    let send_start = tokio::time::timeout(
+        RELAY_SEND_TIMEOUT,
+        write.send(Message::text(start.to_string())),
+    );
+    tokio::select! {
+        result = send_start => {
+            result
+                .context("send start frame timed out")?
+                .context("send start frame")?;
+        }
+        _ = stop_rx.changed() => return Ok(()),
+    }
 
     let health = Arc::new(AtomicU8::new(SttHealth::Starting as u8));
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(RELAY_OUTBOUND_CAP);
     let mut stt: Box<dyn LocalStt> = Box::new(Tier1Relay {
         out: out_tx,
         health: health.clone(),
@@ -353,7 +517,7 @@ async fn run_relay_inner(
     // Reader task: backend segment/session JSON → Tauri events.
     let app_r = app.clone();
     let mut stop_r = stop_rx.clone();
-    let reader = tauri::async_runtime::spawn(async move {
+    let mut reader = tauri::async_runtime::spawn(async move {
         loop {
             if *stop_r.borrow() {
                 break;
@@ -361,18 +525,25 @@ async fn run_relay_inner(
             tokio::select! {
                 _ = stop_r.changed() => break,
                 msg = read.next() => match msg {
-                    Some(Ok(Message::Text(t))) => forward_incoming(&app_r, t.as_str()),
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Text(t))) => {
+                        if forward_incoming(&app_r, t.as_str()) {
+                            return Err(LiveTerminalRejected { status: 404 }.into());
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err(anyhow!("live backend closed the socket"));
+                    }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(error)) => return Err(error).context("read live socket"),
                 },
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     // Writer task: outbound audio frames + clean stop → WS.
     let mut stop_w = stop_rx.clone();
-    let writer = tauri::async_runtime::spawn(async move {
+    let mut writer = tauri::async_runtime::spawn(async move {
         loop {
             if *stop_w.borrow() {
                 break;
@@ -381,8 +552,13 @@ async fn run_relay_inner(
                 _ = stop_w.changed() => break,
                 frame = out_rx.recv() => match frame {
                     Some(bytes) => {
-                        if write.send(Message::binary(bytes)).await.is_err() {
-                            break;
+                        match tokio::time::timeout(
+                            RELAY_SEND_TIMEOUT,
+                            write.send(Message::binary(bytes)),
+                        ).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => return Err(error).context("write live socket"),
+                            Err(_) => return Err(anyhow!("write live socket timed out")),
                         }
                     }
                     None => break,
@@ -390,10 +566,15 @@ async fn run_relay_inner(
             }
         }
         // Best-effort clean close: tell the backend the session ended.
-        let _ = write
-            .send(Message::text(serde_json::json!({ "type": "stop" }).to_string()))
-            .await;
-        let _ = write.close().await;
+        let _ = tokio::time::timeout(
+            RELAY_SEND_TIMEOUT,
+            write.send(Message::text(
+                serde_json::json!({ "type": "stop" }).to_string(),
+            )),
+        )
+        .await;
+        let _ = tokio::time::timeout(RELAY_SEND_TIMEOUT, write.close()).await;
+        Ok::<(), anyhow::Error>(())
     });
 
     health.store(SttHealth::Live as u8, Ordering::Relaxed);
@@ -406,6 +587,24 @@ async fn run_relay_inner(
         }
         tokio::select! {
             _ = stop_rx.changed() => break,
+            result = &mut reader => {
+                writer.abort();
+                let _ = writer.await;
+                return match result {
+                    Ok(Ok(())) => Err(anyhow!("live reader stopped unexpectedly")),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow!("live reader task failed: {error}")),
+                };
+            }
+            result = &mut writer => {
+                reader.abort();
+                let _ = reader.await;
+                return match result {
+                    Ok(Ok(())) => Err(anyhow!("live writer stopped unexpectedly")),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow!("live writer task failed: {error}")),
+                };
+            }
             _ = ring.notify.notified() => {
                 loop {
                     let frame = { ring.q.lock().unwrap().pop_front() };
@@ -419,8 +618,17 @@ async fn run_relay_inner(
     }
 
     // Stop signalled — writer/reader observe the same watch and wind down.
-    let _ = reader.await;
-    let _ = writer.await;
+    drop(stt);
+    if tokio::time::timeout(RELAY_TASK_DRAIN_TIMEOUT, async {
+        let _ = tokio::join!(&mut reader, &mut writer);
+    })
+    .await
+    .is_err()
+    {
+        reader.abort();
+        writer.abort();
+        let _ = tokio::join!(reader, writer);
+    }
     Ok(())
 }
 
@@ -507,12 +715,9 @@ impl ChannelPipe {
         }
 
         let input: Vec<f32> = std::mem::take(&mut self.accum);
-        let adapter = rubato::audioadapter_buffers::direct::InterleavedSlice::new(
-            &input[..],
-            1,
-            input.len(),
-        )
-        .ok()?;
+        let adapter =
+            rubato::audioadapter_buffers::direct::InterleavedSlice::new(&input[..], 1, input.len())
+                .ok()?;
         let out = self
             .resampler
             .process_all(&adapter, input.len(), None)
@@ -563,10 +768,25 @@ fn ws_url_from_base(base: &str) -> String {
 /// authority. Unknown types are ignored (older agents drop the #654 `coaching`
 /// + #659-P2 `live_cue` + #659-P3 `checklist` + Phase-4 `questions` frames —
 /// additive, non-breaking).
-fn forward_incoming(app: &AppHandle, text: &str) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
+fn normalize_terminal_session(v: &mut serde_json::Value) -> bool {
+    let terminal = v.get("type").and_then(|value| value.as_str()) == Some("session")
+        && v.get("status").and_then(|value| value.as_str()) == Some("terminal_error");
+    if terminal {
+        // Keep the UI protocol stable while returning a control signal to the
+        // native reconnect supervisor.
+        v["status"] = serde_json::Value::String("error".into());
+    }
+    terminal
+}
+
+/// Returns true only for a machine-readable terminal session error. The reader
+/// uses that signal to stop reconnecting; ordinary transport/error frames keep
+/// the same bounded recovery path.
+fn forward_incoming(app: &AppHandle, text: &str) -> bool {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
     };
+    let terminal = normalize_terminal_session(&mut v);
     match v.get("type").and_then(|t| t.as_str()) {
         Some("segment") => {
             let _ = app.emit("live-segment", v);
@@ -609,6 +829,7 @@ fn forward_incoming(app: &AppHandle, text: &str) {
         }
         _ => {}
     }
+    terminal
 }
 
 fn emit_session(app: &AppHandle, status: &str, message: Option<&str>) {
@@ -624,4 +845,57 @@ fn emit_session(app: &AppHandle, status: &str, message: Option<&str>) {
         "message": message,
     });
     let _ = app.emit("live-session", payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier1_audio_queue_is_bounded_and_lossy() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut relay = Tier1Relay {
+            out: tx,
+            health: Arc::new(AtomicU8::new(SttHealth::Live as u8)),
+        };
+        relay.feed(Channel::Mic, &[1, 2]);
+        relay.feed(Channel::System, &[3, 4]);
+        relay.feed(Channel::Mic, &[5, 6]);
+
+        assert_eq!(rx.len(), 2, "a stalled writer cannot grow the queue");
+        assert_eq!(rx.try_recv().unwrap()[0], CHANNEL_MIC);
+        assert_eq!(rx.try_recv().unwrap()[0], CHANNEL_SYSTEM);
+    }
+
+    #[test]
+    fn websocket_url_keeps_session_endpoint_stable_across_reconnects() {
+        assert_eq!(
+            ws_url_from_base("https://api.example.test/"),
+            "wss://api.example.test/v1/live/ws"
+        );
+    }
+
+    #[test]
+    fn terminal_live_statuses_do_not_enter_the_reconnect_loop() {
+        for status in [402, 403, 404] {
+            assert!(is_terminal_live_status(status));
+        }
+        for status in [400, 401, 408, 425, 429, 500, 502, 503, 504] {
+            assert!(!is_terminal_live_status(status));
+        }
+    }
+
+    #[test]
+    fn terminal_backend_session_is_normalized_for_the_ui() {
+        let mut message = serde_json::json!({
+            "type": "session",
+            "status": "terminal_error",
+            "message": "configuration requires attention",
+        });
+        assert!(normalize_terminal_session(&mut message));
+        assert_eq!(message["status"], "error");
+
+        let mut transient = serde_json::json!({"type": "session", "status": "error"});
+        assert!(!normalize_terminal_session(&mut transient));
+    }
 }

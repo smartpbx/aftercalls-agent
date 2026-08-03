@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.30.0"
+version = "0.31.0"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -19,11 +19,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "devtools"] }
+tauri = { version = "2.11.1", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-global-shortcut = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
@@ -36,7 +35,9 @@ cpal = "0.15"
 hound = "3.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 anyhow = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "process"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rubato = "4"
@@ -104,6 +105,7 @@ windows = { version = "0.58", features = [
   # Job Object that ties the ffmpeg child's lifetime to the agent
   # (KILL_ON_JOB_CLOSE — the PDEATHSIG analog).
   "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_JobObjects",
   # CreateJobObjectW is #[cfg(feature = "Win32_Security")]-gated in
@@ -122,3 +124,11 @@ tauri-winrt-notification = "0.7"
 lto = "thin"
 codegen-units = 16
 strip = true
+
+# wayland-scanner 0.31.10 on crates.io still requires vulnerable quick-xml
+# 0.39.3 (RUSTSEC-2026-0194/0195). Keep the published source local with
+# upstream's reviewed compatibility rename and 0.41 constraint until release.
+# Compatibility: https://github.com/Smithay/wayland-rs/commit/ec2d932855593d48aa83c76820f3efbcfea86d39
+# Security fix: https://github.com/Smithay/wayland-rs/commit/d07c4f91f28b42e5a485823ffd9d8d5a210b1053
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner-0.31.10" }

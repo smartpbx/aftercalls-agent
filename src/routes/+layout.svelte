@@ -30,6 +30,10 @@
     toggleHelp,
   } from "@aftercalls/shared/shortcuts";
   import { createAgentCommandPaletteSections } from "$lib/commandPalette";
+  import {
+    selectReleaseNotes,
+    type ReleaseNotesEntry,
+  } from "@aftercalls/shared/releaseNotes";
   import { onlineStatus } from "$lib/stores/onlineStatus.svelte";
   import { saveQueue } from "$lib/stores/saveQueue.svelte";
   import { callRecording } from "$lib/stores/callRecording.svelte";
@@ -40,6 +44,7 @@
     LiveCue,
     ChecklistSnapshot,
     QuestionsSnapshot,
+    SpeakerIdentity,
   } from "@aftercalls/shared/types";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
@@ -139,6 +144,12 @@
   // pending fade from the previous session before the floater
   // collapses on the new live state.
   let callFloaterDoneTimer: ReturnType<typeof setTimeout> | null = null;
+  // Pre-call identity replay owns a small retry ladder. A generation ties
+  // every completion/timer to the exact live session so a late response from
+  // call N cannot acknowledge an assignment staged for call N+1.
+  let identityReplayGeneration = 0;
+  const identityReplayTimers = new Set<ReturnType<typeof setTimeout>>();
+  const IDENTITY_REPLAY_DELAYS_MS = [750, 2_000, 5_000] as const;
   let unlistenState: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
   // #659 — live-transcript stream listeners. Registered ONCE here (the
@@ -699,12 +710,6 @@
   // first so the headline at the top is the version they're now
   // running. When only one version is in the set the modal looks
   // identical to the pre-aggregation behaviour.
-  type ReleaseNotesEntry = {
-    version: string;
-    headline: string;
-    changes: string[];
-    footer?: string;
-  };
   let releaseNotes = $state<{
     entries: ReleaseNotesEntry[];
     firstName: string;
@@ -829,6 +834,72 @@
     pushTrayBadge(unreadCallsCount);
   }
 
+  function cancelIdentityReplay() {
+    identityReplayGeneration += 1;
+    for (const timer of identityReplayTimers) clearTimeout(timer);
+    identityReplayTimers.clear();
+  }
+
+  async function deliverPendingIdentity(
+    sessionUuid: string,
+    identity: SpeakerIdentity,
+    generation: number,
+    attempt: number,
+  ) {
+    if (
+      generation !== identityReplayGeneration ||
+      liveSession.sessionUuid !== sessionUuid
+    )
+      return;
+    try {
+      await invoke("live_speaker_identity", {
+        sessionUuid,
+        channel: identity.channel,
+        speakerLabel: identity.speaker_label,
+        kind: identity.kind,
+        displayName: identity.display_name,
+        contactId: identity.contact_id,
+        userId: identity.user_id,
+        isPrimary: identity.is_primary ?? false,
+        clear: false,
+      });
+      if (
+        generation === identityReplayGeneration &&
+        liveSession.sessionUuid === sessionUuid
+      ) {
+        liveSession.ackPendingIdentity(identity);
+      }
+    } catch {
+      if (
+        generation !== identityReplayGeneration ||
+        liveSession.sessionUuid !== sessionUuid ||
+        attempt >= IDENTITY_REPLAY_DELAYS_MS.length
+      )
+        return;
+      const timer = setTimeout(() => {
+        identityReplayTimers.delete(timer);
+        void deliverPendingIdentity(
+          sessionUuid,
+          identity,
+          generation,
+          attempt + 1,
+        );
+      }, IDENTITY_REPLAY_DELAYS_MS[attempt]);
+      identityReplayTimers.add(timer);
+    }
+  }
+
+  /** Replay staged pre-call identities without deleting them first. Each
+   *  successful invoke acknowledges only the exact value it delivered; three
+   *  bounded retries cover transient startup/network races. */
+  function replayPendingIdentities(sessionUuid: string) {
+    cancelIdentityReplay();
+    const generation = identityReplayGeneration;
+    for (const identity of liveSession.peekPendingIdentities()) {
+      void deliverPendingIdentity(sessionUuid, identity, generation, 0);
+    }
+  }
+
   onMount(async () => {
     // #659 P4 / #302 — the overlay + region-select webviews load this app at
     // /overlay and /region-select and render bare. They must NOT run the main
@@ -935,6 +1006,7 @@
     unlistenState = await listen<{
       recording: boolean;
       mode?: "call" | "self_note" | null;
+      session_dir?: string | null;
       // #660 — the live session_uuid minted Rust-side for a Call start with
       // the relay open; absent for self-notes / flag-off / stop transitions.
       session_uuid?: string | null;
@@ -959,7 +1031,11 @@
             clearTimeout(callFloaterDoneTimer);
             callFloaterDoneTimer = null;
           }
-          callRecording.markRecording(mode, Date.now());
+          callRecording.markRecording(
+            mode,
+            Date.now(),
+            evt.payload.session_dir ?? null,
+          );
           // #659 — fresh live-transcript draft per session. Clears the
           // previous call's segments + coaching and seeds status
           // optimistically ("live" when the feature is on; the relay
@@ -980,23 +1056,12 @@
           // staged for the eventual call.
           const replaySu = evt.payload.session_uuid;
           if (replaySu) {
-            for (const idn of liveSession.takePendingIdentities()) {
-              void invoke("live_speaker_identity", {
-                sessionUuid: replaySu,
-                channel: idn.channel,
-                speakerLabel: idn.speaker_label,
-                kind: idn.kind,
-                displayName: idn.display_name,
-                contactId: idn.contact_id,
-                userId: idn.user_id,
-                isPrimary: idn.is_primary ?? false,
-                clear: false,
-              }).catch(() => {});
-            }
+            replayPendingIdentities(replaySu);
           }
           // #659 P4 — open the floating overlay when opted-in (Call + live).
           void maybeOpenOverlay(mode);
         } else if (wasRecording) {
+          cancelIdentityReplay();
           // #659 P4 — close the overlay after a short grace so the final
           // cue stays glanceable. No-op when the overlay isn't open.
           scheduleOverlayClose();
@@ -1194,6 +1259,7 @@
         recording: boolean;
         mode?: "call" | "self_note" | null;
         started_at_ms: number | null;
+        session_dir: string | null;
       }>("is_recording");
       if (status?.recording) {
         recording = true;
@@ -1202,6 +1268,7 @@
         callRecording.markRecording(
           mode,
           status.started_at_ms ?? Date.now(),
+          status.session_dir ?? null,
         );
       }
     } catch {}
@@ -1785,31 +1852,12 @@
       if (lastSeen === version) return;
       const resp = await fetch("/release-notes.json");
       if (!resp.ok) return;
-      const all = (await resp.json()) as Record<
-        string,
-        { headline: string; changes: string[]; footer?: string }
-      >;
-      // Collect every entry with version > lastSeen AND <= current
-      // running. When lastSeen is absent (first install), everything
-      // <= current qualifies — but we cap at the newest 3 entries so
-      // the first-ever launch doesn't dump the whole history at them.
-      const FIRST_INSTALL_CAP = 3;
-      const candidates = Object.keys(all)
-        .filter((v) => !semverGt(v, version)) // v <= current
-        .filter((v) => !lastSeen || semverGt(v, lastSeen)) // v > lastSeen
-        // Newest first.
-        .sort((a, b) => (semverGt(a, b) ? -1 : semverGt(b, a) ? 1 : 0));
-      const slice = lastSeen ? candidates : candidates.slice(0, FIRST_INSTALL_CAP);
-      const entries: ReleaseNotesEntry[] = slice.map((v) => ({
-        version: v,
-        headline: all[v].headline,
-        changes: all[v].changes,
-        footer: all[v].footer,
-      }));
-      if (entries.length === 0) {
-        // Nothing to show. Silently bookmark so the modal doesn't
-        // fire empty next launch.
-        localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
+      const selection = selectReleaseNotes(await resp.json(), version, lastSeen);
+      if (selection.kind === "integrity_error") {
+        console.error("release notes integrity error", selection.reason);
+        return;
+      }
+      if (selection.kind === "none") {
         return;
       }
       // #96: prefer the structured first_name; fall back to splitting
@@ -1819,7 +1867,7 @@
         me?.first_name ||
         (me?.display_name ?? "").split(/\s+/)[0] ||
         "";
-      releaseNotes = { entries, firstName };
+      releaseNotes = { entries: selection.entries, firstName };
     } catch (e) {
       console.warn("release notes load failed", e);
     }
@@ -1971,6 +2019,7 @@
   }
 
   onDestroy(() => {
+    cancelIdentityReplay();
     unlistenState?.();
     unlistenPipeline?.();
     unlistenLiveSegment?.();

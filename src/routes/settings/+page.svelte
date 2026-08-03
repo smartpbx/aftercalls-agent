@@ -3,7 +3,6 @@
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { getVersion } from "@tauri-apps/api/app";
   import {
     loadRecordingPrefs,
@@ -765,6 +764,10 @@
       });
       scrEnabled = enabled;
     } catch (e) {
+      // Disable is persisted before Rust finalizes any live capture. A
+      // finalization error must not make the controlled switch imply that the
+      // privacy preference is still enabled.
+      if (!enabled) scrEnabled = false;
       error = portalErrorToText(e);
     } finally {
       scrSaving = false;
@@ -1074,12 +1077,8 @@
 
   async function pickVaultDir() {
     try {
-      const chosen = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "Select your Obsidian vault folder",
-      });
-      if (typeof chosen === "string" && chosen) {
+      const chosen = await invoke<string | null>("select_vault_directory");
+      if (chosen) {
         vault.path = chosen;
       }
     } catch (e) {
@@ -2520,10 +2519,9 @@
     </dl>
     <p class="about-lgpl">
       This build bundles a sidecar copy of <strong>ffmpeg</strong>,
-      distributed under the <strong>LGPL v2.1+</strong>. Pinned upstream
+      distributed under the <strong>LGPL v3</strong>. Pinned upstream
       versions, the LGPL license text, and the corresponding source
-      tarballs (mirrored on our infrastructure so you can fetch them
-      directly) are listed on the
+      snapshots attached to each release are listed on the
       <a
         href="https://aftercalls.io/licenses"
         onclick={(e) => { e.preventDefault(); openUrl("https://aftercalls.io/licenses"); }}

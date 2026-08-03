@@ -174,78 +174,34 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # Fetch the ffmpeg sidecar for the current target. Tauri's
-      # externalBin picks up src-tauri/binaries/ffmpeg-aftercalls-<triple>
-      # at bundle time and drops it next to the main binary in the
-      # installed app. This removes the need for users to have
-      # ffmpeg on PATH — mix_tracks + compress_for_upload both resolve
-      # the sidecar first, falling back to PATH for dev.
-      - name: Fetch ffmpeg sidecar (Linux)
+      # Provision the ffmpeg sidecar for the current target.
+      #
+      # Linux + Windows both delegate to scripts/fetch-ffmpeg-sidecar.*,
+      # which are MIRRORED from the private repo and are the single source
+      # of truth for which build ships. They pin the same BtbN LGPL
+      # archive per platform (sha256-verified), assert the exact
+      # `ffmpeg -version` identity, require libopus, refuse any
+      # --enable-gpl / --enable-nonfree configuration, and — critically —
+      # populate src-tauri/resources/ with the archive's own LICENSE.txt
+      # plus THIRD_PARTY_NOTICES.md.
+      #
+      # That resources/ step is not optional: tauri.conf.json declares
+      # bundle.resources, and tauri-build copies declared resources
+      # unconditionally in strict mode, so a missing file panics the build
+      # script on every platform. Do NOT reintroduce an inline fetch here —
+      # it will drift from the notices table and break the bundle.
+      #
+      # Tauri's externalBin picks up
+      # src-tauri/binaries/ffmpeg-aftercalls-<triple> at bundle time and
+      # drops it next to the main binary, so users need no ffmpeg on PATH.
+      - name: Fetch pinned ffmpeg sidecar (Linux)
         if: matrix.os == 'ubuntu-24.04'
-        env:
-          # Pinned per #69 — the same exact archive every CI run consumes,
-          # so a customer filing an LGPL §6 source request months from
-          # now gets the binary that actually shipped, not whatever
-          # rolled to "latest" that day. Bump both lines together when
-          # rolling forward (and update THIRD_PARTY_NOTICES.md +
-          # site/licenses/index.html in the same commit).
-          FFMPEG_URL: "https://johnvansickle.com/ffmpeg/releases/ffmpeg-7.0.2-amd64-static.tar.xz"
-          FFMPEG_SHA256: "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
-        run: |
-          set -eux
-          mkdir -p src-tauri/binaries
-          # John Van Sickle static build — fully static LGPL build,
-          # works on any glibc distro without additional libs.
-          curl -sSL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz
-          echo "ffmpeg archive sha256:"
-          sha256sum /tmp/ffmpeg.tar.xz
-          # Fail-loud if upstream changes the bytes under us. The pin
-          # is the contract with anyone filing a corresponding-source
-          # request — if it moves, we want the build to break before
-          # we ship a binary we can't reproduce.
-          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
-          mkdir -p /tmp/ffmpeg-stage
-          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-stage --strip-components=1
-          cp /tmp/ffmpeg-stage/ffmpeg \
-            src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
-          chmod +x src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
-          echo "bundled binary sha256:"
-          sha256sum src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu
-          ls -lh src-tauri/binaries/
+        run: bash scripts/fetch-ffmpeg-sidecar.sh
 
-      - name: Fetch ffmpeg sidecar (Windows)
+      - name: Fetch pinned ffmpeg sidecar (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        env:
-          # Pinned per #69. gyan.dev re-tags the "release" alias on
-          # every upstream bump; the dated build lives in GyanD's
-          # GitHub releases. Bump URL + SHA256 together (and the notices
-          # files) when rolling forward.
-          FFMPEG_URL: "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip"
-          FFMPEG_SHA256: "04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4"
-        run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
-          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
-          $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-stage"
-          # GyanD/codexffmpeg's "essentials" build is the lightweight LGPL
-          # one (~90MB unpacked) — same license posture as the Linux
-          # John Van Sickle build.
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri $env:FFMPEG_URL `
-            -OutFile $zip
-          Write-Host "ffmpeg archive sha256:"
-          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-          Write-Host $hash
-          if ($hash -ne $env:FFMPEG_SHA256) {
-            Write-Error "ffmpeg sha256 mismatch — expected $env:FFMPEG_SHA256, got $hash"
-            exit 1
-          }
-          Expand-Archive -Path $zip -DestinationPath $stage -Force
-          $exe = (Get-ChildItem -Path $stage -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1).FullName
-          Copy-Item $exe "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe"
-          Write-Host "bundled binary sha256:"
-          Get-FileHash -Algorithm SHA256 "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe" | Format-List Algorithm,Hash
-          Get-ChildItem src-tauri/binaries/
+        run: ./scripts/fetch-ffmpeg-sidecar.ps1
 
       # macOS sidecar — osxexperts.net ships LGPL-only static builds
       # for Apple Silicon (and Intel; Intel matrix entry currently
@@ -296,6 +252,40 @@ jobs:
           echo "bundled binary sha256:"
           shasum -a 256 "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
           ls -lh src-tauri/binaries/
+
+          # tauri.conf.json declares bundle.resources, and tauri-build
+          # copies declared resources unconditionally in strict mode — a
+          # missing file panics the build script. Linux/Windows get these
+          # from scripts/fetch-ffmpeg-sidecar.*, which lift LICENSE.txt out
+          # of the pinned BtbN archive. The osxexperts zip is a flat archive
+          # holding only the binary, so there is no builder-supplied license
+          # to bundle and this leg cannot satisfy the same standard.
+          #
+          # THIRD_PARTY_NOTICES.md currently states we publish no macOS
+          # installer or macOS sidecar, and v0.30.0 shipped Linux + Windows
+          # only. This job is `experimental: true`, so failing here does not
+          # block the release — it fails loudly and legibly instead of as an
+          # opaque Rust panic 20 minutes later. To actually ship macOS:
+          # source a verified LGPL mac build that carries its license, add a
+          # macOS branch to fetch-ffmpeg-sidecar.sh, and update the notices
+          # table + site/licenses in the same commit.
+          mkdir -p src-tauri/resources
+          cp THIRD_PARTY_NOTICES.md src-tauri/resources/THIRD_PARTY_NOTICES.md
+          MAC_LICENSE=$(find /tmp/ffmpeg-stage \
+            \( -iname 'LICENSE*' -o -iname 'COPYING*' \) -type f | head -n1)
+          if [ -z "$MAC_LICENSE" ]; then
+            echo "::error::macOS ffmpeg archive carries no license file, so"
+            echo "::error::src-tauri/resources/FFmpeg-LICENSE.txt cannot be"
+            echo "::error::populated and the bundle would ship without the"
+            echo "::error::LGPL text. Not shipping a macOS installer — see"
+            echo "::error::THIRD_PARTY_NOTICES.md. This job is non-blocking."
+            exit 1
+          fi
+          cp "$MAC_LICENSE" src-tauri/resources/FFmpeg-LICENSE.txt
+          grep -Fq 'GNU LESSER GENERAL PUBLIC LICENSE' \
+            src-tauri/resources/FFmpeg-LICENSE.txt \
+            || { echo "::error::macOS ffmpeg license is not LGPL"; exit 1; }
+          ls -lh src-tauri/resources/
 
       # Inert until the founder finishes Azure Artifact Signing setup
       # (#67 in the private repo) and sets six secrets on THIS repo:

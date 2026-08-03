@@ -14,7 +14,7 @@ procedure.
 ## Run locally
 
 ```bash
-pnpm install
+pnpm install --ignore-workspace
 pnpm tauri:dev
 ```
 
@@ -40,10 +40,14 @@ ln -s "$(which ffmpeg)" \
 ```
 
 The binary is gitignored (see `src-tauri/.gitignore`) so your
-personal stub never ends up in a commit. CI downloads the real
-LGPL-only build from John Van Sickle (Linux) or gyan.dev (Windows)
-before `tauri-action` runs — see the release workflow in the public
-mirror.
+personal stub never ends up in a commit. CI downloads the exact
+checksum-pinned BtbN 7.1 LGPL build for Linux or Windows, rejects any
+build configured with `--enable-gpl` or `--enable-nonfree`, stages its
+license text, and then runs the same atomic-publication smoke test on
+both platforms before bundling. The provisioning script also stages the
+top-level `THIRD_PARTY_NOTICES.md` under `src-tauri/resources/`, keeping
+the Tauri bundle self-contained when this directory is mirrored as a
+standalone repository.
 
 ## Licensing
 

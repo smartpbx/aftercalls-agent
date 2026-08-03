@@ -5,7 +5,7 @@ use cpal::{Device, Host, SampleFormat};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::live::{LiveTap, CHANNEL_MIC};
 
@@ -39,6 +40,35 @@ pub struct MicFallback {
     pub reason: MicFallbackReason,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawTrackState {
+    Finalized,
+    NotPresent,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RawTrackFinalization {
+    pub track: &'static str,
+    pub state: RawTrackState,
+    pub path: PathBuf,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TeardownIssue {
+    pub component: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecorderStopReport {
+    pub session_dir: PathBuf,
+    pub tracks: Vec<RawTrackFinalization>,
+    pub issues: Vec<TeardownIssue>,
+}
+
 pub struct Recorder {
     inner: Mutex<Inner>,
     active: AtomicBool,
@@ -46,13 +76,10 @@ pub struct Recorder {
     // the UI rebuild the running timer after a webview remount (tray
     // hide+show, route nav) without persisting state to disk.
     started_at_ms: AtomicI64,
-    // Monotonic session counter, bumped on every successful start().
-    // The auto-stop watchdog (see lib.rs) captures the value at spawn
-    // time and only fires if it still matches — that way a manual
-    // stop followed by a new start can't be nuked by a stale timer
-    // from the previous session. Cheaper + simpler than a Weak/Arc
-    // cancellation token.
-    session_seq: AtomicI64,
+    // The process-wide lifecycle generation shared with screen, rolling, and
+    // live capture. Zero means idle. Stop commands carry the generation they
+    // intend to tear down, so a delayed caller cannot stop a newer session.
+    active_generation: AtomicI64,
     // Per-session dedupe for `mic-fallback` toasts (#3, decisions Q3).
     // Holds the set of saved device names we've already surfaced a
     // fallback toast for THIS process run. First recording with a
@@ -95,6 +122,7 @@ type StartOk = (PathBuf, Option<MicFallback>);
 enum Command_ {
     Start {
         base_dir: PathBuf,
+        generation: u64,
         saved_device: Option<String>,
         // #142 · v0.4.5 — note-to-self mode. When true `begin()`
         // skips `start_system_loopback` entirely so even a
@@ -110,7 +138,9 @@ enum Command_ {
         reply: Sender<Result<StartOk, String>>,
     },
     Stop {
-        reply: Sender<Result<PathBuf, String>>,
+        expected_generation: u64,
+        expected_session_dir: PathBuf,
+        reply: Sender<Result<RecorderStopReport, String>>,
     },
 }
 
@@ -134,6 +164,7 @@ enum SystemCapture {
 }
 
 struct Active {
+    generation: u64,
     cpal_tracks: Vec<CpalTrack>,
     system: Option<SystemCapture>,
     session_dir: PathBuf,
@@ -155,19 +186,17 @@ impl Recorder {
             }),
             active: AtomicBool::new(false),
             started_at_ms: AtomicI64::new(0),
-            session_seq: AtomicI64::new(0),
+            active_generation: AtomicI64::new(0),
             fallback_seen: Mutex::new(HashSet::new()),
             pending_fallback: Mutex::new(None),
             active_session_dir: Mutex::new(None),
         }
     }
 
-    /// Current session sequence. Bumped on every successful start().
-    /// The watchdog spawned in `do_start` captures this value and
-    /// aborts if it ever drifts (manual stop, then new start) — so a
-    /// stale timer from a prior session can't kill a new one.
-    pub fn session_seq(&self) -> i64 {
-        self.session_seq.load(Ordering::Relaxed)
+    pub fn active_generation(&self) -> Option<u64> {
+        u64::try_from(self.active_generation.load(Ordering::Acquire))
+            .ok()
+            .filter(|generation| *generation != 0)
     }
 
     pub fn is_active(&self) -> bool {
@@ -191,17 +220,25 @@ impl Recorder {
     pub fn start(
         &self,
         base_dir: PathBuf,
+        generation: u64,
         saved_device: Option<String>,
         mic_only: bool,
         live_tap: Option<LiveTap>,
     ) -> Result<PathBuf, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.inner
-            .lock()
-            .unwrap()
+        if generation == 0 || generation > i64::MAX as u64 {
+            return Err("invalid recording generation".into());
+        }
+        // Hold the caller-side lock through the worker reply AND mirror
+        // update. Previously Start/Stop commands were serialized only in the
+        // worker queue, allowing an older Stop caller to clear mirrors after a
+        // newer Start caller had set them.
+        let inner = self.inner.lock().unwrap();
+        inner
             .tx
             .send(Command_::Start {
                 base_dir,
+                generation,
                 saved_device,
                 mic_only,
                 live_tap,
@@ -213,12 +250,9 @@ impl Recorder {
             Ok((path, fallback)) => {
                 self.started_at_ms
                     .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-                self.active.store(true, Ordering::Relaxed);
-                // Bump the session seq so any still-pending watchdog
-                // from a prior session sees a mismatch and exits. The
-                // new watchdog (spawned by lib.rs after start())
-                // captures the updated value below.
-                self.session_seq.fetch_add(1, Ordering::Relaxed);
+                self.active_generation
+                    .store(generation as i64, Ordering::Release);
+                self.active.store(true, Ordering::Release);
                 // Stash the fallback info (if any) for the caller to
                 // consume via `take_last_fallback()`. Dedupe happens
                 // there, not here, so `start()` stays a pure
@@ -249,25 +283,30 @@ impl Recorder {
         Some(pending)
     }
 
-    pub fn stop(&self) -> Result<PathBuf, String> {
+    pub fn stop_generation(
+        &self,
+        expected_generation: u64,
+        expected_session_dir: &Path,
+    ) -> Result<RecorderStopReport, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.inner
-            .lock()
-            .unwrap()
+        let inner = self.inner.lock().unwrap();
+        inner
             .tx
-            .send(Command_::Stop { reply: reply_tx })
+            .send(Command_::Stop {
+                expected_generation,
+                expected_session_dir: expected_session_dir.to_path_buf(),
+                reply: reply_tx,
+            })
             .map_err(|e| e.to_string())?;
         let result = reply_rx.recv().map_err(|e| e.to_string())?;
         if result.is_ok() {
-            self.active.store(false, Ordering::Relaxed);
+            self.active.store(false, Ordering::Release);
+            self.active_generation.store(0, Ordering::Release);
             self.started_at_ms.store(0, Ordering::Relaxed);
             // Drop the session_dir snapshot so a post-stop
             // `is_recording` read doesn't hand the webview a stale
             // path. Paired with the set in `start()`.
             *self.active_session_dir.lock().unwrap() = None;
-            // Bump on stop too so the currently-running watchdog's
-            // captured seq goes stale and its next tick is a no-op.
-            self.session_seq.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -279,6 +318,7 @@ fn worker_loop(rx: Receiver<Command_>) {
         match cmd {
             Command_::Start {
                 base_dir,
+                generation,
                 saved_device,
                 mic_only,
                 live_tap,
@@ -288,7 +328,13 @@ fn worker_loop(rx: Receiver<Command_>) {
                     let _ = reply.send(Err("recording already in progress".into()));
                     continue;
                 }
-                match begin(&base_dir, saved_device.as_deref(), mic_only, live_tap) {
+                match begin(
+                    &base_dir,
+                    generation,
+                    saved_device.as_deref(),
+                    mic_only,
+                    live_tap,
+                ) {
                     Ok(rec) => {
                         let path = rec.session_dir.clone();
                         let fallback = rec.fallback.clone();
@@ -300,10 +346,25 @@ fn worker_loop(rx: Receiver<Command_>) {
                     }
                 }
             }
-            Command_::Stop { reply } => match active.take() {
-                Some(rec) => {
-                    let result = finish(rec).map_err(|e| e.to_string());
-                    let _ = reply.send(result);
+            Command_::Stop {
+                expected_generation,
+                expected_session_dir,
+                reply,
+            } => match active.as_ref() {
+                Some(rec)
+                    if rec.generation != expected_generation
+                        || rec.session_dir != expected_session_dir =>
+                {
+                    let _ = reply.send(Err(format!(
+                        "stale recorder stop rejected: expected generation {expected_generation} for {}, active generation is {} for {}",
+                        expected_session_dir.display(),
+                        rec.generation,
+                        rec.session_dir.display()
+                    )));
+                }
+                Some(_) => {
+                    let rec = active.take().expect("checked active recorder");
+                    let _ = reply.send(Ok(finish(rec)));
                 }
                 None => {
                     let _ = reply.send(Err("no active recording".into()));
@@ -315,12 +376,16 @@ fn worker_loop(rx: Receiver<Command_>) {
 
 fn begin(
     base_dir: &Path,
+    generation: u64,
     saved_device: Option<&str>,
     mic_only: bool,
     live_tap: Option<LiveTap>,
 ) -> Result<Active> {
-    let session_dir = base_dir.join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-    fs::create_dir_all(&session_dir).context("create session dir")?;
+    let session_dir = crate::session_fs::allocate(
+        base_dir,
+        crate::session_fs::SessionKind::Recording,
+    )
+    .context("allocate recording session")?;
 
     let host = cpal::default_host();
     let (mic_device, fallback) = resolve_input_device(&host, saved_device)?;
@@ -344,16 +409,21 @@ fn begin(
     // declared mic-only. Privacy + storage are both positively
     // affected; the pipeline already handles a missing system.wav
     // cleanly.
+    let system_path = session_dir.join("system.wav");
     let system = if mic_only {
         eprintln!("aftercalls: mic-only session — skipping system loopback");
         None
     } else {
-        match start_system_loopback(&session_dir.join("system.wav"), live_tap.clone()) {
+        match start_system_loopback(&system_path, live_tap.clone()) {
             Ok((cap, target)) => {
                 eprintln!("aftercalls: recording system audio from {target}");
                 Some(cap)
             }
             Err(e) => {
+                // A failed constructor may have written only a WAV header.
+                // Remove it so the pipeline distinguishes "not recorded"
+                // from a track that captured data and later failed.
+                let _ = std::fs::remove_file(&system_path);
                 eprintln!("aftercalls: skipping system loopback: {e:#}");
                 None
             }
@@ -366,6 +436,7 @@ fn begin(
     }
 
     Ok(Active {
+        generation,
         cpal_tracks: vec![mic_track],
         system,
         session_dir,
@@ -494,40 +565,163 @@ fn is_monitor_source_name(name: &str) -> bool {
         || lower.ends_with(" monitor of built-in audio")
 }
 
-fn finish(rec: Active) -> Result<PathBuf> {
-    for t in rec.cpal_tracks {
-        drop(t._stream);
-        if let Some(w) = t.writer.lock().unwrap().take() {
-            w.finalize().context("finalize wav")?;
+#[derive(Default)]
+struct TeardownAccumulator {
+    issues: Vec<TeardownIssue>,
+}
+
+impl TeardownAccumulator {
+    fn attempt(&mut self, component: impl Into<String>, step: impl FnOnce() -> Result<()>) {
+        let component = component.into();
+        if let Err(error) = step() {
+            self.issues.push(TeardownIssue {
+                component,
+                error: format!("{error:#}"),
+            });
         }
     }
-    match rec.system {
+}
+
+fn finish(rec: Active) -> RecorderStopReport {
+    let Active {
+        cpal_tracks,
+        system,
+        session_dir,
+        ..
+    } = rec;
+    let mut teardown = TeardownAccumulator::default();
+
+    // Drop every live stream first, then attempt every writer finalizer.
+    // `attempt` never short-circuits, so one broken mic writer cannot skip
+    // system capture teardown.
+    for (idx, track) in cpal_tracks.into_iter().enumerate() {
+        drop(track._stream);
+        let component = format!("mic_writer_{idx}");
+        let writer = match track.writer.lock() {
+            Ok(mut writer) => writer.take(),
+            Err(poisoned) => {
+                teardown.issues.push(TeardownIssue {
+                    component: component.clone(),
+                    error: "WAV writer mutex was poisoned; recovering owned writer".into(),
+                });
+                poisoned.into_inner().take()
+            }
+        };
+        teardown.attempt(component, move || {
+            if let Some(writer) = writer {
+                writer.finalize().context("finalize mic WAV")?;
+            }
+            Ok(())
+        });
+    }
+
+    match system {
         Some(SystemCapture::Child(mut child, tap)) => {
-            stop_child_gracefully(&mut child).context("stop system loopback")?;
-            // Kill the live-tap parec (Linux "Them" lane); its reader thread
-            // exits on the resulting stdout EOF. Best-effort — never fail the
-            // stop over the disposable live tap.
+            teardown.attempt("system_loopback", || {
+                stop_child_gracefully(&mut child).context("stop system loopback")
+            });
             if let Some(mut tap_child) = tap {
-                let _ = tap_child.kill();
+                teardown.attempt("system_live_tap", || {
+                    stop_child_now(&mut tap_child).context("stop system live tap")
+                });
             }
         }
-        Some(SystemCapture::Cpal(t)) => {
-            drop(t._stream);
-            if let Some(w) = t.writer.lock().unwrap().take() {
-                w.finalize().context("finalize system wav")?;
-            }
+        Some(SystemCapture::Cpal(track)) => {
+            drop(track._stream);
+            let writer = match track.writer.lock() {
+                Ok(mut writer) => writer.take(),
+                Err(poisoned) => {
+                    teardown.issues.push(TeardownIssue {
+                        component: "system_writer".into(),
+                        error: "WAV writer mutex was poisoned; recovering owned writer".into(),
+                    });
+                    poisoned.into_inner().take()
+                }
+            };
+            teardown.attempt("system_writer", move || {
+                if let Some(writer) = writer {
+                    writer.finalize().context("finalize system WAV")?;
+                }
+                Ok(())
+            });
         }
         #[cfg(target_os = "macos")]
         Some(SystemCapture::Mac(mut loopback)) => {
-            // Tear down the SCStream and patch the WAV header. The
-            // Drop impl on `MacLoopback` would also do this, but
-            // calling explicitly lets us bubble a real error message
-            // up instead of swallowing it on drop.
-            loopback.stop().context("stop system loopback")?;
+            teardown.attempt("system_loopback", || {
+                loopback.stop().context("stop system loopback")
+            });
         }
         None => {}
     }
-    Ok(rec.session_dir)
+
+    let mic = inspect_finalized_wav("mic", session_dir.join("mic.wav"), true);
+    let system = inspect_finalized_wav("system", session_dir.join("system.wav"), false);
+    for track in [&mic, &system] {
+        if track.state == RawTrackState::Failed {
+            teardown.issues.push(TeardownIssue {
+                component: format!("{}_wav", track.track),
+                error: track
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "raw WAV validation failed".into()),
+            });
+        }
+    }
+
+    RecorderStopReport {
+        session_dir,
+        tracks: vec![mic, system],
+        issues: teardown.issues,
+    }
+}
+
+fn inspect_finalized_wav(
+    track: &'static str,
+    path: PathBuf,
+    required: bool,
+) -> RawTrackFinalization {
+    if !path.exists() {
+        return RawTrackFinalization {
+            track,
+            state: if required {
+                RawTrackState::Failed
+            } else {
+                RawTrackState::NotPresent
+            },
+            path,
+            error: required.then(|| "required WAV is missing".into()),
+        };
+    }
+    if let Err(error) = crate::media_manifest::enforce_private_file(&path) {
+        return RawTrackFinalization {
+            track,
+            state: RawTrackState::Failed,
+            path,
+            error: Some(format!("protect finalized WAV: {error:#}")),
+        };
+    }
+    match hound::WavReader::open(&path) {
+        Ok(reader) if reader.spec().sample_rate > 0 && reader.duration() > 0 => {
+            RawTrackFinalization {
+                track,
+                state: RawTrackState::Finalized,
+                path,
+                error: None,
+            }
+        }
+        Ok(_) => RawTrackFinalization {
+            track,
+            state: RawTrackState::Failed,
+            path,
+            error: Some("WAV has zero sample rate or duration".into()),
+        },
+        Err(error) => RawTrackFinalization {
+            track,
+            state: RawTrackState::Failed,
+            path,
+            error: Some(format!("open finalized WAV: {error}")),
+        },
+    }
 }
 
 fn build_cpal_track(
@@ -566,7 +760,9 @@ fn build_cpal_track_from_config(
         },
     };
 
-    let wav = WavWriter::create(&output_path, spec).context("create wav")?;
+    let file = crate::session_fs::create_private_file(&output_path)
+        .with_context(|| format!("create private WAV {}", output_path.display()))?;
+    let wav = WavWriter::new(BufWriter::new(file), spec).context("write WAV header")?;
     let writer: SharedWriter = Arc::new(Mutex::new(Some(wav)));
     let err_fn = |e| eprintln!("aftercalls: input stream error: {e}");
 
@@ -684,11 +880,22 @@ fn start_system_loopback(
     // Ties a parec child's lifetime to the agent — if the agent is SIGKILL'd
     // (binary swap, crash, force-quit) parec gets SIGINT instead of leaking
     // and writing to a stale session dir. Applied to both parecs.
-    let tie = |cmd: &mut Command| {
+    let parent_pid = std::process::id() as libc::pid_t;
+    let tie = move |cmd: &mut Command| {
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                // Media children inherit the process umask by default. Make
+                // every file they create private even on hosts configured
+                // with a permissive 0022 umask.
+                libc::umask(0o077);
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "recorder parent exited before child exec",
+                    ));
                 }
                 Ok(())
             });
@@ -698,6 +905,9 @@ fn start_system_loopback(
     // Batch track → system.wav. parec respects the `.monitor` source name;
     // pw-cat's --target resolves to the wrong node (PipeWire exposes the
     // monitor as a port of the sink node, not a separate node).
+    // Reserve the inode as 0600 before handing it to the external producer;
+    // libsndfile truncates the existing file without widening its mode.
+    drop(crate::session_fs::create_private_file(output_path)?);
     let mut batch = Command::new("parec");
     batch
         .arg("--device")
@@ -706,9 +916,16 @@ fn start_system_loopback(
         .arg(output_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        // Do not leave an unread pipe that can fill and deadlock Stop.
+        .stderr(Stdio::null());
     tie(&mut batch);
-    let batch_child = batch.spawn().context("spawn parec")?;
+    let batch_child = match batch.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(output_path);
+            return Err(error).context("spawn parec");
+        }
+    };
 
     // Live-tap track → raw s16le PCM on stdout (48 kHz stereo; the live module
     // downmixes + resamples to 16 kHz mono off-thread). A detached reader
@@ -834,16 +1051,100 @@ fn default_sink_name() -> Result<String> {
 
 #[cfg(unix)]
 fn stop_child_gracefully(child: &mut Child) -> Result<()> {
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(poll_error) => {
+            let _ = child.kill();
+            let reap = child.wait();
+            return match reap {
+                Ok(_) => Err(poll_error)
+                    .context("poll child before stop (child killed and reaped)"),
+                Err(reap_error) => anyhow::bail!(
+                    "poll child before stop failed: {poll_error}; kill/reap also failed: {reap_error}"
+                ),
+            };
+        }
     }
-    child.wait().context("wait child")?;
-    Ok(())
+    let signal_result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    if signal_result != 0 {
+        let signal_error = std::io::Error::last_os_error();
+        // Even when signalling races an exit, collect the child. A signal
+        // error must never turn into a dropped, unreaped process handle.
+        let reap_result = stop_child_now(child);
+        return match reap_result {
+            Ok(()) => Err(signal_error).context("signal child (child reaped)"),
+            Err(reap_error) => anyhow::bail!(
+                "signal child failed: {signal_error}; kill/reap also failed: {reap_error:#}"
+            ),
+        };
+    }
+    wait_child_bounded(child, Duration::from_secs(5))
 }
 
 #[cfg(not(unix))]
 fn stop_child_gracefully(child: &mut Child) -> Result<()> {
-    child.kill().ok();
-    child.wait().context("wait child")?;
+    stop_child_now(child)
+}
+
+fn stop_child_now(child: &mut Child) -> Result<()> {
+    let _ = child.kill();
+    child.wait().context("reap child")?;
     Ok(())
+}
+
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                child.wait().context("reap timed-out child")?;
+                anyhow::bail!(
+                    "child did not stop within {}s; killed and reaped",
+                    timeout.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(poll_error) => {
+                let _ = child.kill();
+                let reap = child.wait();
+                return match reap {
+                    Ok(_) => Err(poll_error).context("poll child (child killed and reaped)"),
+                    Err(reap_error) => anyhow::bail!(
+                        "poll child failed: {poll_error}; kill/reap also failed: {reap_error}"
+                    ),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn independent_finalizer_failure_does_not_short_circuit_later_steps() {
+        let ran = AtomicUsize::new(0);
+        let mut teardown = TeardownAccumulator::default();
+        teardown.attempt("mic", || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("injected mic finalize failure")
+        });
+        teardown.attempt("system", || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        teardown.attempt("live", || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        assert_eq!(teardown.issues.len(), 1);
+        assert_eq!(teardown.issues[0].component, "mic");
+    }
 }

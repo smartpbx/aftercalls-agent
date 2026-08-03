@@ -1,7 +1,10 @@
 <script lang="ts" module>
-  import type { ScreenRecording } from "@aftercalls/shared/types";
+  import type {
+    ScreenPlaybackUrl,
+    ScreenRecording,
+  } from "@aftercalls/shared/types";
 
-  export type { ScreenRecording };
+  export type { ScreenPlaybackUrl, ScreenRecording };
 
   export type ScreenRecordingPlayerProps = {
     /** Call id — passed straight to `fetchMeta`. */
@@ -13,6 +16,9 @@
     /** Whether the audio element is currently playing. The muted video
      *  mirrors this (play/pause) once it's past `start_offset_ms`. */
     playing: boolean;
+    /** Playback speed of the audio master. The muted video mirrors it so
+     *  accelerated playback does not continuously drift and seek. */
+    playbackRate?: number;
     /** Call/audio duration in ms, for clamping the follower. Falls back
      *  to the recording's own `duration_ms` when absent. */
     durationMs?: number;
@@ -21,23 +27,28 @@
      *  `null` on a 404 (org flag off OR no row) → the player renders
      *  nothing. */
     fetchMeta: (callId: string) => Promise<ScreenRecording | null>;
-    /** Surface-specific `<video src>` resolver from ready metadata.
-     *  Both surfaces bind the presigned `url` (Spaces serves Range
-     *  natively); cross-origin media playback needs no auth header. */
-    resolveSrc: (meta: ScreenRecording) => string;
+    /** Mint a short-lived playback credential. Called only after the user
+     *  expands a ready recording. The returned immutable generation id is
+     *  correlated against the metadata before `<video src>` is updated. */
+    fetchPlaybackUrl: (callId: string) => Promise<ScreenPlaybackUrl>;
   };
 </script>
 
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
+  import {
+    classifyScreenPlaybackCandidate,
+    screenPlaybackRefreshDelayMs,
+  } from "@aftercalls/shared/screenPlayback";
 
   let {
     callId,
     currentMs,
     playing,
+    playbackRate = 1,
     durationMs,
     fetchMeta,
-    resolveSrc,
+    fetchPlaybackUrl,
   }: ScreenRecordingPlayerProps = $props();
 
   // `undefined` = still loading (render nothing); `null` = absent
@@ -48,55 +59,303 @@
   let videoEl = $state<HTMLVideoElement | undefined>(undefined);
   let buffering = $state(false);
   let playbackError = $state(false);
+  let playbackLoading = $state(false);
+  let videoSrc = $state("");
+  let playbackGenerationId = $state<string | null>(null);
+  let playbackExpiresAt = $state<string | null>(null);
   // `failed` is dismissable inline — it must never block the page.
   let failedDismissed = $state(false);
 
-  let pollHandle: ReturnType<typeof setInterval> | null = null;
+  let pollHandle: ReturnType<typeof setTimeout> | null = null;
+  let playbackRefreshHandle: ReturnType<typeof setTimeout> | null = null;
   let destroyed = false;
+  let loadSequence = 0;
+  let playbackSequence = 0;
+  let transientFailures = 0;
+  const TRANSIENT_RETRY_DELAYS_MS = [
+    1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 30_000, 30_000,
+  ] as const;
 
   function isProcessing(m: ScreenRecording | null | undefined): boolean {
     return m?.status === "recording" || m?.status === "uploading";
   }
 
-  async function load() {
+  function stopPlaybackRefresh() {
+    if (playbackRefreshHandle) {
+      clearTimeout(playbackRefreshHandle);
+      playbackRefreshHandle = null;
+    }
+  }
+
+  function clearPlaybackCredential(cancelRequest = true) {
+    if (cancelRequest) playbackSequence += 1;
+    stopPlaybackRefresh();
+    videoSrc = "";
+    playbackGenerationId = null;
+    playbackExpiresAt = null;
+    playbackLoading = false;
+    buffering = false;
+  }
+
+  function applyMetadata(next: ScreenRecording | null) {
+    meta = next;
+    if (
+      playbackGenerationId &&
+      (next?.status !== "ready" ||
+        playbackGenerationId !== next.generation_id)
+    ) {
+      // A credential is scoped to one immutable generation. A metadata
+      // refresh that points elsewhere invalidates it immediately.
+      clearPlaybackCredential(false);
+    }
+  }
+
+  async function load(requestedCallId = callId) {
+    stopPoll();
+    const sequence = ++loadSequence;
     try {
-      const next = await fetchMeta(callId);
-      if (destroyed) return;
-      meta = next;
+      const next = await fetchMeta(requestedCallId);
+      if (
+        destroyed ||
+        sequence !== loadSequence ||
+        requestedCallId !== callId
+      )
+        return;
+      transientFailures = 0;
+      applyMetadata(next);
       // Keep polling while the row is still finalizing; stop otherwise.
-      if (isProcessing(next)) startPoll();
+      if (isProcessing(next)) schedulePoll(5_000);
       else stopPoll();
     } catch {
       // A transient fetch error shouldn't fabricate an error surface on
       // the page — treat it as "not known yet" and let a later poll (or
       // a page reload) settle it. Absent-until-known keeps the common
       // audio-only call untouched.
-      if (!destroyed && meta === undefined) meta = null;
+      if (
+        destroyed ||
+        sequence !== loadSequence ||
+        requestedCallId !== callId
+      )
+        return;
+      if (meta === undefined) meta = null;
+      // Initial network failures used to permanently collapse the player
+      // until a full page reload. Retry with bounded exponential backoff;
+      // terminal `null` responses still stop immediately on the success path.
+      if (transientFailures < TRANSIENT_RETRY_DELAYS_MS.length) {
+        const delay = TRANSIENT_RETRY_DELAYS_MS[transientFailures];
+        transientFailures += 1;
+        schedulePoll(delay);
+      }
     }
   }
 
-  function startPoll() {
-    if (pollHandle) return;
-    pollHandle = setInterval(load, 5000);
+  function schedulePoll(delayMs: number) {
+    stopPoll();
+    pollHandle = setTimeout(() => {
+      pollHandle = null;
+      void load();
+    }, delayMs);
   }
   function stopPoll() {
     if (pollHandle) {
-      clearInterval(pollHandle);
+      clearTimeout(pollHandle);
       pollHandle = null;
     }
   }
 
-  onMount(load);
-  onDestroy(() => {
-    destroyed = true;
-    stopPoll();
+  // SvelteKit reuses the same `[id]` route component when navigating directly
+  // between calls. Reset/reload on the id itself so metadata, errors, expansion,
+  // and retry timers from call N never bleed into call N+1.
+  $effect(() => {
+    const activeCallId = callId;
+    untrack(() => {
+      loadSequence += 1;
+      stopPoll();
+      transientFailures = 0;
+      meta = undefined;
+      expanded = false;
+      playbackError = false;
+      failedDismissed = false;
+      clearPlaybackCredential();
+      void load(activeCallId);
+    });
+    return () => {
+      untrack(() => {
+        loadSequence += 1;
+        stopPoll();
+        clearPlaybackCredential();
+      });
+    };
   });
 
-  // Only mint the (byte-heavy) source once the user expands a ready
-  // recording — collapsed calls never pull the object.
-  let videoSrc = $derived(
-    expanded && meta?.status === "ready" ? resolveSrc(meta) : "",
-  );
+  onDestroy(() => {
+    destroyed = true;
+    loadSequence += 1;
+    stopPoll();
+    clearPlaybackCredential();
+  });
+
+  function playbackRequestIsCurrent(
+    request: number,
+    requestedCallId: string,
+  ): boolean {
+    return (
+      !destroyed &&
+      request === playbackSequence &&
+      requestedCallId === callId &&
+      expanded
+    );
+  }
+
+  function schedulePlaybackRefresh(
+    requestedCallId: string,
+    generationId: string,
+    delayMs: number,
+  ) {
+    stopPlaybackRefresh();
+    playbackRefreshHandle = setTimeout(() => {
+      playbackRefreshHandle = null;
+      if (
+        destroyed ||
+        !expanded ||
+        requestedCallId !== callId ||
+        meta?.status !== "ready" ||
+        meta.generation_id !== generationId
+      ) {
+        return;
+      }
+      void mintPlayback(requestedCallId);
+    }, Math.max(0, delayMs));
+  }
+
+  function currentCredentialIsUsable(nowMs = Date.now()): boolean {
+    if (
+      !videoSrc ||
+      !playbackExpiresAt ||
+      meta?.status !== "ready" ||
+      playbackGenerationId !== meta.generation_id
+    ) {
+      return false;
+    }
+    const expiresAtMs = Date.parse(playbackExpiresAt);
+    return Number.isFinite(expiresAtMs) && expiresAtMs > nowMs;
+  }
+
+  function installPlayback(
+    requestedCallId: string,
+    recording: ScreenRecording,
+    candidate: ScreenPlaybackUrl,
+  ) {
+    videoSrc = candidate.playback_url;
+    playbackGenerationId = candidate.generation_id;
+    playbackExpiresAt = candidate.playback_url_expires_at;
+    playbackLoading = false;
+    playbackError = false;
+    const refreshDelay = screenPlaybackRefreshDelayMs(
+      candidate.playback_url_expires_at,
+    );
+    if (refreshDelay !== null) {
+      schedulePlaybackRefresh(
+        requestedCallId,
+        recording.generation_id,
+        refreshDelay,
+      );
+    }
+  }
+
+  async function mintPlayback(requestedCallId = callId) {
+    const startingMeta = meta;
+    if (
+      destroyed ||
+      !expanded ||
+      requestedCallId !== callId ||
+      startingMeta?.status !== "ready"
+    ) {
+      return;
+    }
+
+    stopPlaybackRefresh();
+    const request = ++playbackSequence;
+    playbackLoading = true;
+    playbackError = false;
+    let authorityMismatchSeen = false;
+
+    try {
+      // A newly published generation can race the metadata read. At most one
+      // metadata refresh + second mint is needed to converge on a stable pair.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const candidate = await fetchPlaybackUrl(requestedCallId);
+        if (!playbackRequestIsCurrent(request, requestedCallId)) return;
+
+        let recording = meta;
+        let classification = classifyScreenPlaybackCandidate(
+          recording,
+          candidate,
+        );
+        if (classification === "generation_mismatch") {
+          authorityMismatchSeen = true;
+          const refreshed = await fetchMeta(requestedCallId);
+          if (!playbackRequestIsCurrent(request, requestedCallId)) return;
+          if (refreshed === null) {
+            // The playback endpoint just proved a current generation exists;
+            // a contradictory metadata 404 is transient. Keep the ready row
+            // visible so Retry can converge instead of hiding the player.
+            throw new Error("screen metadata disappeared during playback mint");
+          }
+          applyMetadata(refreshed);
+          recording = refreshed;
+          classification = classifyScreenPlaybackCandidate(
+            recording,
+            candidate,
+          );
+        }
+
+        if (classification === "ready" && recording) {
+          installPlayback(requestedCallId, recording, candidate);
+          return;
+        }
+        if (classification === "recording_not_ready") {
+          clearPlaybackCredential(false);
+          playbackError = false;
+          return;
+        }
+        if (classification !== "generation_mismatch" || attempt === 1) {
+          throw new Error(`screen playback credential ${classification}`);
+        }
+      }
+    } catch {
+      if (!playbackRequestIsCurrent(request, requestedCallId)) return;
+      playbackLoading = false;
+      if (!authorityMismatchSeen && currentCredentialIsUsable()) {
+        // A proactive refresh failure must not discard a still-valid source.
+        // Retry quietly while the current credential can continue playback.
+        const remainingMs =
+          Date.parse(playbackExpiresAt ?? "") - Date.now();
+        schedulePlaybackRefresh(
+          requestedCallId,
+          playbackGenerationId ?? startingMeta.generation_id,
+          Math.max(1_000, Math.min(5_000, remainingMs - 1_000)),
+        );
+      } else {
+        clearPlaybackCredential(false);
+        playbackError = true;
+      }
+    }
+  }
+
+  function ensurePlayback() {
+    const recording = meta;
+    if (recording?.status !== "ready" || !expanded) return;
+    if (currentCredentialIsUsable()) {
+      const refreshDelay = screenPlaybackRefreshDelayMs(playbackExpiresAt!);
+      if (refreshDelay !== null) {
+        schedulePlaybackRefresh(callId, recording.generation_id, refreshDelay);
+      }
+      return;
+    }
+    clearPlaybackCredential();
+    void mintPlayback(callId);
+  }
 
   let effectiveDurationMs = $derived(durationMs ?? meta?.duration_ms ?? 0);
 
@@ -113,13 +372,21 @@
   // the frame when it has drifted past a threshold so we don't fight the
   // video's own playback every timeupdate tick, and we mirror play/pause
   // exactly once per transition.
-  $effect(() => {
+  function syncVideoToAudio(force = false) {
     const v = videoEl;
     const m = meta;
-    // Read the reactive deps unconditionally so the effect re-subscribes.
     const clockMs = currentMs;
     const isPlaying = playing;
-    if (!v || !m || m.status !== "ready" || !expanded) return;
+    const requestedRate = playbackRate;
+    if (!v || !m || m.status !== "ready" || !expanded || !videoSrc) return;
+
+    const followerRate =
+      Number.isFinite(requestedRate) && requestedRate > 0
+        ? requestedRate
+        : 1;
+    if (v.playbackRate !== followerRate) {
+      v.playbackRate = followerRate;
+    }
 
     const offset = m.start_offset_ms ?? 0;
     if (clockMs < offset) {
@@ -132,7 +399,7 @@
     const durSec = effectiveDurationMs > 0 ? (effectiveDurationMs - offset) / 1000 : Infinity;
     const target = Math.max(0, Math.min((clockMs - offset) / 1000, durSec));
     // Correct only on meaningful drift (seek, skip, transcript click).
-    if (Math.abs(v.currentTime - target) > 0.35) {
+    if (Math.abs(v.currentTime - target) > (force ? 0.05 : 0.35)) {
       v.currentTime = target;
     }
     // Mirror transport play/pause. Guarded so we don't spam play().
@@ -141,11 +408,42 @@
     } else if (!isPlaying && !v.paused) {
       v.pause();
     }
+  }
+
+  $effect(() => {
+    // Read the reactive deps before entering the helper so the effect follows
+    // the audio clock/play state even though video itself is imperative.
+    currentMs;
+    playing;
+    effectiveDurationMs;
+    expanded;
+    videoEl;
+    meta;
+    syncVideoToAudio(false);
   });
 
+  let transportRepairQueued = false;
+  function enforceAudioMaster() {
+    if (transportRepairQueued) return;
+    transportRepairQueued = true;
+    queueMicrotask(() => {
+      transportRepairQueued = false;
+      syncVideoToAudio(true);
+    });
+  }
+
   function toggleExpand() {
-    expanded = !expanded;
-    if (!expanded && videoEl && !videoEl.paused) videoEl.pause();
+    if (expanded) {
+      expanded = false;
+      playbackSequence += 1;
+      playbackLoading = false;
+      stopPlaybackRefresh();
+      if (videoEl && !videoEl.paused) videoEl.pause();
+      return;
+    }
+    expanded = true;
+    playbackError = false;
+    ensurePlayback();
   }
 
   function onVideoWaiting() {
@@ -154,18 +452,27 @@
   function onVideoPlaying() {
     buffering = false;
     playbackError = false;
+    enforceAudioMaster();
+  }
+  function onVideoPaused() {
+    enforceAudioMaster();
+  }
+  function onVideoSeeking() {
+    enforceAudioMaster();
   }
   function onVideoError() {
     buffering = false;
+    if (!videoSrc) return;
+    // The retry action always re-mints instead of reusing this source, which
+    // covers expiry and Range failures without an automatic error loop for a
+    // genuinely corrupt object.
     playbackError = true;
   }
 
-  async function retryPlayback() {
+  function retryPlayback() {
     playbackError = false;
-    // Re-mint the source (the presigned url is short-lived) then force a
-    // reload — an identical string wouldn't retrigger the media element.
-    await load();
-    if (videoEl) videoEl.load();
+    clearPlaybackCredential();
+    void mintPlayback(callId);
   }
 
   function fmtDuration(ms: number | undefined): string {
@@ -271,7 +578,10 @@
     </button>
 
     {#if expanded}
-      <div class="scr-video-wrap" class:scr-buffering={buffering}>
+      <div
+        class="scr-video-wrap"
+        class:scr-buffering={buffering || playbackLoading}
+      >
         <!-- svelte-ignore a11y_media_has_caption -->
         <video
           bind:this={videoEl}
@@ -280,9 +590,12 @@
           muted
           playsinline
           preload="metadata"
-          controls
+          tabindex="-1"
           aria-label="Screen recording for this call"
           onwaiting={onVideoWaiting}
+          onplay={enforceAudioMaster}
+          onpause={onVideoPaused}
+          onseeking={onVideoSeeking}
           onplaying={onVideoPlaying}
           oncanplay={onVideoPlaying}
           onerror={onVideoError}

@@ -1,5 +1,11 @@
 fn main() {
-    tauri_build::build();
+    // An explicit application manifest turns custom commands into ACL-managed
+    // resources. `permissions/app.toml` then assigns separate command sets to
+    // the main, co-pilot and region-selection windows.
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new()),
+    )
+    .expect("build Tauri application manifest");
 
     #[cfg(target_os = "macos")]
     macos::build_loopback();

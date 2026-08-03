@@ -63,6 +63,11 @@ function createStore() {
   let mode = $state<CallRecordingMode>("call");
   let stage = $state<CallRecordingStage>("live");
   let startedAtMs = $state<number | null>(null);
+  /** Exact backend-owned session directory for the active recording.
+   *  Correlates asynchronous per-call UI (notably the screen-source
+   *  chooser) with the recording that emitted it, so a late response from
+   *  call N can never act on call N+1. */
+  let sessionDir = $state<string | null>(null);
   let elapsedMs = $state(0);
   let stopRequestId = $state(0);
   /** Latest known call id (set on the pipeline `transcribed` event,
@@ -73,7 +78,7 @@ function createStore() {
   /** Sanitized error string for the failed surface. Plain text. */
   let errorMessage = $state<string>("");
   /** #302 Slice C — whether the screen is ALSO being captured for this
-   *  call. Driven by the floater polling `screen_capture_status()` while
+   *  call. Driven by the floater polling `screen_capture_local_status()` while
    *  live (no dedicated backend event this slice). Widens the floater to
    *  "Recording call + screen" + a SCREEN chip; the audio Stop halts both
    *  together on the Rust side. */
@@ -125,6 +130,9 @@ function createStore() {
     get startedAtMs(): number | null {
       return startedAtMs;
     },
+    get sessionDir(): string | null {
+      return sessionDir;
+    },
     get stopRequestId(): number {
       return stopRequestId;
     },
@@ -145,9 +153,14 @@ function createStore() {
      *  layout's `recording-state` listener when `recording=true`.
      *  `seedAtMs` lets a re-mounted webview pick up an in-flight
      *  session via `is_recording` without losing elapsed time. */
-    markRecording(nextMode: CallRecordingMode, seedAtMs: number | null) {
+    markRecording(
+      nextMode: CallRecordingMode,
+      seedAtMs: number | null,
+      nextSessionDir: string | null = null,
+    ) {
       mode = nextMode;
       stage = "live";
+      sessionDir = nextSessionDir;
       callId = "";
       errorMessage = "";
       screenActive = false;
@@ -163,6 +176,7 @@ function createStore() {
     markStopping() {
       if (state === "idle") return;
       stopTimer();
+      sessionDir = null;
       state = "stopping";
       stage = "transcribing"; // best-guess until the pipeline reports
     },
@@ -198,7 +212,7 @@ function createStore() {
       errorMessage = msg;
     },
 
-    /** #302 Slice C — the floater's `screen_capture_status()` poll writes
+    /** #302 Slice C — the floater's `screen_capture_local_status()` poll writes
      *  this while the call is live. Idempotent; ignored once the call
      *  leaves the live state (post-stop the screen capture is done too). */
     setScreenActive(active: boolean) {
@@ -208,7 +222,7 @@ function createStore() {
     },
 
     /** #302 follow-up — the floater's poll writes the active capture kind
-     *  (from `screen_capture_status().source_kind`). `null` = no capture
+     *  (from `screen_capture_local_status().source_kind`). `null` = no capture
      *  running (never picked, or it died mid-call), which drops the cue. */
     setScreenSource(kind: string | null) {
       if (state !== "recording") return;
@@ -224,6 +238,7 @@ function createStore() {
       mode = "call";
       stopTimer();
       startedAtMs = null;
+      sessionDir = null;
       elapsedMs = 0;
       callId = "";
       errorMessage = "";

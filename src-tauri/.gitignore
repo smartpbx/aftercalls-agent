@@ -10,3 +10,8 @@
 # "Fetch ffmpeg sidecar" step) or copied in locally for pnpm tauri:dev.
 # The per-triple files are big and platform-specific; not checked in.
 /binaries/
+
+# Extracted from the exact checksum-verified sidecar archive by the same
+# provisioning scripts. Tauri bundles it as licenses/FFmpeg-LICENSE.txt.
+/resources/FFmpeg-LICENSE.txt
+/resources/THIRD_PARTY_NOTICES.md

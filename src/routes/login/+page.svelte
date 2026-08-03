@@ -112,7 +112,6 @@
           type="email"
           autocomplete="email"
           required
-          autofocus
           bind:value={email}
           disabled={submitting}
         />

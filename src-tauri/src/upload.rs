@@ -11,29 +11,20 @@ use std::time::Duration;
 
 use crate::config::{read_auth_file, AuthFile, Backend};
 use crate::portal::{build_auth_header, retry_http, user_agent, FailureClass, RetryGuard};
-use crate::screen_recorder::{ScreenRecordingMeta, SCREEN_SUBDIR};
-
-#[derive(Deserialize, Debug, Default)]
-pub struct UploadUrls {
-    pub mic: Option<String>,
-    pub system: Option<String>,
-    // The backend still mints a `mixed` presigned PUT URL in its
-    // response, but the agent no longer uploads a mixed track (it's
-    // regenerated server-side). serde ignores the unread field.
-}
+use crate::screen_recorder::{
+    ScreenRecordingMeta, META_FILENAME, RECORDING_FILENAME, SCREEN_SUBDIR,
+};
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct CreateCallResponse {
     pub call_id: String,
-    pub upload_urls: UploadUrls,
 }
 
 /// Create (or upsert) the call row on the backend with the minimal
 /// metadata we know pre-pipeline: session_id, recorded_at, duration
 /// estimate (zero is fine — transcribe backfills the real duration),
 /// the source descriptor, and an empty utterances array. The response
-/// carries the presigned PUT URLs the agent needs for the audio.
+/// returns the call id used by the resumable media-generation API.
 ///
 /// #646 Layer A — wrapped in `retry_http` so a transient network blip
 /// between agent and backend doesn't lose the row. create_call is
@@ -179,15 +170,13 @@ pub async fn attach_note_path(
 }
 
 /// #646 Layer B — per-track outcome of `upload_audio`. One entry per
-/// track the pipeline attempted. `uploaded=true` means Spaces returned
-/// 2xx; `failure_class` carries the last classified error for the
-/// tail-failed tracks so the pending_uploads sentinel can record it.
-/// Skipped tracks (file missing on disk, presigned URL absent in the
-/// create_call response) yield `uploaded=false, failure_class=None,
-/// final_error=None`.
+/// validated candidate. `uploaded=true` means this run obtained authoritative
+/// ready/current evidence for the immutable generation.
+/// `failure_class` carries the last classified error for tail-failed tracks so
+/// the pending_uploads sentinel can record it.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackOutcome {
-    /// One of `"mic" | "system" | "mixed"`.
+    /// One of `"mic" | "system"`.
     pub track: &'static str,
     pub uploaded: bool,
     /// `None` on success or skipped; populated only when retry_http
@@ -198,13 +187,24 @@ pub struct TrackOutcome {
     pub final_error: Option<String>,
 }
 
+/// A path the local media pipeline positively published after clean encode and
+/// decode/duration validation, or the same path recovered from an immutable
+/// generation checkpoint. Recovery may carry a now-missing path solely so the
+/// generation client can GET authority before deciding whether an abort is
+/// required; file presence alone never manufactures readiness.
+#[derive(Debug, Clone)]
+pub struct PreparedAudioTrack {
+    pub track: &'static str,
+    pub opus_path: PathBuf,
+}
+
 /// #646 Layer B — sentinel file written to `<session_dir>/pending_uploads.json`
 /// when at least one track exhausted its retry ladder. Survives
-/// agent restarts so the orphan-resume path can re-upload only the
-/// missing tracks instead of blindly re-uploading everything.
+/// agent restarts so the orphan-resume path can revisit only tracks whose
+/// generations are not yet ready/current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingUploads {
-    /// Subset of `["mic", "system", "mixed"]` that still needs to land.
+    /// Subset of `["mic", "system"]` that still needs authoritative readiness.
     pub tracks: Vec<String>,
     /// `failure_class` of the last failed attempt, snake_case wire
     /// format (`transient_network`, `backend_5xx`, etc.). The Layer C
@@ -214,7 +214,6 @@ pub struct PendingUploads {
 }
 
 const PENDING_UPLOADS_FILENAME: &str = "pending_uploads.json";
-
 fn pending_uploads_path(session_dir: &Path) -> PathBuf {
     session_dir.join(PENDING_UPLOADS_FILENAME)
 }
@@ -229,9 +228,9 @@ pub fn read_pending_uploads(session_dir: &Path) -> Option<PendingUploads> {
     serde_json::from_str(&text).ok()
 }
 
-/// Delete the sentinel — called after a successful re-upload run when
-/// every previously-failed track has landed. Best-effort; a leftover
-/// file is cleaned by the 7-day orphan sweep anyway.
+/// Delete the sentinel after a successful re-upload run when every
+/// previously-failed track has landed. Best-effort; local media itself is
+/// retained until a matching backend-ready acknowledgement exists.
 pub fn clear_pending_uploads(session_dir: &Path) {
     let path = pending_uploads_path(session_dir);
     if path.exists() {
@@ -248,7 +247,7 @@ fn write_pending_uploads(session_dir: &Path, pending: &PendingUploads) {
     let path = pending_uploads_path(session_dir);
     match serde_json::to_string_pretty(pending) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(&path, text) {
+            if let Err(e) = crate::session_fs::write_private_file(&path, text.as_bytes()) {
                 eprintln!(
                     "aftercalls: write pending_uploads {} failed: {e}",
                     path.display()
@@ -261,181 +260,72 @@ fn write_pending_uploads(session_dir: &Path, pending: &PendingUploads) {
     }
 }
 
-/// PUTs the three track files to their presigned URLs. Prefers the
-/// `.opus` (compressed by pipeline.rs via ffmpeg) and falls back to
-/// the raw `.wav` when ffmpeg isn't available — notably on stock
-/// Windows. The consuming services (AssemblyAI, ffmpeg on the
-/// backend, the browser's `<audio>`) sniff the container on
-/// download, so the bytes drive decoding regardless of the
-/// advertised content type.
+/// Uploads only explicitly prepared, fully validated Opus tracks. Raw WAV is
+/// never passed to the upload layer and a file's presence/length can never
+/// manufacture a readiness proof.
 ///
-/// Critically, the `content-type` we send on the PUT must match the
-/// one the backend baked into the presigned URL's signature — S3
-/// SigV4 signs that header. If we send `audio/wav` for a WAV fallback
-/// to a URL signed as `audio/ogg`, Spaces returns 403 and the upload
-/// silently drops. We use the signed-for content-type for the PUT
-/// header and let the consumer sniff the actual bytes.
+/// Each immutable file is hashed before create/resume. The backend supplies an
+/// exact part plan and checksum-bound required headers; local bytes are removed
+/// only after that generation is authoritative `ready/current`.
 ///
 /// #646 Layer B — return value is now `Vec<TrackOutcome>` instead of
-/// `Result<()>`. Each PUT routes through `retry_http`; tracks that
-/// exhaust the retry ladder yield a `TrackOutcome { uploaded: false,
-/// ... }` entry and emit `pipeline::track_upload_failed` telemetry.
+/// `Result<()>`. Backend control-plane calls use guarded retries; signed
+/// object-storage PUTs use their own credential-isolated transient retry
+/// ladder. Tracks that exhaust it yield a
+/// `TrackOutcome { uploaded: false, ... }` entry and emit
+/// `pipeline::track_upload_failed` telemetry.
 /// On any partial failure we write a `pending_uploads.json` sentinel
 /// next to the audio so a later orphan-resume can attempt only the
 /// still-missing tracks. On full success in a re-run we delete the
 /// existing sentinel.
 pub async fn upload_audio(
     session_dir: &Path,
-    urls: &UploadUrls,
+    prepared: &[PreparedAudioTrack],
     backend: &Backend,
     call_id: &str,
     guard: &RetryGuard,
     session_id_for_telemetry: Option<&str>,
 ) -> Result<Vec<TrackOutcome>> {
-    let client = http_client()?;
-
-    // If a sentinel from a previous failed run is present, narrow this
-    // attempt to ONLY the tracks it lists — tracks that already landed
-    // at Spaces don't need re-uploading. A missing/corrupt sentinel
-    // falls through to "attempt both" (conservative re-upload).
-    let pending = read_pending_uploads(session_dir);
-    let allowed: Option<Vec<String>> = pending.as_ref().map(|p| p.tracks.clone());
-
-    // Each entry: (track-name, single-PUT presigned URL, the content-type
-    // the backend signed that URL with, preferred-then-fallback source
-    // paths). `mixed` is intentionally absent — the agent no longer
-    // produces or uploads it; the backend regenerates it server-side
-    // (mix::ensure_mixed_audio) for playback + peaks.
-    let candidates: [(&'static str, Option<&str>, &str, [PathBuf; 2]); 2] = [
-        (
-            "mic",
-            urls.mic.as_deref(),
-            "audio/ogg",
-            [session_dir.join("mic.opus"), session_dir.join("mic.wav")],
-        ),
-        (
-            "system",
-            urls.system.as_deref(),
-            "audio/ogg",
-            [session_dir.join("system.opus"), session_dir.join("system.wav")],
-        ),
-    ];
-
     let mut outcomes: Vec<TrackOutcome> = Vec::with_capacity(2);
 
-    for (track, url, content_type, sources) in &candidates {
-        // Skip if a previous run's sentinel restricts the set and
-        // this track is NOT in the resume list — it already landed
-        // and re-uploading would just rewrite the same object.
-        if let Some(allowed_tracks) = &allowed {
-            if !allowed_tracks.iter().any(|s| s == track) {
-                continue;
-            }
-        }
-
-        // Optimized path (chunked-upload): upload the rolling `.opus` via
-        // the audio S3-multipart contract. `complete` assembles it into
-        // the exact `audio_key(id, track)` transcribe HEAD-checks. Only
-        // attempted when a usable `.opus` is on disk (the rolling encoder
-        // or the pipeline's fallback compress produced it).
-        let opus_path = &sources[0];
-        let opus_ready = tokio::fs::metadata(opus_path)
-            .await
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-        if opus_ready {
-            match upload_audio_track_multipart(
-                backend,
-                guard,
-                session_id_for_telemetry,
-                call_id,
-                track,
-                opus_path,
-            )
-            .await
-            {
-                Ok(()) => {
-                    outcomes.push(TrackOutcome {
-                        track,
-                        uploaded: true,
-                        failure_class: None,
-                        final_error: None,
-                    });
-                    continue;
-                }
-                Err(e) => {
-                    // Multipart failed (e.g. an older backend without the
-                    // audio-upload routes, or a mid-upload error). Fall
-                    // back to the unchanged single PUT below — a pure
-                    // optimization must never be the thing that loses a
-                    // track. Info-level breadcrumb; not a user-facing
-                    // failure.
-                    eprintln!(
-                        "aftercalls: audio multipart for {track} failed, falling back to single PUT: {e:#}"
-                    );
-                    crate::telemetry::log(
-                        "info",
-                        "pipeline::audio_multipart_fallback",
-                        format!("audio {track} multipart failed; falling back to single PUT"),
-                        Some(serde_json::json!({
-                            "track": track,
-                            "final_error": format!("{e:#}"),
-                        })),
-                        session_id_for_telemetry.map(|s| s.to_string()),
-                    );
-                }
-            }
-        }
-
-        // Single-PUT fallback (unchanged path). Needs the create_call
-        // presigned URL + the first non-empty source (prefers `.opus`,
-        // falls back to the raw `.wav`).
-        let Some(url) = url else { continue };
-        let Some(path) = first_nonempty_source(sources).await else {
-            continue;
-        };
-
-        let attempt_path = path.clone();
-        let attempt_url = url.to_string();
-        let attempt_ct = content_type.to_string();
-        let client_ref = &client;
-        let result = retry_http(
-            // The backend handle is needed for `force_refresh_auth`
-            // on a 401. Spaces PUTs don't carry our JWT (they're
-            // pre-signed), so a 401 here is structurally impossible —
-            // but the helper still wants a backend reference for type
-            // signature consistency, and the no-op refresh path is
-            // safe.
-            &dummy_backend_for_spaces_retry(),
+    for candidate in prepared {
+        let track = candidate.track;
+        // The explicit `PreparedAudioTrack` is the validity proof. A stat
+        // below may size the request, but cannot create that proof.
+        let opus_path = &candidate.opus_path;
+        let kind = crate::media_upload::MediaKind::from_audio_track(track)?;
+        let source = crate::media_upload::MediaSource::audio(
+            kind,
+            opus_path.clone(),
+            session_dir.join(format!("{track}.wav")),
+        )?;
+        match crate::media_upload::ensure_generation_ready(
+            session_dir,
+            call_id,
+            backend,
             guard,
-            "put_file",
-            4,
             session_id_for_telemetry,
-            |_attempt| {
-                let path = attempt_path.clone();
-                let url = attempt_url.clone();
-                let content_type = attempt_ct.clone();
-                async move { put_file(client_ref, &url, &path, &content_type).await }
-            },
+            &source,
         )
-        .await;
-
-        match result {
-            Ok(()) => {
+        .await
+        {
+            Ok(ready) => {
+                eprintln!(
+                    "aftercalls: audio {track} generation {} is ready/current",
+                    ready.generation_id
+                );
                 outcomes.push(TrackOutcome {
                     track,
                     uploaded: true,
                     failure_class: None,
                     final_error: None,
                 });
+                continue;
             }
             Err(e) => {
+                eprintln!("aftercalls: audio generation for {track} remains pending: {e:#}");
                 let class = crate::portal::classify_reqwest_error(&e);
                 let err_str = format!("{e:#}");
-                eprintln!(
-                    "aftercalls: audio upload failed for {} ({track}): {err_str}",
-                    path.display()
-                );
                 // pipeline::track_upload_failed (warn) per failed
                 // track. Vendor-opaque copy: no "DigitalOcean Spaces"
                 // in the message. Final_error is the raw chain — that
@@ -471,6 +361,40 @@ pub async fn upload_audio(
         .map(|o| o.track.to_string())
         .collect();
     if failed_tracks.is_empty() {
+        // Aggregate cleanup boundary: do not delete the first ready track if
+        // another recorded track failed later in the same run.
+        for candidate in prepared {
+            let kind = crate::media_upload::MediaKind::from_audio_track(candidate.track)?;
+            let source = crate::media_upload::MediaSource::audio(
+                kind,
+                candidate.opus_path.clone(),
+                session_dir.join(format!("{}.wav", candidate.track)),
+            )?;
+            crate::media_upload::cleanup_ready_source(session_dir, &source);
+        }
+        // A retry can enter with one or both generations already acknowledged
+        // ready while their local bytes survived a crash before aggregate
+        // cleanup. Once this run proves there are no pending tracks, remove
+        // the canonical local sources for every acknowledged audio kind too.
+        if let Some(manifest) = crate::media_manifest::read(session_dir)? {
+            for track in ["mic", "system"] {
+                let ready = manifest
+                    .audio
+                    .get(track)
+                    .is_some_and(|item| {
+                        item.state == crate::media_manifest::ArtifactState::ReadyAcknowledged
+                    });
+                if ready {
+                    let kind = crate::media_upload::MediaKind::from_audio_track(track)?;
+                    let source = crate::media_upload::MediaSource::audio(
+                        kind,
+                        session_dir.join(format!("{track}.opus")),
+                        session_dir.join(format!("{track}.wav")),
+                    )?;
+                    crate::media_upload::cleanup_ready_source(session_dir, &source);
+                }
+            }
+        }
         clear_pending_uploads(session_dir);
     } else {
         // The last classified failure wins — useful enough for the
@@ -493,21 +417,6 @@ pub async fn upload_audio(
     Ok(outcomes)
 }
 
-/// Stand-in `Backend` used only as a refresh anchor for `retry_http`
-/// from inside the Spaces PUT loop. The PUTs themselves never hit our
-/// backend URL (they go to Spaces via the presigned URL the
-/// create_call response delivered), so a 401 is structurally
-/// impossible — if it ever appeared it would be a SigV4 issue, which
-/// our classifier surfaces as `SignatureMismatch` and bubbles
-/// non-retryable. The helper still needs a `&Backend` reference for
-/// the type signature, hence this dummy.
-fn dummy_backend_for_spaces_retry() -> Backend {
-    Backend {
-        url: String::new(),
-        token: None,
-    }
-}
-
 /// Serialize a `FailureClass` to the same snake_case wire token the
 /// staff dashboard uses. Kept here to avoid pulling `serde_json` into
 /// every callsite that needs the string. Mirrors the
@@ -524,38 +433,12 @@ fn failure_class_wire_token(class: FailureClass) -> String {
     }
 }
 
-async fn put_file(
-    client: &reqwest::Client,
-    url: &str,
-    path: &PathBuf,
-    content_type: &str,
-) -> Result<()> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read {}", path.display()))?;
-    let resp = client
-        .put(url)
-        .header("content-type", content_type)
-        .body(bytes)
-        .send()
-        .await
-        .with_context(|| format!("PUT {}", path.display()))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("PUT returned {status}: {text}");
-    }
-    Ok(())
-}
-
 fn http_client() -> Result<reqwest::Client> {
     // #293 — stamp the same `aftercalls/<ver> (<os>)` UA portal::client()
     // uses, so backend tracing on `POST /v1/calls` can attribute the
     // request to a specific agent build instead of logging
     // `agent_ver = "unknown"`. `attach_note_path` reuses this client too
-    // and benefits from the same attribution; the S3 PUTs in
-    // `upload_audio` ignore custom UAs (Spaces signs `host` + `content-
-    // type`, not user-agent), so the change is a no-op there.
+    // and benefits from the same attribution.
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .user_agent(user_agent())
@@ -563,9 +446,7 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 fn parse_session_timestamp(session_id: &str) -> DateTime<Utc> {
-    chrono::NaiveDateTime::parse_from_str(session_id, "%Y%m%dT%H%M%SZ")
-        .map(|ndt| ndt.and_utc())
-        .unwrap_or_else(|_| Utc::now())
+    crate::session_fs::parse_timestamp(session_id).unwrap_or_else(Utc::now)
 }
 
 #[derive(Serialize)]
@@ -623,711 +504,492 @@ pub fn current_auth() -> Option<AuthFile> {
     read_auth_file().ok().flatten()
 }
 
-// ── Screen recording — resumable multipart upload (#302 Slice B) ──────
+// ── Screen recording — resumable media generation ─────────────────────
 //
-// After a Call that captured the screen, `screen/recording.json` +
-// `screen/recording.mp4` sit in the session dir (written by
-// `screen_recorder::ScreenRecorder::stop_and_persist`). This step
-// remuxes the mp4 for `<video>` seeking (moov-at-front) and uploads it to
-// object storage via the backend's S3-multipart contract:
-//
-//   init  → POST /v1/calls/{id}/screen/upload/init      { start_offset_ms, dims, fps, codec }
-//   part  → POST /v1/calls/{id}/screen/upload/part      { upload_id, part_number } → presigned PUT url
-//           PUT the 8 MiB part bytes to the url, read the ETag response header
-//   done  → POST /v1/calls/{id}/screen/upload/complete  { upload_id, parts, byte_size, duration_ms, ... }
-//   fail  → POST /v1/calls/{id}/screen/upload/abort     { upload_id }   (best-effort, no leaked parts)
-//
-// EVERYTHING here is best-effort: a missing capture, a remux failure, a
-// consent 400, a flag-off 404, or an exhausted retry ladder leaves the
-// call fully functional (audio + transcript + summary intact) — the
-// backend row simply goes `failed`/absent and the call-detail player
-// shows its empty state. The screen video is NEVER fed to the AI.
+// Screen metadata and the faststart representation remain local until the
+// shared generation client validates authoritative ready/current evidence.
 
-/// Retention of the S3 ETag verbatim as the UploadPart response returned
-/// it (S3 quotes it); the backend hands it straight to
-/// CompleteMultipartUpload, which expects the exact returned value.
-#[derive(Debug, Clone, Serialize)]
-struct ScreenCompletePart {
-    part_number: i32,
-    etag: String,
-}
-
-#[derive(Serialize)]
-struct ScreenInitBody {
-    start_offset_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    width: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fps: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codec: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ScreenInitResponse {
-    upload_id: String,
-    /// Part size the agent uses for every part except the last (8 MiB).
-    /// `recording_id` / `key` / `min_part_size` are also on the wire but
-    /// unused agent-side (serde ignores them).
-    part_size: usize,
-}
-
-#[derive(Serialize)]
-struct ScreenSignPartBody {
-    upload_id: String,
-    part_number: i32,
-}
-
-#[derive(Deserialize)]
-struct ScreenSignPartResponse {
-    url: String,
-}
-
-#[derive(Serialize)]
-struct ScreenCompleteBody {
-    upload_id: String,
-    parts: Vec<ScreenCompletePart>,
-    byte_size: Option<i64>,
-    duration_ms: Option<i64>,
-    start_offset_ms: Option<i64>,
-    width: Option<i32>,
-    height: Option<i32>,
-    fps: Option<i32>,
-    codec: Option<String>,
+#[derive(Debug, Clone)]
+pub enum ScreenUploadOutcome {
+    NotPresent,
+    ReadyAcknowledged { generation_id: String },
 }
 
 /// Upload the captured screen video for `call_id`, if this session
-/// produced one. Best-effort throughout; returns `Ok(())` on every path
-/// that leaves the call intact (which is all of them).
+/// produced one. Upload failure is not success: it returns `Err` after
+/// atomically checkpointing a retryable local copy, and the aggregate pipeline
+/// must not report completion until a later retry reaches ready/current.
 pub async fn upload_screen_recording(
     session_dir: &Path,
     call_id: &str,
     backend: &Backend,
     guard: &RetryGuard,
     session_id_for_telemetry: Option<&str>,
-) -> Result<()> {
-    // No capture this session → nothing to do.
-    let Some(meta) = ScreenRecordingMeta::read(session_dir) else {
-        return Ok(());
-    };
+) -> Result<ScreenUploadOutcome> {
     let screen_dir = session_dir.join(SCREEN_SUBDIR);
+    let raw_default = screen_dir.join(RECORDING_FILENAME);
+    let checkpoint = crate::media_manifest::read(session_dir)?.and_then(|manifest| manifest.screen);
+    if let Some(checkpoint) = &checkpoint {
+        if checkpoint.state == crate::media_manifest::ArtifactState::ReadyAcknowledged {
+            let generation_id = checkpoint
+                .upload
+                .as_ref()
+                .and_then(|upload| upload.generation_id.clone())
+                .context("ready screen checkpoint omitted its generation id")?;
+            // A crash can land after durable ready evidence but before local
+            // cleanup. This path trusts only the fixed in-session filenames;
+            // no checkpoint-controlled path is passed to deletion.
+            let source = crate::media_upload::MediaSource::resume_screen(
+                raw_default.clone(),
+                raw_default.clone(),
+            );
+            crate::media_upload::cleanup_ready_source(session_dir, &source);
+            return Ok(ScreenUploadOutcome::ReadyAcknowledged { generation_id });
+        }
+        if checkpoint
+            .upload
+            .as_ref()
+            .and_then(|upload| upload.generation_id.as_ref())
+            .is_some()
+        {
+            let upload_path = checkpoint
+                .published_path
+                .as_deref()
+                .map(|path| session_dir.join(path))
+                .unwrap_or_else(|| screen_dir.join("recording_fs.mp4"));
+            let raw_path = checkpoint
+                .raw_path
+                .as_deref()
+                .map(|path| session_dir.join(path))
+                .unwrap_or_else(|| raw_default.clone());
+            let source =
+                crate::media_upload::MediaSource::resume_screen(upload_path, raw_path.clone());
+            return upload_screen_source(
+                session_dir,
+                call_id,
+                backend,
+                guard,
+                session_id_for_telemetry,
+                source,
+                &raw_path,
+            )
+            .await;
+        }
+    }
+
+    // No capture this session → nothing to do. If durable state or local
+    // bytes say a capture existed, missing/corrupt metadata is a retryable
+    // failure, never "not present".
+    let Some(meta) = ScreenRecordingMeta::read(session_dir) else {
+        let meta_path = screen_dir.join(META_FILENAME);
+        let checkpoint_needs_media = checkpoint
+            .as_ref()
+            .map(|checkpoint| {
+                matches!(
+                    checkpoint.state,
+                    crate::media_manifest::ArtifactState::Recording
+                        | crate::media_manifest::ArtifactState::RawReady
+                        | crate::media_manifest::ArtifactState::EncodingFailed
+                        | crate::media_manifest::ArtifactState::Published
+                        | crate::media_manifest::ArtifactState::UploadPending
+                        | crate::media_manifest::ArtifactState::UploadedAwaitingBackendReady
+                )
+            })
+            .unwrap_or(false);
+        if checkpoint_needs_media || meta_path.exists() || raw_default.exists() {
+            return Err(retain_screen_upload_failure(
+                session_dir,
+                call_id,
+                &raw_default,
+                "screen recording metadata is missing or unreadable".into(),
+            ));
+        }
+        crate::media_manifest::mark_screen_not_present(session_dir)?;
+        return Ok(ScreenUploadOutcome::NotPresent);
+    };
+    if meta.file != RECORDING_FILENAME {
+        return Err(retain_screen_upload_failure(
+            session_dir,
+            call_id,
+            &raw_default,
+            format!(
+                "screen recording metadata referenced unsupported filename {:?}",
+                meta.file
+            ),
+        ));
+    }
     let raw_path = screen_dir.join(&meta.file);
     if !raw_path.exists() {
-        eprintln!(
-            "aftercalls: screen recording meta present but file missing at {} — skipping",
-            raw_path.display()
-        );
-        return Ok(());
+        return Err(retain_screen_upload_failure(
+            session_dir,
+            call_id,
+            &raw_path,
+            format!(
+                "screen recording metadata exists but {} is missing",
+                raw_path.display()
+            ),
+        ));
     }
+
+    // Persist intent before the first remux/network side effect. A crash from
+    // here onward leaves an explicit pending job for restart recovery.
+    crate::media_manifest::mark_screen_upload_pending(
+        session_dir,
+        Some(call_id),
+        &raw_path,
+        "screen upload started".into(),
+    )?;
 
     // Faststart remux so the portal/agent `<video>` can seek (the raw mp4
-    // has moov-at-end). Best-effort: on failure upload the raw file.
-    let upload_path = match remux_faststart(&raw_path).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("aftercalls: screen faststart remux failed, uploading raw: {e:#}");
-            raw_path.clone()
-        }
-    };
-
-    let byte_size = match std::fs::metadata(&upload_path) {
-        Ok(m) => m.len() as i64,
-        Err(e) => {
-            eprintln!("aftercalls: stat screen video failed: {e}");
-            return Ok(());
-        }
-    };
-    if byte_size == 0 {
-        eprintln!("aftercalls: screen video is empty — skipping upload");
-        return Ok(());
-    }
-
-    // init — open the multipart upload. A consent 400
-    // (`screen_capture_consent_required`) or a flag-off 404 both bubble as
-    // non-retryable and we skip gracefully; init failing means there's no
-    // upload to abort.
-    let init_body = ScreenInitBody {
-        start_offset_ms: meta.start_offset_ms,
-        width: meta.width,
-        height: meta.height,
-        fps: Some(meta.fps),
-        codec: Some(meta.codec.clone()),
-    };
-    let init_body_value = serde_json::to_value(&init_body).context("serialize screen init body")?;
-    let init_path = format!("/v1/calls/{call_id}/screen/upload/init");
-    let init: ScreenInitResponse = match retry_http(
-        backend,
-        guard,
-        "screen_init",
-        4,
-        session_id_for_telemetry,
-        |_attempt| {
-            let body = init_body_value.clone();
-            let path = init_path.clone();
-            async move { screen_post_json::<ScreenInitResponse>(backend, &path, body).await }
-        },
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!("{e:#}");
-            // Vendor-opaque, calm breadcrumb — a rejected init is expected
-            // when consent hasn't been posted or the flag is off.
-            let reason = if msg.contains("screen_capture_consent_required") {
-                "consent not recorded"
-            } else if msg.contains("backend 404") {
-                "feature not enabled"
-            } else {
-                "upload init rejected"
-            };
-            eprintln!("aftercalls: screen upload skipped ({reason}): {msg}");
-            crate::telemetry::log(
-                "warn",
-                "pipeline::screen_upload_skipped",
-                format!("screen upload init failed: {reason}"),
-                Some(serde_json::json!({ "final_error": msg })),
-                session_id_for_telemetry.map(|s| s.to_string()),
-            );
-            return Ok(());
-        }
-    };
-
-    // Body of the upload: sign + PUT each part, then complete. On any
-    // failure, abort so parts don't leak on the bucket.
-    match screen_upload_parts_and_complete(
-        backend,
-        guard,
-        session_id_for_telemetry,
-        call_id,
-        &meta,
-        &upload_path,
-        &init,
-        byte_size,
-    )
-    .await
-    {
-        Ok(()) => {
-            eprintln!("aftercalls: screen recording uploaded for call {call_id}");
-            Ok(())
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            eprintln!("aftercalls: screen upload failed, aborting: {msg}");
-            crate::telemetry::log(
-                "warn",
-                "pipeline::screen_upload_failed",
-                "screen recording upload failed (object storage)".to_string(),
-                Some(serde_json::json!({ "final_error": msg })),
-                session_id_for_telemetry.map(|s| s.to_string()),
-            );
-            // Best-effort abort — releases any parts already uploaded.
-            let abort_path = format!("/v1/calls/{call_id}/screen/upload/abort");
-            let abort_body = serde_json::json!({ "upload_id": init.upload_id });
-            if let Err(ae) = screen_post_nop(backend, &abort_path, abort_body).await {
-                eprintln!("aftercalls: screen upload abort failed: {ae:#}");
+    // has moov-at-end). Remux failure remains pending; do not silently upload
+    // a different, unvalidated representation.
+    let checkpointed_upload = checkpoint.as_ref().and_then(|item| {
+        item.upload.as_ref()?;
+        item.published_path
+            .as_deref()
+            .map(|path| session_dir.join(path))
+            .filter(|path| path.exists())
+    });
+    let upload_path = match checkpointed_upload {
+        Some(path) => path,
+        None => match remux_faststart(&raw_path).await {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(retain_screen_upload_failure(
+                    session_dir,
+                    call_id,
+                    &raw_path,
+                    format!("screen faststart remux failed: {error:#}"),
+                ));
             }
-            Ok(())
+        },
+    };
+    let (width, height) = match resolve_screen_dimensions(&meta, &upload_path).await {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return Err(retain_screen_upload_failure(
+                session_dir,
+                call_id,
+                &raw_path,
+                format!("screen dimensions unavailable: {error:#}"),
+            ));
         }
+    };
+    if !meta.codec.eq_ignore_ascii_case("h264") {
+        return Err(retain_screen_upload_failure(
+            session_dir,
+            call_id,
+            &raw_path,
+            format!("unsupported screen codec {:?}", meta.codec),
+        ));
     }
+    let source = crate::media_upload::MediaSource::screen(
+        upload_path,
+        raw_path.clone(),
+        meta.duration_ms,
+        width,
+        height,
+        f64::from(meta.fps),
+        meta.start_offset_ms,
+    );
+    upload_screen_source(
+        session_dir,
+        call_id,
+        backend,
+        guard,
+        session_id_for_telemetry,
+        source,
+        &raw_path,
+    )
+    .await
 }
 
-/// Sign + PUT every 8 MiB part in order, collecting `(part_number, etag)`,
-/// then finalize with `complete`. Bubbles on the first exhausted retry so
-/// the caller can abort. Resume-friendly at the backend level: the row +
-/// `upload_id` persist, so a future `init` (re-run) aborts the stale
-/// upload and starts fresh.
 #[allow(clippy::too_many_arguments)]
-async fn screen_upload_parts_and_complete(
+async fn upload_screen_source(
+    session_dir: &Path,
+    call_id: &str,
     backend: &Backend,
     guard: &RetryGuard,
     session_id_for_telemetry: Option<&str>,
-    call_id: &str,
-    meta: &ScreenRecordingMeta,
-    upload_path: &Path,
-    init: &ScreenInitResponse,
-    byte_size: i64,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-
-    let part_size = init.part_size.max(1);
-    let client = screen_http_client()?;
-
-    let mut file = tokio::fs::File::open(upload_path)
-        .await
-        .with_context(|| format!("open {}", upload_path.display()))?;
-
-    let mut parts: Vec<ScreenCompletePart> = Vec::new();
-    let mut part_number: i32 = 1;
-    loop {
-        // Read up to one full part (handles short reads on large files).
-        let mut buf = vec![0u8; part_size];
-        let mut filled = 0usize;
-        while filled < part_size {
-            let n = file
-                .read(&mut buf[filled..])
-                .await
-                .context("read screen video part")?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        if filled == 0 {
-            break; // clean EOF on a part boundary
-        }
-        buf.truncate(filled);
-
-        // Sign this part's PUT URL.
-        let sign_path = format!("/v1/calls/{call_id}/screen/upload/part");
-        let sign_body = serde_json::to_value(ScreenSignPartBody {
-            upload_id: init.upload_id.clone(),
-            part_number,
-        })
-        .context("serialize sign-part body")?;
-        let signed: ScreenSignPartResponse = retry_http(
-            backend,
-            guard,
-            "screen_sign_part",
-            4,
-            session_id_for_telemetry,
-            |_attempt| {
-                let body = sign_body.clone();
-                let path = sign_path.clone();
-                async move { screen_post_json::<ScreenSignPartResponse>(backend, &path, body).await }
-            },
-        )
-        .await?;
-
-        // PUT the bytes to object storage; read the ETag back. The
-        // presigned UploadPart signs only host — no content-type header
-        // (sending an extra signed header would 403), matching the audio
-        // presign discipline in `put_file`.
-        let put_url = signed.url.clone();
-        let etag = retry_http(
-            backend,
-            guard,
-            "screen_put_part",
-            4,
-            session_id_for_telemetry,
-            |_attempt| {
-                let client = client.clone();
-                let url = put_url.clone();
-                let bytes = buf.clone();
-                async move { put_screen_part(&client, &url, bytes).await }
-            },
-        )
-        .await?;
-
-        parts.push(ScreenCompletePart { part_number, etag });
-
-        // A short read means we just handled the final part.
-        if filled < part_size {
-            break;
-        }
-        part_number += 1;
-    }
-
-    if parts.is_empty() {
-        anyhow::bail!("screen video produced no parts");
-    }
-
-    // complete — finalize + stamp metadata/retention.
-    let complete_path = format!("/v1/calls/{call_id}/screen/upload/complete");
-    let complete_body = serde_json::to_value(ScreenCompleteBody {
-        upload_id: init.upload_id.clone(),
-        parts,
-        byte_size: Some(byte_size),
-        duration_ms: Some(meta.duration_ms),
-        start_offset_ms: Some(meta.start_offset_ms),
-        width: meta.width,
-        height: meta.height,
-        fps: Some(meta.fps),
-        codec: Some(meta.codec.clone()),
-    })
-    .context("serialize screen complete body")?;
-    retry_http(
+    source: crate::media_upload::MediaSource,
+    raw_path: &Path,
+) -> Result<ScreenUploadOutcome> {
+    match crate::media_upload::ensure_generation_ready(
+        session_dir,
+        call_id,
         backend,
         guard,
-        "screen_complete",
-        4,
         session_id_for_telemetry,
-        |_attempt| {
-            let body = complete_body.clone();
-            let path = complete_path.clone();
-            async move { screen_post_nop(backend, &path, body).await }
-        },
+        &source,
     )
-    .await?;
-
-    Ok(())
-}
-
-/// Faststart remux (`-c copy -movflags +faststart`) so `<video>` can seek
-/// without downloading the whole file. Stream copy → fast, no re-encode.
-/// Output is `recording_fs.mp4` next to the raw capture.
-async fn remux_faststart(raw: &Path) -> Result<PathBuf> {
-    let out = raw.with_file_name("recording_fs.mp4");
-    let mut cmd = tokio::process::Command::new(crate::pipeline::ffmpeg_binary());
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(raw)
-        .arg("-c")
-        .arg("copy")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(&out)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    crate::pipeline::no_console(&mut cmd);
-    let status = cmd.status().await.context("run ffmpeg faststart remux")?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg faststart remux exited with {status}");
+    .await
+    {
+        Ok(ready) => {
+            eprintln!(
+                "aftercalls: screen generation {} is ready/current for call {call_id}",
+                ready.generation_id
+            );
+            crate::media_upload::cleanup_ready_source(session_dir, &source);
+            Ok(ScreenUploadOutcome::ReadyAcknowledged {
+                generation_id: ready.generation_id,
+            })
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            crate::telemetry::log(
+                "warn",
+                "pipeline::screen_upload_failed",
+                "screen recording upload remains pending".to_string(),
+                Some(serde_json::json!({ "final_error": message })),
+                session_id_for_telemetry.map(str::to_string),
+            );
+            Err(retain_screen_upload_failure(
+                session_dir,
+                call_id,
+                raw_path,
+                format!("screen generation upload pending: {message}"),
+            ))
+        }
     }
-    Ok(out)
 }
 
-/// PUT one part's bytes to its presigned URL; return the S3 `ETag`
-/// (verbatim, quotes included) the backend needs for `complete`. No
-/// content-type header — the UploadPart presign signs only host.
-async fn put_screen_part(client: &reqwest::Client, url: &str, bytes: Vec<u8>) -> Result<String> {
-    let resp = client
-        .put(url)
-        .body(bytes)
-        .send()
-        .await
-        .context("PUT screen part")?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("PUT returned {s}: {t}");
+fn retain_screen_upload_failure(
+    session_dir: &Path,
+    call_id: &str,
+    local_path: &Path,
+    error: String,
+) -> anyhow::Error {
+    let checkpoint_error = crate::media_manifest::mark_screen_upload_pending(
+        session_dir,
+        Some(call_id),
+        local_path,
+        error.clone(),
+    )
+    .err();
+    match checkpoint_error {
+        Some(checkpoint_error) => anyhow!(
+            "{error}; additionally failed to persist pending-media checkpoint: {checkpoint_error:#}"
+        ),
+        None => anyhow!(error),
     }
-    resp.headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("screen part upload response missing ETag"))
 }
 
-/// Authed POST → typed JSON against the backend. Non-2xx bails with the
-/// same `backend {status}: {body}` shape `classify_reqwest_error`
-/// recognizes, so `retry_http` retries 5xx/network + bubbles 4xx.
-async fn screen_post_json<T: serde::de::DeserializeOwned>(
-    backend: &Backend,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<T> {
-    let auth = build_auth_header(backend).await?;
-    let client = screen_http_client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {status}: {t}");
+async fn resolve_screen_dimensions(
+    meta: &ScreenRecordingMeta,
+    media_path: &Path,
+) -> Result<(u32, u32)> {
+    match (meta.width, meta.height) {
+        (Some(width), Some(height))
+            if (1..=16_384).contains(&width) && (1..=16_384).contains(&height) =>
+        {
+            return Ok((width as u32, height as u32));
+        }
+        (Some(_), Some(_)) => anyhow::bail!("recorded dimensions are outside 1..=16384"),
+        _ => {}
     }
-    let text = resp.text().await.unwrap_or_default();
-    serde_json::from_str(&text).context("decode screen upload response")
+    let path = media_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(crate::pipeline::ffmpeg_binary());
+        command
+            .arg("-hide_banner")
+            .arg("-i")
+            .arg(&path)
+            .arg("-map")
+            .arg("0:v:0")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-f")
+            .arg("null")
+            .arg("-");
+        let output = crate::media_process::run_bounded(
+            command,
+            Duration::from_secs(2 * 60),
+            crate::media_process::STDERR_LIMIT_BYTES,
+        )
+        .context("probe screen recording dimensions")?;
+        if !output.success() {
+            anyhow::bail!("screen dimension probe failed: {}", output.diagnostic());
+        }
+        parse_ffmpeg_video_dimensions(&String::from_utf8_lossy(&output.stderr))
+            .context("screen dimension probe did not report a video size")
+    })
+    .await
+    .context("join screen dimension probe")?
 }
 
-/// Authed POST that ignores the body (complete/abort return small or
-/// no-content payloads the agent doesn't read).
-async fn screen_post_nop(
-    backend: &Backend,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<()> {
-    let auth = build_auth_header(backend).await?;
-    let client = screen_http_client()?;
-    let url = format!("{}{path}", backend.url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .header("authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let t = resp.text().await.unwrap_or_default();
-        anyhow::bail!("backend {status}: {t}");
-    }
-    Ok(())
-}
-
-/// reqwest client for the screen-upload flow. Long timeout because a
-/// single 8 MiB part PUT over a slow uplink can take a while; the UA is
-/// stamped for backend attribution (matches `http_client`).
-fn screen_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .user_agent(user_agent())
-        .build()?)
-}
-
-// ── Per-channel audio — resumable multipart upload (chunked-upload) ────
-//
-// mic / system are rolling-encoded to `.opus` DURING the call
-// (rolling_encode.rs). Here we upload the finished `.opus` at stop via
-// the backend's audio S3-multipart contract (the same shape as the
-// screen video, reusing the authed-POST + part-PUT helpers above):
-//
-//   init  → POST /v1/calls/{id}/audio/upload/init      { track }
-//   part  → POST /v1/calls/{id}/audio/upload/part      { track, upload_id, part_number } → presigned PUT url
-//           PUT the part bytes to the url, read the ETag response header
-//   done  → POST /v1/calls/{id}/audio/upload/complete  { track, upload_id, parts, byte_size }
-//   fail  → POST /v1/calls/{id}/audio/upload/abort     { track, upload_id }  (best-effort, no leaked parts)
-//
-// `complete` assembles the parts into `audio_key(id, track)` — the exact
-// key transcribe HEAD-checks. This is a pure optimization: `upload_audio`
-// falls back to the unchanged single PUT (create_call URL) whenever this
-// path can't land a track, so nothing here can lose a recording.
-
-#[derive(Serialize)]
-struct AudioInitBody {
-    track: &'static str,
-}
-
-#[derive(Deserialize)]
-struct AudioInitResponse {
-    upload_id: String,
-    /// Part size the agent uses for every part except the last.
-    /// `key` / `min_part_size` are also on the wire but unused (serde skips).
-    part_size: usize,
-}
-
-#[derive(Serialize)]
-struct AudioSignPartBody {
-    track: &'static str,
-    upload_id: String,
-    part_number: i32,
-}
-
-#[derive(Deserialize)]
-struct AudioSignPartResponse {
-    url: String,
-}
-
-#[derive(Serialize)]
-struct AudioCompletePartRef {
-    part_number: i32,
-    etag: String,
-}
-
-#[derive(Serialize)]
-struct AudioCompleteBody {
-    track: &'static str,
-    upload_id: String,
-    parts: Vec<AudioCompletePartRef>,
-    byte_size: Option<i64>,
-}
-
-/// First source path that exists AND is non-empty (prefers `.opus`, then
-/// the raw `.wav`). Guards the single-PUT fallback against uploading a
-/// 0-byte artifact — a track with no usable audio is simply skipped.
-async fn first_nonempty_source(sources: &[PathBuf]) -> Option<PathBuf> {
-    for p in sources {
-        if let Ok(m) = tokio::fs::metadata(p).await {
-            if m.len() > 0 {
-                return Some(p.clone());
+fn parse_ffmpeg_video_dimensions(stderr: &str) -> Option<(u32, u32)> {
+    for line in stderr.lines().filter(|line| line.contains("Video:")) {
+        for token in line.split_whitespace() {
+            let candidate = token
+                .trim_matches(|character: char| !character.is_ascii_digit() && character != 'x');
+            let Some((width, height)) = candidate.split_once('x') else {
+                continue;
+            };
+            let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>()) else {
+                continue;
+            };
+            if (1..=16_384).contains(&width) && (1..=16_384).contains(&height) {
+                return Some((width, height));
             }
         }
     }
     None
 }
 
-/// Multipart-upload one already-encoded `.opus` to `audio_key(id, track)`.
-/// Bubbles on the first exhausted retry so the caller can fall back to a
-/// single PUT. Aborts a partially-uploaded multipart on any failure so
-/// parts don't leak on the bucket.
-async fn upload_audio_track_multipart(
-    backend: &Backend,
-    guard: &RetryGuard,
-    session_id_for_telemetry: Option<&str>,
-    call_id: &str,
-    track: &'static str,
-    opus_path: &Path,
-) -> Result<()> {
-    let byte_size = tokio::fs::metadata(opus_path)
-        .await
-        .map(|m| m.len() as i64)
-        .unwrap_or(0);
-    if byte_size == 0 {
-        anyhow::bail!("{track}.opus missing or empty");
-    }
-
-    // init — open the multipart upload.
-    let init_path = format!("/v1/calls/{call_id}/audio/upload/init");
-    let init_body = serde_json::to_value(AudioInitBody { track }).context("serialize audio init body")?;
-    let init: AudioInitResponse = retry_http(
-        backend,
-        guard,
-        "audio_init",
-        4,
-        session_id_for_telemetry,
-        |_attempt| {
-            let body = init_body.clone();
-            let path = init_path.clone();
-            async move { screen_post_json::<AudioInitResponse>(backend, &path, body).await }
-        },
-    )
-    .await?;
-
-    match audio_upload_parts_and_complete(
-        backend,
-        guard,
-        session_id_for_telemetry,
-        call_id,
-        track,
-        opus_path,
-        &init,
-        byte_size,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Best-effort abort so already-uploaded parts don't leak, then
-            // bubble for the caller's single-PUT fallback.
-            let abort_path = format!("/v1/calls/{call_id}/audio/upload/abort");
-            let abort_body = serde_json::json!({ "track": track, "upload_id": init.upload_id });
-            if let Err(ae) = screen_post_nop(backend, &abort_path, abort_body).await {
-                eprintln!("aftercalls: audio multipart abort failed: {ae:#}");
-            }
-            Err(e)
+/// Faststart remux (`-c copy -movflags +faststart`) so `<video>` can seek
+/// without downloading the whole file. Stream copy → fast, no re-encode.
+/// Output is `recording_fs.mp4` next to the raw capture.
+async fn remux_faststart(raw: &Path) -> Result<PathBuf> {
+    let raw = raw.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let out = raw.with_file_name("recording_fs.mp4");
+        let staged = out.with_file_name(format!("recording_fs.mp4.part.{}", uuid::Uuid::new_v4()));
+        let _stage_guard = crate::media_manifest::reserve_private_stage(&staged)?;
+        let mut command = std::process::Command::new(crate::pipeline::ffmpeg_binary());
+        command
+            .arg("-y")
+            .arg("-i")
+            .arg(&raw)
+            .arg("-c")
+            .arg("copy")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg("-f")
+            .arg("mp4")
+            .arg(&staged);
+        let process = crate::media_process::run_bounded(
+            command,
+            Duration::from_secs(10 * 60),
+            crate::media_process::STDERR_LIMIT_BYTES,
+        )
+        .context("run bounded ffmpeg faststart remux")?;
+        if !process.success() {
+            let _ = std::fs::remove_file(&staged);
+            anyhow::bail!("ffmpeg faststart remux failed: {}", process.diagnostic());
         }
-    }
+        let byte_size = std::fs::metadata(&staged)
+            .with_context(|| format!("stat staged screen remux {}", staged.display()))?
+            .len();
+        if byte_size == 0 {
+            let _ = std::fs::remove_file(&staged);
+            anyhow::bail!("ffmpeg faststart remux produced an empty file");
+        }
+        crate::media_manifest::enforce_private_file(&staged)?;
+        crate::media_manifest::sync_staged_file(&staged)
+            .with_context(|| format!("sync staged screen remux {}", staged.display()))?;
+        crate::media_manifest::atomic_replace_file(&staged, &out)?;
+        Ok(out)
+    })
+    .await
+    .context("join screen faststart remux")?
 }
 
-/// Sign + PUT every part in order, collecting `(part_number, etag)`, then
-/// finalize with `complete`. Bubbles on the first exhausted retry so the
-/// caller can abort + fall back.
-#[allow(clippy::too_many_arguments)]
-async fn audio_upload_parts_and_complete(
-    backend: &Backend,
-    guard: &RetryGuard,
-    session_id_for_telemetry: Option<&str>,
-    call_id: &str,
-    track: &'static str,
-    opus_path: &Path,
-    init: &AudioInitResponse,
-    byte_size: i64,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
+#[cfg(test)]
+mod media_retention_tests {
+    use super::*;
+    use crate::media_manifest::{self, ArtifactState};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let part_size = init.part_size.max(1);
-    let client = screen_http_client()?;
+    const CALL_ID: &str = "4da6e5c4-7ac1-45bb-bab6-8e269a2664c2";
 
-    let mut file = tokio::fs::File::open(opus_path)
-        .await
-        .with_context(|| format!("open {}", opus_path.display()))?;
-
-    let mut parts: Vec<AudioCompletePartRef> = Vec::new();
-    let mut part_number: i32 = 1;
-    loop {
-        // Read up to one full part (handles short reads).
-        let mut buf = vec![0u8; part_size];
-        let mut filled = 0usize;
-        while filled < part_size {
-            let n = file
-                .read(&mut buf[filled..])
-                .await
-                .context("read audio part")?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "aftercalls-screen-retention-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(path.join("screen")).unwrap();
+            Self(path)
         }
-        if filled == 0 {
-            break; // clean EOF on a part boundary
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
-        buf.truncate(filled);
-
-        // Sign this part's PUT URL.
-        let sign_path = format!("/v1/calls/{call_id}/audio/upload/part");
-        let sign_body = serde_json::to_value(AudioSignPartBody {
-            track,
-            upload_id: init.upload_id.clone(),
-            part_number,
-        })
-        .context("serialize audio sign-part body")?;
-        let signed: AudioSignPartResponse = retry_http(
-            backend,
-            guard,
-            "audio_sign_part",
-            4,
-            session_id_for_telemetry,
-            |_attempt| {
-                let body = sign_body.clone();
-                let path = sign_path.clone();
-                async move { screen_post_json::<AudioSignPartResponse>(backend, &path, body).await }
-            },
-        )
-        .await?;
-
-        // PUT the bytes to object storage; read the ETag back. Reuses the
-        // screen part-PUT helper (no content-type header — the UploadPart
-        // presign signs only host).
-        let put_url = signed.url.clone();
-        let etag = retry_http(
-            backend,
-            guard,
-            "audio_put_part",
-            4,
-            session_id_for_telemetry,
-            |_attempt| {
-                let client = client.clone();
-                let url = put_url.clone();
-                let bytes = buf.clone();
-                async move { put_screen_part(&client, &url, bytes).await }
-            },
-        )
-        .await?;
-
-        parts.push(AudioCompletePartRef { part_number, etag });
-
-        // A short read means we just handled the final part.
-        if filled < part_size {
-            break;
-        }
-        part_number += 1;
     }
 
-    if parts.is_empty() {
-        anyhow::bail!("audio {track} produced no parts");
+    #[test]
+    fn screen_upload_failure_is_pending_and_retains_only_local_video() {
+        let scratch = Scratch::new();
+        let video = scratch.0.join("screen").join("recording.mp4");
+        std::fs::write(&video, b"only local video").unwrap();
+        media_manifest::initialize(&scratch.0).unwrap();
+
+        let error = retain_screen_upload_failure(
+            &scratch.0,
+            CALL_ID,
+            &video,
+            "injected complete failure".into(),
+        );
+        assert!(error.to_string().contains("injected complete failure"));
+        assert!(video.exists(), "failure must not delete the only video");
+        let manifest = media_manifest::read(&scratch.0).unwrap().unwrap();
+        assert_eq!(manifest.screen.unwrap().state, ArtifactState::UploadPending);
     }
 
-    // complete — assemble the parts into audio_key(id, track).
-    let complete_path = format!("/v1/calls/{call_id}/audio/upload/complete");
-    let complete_body = serde_json::to_value(AudioCompleteBody {
-        track,
-        upload_id: init.upload_id.clone(),
-        parts,
-        byte_size: Some(byte_size),
-    })
-    .context("serialize audio complete body")?;
-    retry_http(
-        backend,
-        guard,
-        "audio_complete",
-        4,
-        session_id_for_telemetry,
-        |_attempt| {
-            let body = complete_body.clone();
-            let path = complete_path.clone();
-            async move { screen_post_nop(backend, &path, body).await }
-        },
-    )
-    .await?;
+    #[tokio::test]
+    async fn missing_metadata_preserves_pending_screen_for_restart() {
+        let scratch = Scratch::new();
+        let video = scratch.0.join("screen").join(RECORDING_FILENAME);
+        std::fs::write(&video, b"recoverable video").unwrap();
+        media_manifest::mark_screen_upload_pending(
+            &scratch.0,
+            Some(CALL_ID),
+            &video,
+            "injected crash before retry".into(),
+        )
+        .unwrap();
+        let backend = Backend {
+            url: "http://127.0.0.1:1".into(),
+            token: None,
+        };
 
-    Ok(())
+        let result =
+            upload_screen_recording(&scratch.0, CALL_ID, &backend, &RetryGuard::new(), None).await;
+        assert!(result.is_err());
+        assert!(video.exists());
+        let manifest = media_manifest::read(&scratch.0).unwrap().unwrap();
+        assert_eq!(manifest.screen.unwrap().state, ArtifactState::UploadPending);
+    }
+
+    #[tokio::test]
+    async fn legacy_awaiting_screen_without_generation_remains_pending() {
+        let scratch = Scratch::new();
+        let video = scratch.0.join("screen").join(RECORDING_FILENAME);
+        std::fs::write(&video, b"uploaded video").unwrap();
+        media_manifest::mark_screen_uploaded(&scratch.0, CALL_ID, &video).unwrap();
+        let backend = Backend {
+            url: "http://127.0.0.1:1".into(),
+            token: None,
+        };
+
+        let result =
+            upload_screen_recording(&scratch.0, CALL_ID, &backend, &RetryGuard::new(), None).await;
+        assert!(result.is_err());
+        assert!(video.exists());
+        let manifest = media_manifest::read(&scratch.0).unwrap().unwrap();
+        assert_eq!(
+            manifest.screen.unwrap().state,
+            ArtifactState::UploadedAwaitingBackendReady
+        );
+    }
+
+    #[test]
+    fn parses_only_bounded_video_dimensions() {
+        let stderr = "Stream #0:0: Video: h264, yuv420p, 1920x1080, 15 fps";
+        assert_eq!(parse_ffmpeg_video_dimensions(stderr), Some((1920, 1080)));
+        assert_eq!(
+            parse_ffmpeg_video_dimensions(
+                "Stream #0:0: Audio: opus\nmetadata 1920x1080 but no video marker"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ffmpeg_video_dimensions("Video: h264, 99999x1080"),
+            None
+        );
+    }
 }

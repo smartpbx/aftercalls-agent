@@ -103,6 +103,7 @@ enum Phase {
     Recording {
         consumer: String,
         gone_since: Option<Instant>,
+        session_dir: Option<std::path::PathBuf>,
     },
     /// `gone_since` is inherited from Recording so the 15s force-stop
     /// watchdog (#74) measures total consumer-absence, not just time
@@ -112,6 +113,7 @@ enum Phase {
     AwaitingEndConfirm {
         consumer: String,
         gone_since: Instant,
+        session_dir: Option<std::path::PathBuf>,
     },
     /// User explicitly said no to recording this consumer. Release when the
     /// consumer stops using the mic — they may come back for another call.
@@ -214,11 +216,13 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
         Phase::Recording {
             consumer,
             gone_since,
+            session_dir,
         } => {
             if consumers.contains(&consumer) {
                 Phase::Recording {
                     consumer,
                     gone_since: None,
+                    session_dir,
                 }
             } else {
                 let since = gone_since.unwrap_or_else(Instant::now);
@@ -234,11 +238,13 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
                     Phase::AwaitingEndConfirm {
                         consumer,
                         gone_since: since,
+                        session_dir,
                     }
                 } else {
                     Phase::Recording {
                         consumer,
                         gone_since: Some(since),
+                        session_dir,
                     }
                 }
             }
@@ -246,6 +252,7 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
         Phase::AwaitingEndConfirm {
             consumer,
             gone_since,
+            session_dir,
         } => {
             if consumers.contains(&consumer) {
                 // Consumer came back — user rejoined. Cancel the end prompt.
@@ -253,6 +260,7 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
                 Phase::Recording {
                     consumer,
                     gone_since: None,
+                    session_dir,
                 }
             } else if gone_since.elapsed() >= CONSUMER_GONE_FORCE_STOP {
                 // Safety net (#74): consumer has been dead for
@@ -266,7 +274,9 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
                 );
                 let state = app.state::<Recorder>();
                 if state.is_active() {
-                    let _ = crate::do_stop(&state, app);
+                    if let Some(session_dir) = session_dir.as_deref() {
+                        let _ = crate::do_stop_session(&state, app, session_dir);
+                    }
                 }
                 emit(app, AutoDetectEvent::Cleared);
                 Phase::Idle
@@ -274,6 +284,7 @@ fn tick(app: &AppHandle, phase: Phase, mic_consumers: &[RawMicConsumer]) -> Phas
                 Phase::AwaitingEndConfirm {
                     consumer,
                     gone_since,
+                    session_dir,
                 }
             }
         }
@@ -312,6 +323,7 @@ fn reconcile_external(phase: Phase, is_recording: bool, app: &AppHandle) -> Phas
             Phase::Recording {
                 consumer,
                 gone_since: None,
+                session_dir: app.state::<Recorder>().session_dir(),
             }
         }
         (other, _) => other,
@@ -323,13 +335,8 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
     match (phase, decision) {
         (Phase::AwaitingStartConfirm { consumer }, UserDecision::ConfirmStart) => {
             // Auto-detect start has no co-pilot picker context → no contact hint.
-            match crate::do_start(&state, app, None) {
+            match crate::do_start(&state, app, None, "auto_detected", Some(&consumer)) {
                 Ok(path) => {
-                    crate::write_session_source(
-                        std::path::Path::new(&path),
-                        "auto_detected",
-                        Some(&consumer),
-                    );
                     // Confirmed record — wipe the per-consumer snooze
                     // so a future mic-detect for the same app (after
                     // a Stop) can re-toast immediately. The snooze is
@@ -340,6 +347,7 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
                     Phase::Recording {
                         consumer,
                         gone_since: None,
+                        session_dir: Some(std::path::PathBuf::from(path)),
                     }
                 }
                 Err(e) => {
@@ -353,18 +361,31 @@ async fn handle_decision(app: &AppHandle, phase: Phase, decision: UserDecision) 
             emit(app, AutoDetectEvent::Cleared);
             Phase::Suppressed { consumer }
         }
-        (Phase::AwaitingEndConfirm { .. }, UserDecision::ConfirmEnd) => {
+        (
+            Phase::AwaitingEndConfirm { session_dir, .. },
+            UserDecision::ConfirmEnd,
+        ) => {
             if state.is_active() {
-                let _ = crate::do_stop(&state, app);
+                if let Some(session_dir) = session_dir.as_deref() {
+                    let _ = crate::do_stop_session(&state, app, session_dir);
+                }
             }
             emit(app, AutoDetectEvent::Cleared);
             Phase::Idle
         }
-        (Phase::AwaitingEndConfirm { consumer, .. }, UserDecision::KeepRecording) => {
+        (
+            Phase::AwaitingEndConfirm {
+                consumer,
+                session_dir,
+                ..
+            },
+            UserDecision::KeepRecording,
+        ) => {
             emit(app, AutoDetectEvent::Cleared);
             Phase::Recording {
                 consumer,
                 gone_since: None,
+                session_dir,
             }
         }
         (phase, _) => phase,
@@ -593,4 +614,3 @@ mod tests {
         assert_eq!(out, vec!["brand-new-app".to_string()]);
     }
 }
-

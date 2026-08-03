@@ -1,13 +1,12 @@
 //! Post-recording orchestration. Steps:
 //!
-//! 1. Ensure a per-channel `.opus` exists for mic + system. The rolling
-//!    encoder (rolling_encode.rs) produces these DURING the call, so this
-//!    is usually a no-op; the SAFETY NET compresses the raw WAV here only
-//!    when the rolling `.opus` is absent/partial. `mixed` is NOT produced
-//!    — the backend regenerates it server-side post-transcribe.
-//! 2. Create a pending call row on the backend, collect upload URLs
-//! 3. Upload mic + system via the audio S3-multipart contract, falling
-//!    back to the single PUT (create_call URL) per track on any failure
+//! 1. Consume the rolling encoder's explicit finalization report. A track is
+//!    uploadable only after clean encode exit plus full decode/duration
+//!    validation; any other state is safely re-encoded from the finalized WAV.
+//!    `mixed` is NOT produced — the backend regenerates it server-side.
+//! 2. Create or resume the pending call row on the backend.
+//! 3. Create or resume immutable mic/system media generations, retaining
+//!    local bytes until the backend proves each generation ready/current.
 //! 4. Ask backend to transcribe — the vendor runs server-side, backend
 //!    persists utterances, returns the merged transcript
 //! 5. Ask backend to summarize — runs server-side, backend persists
@@ -27,6 +26,9 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::config::Config;
 use crate::portal::RetryGuard;
+use crate::rolling_encode::{
+    fallback_encode_track, RollingFinalizationReport, TrackPublicationState,
+};
 use crate::summary::Summary;
 use crate::transcription::MergedTranscript;
 use crate::{portal, upload, vault};
@@ -115,13 +117,35 @@ impl PipelineTrigger {
 }
 
 pub async fn run(session_dir: PathBuf, app: AppHandle) {
-    run_with_trigger(session_dir, app, PipelineTrigger::User).await
+    let rolling = RollingFinalizationReport::conservative(&session_dir);
+    run_with_trigger_and_report(session_dir, app, PipelineTrigger::User, rolling).await
+}
+
+/// Entry point used only by the live Stop path. Unlike recovery/import runs,
+/// it carries current-process proof for each atomically published rolling
+/// track.
+pub async fn run_after_stop(
+    session_dir: PathBuf,
+    app: AppHandle,
+    rolling: RollingFinalizationReport,
+) {
+    run_with_trigger_and_report(session_dir, app, PipelineTrigger::User, rolling).await
 }
 
 pub async fn run_with_trigger(
     session_dir: PathBuf,
     app: AppHandle,
     trigger: PipelineTrigger,
+) {
+    let rolling = RollingFinalizationReport::conservative(&session_dir);
+    run_with_trigger_and_report(session_dir, app, trigger, rolling).await
+}
+
+async fn run_with_trigger_and_report(
+    session_dir: PathBuf,
+    app: AppHandle,
+    trigger: PipelineTrigger,
+    rolling: RollingFinalizationReport,
 ) {
     PIPELINE_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     // Scope guard in case any early-return is introduced later —
@@ -178,7 +202,7 @@ pub async fn run_with_trigger(
             },
         );
     }
-    match run_inner(&session_dir, &app).await {
+    match run_inner(&session_dir, &app, &rolling).await {
         Ok((note_path, call_id)) => {
             let note_str = note_path.to_string_lossy().into_owned();
             notify_done(&app, &note_path);
@@ -194,34 +218,9 @@ pub async fn run_with_trigger(
                 PipelineEvent::Done {
                     session_dir: session_str.clone(),
                     note_path: note_str,
-                    call_id,
+                    call_id: call_id.clone(),
                 },
             );
-            // #77 (v0.4.7) — once the pipeline has succeeded the
-            // backend is the single source of truth for the call
-            // audio (streamed from Spaces). Clear the local
-            // session_dir unconditionally so the user's disk
-            // doesn't carry redundant raw audio + compressed
-            // uploads indefinitely. Failure path (run_inner
-            // returned Err) leaves the session on disk — the 7-day
-            // orphan sweeper at launch picks it up for retry.
-            // Best-effort: a filesystem hiccup gets logged to
-            // telemetry, not surfaced, because the backend already
-            // has the full call and the orphan sweeper catches
-            // stragglers next session.
-            if let Err(e) = crate::recovery::discard(&session_dir).await {
-                eprintln!(
-                    "aftercalls: post-pipeline cleanup failed for {}: {e}",
-                    session_dir.display()
-                );
-                crate::telemetry::log(
-                    "warn",
-                    "pipeline::cleanup_failed",
-                    e,
-                    None,
-                    Some(session_str.clone()),
-                );
-            }
         }
         Err(e) => {
             let err_str = format!("{e:#}");
@@ -262,7 +261,11 @@ pub async fn run_with_trigger(
     crate::tray_refresh_after_pipeline(&app, pipeline_still_active);
 }
 
-async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, String)> {
+async fn run_inner(
+    session_dir: &Path,
+    app: &AppHandle,
+    rolling: &RollingFinalizationReport,
+) -> Result<(PathBuf, String)> {
     let config = Config::load()?;
     let backend = config
         .backend
@@ -280,41 +283,85 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     // ONCE and subsequent steps coast on the freshened bundle.
     let guard = RetryGuard::new();
 
-    // Steps 1–2 (chunked-upload): the mic + system `.opus` are produced
-    // by the rolling encoder DURING the call (rolling_encode.rs), so the
-    // expensive whole-file encodes are OFF the end-of-call path. SAFETY
-    // NET: if a track's rolling `.opus` is absent or empty (rolling
-    // encode disabled, spawn failed, crashed mid-call, or an
-    // orphan-resume with only the raw WAV on disk), fall back to today's
-    // whole-WAV Opus compress here so a usable `.opus` always exists for
-    // upload. `mixed` is intentionally NOT produced or uploaded — the
-    // backend regenerates it server-side post-transcribe
-    // (mix::ensure_mixed_audio) for playback + peaks.
-    ensure_track_opus(session_dir, "mic").await;
-    ensure_track_opus(session_dir, "system").await;
+    // Steps 1–2 (chunked-upload): consume only current-process publication
+    // proof from rolling_encode. Recovery/import runs deliberately carry a
+    // conservative report and re-encode the finalized WAV; a pre-existing,
+    // nonempty `.opus` is never promoted to ready based on file length.
+    let media_checkpoint = crate::media_manifest::read(session_dir)?;
+    let already_ready = |track: &str| {
+        media_checkpoint
+            .as_ref()
+            .and_then(|manifest| manifest.audio.get(track))
+            .map(|checkpoint| {
+                checkpoint.state == crate::media_manifest::ArtifactState::ReadyAcknowledged
+            })
+            .unwrap_or(false)
+    };
+    let mut prepared = Vec::with_capacity(2);
+    for track in ["mic", "system"] {
+        if already_ready(track) {
+            continue;
+        }
+        // A prior run may have already created/partially confirmed an
+        // immutable generation. Reconstruct the resume job only when the
+        // private checkpoint carries that identity and its published path's
+        // parent resolves inside this exact session. A missing file is passed
+        // through intentionally: the generation client GETs authority first,
+        // then either recognizes ready/current or aborts an incomplete upload.
+        if let Some(checkpoint) = media_checkpoint
+            .as_ref()
+            .and_then(|manifest| manifest.audio.get(track))
+        {
+            if checkpoint.upload.is_some() {
+                if let Some(opus_path) =
+                    checkpointed_media_path(session_dir, checkpoint.published_path.as_deref())
+                {
+                    prepared.push(upload::PreparedAudioTrack { track, opus_path });
+                    continue;
+                }
+            }
+        }
+        if let Some(candidate) = ensure_track_opus(session_dir, track, rolling).await? {
+            prepared.push(candidate);
+        }
+    }
+    let had_ready_audio = ["mic", "system"].iter().any(|track| already_ready(track));
+    if prepared.is_empty() && !had_ready_audio {
+        anyhow::bail!("no validated audio tracks are available for upload");
+    }
 
-    // Step 3: create the call row so we get upload URLs. Retries the
+    // Step 3: create the call row and obtain its stable call id. Retries the
     // create_call POST through retry_http (idempotent server-side).
     emit(app, PipelineEvent::Uploading);
     let created = upload::create_call(backend, session_dir, 0, &guard, session_telemetry).await?;
+    crate::media_manifest::bind_call(session_dir, &created.call_id)
+        .context("bind local media session to backend call")?;
 
-    // Step 4: upload mic + system. The rolling `.opus` go up via the
-    // audio S3-multipart contract; a track whose `.opus` is missing or
-    // whose multipart fails falls back to the unchanged single PUT
-    // (create_call URL). Returns per-track outcomes — partial success
-    // keeps the pipeline running so the surviving tracks still get
-    // transcribed. The sentinel + telemetry are managed inside
-    // upload_audio.
+    // Step 4: create/resume one immutable media generation per validated
+    // `.opus`. The backend's confirmed-part status is authoritative across
+    // restarts, and local media survives until exact ready/current evidence.
+    // Every recorded track must become authoritative ready/current before the
+    // pipeline advances. The retry sentinel + telemetry are managed by
+    // upload_audio, and any partial failure retains local media and fails this
+    // run for recovery.
     let track_outcomes = upload::upload_audio(
         session_dir,
-        &created.upload_urls,
+        &prepared,
         backend,
         &created.call_id,
         &guard,
         session_telemetry,
     )
     .await?;
-    let any_uploaded = track_outcomes.iter().any(|o| o.uploaded);
+    for outcome in &track_outcomes {
+        crate::media_manifest::mark_audio_upload(
+            session_dir,
+            outcome.track,
+            outcome.uploaded,
+            outcome.final_error.clone(),
+        )?;
+    }
+    let any_uploaded = had_ready_audio || track_outcomes.iter().any(|o| o.uploaded);
     let any_failed = track_outcomes.iter().any(|o| !o.uploaded);
     if !any_uploaded && !track_outcomes.is_empty() {
         // Every track failed — there's nothing for AssemblyAI to chew
@@ -325,18 +372,20 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         anyhow::bail!("all track uploads failed");
     }
     if any_failed {
-        // Quiet structured breadcrumb. Call-detail will surface the
-        // track-quality chip; staff dashboard reads this entry. No
-        // alarm — the pipeline keeps running.
+        // Preserve every still-local source and fail the run. Reporting Done
+        // here would launch destructive completion/cleanup paths while a
+        // recorded channel is still pending, making the call appear complete
+        // with silently missing audio.
         crate::telemetry::log(
             "warn",
             "pipeline::partial_upload",
-            "one or more tracks failed to upload; pipeline continuing",
+            "one or more recorded tracks failed to upload; pipeline retained for retry",
             Some(serde_json::json!({
                 "outcomes": track_outcomes,
             })),
             session_telemetry.map(|s| s.to_string()),
         );
+        anyhow::bail!("one or more recorded audio track uploads remain pending");
     }
 
     // Step 5: backend transcribe (AssemblyAI with the org's key).
@@ -467,16 +516,12 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         session_dir.to_path_buf()
     };
 
-    // Step 8.5 (#302 Slice B): upload the screen recording, if this Call
-    // captured one. AWAITED (so the session_dir isn't discarded out from
-    // under the local mp4 the multipart flow streams) but fully
-    // best-effort — a missing capture, a remux failure, a consent 400, or
-    // an exhausted retry ladder never fails the call. Placed AFTER the
-    // transcript + summary + note so the user already has everything
-    // useful; only the (bounded-size) video lands a touch later. The
-    // screen video is a stored media asset ONLY — it never enters
-    // transcribe / summarize / co-pilot.
-    if let Err(e) = upload::upload_screen_recording(
+    // Step 8.5 (#302 Slice B): upload the screen recording, if present.
+    // A failure is durably retryable and fails this run so it cannot emit Done
+    // or mark the local pipeline complete while recorded video is still local.
+    // Cleanup occurs only after the screen generation is ready/current with
+    // exact byte/hash evidence.
+    match upload::upload_screen_recording(
         session_dir,
         &created.call_id,
         backend,
@@ -485,9 +530,13 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
     )
     .await
     {
-        // upload_screen_recording swallows its own errors and returns
-        // Ok on every call-preserving path; this arm is defensive only.
-        eprintln!("aftercalls: screen recording upload errored (non-fatal): {e:#}");
+        Ok(upload::ScreenUploadOutcome::NotPresent) => {}
+        Ok(upload::ScreenUploadOutcome::ReadyAcknowledged { generation_id }) => {
+            eprintln!(
+                "aftercalls: screen recording generation {generation_id} is authoritative ready/current"
+            );
+        }
+        Err(e) => return Err(e.context("screen recording upload remains pending")),
     }
 
     // Step 9: peaks, fire-and-forget — failure doesn't block the user
@@ -517,6 +566,8 @@ async fn run_inner(session_dir: &Path, app: &AppHandle) -> Result<(PathBuf, Stri
         }
     });
 
+    crate::media_manifest::mark_pipeline_complete(session_dir, &created.call_id)
+        .context("durably checkpoint completed media pipeline")?;
     Ok((note_path, created.call_id))
 }
 
@@ -638,55 +689,106 @@ pub fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Com
     cmd
 }
 
-/// SAFETY NET for the rolling-encode optimization (chunked-upload):
-/// guarantee a usable `<track>.opus` exists before upload. When the
-/// rolling encoder already produced one (present + non-empty) this is a
-/// no-op — the encode stays off the end-of-call path. Otherwise fall
-/// back to the whole-WAV Opus compress right here (today's behavior).
-/// Best-effort: a missing WAV (track never recorded) or an ffmpeg
-/// failure just leaves no `.opus`, and the upload step skips that track
-/// exactly as it does today.
-async fn ensure_track_opus(session_dir: &Path, track: &str) {
-    let opus = session_dir.join(format!("{track}.opus"));
-    if let Ok(meta) = tokio::fs::metadata(&opus).await {
-        if meta.len() > 0 {
-            return; // rolling encode already delivered a usable track
-        }
+fn checkpointed_media_path(session_dir: &Path, relative: Option<&str>) -> Option<PathBuf> {
+    let relative = Path::new(relative?);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+        })
+    {
+        return None;
     }
-    let wav = session_dir.join(format!("{track}.wav"));
-    if let Err(e) = compress_for_upload(&wav).await {
-        eprintln!("aftercalls: fallback compress for {track} failed: {e:#}");
+    let session = std::fs::canonicalize(session_dir).ok()?;
+    let candidate = session_dir.join(relative);
+    let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    if !parent.starts_with(&session) {
+        return None;
+    }
+    let candidate = parent.join(candidate.file_name()?);
+    if candidate.exists() {
+        let resolved = std::fs::canonicalize(candidate).ok()?;
+        resolved.starts_with(&session).then_some(resolved)
+    } else {
+        // A checkpointed generation still needs an authoritative GET when the
+        // local source vanished. The generation client will either recognize
+        // ready/current or abort an upload that can no longer be completed.
+        Some(candidate)
     }
 }
 
-/// 16 kHz mono Opus @ 32kbps — ~15× smaller than the raw WAV with no
-/// quality loss the transcription model would care about. Output sits
-/// next to the input with a `.opus` extension; callers use it by path.
-async fn compress_for_upload(input: &Path) -> Result<PathBuf> {
-    if !input.exists() {
-        anyhow::bail!("{} not present", input.display());
+/// Resolve one track into an explicit upload capability. The rolling report is
+/// the only fast path; all recovery/import/unknown states re-encode from WAV
+/// through the same staged, validated, atomic publication boundary.
+async fn ensure_track_opus(
+    session_dir: &Path,
+    track: &'static str,
+    rolling: &RollingFinalizationReport,
+) -> Result<Option<upload::PreparedAudioTrack>> {
+    if rolling.session_dir == session_dir {
+        if let Some(result) = rolling.track(track) {
+            if result.state == TrackPublicationState::Published {
+                if let Some(opus_path) = result.opus_path.clone() {
+                    crate::media_manifest::mark_audio_published(
+                        session_dir,
+                        track,
+                        &opus_path,
+                    )?;
+                    return Ok(Some(upload::PreparedAudioTrack { track, opus_path }));
+                }
+            }
+        }
     }
-    let output = input.with_extension("opus");
-    let mut cmd = tokio::process::Command::new(ffmpeg_binary());
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(input)
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg("16000")
-        .arg("-c:a")
-        .arg("libopus")
-        .arg("-b:a")
-        .arg("32k")
-        .arg(&output)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    no_console(&mut cmd);
-    let status = cmd.status().await.context("run ffmpeg")?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg exited with {status}");
+
+    let owned_session = session_dir.to_path_buf();
+    let encoded =
+        tokio::task::spawn_blocking(move || fallback_encode_track(&owned_session, track))
+            .await
+            .context("join fallback audio encoder")?;
+    match encoded.state {
+        TrackPublicationState::Published => {
+            let opus_path = encoded
+                .opus_path
+                .context("published fallback missing Opus path")?;
+            crate::media_manifest::mark_audio_published(session_dir, track, &opus_path)?;
+            Ok(Some(upload::PreparedAudioTrack { track, opus_path }))
+        }
+        TrackPublicationState::FallbackRequired => {
+            let error = encoded
+                .error
+                .unwrap_or_else(|| "audio fallback did not publish".into());
+            crate::media_manifest::mark_audio_fallback(session_dir, track, error.clone())?;
+            anyhow::bail!("fallback compress for recorded {track} track failed: {error}")
+        }
+        TrackPublicationState::NotRecorded => {
+            let explicitly_absent = crate::media_manifest::artifact(session_dir, track)?
+                .is_some_and(|item| {
+                    item.state == crate::media_manifest::ArtifactState::NotPresent
+                });
+            // Sessions recorded before this release have no `media-state.json`
+            // at all, so a track that legitimately never existed (system audio
+            // on a mic-only call) cannot be "explicitly absent" — the manifest
+            // is created mid-resume and seeds both tracks as Pending. Treat a
+            // track with no raw WAV and no Opus as genuinely not recorded
+            // rather than failing the resume permanently. The bail below stays
+            // for the real fault: raw audio present but unencodable.
+            let raw_missing = !session_dir.join(format!("{track}.wav")).exists()
+                && !session_dir.join(format!("{track}.opus")).exists();
+            if explicitly_absent || raw_missing {
+                if !explicitly_absent {
+                    crate::media_manifest::mark_audio_not_present(session_dir, track)?;
+                }
+                Ok(None)
+            } else {
+                let error = encoded
+                    .error
+                    .unwrap_or_else(|| "expected raw audio is missing".into());
+                crate::media_manifest::mark_audio_fallback(
+                    session_dir,
+                    track,
+                    error.clone(),
+                )?;
+                anyhow::bail!("recorded {track} track is unavailable: {error}")
+            }
+        }
     }
-    Ok(output)
 }

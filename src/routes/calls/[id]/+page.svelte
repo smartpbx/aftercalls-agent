@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-  import { readFile } from "@tauri-apps/plugin-fs";
   import { writeText, writeHtml } from "@tauri-apps/plugin-clipboard-manager";
   import { page } from "$app/state";
   import { onMount, onDestroy } from "svelte";
@@ -18,7 +17,10 @@
   import ActionItem from "@aftercalls/shared/ui/ActionItem.svelte";
   import ChipMenu from "@aftercalls/shared/ui/ChipMenu.svelte";
   import ScreenRecordingPlayer from "@aftercalls/shared/ui/ScreenRecordingPlayer.svelte";
-  import type { ScreenRecording } from "@aftercalls/shared/types";
+  import type {
+    ScreenPlaybackUrl,
+    ScreenRecording,
+  } from "@aftercalls/shared/types";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import SendToZohoModal, {
     type SzmPriorPush,
@@ -27,6 +29,14 @@
     type SzmPushResponse,
   } from "@aftercalls/shared/ui/SendToZohoModal.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
+  import {
+    ExternalPushPollingCancelled,
+    ExternalPushSettlementError,
+    createExternalPushIdempotencyKey,
+    externalHttpsUrl,
+    runAgentExternalPush,
+    type ExternalPushAccepted,
+  } from "$lib/externalPush";
   // #107 — local save-queue: keep optimistic state + queue mutations
   // when the failure looks like a transient network/server blip.
   import {
@@ -50,6 +60,27 @@
     readyToastMessage,
     readyTrayBody,
   } from "@aftercalls/shared/processing-thresholds";
+  import {
+    NEW_QUESTION_MUTATION_KEY,
+    QUESTION_ANSWER_MAX_CHARS,
+    QUESTION_TEXT_MAX_CHARS,
+    beginQuestionMutation,
+    captureQuestionPoll,
+    createQuestionMutationState,
+    finishQuestionMutation,
+    isQuestionCollectionCurrent,
+    isQuestionMutationCurrent,
+    isQuestionMutationPending,
+    isQuestionRevisionConflict,
+    lockQuestionCollection,
+    mergeQuestionPoll,
+    removeQuestionRow,
+    replaceQuestionRow,
+    rollbackQuestionRow,
+    unlockQuestionCollection,
+    type QuestionCollectionToken,
+    type QuestionMutationToken,
+  } from "@aftercalls/shared/questionMutations";
   import ShareCallModal from "@aftercalls/shared/ui/ShareCallModal.svelte";
   import HighlightCorrectMenu from "@aftercalls/shared/ui/HighlightCorrectMenu.svelte";
   import type {
@@ -249,6 +280,13 @@
   let zohoDeskFeatureEnabled = $derived(!!me?.features?.zoho_desk);
   let zohoFallbackOwnerName = $derived(zohoStore.connectedByDisplayName);
   let zohoModalOpen = $state(false);
+  let zohoPushAction: {
+    fingerprint: string;
+    key: string;
+    accepted?: ExternalPushAccepted;
+    unresolved?: "pending" | "uncertain";
+  } | null = null;
+  let zohoPushAbort: AbortController | null = null;
   let zohoPushed = $derived(
     !!call?.tags?.some(
       (t) => t.kind === "custom" && t.value === "zoho:pushed",
@@ -256,16 +294,22 @@
   );
 
   function openSendToZoho() {
+    zohoPushAbort?.abort();
+    zohoPushAbort = null;
+    if (!zohoPushAction?.unresolved) zohoPushAction = null;
     zohoModalOpen = true;
   }
 
   function closeSendToZoho() {
+    zohoPushAbort?.abort();
+    zohoPushAbort = null;
+    if (!zohoPushAction?.unresolved) zohoPushAction = null;
     zohoModalOpen = false;
   }
 
   // Bridge to backend via Tauri commands. Same shape as the portal's
-  // api.zoho.* helpers — that's what keeps the SendToZohoModal mirror
-  // pair byte-identical between portal and agent.
+  // api.zoho.* helpers — the shared modal receives the same contract on
+  // portal and agent while each surface keeps its own transport.
   const zohoApi = {
     recordTypes: async (): Promise<SzmRecordTypes> => {
       // #197: backend returns `{ standard, custom, custom_refreshed_at }`.
@@ -294,12 +338,94 @@
         extra_tags?: string[];
       },
     ): Promise<SzmPushResponse> => {
+      const fingerprint = `${callId}:${JSON.stringify(body)}`;
+      if (
+        zohoPushAction?.unresolved &&
+        zohoPushAction.fingerprint !== fingerprint
+      ) {
+        throw new ExternalPushSettlementError(
+          zohoPushAction.unresolved === "uncertain"
+            ? "external_push_uncertain"
+            : "external_push_pending",
+          zohoPushAction.unresolved === "uncertain"
+            ? "The prior push must be reconciled before starting another request."
+            : "The prior push is still settling. Retry the same request.",
+          zohoPushAction.unresolved === "uncertain" ? 409 : 202,
+          zohoPushAction.unresolved === "uncertain"
+            ? "contact_admin_for_reconciliation"
+            : "poll",
+        );
+      }
+      if (!zohoPushAction || zohoPushAction.fingerprint !== fingerprint) {
+        zohoPushAbort?.abort();
+        zohoPushAction = {
+          fingerprint,
+          key: createExternalPushIdempotencyKey(),
+        };
+      }
+      const action = zohoPushAction;
+      const controller = new AbortController();
+      zohoPushAbort = controller;
       try {
-        return (await invoke("zoho_push_call", {
+        const result = await runAgentExternalPush<SzmPushResponse>({
           callId,
-          body,
-        })) as SzmPushResponse;
+          integration: "crm",
+          signal: controller.signal,
+          accepted: action.accepted,
+          onAccepted: (accepted) => {
+            if (zohoPushAction === action) action.accepted = accepted;
+          },
+          submit: () =>
+            invoke("zoho_push_call", {
+              callId,
+              body,
+              idempotencyKey: action.key,
+            }),
+        });
+        if (zohoPushAction === action) zohoPushAction = null;
+        if (result.kind === "legacy") return result.value;
+
+        // The durable status response has remote identifiers but not the
+        // legacy tags payload. The post-success callback separately refreshes
+        // tags and the canonical prior-push row.
+        return {
+          push_id: result.value.attempt_id,
+          zoho_call_record_id: result.value.remote_id ?? "",
+          zoho_url: result.value.remote_url ?? "",
+          tags_added: [],
+        };
       } catch (e: unknown) {
+        const retryGuidance = (e as { retryGuidance?: string } | null)
+          ?.retryGuidance;
+        const code = (e as { code?: string } | null)?.code;
+        if (zohoPushAction === action) {
+          if (
+            code === "external_push_uncertain" ||
+            code === "external_push_protocol" ||
+            retryGuidance === "contact_admin_for_reconciliation"
+          ) {
+            action.unresolved = "uncertain";
+          } else if (
+            action.accepted ||
+            code === "external_push_pending" ||
+            retryGuidance === "poll"
+          ) {
+            action.unresolved = "pending";
+          }
+        }
+        if (
+          zohoPushAction === action &&
+          (retryGuidance === "new_request" ||
+            retryGuidance === "new_request_after_correction")
+        ) {
+          zohoPushAction = null;
+        }
+        if (
+          e instanceof ExternalPushSettlementError ||
+          e instanceof ExternalPushPollingCancelled
+        ) {
+          throw e;
+        }
         // Tauri command now returns a structured PortalError (#124
         // sweep). Reshape into a fetch-style `{message, status}` so
         // the modal's existing 429 / 404 / 502 classifier keeps
@@ -309,6 +435,8 @@
         const err = new Error(message) as Error & { status?: number };
         if (status) err.status = status;
         throw err;
+      } finally {
+        if (zohoPushAbort === controller) zohoPushAbort = null;
       }
     },
   };
@@ -350,25 +478,34 @@
   }
 
   function openZohoUrl(url: string) {
-    void openUrl(url).catch((e) => console.warn("openUrl failed", e));
+    const safeUrl = externalHttpsUrl(url);
+    if (!safeUrl) return;
+    void openUrl(safeUrl).catch((e) => console.warn("openUrl failed", e));
   }
 
-  function onZohoPushed(resp: SzmPushResponse) {
+  function onZohoPushed(_resp: SzmPushResponse) {
     if (!call) return;
-    const existing = call.tags ?? [];
-    const merged = [...existing];
-    for (const t of resp.tags_added) {
+    const callId = call.id;
+    const generation = ++zohoPriorPushGeneration;
+    // A 202 status intentionally omits the legacy tags payload. Re-read both
+    // authoritative resources and ignore settlements for a page that moved on.
+    void Promise.allSettled([
+      invoke<Call>("get_call", { id: callId }),
+      invoke<SzmPriorPush | null>("zoho_prior_push", { callId }),
+    ]).then(([fresh, prior]) => {
       if (
-        !merged.some((e) => e.kind === t.kind && e.value === t.value)
+        generation !== zohoPriorPushGeneration ||
+        call?.id !== callId
       ) {
-        merged.push({ kind: t.kind as TagKind, value: t.value });
+        return;
       }
-    }
-    call = { ...call, tags: merged };
-    // Phase 3 — refresh the prior-push record so the after-call surface (the
-    // "Pushed to <Deal>" line + the modal's Step-0 card) reflects the fresh
-    // push without a reload.
-    void loadPriorPush();
+      if (fresh.status === "fulfilled") {
+        call = { ...call, tags: fresh.value.tags };
+      }
+      if (prior.status === "fulfilled") {
+        zohoPriorPush = prior.value;
+      }
+    });
   }
 
   // Phase 3 — most-recent successful push for this call. Was hardcoded null;
@@ -378,17 +515,30 @@
   // push status. Best-effort: a 404 / missing shim / transport error decodes to
   // null (no surface) — never an error panel.
   let zohoPriorPush = $state<SzmPriorPush | null>(null);
+  let zohoPriorPushGeneration = 0;
 
   async function loadPriorPush() {
-    const id = page.params.id;
-    if (!id) return;
+    const callId = call?.id ?? page.params.id;
+    if (!callId) return;
+    const generation = ++zohoPriorPushGeneration;
     try {
-      zohoPriorPush =
-        ((await invoke("zoho_prior_push", { callId: id })) as
+      const prior =
+        ((await invoke("zoho_prior_push", { callId })) as
           | SzmPriorPush
           | null) ?? null;
+      if (
+        generation === zohoPriorPushGeneration &&
+        call?.id === callId
+      ) {
+        zohoPriorPush = prior;
+      }
     } catch {
-      zohoPriorPush = null;
+      if (
+        generation === zohoPriorPushGeneration &&
+        call?.id === callId
+      ) {
+        zohoPriorPush = null;
+      }
     }
   }
 
@@ -552,7 +702,7 @@
     // v0.4.1 (#122 F.2): belt-and-suspenders — the button's
     // `disabled` already blocks this path when regen is in-flight,
     // but a focus-Enter race could slip through.
-    if (regenInFlight) return;
+    if (regenInFlight || questionCollectionBusy) return;
     regenModalError = "";
     // Fresh attempt clears any lingering async-error callout.
     regenAsyncError = null;
@@ -572,7 +722,7 @@
     regenModalError = "";
   }
   async function confirmRegenerate() {
-    if (!call || regenInFlight) return;
+    if (!call || regenInFlight || questionCollectionBusy) return;
     regenInFlight = true;
     regenModalError = "";
     // v0.4.1 (#122 F.1): close the modal BEFORE awaiting the POST.
@@ -580,12 +730,24 @@
     // to work; existing `.gen-shimmer` + "Regenerating…" button
     // label carry the in-flight UI.
     regenConfirmOpen = false;
+    const questionBarrier = await acquireQuestionCollectionBarrier();
+    if (!questionBarrier) {
+      regenInFlight = false;
+      return;
+    }
     try {
-      const fresh = (await invoke("resummarize_call", { id: call.id })) as Call;
+      const fresh = (await invoke("resummarize_call", {
+        id: questionBarrier.callId,
+      })) as Call;
       // Preserve the local notes buffer — server copy might be stale
       // vs. what the user just typed.
       fresh.notes = notesBuffer;
-      call = fresh;
+      if (
+        call?.id === questionBarrier.callId &&
+        isQuestionCollectionCurrent(questionMutationState, questionBarrier)
+      ) {
+        call = fresh;
+      }
       // Success also clears any prior async-error callout.
       regenAsyncError = null;
       startCooldownTicker(30);
@@ -611,6 +773,7 @@
           "Couldn't regenerate the summary. Your existing summary and action items are unchanged. Try again in a moment.";
       }
     } finally {
+      releaseQuestionCollectionBarrier(questionBarrier);
       regenInFlight = false;
     }
   }
@@ -1203,35 +1366,174 @@
 
   // ── Manual editing of Questions (Phase 4 follow-up) ──────────────
   //
-  // Add / edit wording + answer / toggle answered / delete, calling the
-  // backend CRUD via the `*_call_question` Tauri shims. Optimistic local
-  // update reconciled with the server's returned row (mirrors the
-  // action-item handlers); no full call refetch. A manual add is
-  // `source='manual'` server-side; editing an auto row flips it to manual so
-  // re-enrichment never wipes the edit (backend `populate_call_questions`
-  // deletes only `source='auto'` rows).
+  // Per-row generations prevent conflicting controls from racing. A collection
+  // epoch protects the list from late poll responses, while collection locks
+  // provide a drain-before-resummarize/refresh barrier.
   let addingQuestion = $state(false);
   let qAddText = $state("");
   let qAddSide = $state<"you" | "them">("you");
   let qAddAnswer = $state("");
-  let addingQuestionSaving = $state(false);
 
   let editingQuestionId = $state<string | null>(null);
   let qEditText = $state("");
   let qEditAnswer = $state("");
-  let savingQuestionIds = $state<Set<string>>(new Set());
   let confirmingQuestionDeleteId = $state<string | null>(null);
   let deletingQuestionId = $state<string | null>(null);
+  let questionMutationState = $state(createQuestionMutationState());
+  let questionRefreshQueued = false;
+  let questionRefreshInFlight = false;
+  const questionMutationWaiters = new Map<
+    number,
+    { promise: Promise<void>; resolve: () => void }
+  >();
 
-  function markQuestionSaving(id: string, on: boolean) {
-    const next = new Set(savingQuestionIds);
-    if (on) next.add(id);
-    else next.delete(id);
-    savingQuestionIds = next;
+  let questionCollectionBusy = $derived(
+    questionMutationState.collectionGeneration !== null,
+  );
+  let addingQuestionSaving = $derived(
+    isQuestionMutationPending(
+      questionMutationState,
+      NEW_QUESTION_MUTATION_KEY,
+    ),
+  );
+
+  function questionRowBusy(id: string): boolean {
+    return isQuestionMutationPending(questionMutationState, id);
+  }
+
+  function startQuestionMutation(
+    key: string,
+  ): QuestionMutationToken | null {
+    if (!call || regenInFlight) return null;
+    const started = beginQuestionMutation(questionMutationState, call.id, key);
+    questionMutationState = started.state;
+    if (!started.token) return null;
+
+    let resolve = () => {};
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    questionMutationWaiters.set(started.token.generation, {
+      promise,
+      resolve,
+    });
+    return started.token;
+  }
+
+  function finishQuestionWrite(token: QuestionMutationToken) {
+    questionMutationState = finishQuestionMutation(
+      questionMutationState,
+      token,
+    );
+    const waiter = questionMutationWaiters.get(token.generation);
+    questionMutationWaiters.delete(token.generation);
+    waiter?.resolve();
+    void flushQueuedQuestionRefresh();
+  }
+
+  function questionWriteIsCurrent(token: QuestionMutationToken): boolean {
+    return (
+      call?.id === token.callId &&
+      isQuestionMutationCurrent(questionMutationState, token)
+    );
+  }
+
+  async function acquireQuestionCollectionBarrier(): Promise<
+    QuestionCollectionToken | null
+  > {
+    if (!call) return null;
+    const locked = lockQuestionCollection(questionMutationState, call.id);
+    questionMutationState = locked.state;
+    if (!locked.token) return null;
+
+    await Promise.all(
+      [...questionMutationWaiters.values()].map((waiter) => waiter.promise),
+    );
+    if (
+      call?.id !== locked.token.callId ||
+      !isQuestionCollectionCurrent(questionMutationState, locked.token)
+    ) {
+      questionMutationState = unlockQuestionCollection(
+        questionMutationState,
+        locked.token,
+      );
+      return null;
+    }
+    return locked.token;
+  }
+
+  function releaseQuestionCollectionBarrier(token: QuestionCollectionToken) {
+    questionMutationState = unlockQuestionCollection(
+      questionMutationState,
+      token,
+    );
+    void flushQueuedQuestionRefresh();
+  }
+
+  function queueCanonicalQuestionRefresh() {
+    questionRefreshQueued = true;
+    void flushQueuedQuestionRefresh();
+  }
+
+  async function flushQueuedQuestionRefresh() {
+    if (
+      !questionRefreshQueued ||
+      questionRefreshInFlight ||
+      questionMutationWaiters.size > 0 ||
+      questionMutationState.collectionGeneration !== null ||
+      !call
+    ) {
+      return;
+    }
+
+    const locked = lockQuestionCollection(questionMutationState, call.id);
+    questionMutationState = locked.state;
+    if (!locked.token) return;
+    questionRefreshQueued = false;
+    questionRefreshInFlight = true;
+    try {
+      const fresh = await invoke<Call>("get_call", {
+        id: locked.token.callId,
+      });
+      if (
+        call?.id === locked.token.callId &&
+        isQuestionCollectionCurrent(questionMutationState, locked.token)
+      ) {
+        call = { ...call, questions: fresh.questions };
+      }
+    } catch (e) {
+      toast.error("Couldn't reload the latest questions. Try refreshing.");
+      console.warn("question conflict refresh failed", e);
+    } finally {
+      questionMutationState = unlockQuestionCollection(
+        questionMutationState,
+        locked.token,
+      );
+      questionRefreshInFlight = false;
+      if (questionRefreshQueued) void flushQueuedQuestionRefresh();
+    }
+  }
+
+  function handleQuestionWriteError(
+    error: unknown,
+    fallback: string,
+  ): boolean {
+    const alreadyChanged =
+      isQuestionRevisionConflict(error) ||
+      (isPortalError(error) && error.kind === "not_found");
+    if (alreadyChanged) {
+      toast.info(
+        "This question changed elsewhere. Reloading the latest version.",
+      );
+      queueCanonicalQuestionRefresh();
+      return true;
+    }
+    toast.error(isPortalError(error) ? portalErrorToText(error) : fallback);
+    return false;
   }
 
   function openAddQuestion() {
-    if (!canEditSummary) return;
+    if (!canEditSummary || questionCollectionBusy || regenInFlight) return;
     // Close any in-progress row edit so only one composer is open.
     editingQuestionId = null;
     qAddText = "";
@@ -1247,14 +1549,15 @@
   }
 
   async function saveAddQuestion() {
-    if (!call || addingQuestionSaving) return;
+    if (!call || addingQuestionSaving || questionCollectionBusy) return;
     const text = qAddText.trim();
     if (!text) return;
-    addingQuestionSaving = true;
+    const token = startQuestionMutation(NEW_QUESTION_MUTATION_KEY);
+    if (!token) return;
     try {
       const answer = qAddAnswer.trim();
       const created = (await invoke("add_call_question", {
-        callId: call.id,
+        callId: token.callId,
         body: {
           question_text: text,
           asker_side: qAddSide,
@@ -1263,26 +1566,35 @@
             : { status: "open" }),
         },
       })) as CallQuestion;
-      call = {
-        ...call,
-        questions: [...(call.questions ?? []), created],
-      };
-      addingQuestion = false;
-      qAddText = "";
-      qAddAnswer = "";
+      if (questionWriteIsCurrent(token) && call) {
+        call = {
+          ...call,
+          questions: [...(call.questions ?? []), created],
+        };
+        addingQuestion = false;
+        qAddText = "";
+        qAddAnswer = "";
+      }
     } catch (e: unknown) {
-      const msg = isPortalError(e)
-        ? portalErrorToText(e)
-        : "Couldn't add the question. Try again.";
-      toast.error(msg);
+      handleQuestionWriteError(
+        e,
+        "Couldn't add the question. Try again.",
+      );
       console.warn("add question failed", e);
     } finally {
-      addingQuestionSaving = false;
+      finishQuestionWrite(token);
     }
   }
 
   function openEditQuestion(q: CallQuestion) {
-    if (!canEditSummary) return;
+    if (
+      !canEditSummary ||
+      questionCollectionBusy ||
+      regenInFlight ||
+      questionRowBusy(q.id)
+    ) {
+      return;
+    }
     addingQuestion = false;
     editingQuestionId = q.id;
     qEditText = q.question_text;
@@ -1296,10 +1608,11 @@
   }
 
   async function saveEditQuestion(q: CallQuestion) {
-    if (!call || savingQuestionIds.has(q.id)) return;
+    if (!call || questionRowBusy(q.id) || questionCollectionBusy) return;
     const text = qEditText.trim();
     if (!text) return;
-    markQuestionSaving(q.id, true);
+    const token = startQuestionMutation(q.id);
+    if (!token) return;
     try {
       const answer = qEditAnswer.trim();
       // Sending an answer on an open question also marks it answered; clearing
@@ -1307,71 +1620,92 @@
       // "answered but no recorded answer" is valid). The status toggle is a
       // separate affordance.
       const body: Record<string, unknown> = {
+        revision: q.revision,
         question_text: text,
         answer_text: answer ? answer : null,
       };
       if (answer && q.status === "open") body.status = "answered";
       const updated = (await invoke("patch_call_question", {
-        callId: call.id,
+        callId: token.callId,
         qid: q.id,
         body,
       })) as CallQuestion;
-      call = {
-        ...call,
-        questions: (call.questions ?? []).map((row) =>
-          row.id === updated.id ? updated : row,
-        ),
-      };
-      editingQuestionId = null;
-      qEditText = "";
-      qEditAnswer = "";
+      if (questionWriteIsCurrent(token) && call) {
+        call = {
+          ...call,
+          questions: replaceQuestionRow(call.questions ?? [], updated),
+        };
+        editingQuestionId = null;
+        qEditText = "";
+        qEditAnswer = "";
+      }
     } catch (e: unknown) {
-      const msg = isPortalError(e)
-        ? portalErrorToText(e)
-        : "Couldn't save the question. Try again.";
-      toast.error(msg);
+      if (
+        handleQuestionWriteError(
+          e,
+          "Couldn't save the question. Try again.",
+        )
+      ) {
+        cancelEditQuestion();
+      }
       console.warn("edit question failed", e);
     } finally {
-      markQuestionSaving(q.id, false);
+      finishQuestionWrite(token);
     }
   }
 
   async function toggleQuestionAnswered(q: CallQuestion) {
-    if (!call || savingQuestionIds.has(q.id)) return;
+    if (!call || questionRowBusy(q.id) || questionCollectionBusy) return;
+    const token = startQuestionMutation(q.id);
+    if (!token) return;
     const nextStatus = q.status === "answered" ? "open" : "answered";
-    markQuestionSaving(q.id, true);
-    const prev = call.questions ?? [];
     // Optimistic flip.
     call = {
       ...call,
-      questions: prev.map((row) =>
-        row.id === q.id ? { ...row, status: nextStatus } : row,
-      ),
+      questions: replaceQuestionRow(call.questions ?? [], {
+        ...q,
+        status: nextStatus,
+        ...(nextStatus === "open" ? { answer_text: undefined } : {}),
+      }),
     };
     try {
       const updated = (await invoke("patch_call_question", {
-        callId: call.id,
+        callId: token.callId,
         qid: q.id,
-        body: { status: nextStatus },
+        body: { revision: q.revision, status: nextStatus },
       })) as CallQuestion;
-      call = {
-        ...call,
-        questions: (call.questions ?? []).map((row) =>
-          row.id === updated.id ? updated : row,
-        ),
-      };
+      if (questionWriteIsCurrent(token) && call) {
+        call = {
+          ...call,
+          questions: replaceQuestionRow(call.questions ?? [], updated),
+        };
+      }
     } catch (e: unknown) {
-      // Roll back the optimistic flip.
-      call = { ...call, questions: prev };
-      toast.error("Couldn't update the question. Try again.");
+      if (questionWriteIsCurrent(token) && call) {
+        call = {
+          ...call,
+          questions: rollbackQuestionRow(call.questions ?? [], q),
+        };
+      }
+      handleQuestionWriteError(
+        e,
+        "Couldn't update the question. Try again.",
+      );
       console.warn("toggle question failed", e);
     } finally {
-      markQuestionSaving(q.id, false);
+      finishQuestionWrite(token);
     }
   }
 
   function requestDeleteQuestion(q: CallQuestion) {
-    if (deletingQuestionId) return;
+    if (
+      deletingQuestionId ||
+      questionCollectionBusy ||
+      regenInFlight ||
+      questionRowBusy(q.id)
+    ) {
+      return;
+    }
     confirmingQuestionDeleteId = q.id;
   }
   function cancelDeleteQuestion(q: CallQuestion) {
@@ -1379,21 +1713,39 @@
     if (confirmingQuestionDeleteId === q.id) confirmingQuestionDeleteId = null;
   }
   async function confirmDeleteQuestion(q: CallQuestion) {
-    if (!call || deletingQuestionId) return;
+    if (
+      !call ||
+      deletingQuestionId ||
+      questionCollectionBusy ||
+      questionRowBusy(q.id)
+    ) {
+      return;
+    }
+    const token = startQuestionMutation(q.id);
+    if (!token) return;
     deletingQuestionId = q.id;
     try {
-      // The Rust shim maps 404 → Ok, so "already gone" is silent success.
-      await invoke("delete_call_question", { callId: call.id, qid: q.id });
-      call = {
-        ...call,
-        questions: (call.questions ?? []).filter((row) => row.id !== q.id),
-      };
-      confirmingQuestionDeleteId = null;
+      await invoke("delete_call_question", {
+        callId: token.callId,
+        qid: q.id,
+        revision: q.revision,
+      });
+      if (questionWriteIsCurrent(token) && call) {
+        call = {
+          ...call,
+          questions: removeQuestionRow(call.questions ?? [], q.id),
+        };
+        confirmingQuestionDeleteId = null;
+      }
     } catch (e: unknown) {
-      toast.error("Couldn't delete the question. Try again.");
+      handleQuestionWriteError(
+        e,
+        "Couldn't delete the question. Try again.",
+      );
       console.warn("delete question failed", e);
     } finally {
       deletingQuestionId = null;
+      finishQuestionWrite(token);
     }
   }
 
@@ -1988,6 +2340,7 @@
   });
 
   let pollTimer: number | undefined;
+  let latestQuestionPollGeneration = 0;
   const TERMINAL_STATES = new Set(["complete", "failed"]);
 
   // #286 — derived "still working" UX. Mirror of the portal detail
@@ -2025,19 +2378,43 @@
       }, 30_000);
     }
     pollTimer = window.setInterval(async () => {
+      if (!call) return;
+      const pollGeneration = ++latestQuestionPollGeneration;
+      const questionPoll = captureQuestionPoll(
+        questionMutationState,
+        call.id,
+      );
       try {
         const fresh = await invoke<Call>("get_call", {
-          id: page.params.id,
+          id: questionPoll.callId,
         });
+        // A newer poll has already started, or navigation replaced the call.
+        // Ignore this settlement wholesale instead of moving state backwards.
+        if (
+          pollGeneration !== latestQuestionPollGeneration ||
+          !call ||
+          call.id !== questionPoll.callId
+        ) {
+          return;
+        }
         // Keep participants + utterances in sync too — rename
         // propagation can land while we're polling. Preserve the
         // local notesBuffer so a server copy that's stale relative
         // to mid-type edits doesn't clobber in-flight keystrokes.
         fresh.notes = notesBuffer;
-        call = fresh;
+        const merged = mergeQuestionPoll(
+          call,
+          fresh,
+          questionPoll,
+          questionMutationState,
+        );
+        call = merged.call;
         if (TERMINAL_STATES.has(fresh.status)) {
           clearInterval(pollTimer);
           pollTimer = undefined;
+          // Polling stops at terminal state. If this response crossed a local
+          // write, refresh the collection after the write/barrier drains.
+          if (merged.questionsPreserved) queueCanonicalQuestionRefresh();
           // #286 — fire the "ready" toast + tray notification only
           // when the call had crossed the delay threshold at some
           // point during this page-view. Fast-completing calls stay
@@ -2312,6 +2689,11 @@
   }
 
   onDestroy(() => {
+    zohoPushAbort?.abort();
+    zohoPushAbort = null;
+    zohoPushAction = null;
+    zohoPriorPushGeneration += 1;
+    latestQuestionPollGeneration += 1;
     if (audioSrc.startsWith("blob:")) URL.revokeObjectURL(audioSrc);
     if (pollTimer !== undefined) {
       clearInterval(pollTimer);
@@ -2354,27 +2736,12 @@
     if (!url || !call) return;
     const base = safeFilename(call.title?.trim() || call.session_id);
     const filename = `${base}.opus`;
-    // Ask the user where to save — native dialog, remembers last dir.
-    let dest: string | null = null;
-    try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      dest = await save({
-        defaultPath: filename,
-        filters: [{ name: "Opus audio", extensions: ["opus"] }],
-      });
-    } catch (e) {
-      audioError = `Save dialog failed: ${e}`;
-      return;
-    }
-    if (!dest) return;
     downloading = true;
     audioError = "";
     try {
-      // Hands off to a Rust command that uses reqwest. Browser
-      // `fetch()` from tauri://localhost to Spaces is CORS-blocked
-      // (native <audio> bypasses CORS; fetch doesn't). Rust-side
-      // reqwest doesn't care about origin.
-      await invoke("download_audio", { url, dest });
+      // Rust verifies this exact URL was issued by get_audio_urls, then opens
+      // the native save dialog and streams into an atomic private stage.
+      await invoke("download_audio", { url, suggestedFilename: filename });
     } catch (e) {
       audioError = `Download failed: ${e}`;
     } finally {
@@ -2463,8 +2830,8 @@
   // #629 — download the transcript as a plain-text file. WKWebView /
   // WebView2 ignore <a download>, so the blob-anchor pattern is a no-op
   // in the desktop agent. Mirror downloadCurrentTrack: native save
-  // dialog picks a path, then the Rust `save_text_file` command writes
-  // the UTF-8 bytes via std::fs::write. Header (title + recorded +
+  // dialog and write both live in the Rust `save_text_file` command, so no
+  // destination path crosses IPC. Header (title + recorded +
   // duration) followed by `[mm:ss] Speaker: text` lines, byte-identical
   // to the portal's downloadTranscript output.
   async function downloadTranscript() {
@@ -2497,20 +2864,11 @@
     }
     const contents = lines.join("\n") + "\n";
     const safeStem = titleStr.replace(/[^\w\s.-]+/g, "_").slice(0, 80);
-    let dest: string | null = null;
     try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      dest = await save({
-        defaultPath: `${safeStem}-transcript.txt`,
-        filters: [{ name: "Text", extensions: ["txt"] }],
+      await invoke("save_text_file", {
+        suggestedFilename: `${safeStem}-transcript.txt`,
+        contents,
       });
-    } catch (e) {
-      transcriptError = `Save dialog failed: ${e}`;
-      return;
-    }
-    if (!dest) return;
-    try {
-      await invoke("save_text_file", { dest, contents });
     } catch (e) {
       transcriptError = portalErrorToText(e);
     }
@@ -2922,15 +3280,13 @@
     }
   }
 
-  // #302 Slice C — screen-recording player wiring. The agent webview
-  // fetches metadata through a Rust shim (no token in the webview) and
-  // binds `<video src>` to the presigned url directly. The player is a
-  // follower of the audio master clock — `seekTo` above already moves
-  // `currentMs`, and the follower `$effect` inside the component aligns
-  // the frame.
+  // #302 Slice C — metadata passes through the Rust shim because the webview
+  // has no token. A second command lazily mints playback only when the user
+  // expands a ready recording; the shared player correlates generation ids.
   const fetchScreenRecording = (id: string): Promise<ScreenRecording | null> =>
     invoke<ScreenRecording | null>("get_screen_recording", { id });
-  const resolveScreenSrc = (m: ScreenRecording): string => m.url ?? "";
+  const fetchScreenPlaybackUrl = (id: string): Promise<ScreenPlaybackUrl> =>
+    invoke<ScreenPlaybackUrl>("create_screen_playback_url", { id });
 
   function onTimeUpdate() {
     if (audioEl) currentMs = Math.floor(audioEl.currentTime * 1000);
@@ -4026,9 +4382,10 @@
           callId={page.params.id ?? ""}
           {currentMs}
           {playing}
+          playbackRate={rate}
           durationMs={call.duration_ms}
           fetchMeta={fetchScreenRecording}
-          resolveSrc={resolveScreenSrc}
+          fetchPlaybackUrl={fetchScreenPlaybackUrl}
         />
       {/if}
       <div class="wave-host">
@@ -4504,7 +4861,10 @@
                 type="button"
                 class="regen-btn"
                 onclick={openRegenConfirm}
-                disabled={regenInFlight || regenCooldownSeconds > 0 || call.status !== "complete"}
+                disabled={regenInFlight ||
+                  questionCollectionBusy ||
+                  regenCooldownSeconds > 0 ||
+                  call.status !== "complete"}
                 aria-disabled={regenCooldownSeconds > 0 ? "true" : undefined}
                 title={regenCooldownSeconds > 0
                   ? `Available again in ${regenCooldownSeconds} seconds`
@@ -4903,13 +5263,19 @@
         class:open={q.status === "open"}
         class:answered={q.status === "answered"}
         class:editing={editingQuestionId === q.id}
+        aria-busy={questionRowBusy(q.id)}
       >
         {#if canEditSummary}
           <button
             type="button"
             class="aq-tick aq-tick-btn"
             onclick={() => toggleQuestionAnswered(q)}
-            disabled={savingQuestionIds.has(q.id) || editingQuestionId === q.id}
+            disabled={questionRowBusy(q.id) ||
+              editingQuestionId === q.id ||
+              confirmingQuestionDeleteId === q.id ||
+              questionCollectionBusy ||
+              regenInFlight}
+            aria-pressed={q.status === "answered"}
             aria-label={q.status === "answered"
               ? "Mark as unanswered"
               : "Mark as answered"}
@@ -4958,30 +5324,36 @@
               class="aq-edit-q"
               bind:value={qEditText}
               rows="2"
+              maxlength={QUESTION_TEXT_MAX_CHARS}
               placeholder="Question"
               aria-label="Edit question"
+              disabled={questionRowBusy(q.id) || questionCollectionBusy}
             ></textarea>
             <textarea
               class="aq-edit-a"
               bind:value={qEditAnswer}
               rows="2"
+              maxlength={QUESTION_ANSWER_MAX_CHARS}
               placeholder="Answer (optional)"
               aria-label="Edit answer"
+              disabled={questionRowBusy(q.id) || questionCollectionBusy}
             ></textarea>
             <div class="aq-edit-actions">
               <button
                 type="button"
                 class="aq-btn aq-btn-primary"
                 onclick={() => saveEditQuestion(q)}
-                disabled={savingQuestionIds.has(q.id) || !qEditText.trim()}
+                disabled={questionRowBusy(q.id) ||
+                  questionCollectionBusy ||
+                  !qEditText.trim()}
               >
-                {savingQuestionIds.has(q.id) ? "Saving…" : "Save"}
+                {questionRowBusy(q.id) ? "Saving…" : "Save"}
               </button>
               <button
                 type="button"
                 class="aq-btn"
                 onclick={cancelEditQuestion}
-                disabled={savingQuestionIds.has(q.id)}
+                disabled={questionRowBusy(q.id) || questionCollectionBusy}
               >
                 Cancel
               </button>
@@ -5010,7 +5382,9 @@
                 type="button"
                 class="aq-btn aq-btn-danger"
                 onclick={() => confirmDeleteQuestion(q)}
-                disabled={deletingQuestionId === q.id}
+                disabled={questionRowBusy(q.id) ||
+                  deletingQuestionId === q.id ||
+                  questionCollectionBusy}
               >
                 {deletingQuestionId === q.id ? "…" : "Yes"}
               </button>
@@ -5018,7 +5392,9 @@
                 type="button"
                 class="aq-btn"
                 onclick={() => cancelDeleteQuestion(q)}
-                disabled={deletingQuestionId === q.id}
+                disabled={questionRowBusy(q.id) ||
+                  deletingQuestionId === q.id ||
+                  questionCollectionBusy}
               >
                 No
               </button>
@@ -5027,6 +5403,9 @@
                 type="button"
                 class="aq-icon-btn"
                 onclick={() => openEditQuestion(q)}
+                disabled={questionRowBusy(q.id) ||
+                  questionCollectionBusy ||
+                  regenInFlight}
                 aria-label="Edit question"
                 title="Edit"
               >
@@ -5051,6 +5430,9 @@
                 type="button"
                 class="aq-icon-btn"
                 onclick={() => requestDeleteQuestion(q)}
+                disabled={questionRowBusy(q.id) ||
+                  questionCollectionBusy ||
+                  regenInFlight}
                 aria-label="Delete question"
                 title="Delete"
               >
@@ -5089,7 +5471,9 @@
                 type="button"
                 class="add-item-btn"
                 onclick={openAddQuestion}
-                disabled={addingQuestion}
+                disabled={addingQuestion ||
+                  questionCollectionBusy ||
+                  regenInFlight}
                 aria-label="Add question"
               >
                 <svg
@@ -5134,8 +5518,10 @@
               class="aq-edit-q"
               bind:value={qAddText}
               rows="2"
+              maxlength={QUESTION_TEXT_MAX_CHARS}
               placeholder="Add a question the call missed…"
               aria-label="New question"
+              disabled={addingQuestionSaving || questionCollectionBusy}
             ></textarea>
             <div class="aq-composer-meta">
               <span class="aq-composer-lbl">Asked by</span>
@@ -5145,6 +5531,8 @@
                   class="aq-side-opt"
                   class:active={qAddSide === "you"}
                   onclick={() => (qAddSide = "you")}
+                  aria-pressed={qAddSide === "you"}
+                  disabled={addingQuestionSaving || questionCollectionBusy}
                 >
                   You
                 </button>
@@ -5153,6 +5541,8 @@
                   class="aq-side-opt"
                   class:active={qAddSide === "them"}
                   onclick={() => (qAddSide = "them")}
+                  aria-pressed={qAddSide === "them"}
+                  disabled={addingQuestionSaving || questionCollectionBusy}
                 >
                   Them
                 </button>
@@ -5162,15 +5552,19 @@
               class="aq-edit-a"
               bind:value={qAddAnswer}
               rows="2"
+              maxlength={QUESTION_ANSWER_MAX_CHARS}
               placeholder="Answer (optional — marks it answered)"
               aria-label="Answer for the new question"
+              disabled={addingQuestionSaving || questionCollectionBusy}
             ></textarea>
             <div class="aq-edit-actions">
               <button
                 type="button"
                 class="aq-btn aq-btn-primary"
                 onclick={saveAddQuestion}
-                disabled={addingQuestionSaving || !qAddText.trim()}
+                disabled={addingQuestionSaving ||
+                  questionCollectionBusy ||
+                  !qAddText.trim()}
               >
                 {addingQuestionSaving ? "Adding…" : "Add"}
               </button>
@@ -5178,7 +5572,7 @@
                 type="button"
                 class="aq-btn"
                 onclick={cancelAddQuestion}
-                disabled={addingQuestionSaving}
+                disabled={addingQuestionSaving || questionCollectionBusy}
               >
                 Cancel
               </button>
@@ -5535,7 +5929,7 @@
           type="button"
           class="rn-link"
           onclick={dismissRegenConfirm}
-          disabled={regenInFlight}
+          disabled={regenInFlight || questionCollectionBusy}
         >
           Cancel
         </button>
@@ -5543,7 +5937,7 @@
           type="button"
           class="rn-dismiss rn-primary"
           onclick={confirmRegenerate}
-          disabled={regenInFlight}
+          disabled={regenInFlight || questionCollectionBusy}
         >
           {regenInFlight ? "Regenerating…" : "Regenerate"}
         </button>
@@ -6922,10 +7316,15 @@
       background 0.12s ease,
       border-color 0.12s ease;
   }
-  .aq-icon-btn:hover {
+  .aq-icon-btn:hover:not(:disabled) {
     color: var(--bone-0);
     background: var(--ink-2);
     border-color: var(--hairline);
+  }
+  .aq-icon-btn:disabled,
+  .aq-side-opt:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .aq-icon-btn:focus-visible {
     outline: 2px solid var(--accent);
@@ -7064,12 +7463,34 @@
   .aq-side-opt + .aq-side-opt {
     border-left: 1px solid var(--hairline-hi);
   }
-  .aq-side-opt:hover {
+  .aq-side-opt:hover:not(:disabled) {
     color: var(--bone-0);
   }
   .aq-side-opt.active {
     background: var(--accent-soft);
     color: var(--accent-hi);
+  }
+
+  /* Touch has no hover reveal, and 24px icon targets are too small. Keep the
+     quiet desktop treatment while making every question action visible and at
+     least 44px on coarse/no-hover pointers. */
+  @media (hover: none), (pointer: coarse) {
+    .aq-actions {
+      opacity: 1;
+    }
+    .aq-icon-btn {
+      width: 44px;
+      height: 44px;
+    }
+    .aq-tick-btn {
+      width: 44px;
+      height: 44px;
+      margin: -11px -14px 0;
+    }
+    .aq-btn,
+    .aq-side-opt {
+      min-height: 44px;
+    }
   }
 
   /* ── Transcript ────────────────────────────────────────────────────── */

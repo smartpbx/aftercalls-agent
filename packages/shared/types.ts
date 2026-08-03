@@ -51,14 +51,16 @@ export type ScreenRecordingStatus =
 
 /** #302 (Slice C) — screen-recording metadata for a call, returned by
  *  `GET /v1/calls/{id}/screen` (agent: `get_screen_recording` Tauri
- *  command; portal: `api.calls.screenRecording`). `url` is a short-lived
- *  presigned GET, present only when `status === "ready"`. A 404 (org flag
- *  off OR no row) decodes to `null` at the call site — the player renders
- *  nothing. `start_offset_ms` is the whole feature: how far into the call
+ *  command; portal: `api.calls.screenRecording`). A 404 (org flag off OR
+ *  no row) decodes to `null` at the call site — the player renders nothing.
+ *  Internal generation checkpoints are collapsed by the backend into the
+ *  stable public statuses above. `start_offset_ms` is how far into the call
  *  audio the video began, so the follower can align frames to the audio
  *  master clock. */
 export type ScreenRecording = {
   recording_id: string;
+  /** Immutable identity used to correlate an on-demand playback URL. */
+  generation_id: string;
   status: ScreenRecordingStatus;
   start_offset_ms: number;
   duration_ms?: number;
@@ -68,11 +70,15 @@ export type ScreenRecording = {
   codec?: string;
   byte_size?: number;
   expires_at?: string;
-  /** Presigned GET (Spaces serves Range natively). Only set when
-   *  `status === "ready"`. Both surfaces bind `<video src>` to it —
-   *  cross-origin media playback needs no auth header (like the audio
-   *  `<audio src>` path). */
-  url?: string;
+};
+
+/** Short-lived playback credential minted only after a user expands a ready
+ *  screen recording. `generation_id` must match the metadata generation
+ *  before the URL can be attached to a media element. */
+export type ScreenPlaybackUrl = {
+  generation_id: string;
+  playback_url: string;
+  playback_url_expires_at: string;
 };
 
 /** #659 P5a — in-call co-pilot persona. `"sales"` grounds the Contact lane
@@ -565,15 +571,13 @@ export type LinkedTicketResponse = {
   linked_ticket: LinkedTicket | null;
 };
 
-/** Zoho Desk — response of `zoho_desk_push_call` (backend
- *  `POST /v1/calls/{id}/zoho-desk/push`): the finished call was added to the
- *  ticket as a private internal note. Every field is optional so an older
- *  backend decodes cleanly — the ended-card confirmation deep-links from the
- *  linked ticket's `web_url`, so it never depends on this shape. */
+/** Zoho Desk — legacy synchronous 200 response of `zoho_desk_push_call`
+ * (backend `POST /v1/calls/{id}/zoho-desk/push`). A durable 202 is parsed
+ * separately by the shared external-push settlement helper. */
 export type ZohoDeskPushResponse = {
-  push_id?: string;
-  comment_id?: string;
-  web_url?: string;
+  push_id: string;
+  desk_ticket_id: string;
+  desk_comment_id: string;
 };
 
 /** Phase 3 — per-user call-end CRM push mode. `"prompt"` (default) asks on the
@@ -717,6 +721,9 @@ export type CallLinkedTicket = {
  *  transcript-derived → rendered as plain text, NEVER `{@html}`. */
 export type CallQuestion = {
   id: string;
+  /** Monotonic optimistic-concurrency token. Every PATCH/DELETE must send the
+   *  revision it read; the backend returns 409 when another writer won. */
+  revision: number;
   asker_side: "you" | "them";
   asker_display: string;
   question_text: string;

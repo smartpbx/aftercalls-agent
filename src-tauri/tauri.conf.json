@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "aftercalls",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "identifier": "io.aftercalls.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -23,7 +23,11 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPLOCALDATA/**", "$APPLOCALDATA/**/*"]
+        "scope": [
+          "$APPLOCALDATA/recordings/*/mic.wav",
+          "$APPLOCALDATA/recordings/*/system.wav",
+          "$APPLOCALDATA/recordings/*/mixed.wav"
+        ]
       }
     }
   },
@@ -39,6 +43,10 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/ffmpeg-aftercalls"],
+    "resources": {
+      "resources/THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "resources/FFmpeg-LICENSE.txt": "licenses/FFmpeg-LICENSE.txt"
+    },
     "macOS": {
       "entitlements": "aftercalls.entitlements",
       "infoPlist": "Info.plist",

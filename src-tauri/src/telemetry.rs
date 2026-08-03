@@ -238,11 +238,13 @@ pub fn recent_session_ids(cap: usize) -> Vec<String> {
     out
 }
 
-async fn flush_once(app: &AppHandle) -> anyhow::Result<()> {
+async fn flush_once(_app: &AppHandle) -> anyhow::Result<()> {
     // Drain what's in the buffer; if the POST fails, re-insert at the
     // front so we retry on the next tick.
     let drained: Vec<Entry> = {
-        let mut buf = buffer().lock().map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut buf = buffer()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
         let take = buf.len().min(BATCH_MAX);
         buf.drain(..take).collect()
     };
@@ -268,10 +270,7 @@ async fn flush_once(app: &AppHandle) -> anyhow::Result<()> {
     let agent_version = env!("CARGO_PKG_VERSION").to_string();
     let platform = std::env::consts::OS.to_string();
 
-    let url = format!(
-        "{}/v1/agent/logs/batch",
-        backend.url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/agent/logs/batch", backend.url.trim_end_matches('/'));
     let body = serde_json::json!({
         "agent_version": agent_version,
         "platform": platform,

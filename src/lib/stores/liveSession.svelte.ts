@@ -245,7 +245,7 @@ function createStore() {
   // #646 (Phase 2) — PRE-CALL staged assignments, keyed `channel + speaker_label`.
   // An assign made BEFORE the session mints (no session_uuid yet) can't POST, so
   // it's held here and REPLAYED to the backend the instant recording starts (the
-  // layout drains this via `takePendingIdentities`). It deliberately SURVIVES
+  // layout peeks, then acknowledges each entry only after delivery). It deliberately SURVIVES
   // `resetForNewSession` — which re-seeds the display map from it — so a contact
   // the rep assigned for THIS starting call isn't wiped alongside the PREVIOUS
   // call's assignments (which only ever lived in `speakerIdentities`). In-call
@@ -632,16 +632,25 @@ function createStore() {
       pendingIdentities = next;
     },
 
-    /** #646 (Phase 2) — DRAIN the staged pre-call assignments: return them and
-     *  empty the buffer. The layout calls this right after the session_uuid is
-     *  minted and replays each to the backend (best-effort), so a contact
-     *  assigned before/at call-connect actually lands in
-     *  `state.copilot.speaker_identities` instead of being lost. */
-    takePendingIdentities(): SpeakerIdentity[] {
-      if (pendingIdentities.size === 0) return [];
-      const out = [...pendingIdentities.values()];
-      pendingIdentities = new Map();
-      return out;
+    /** #646 (Phase 2) — snapshot staged pre-call assignments without deleting
+     *  them. Delivery is asynchronous and can fail transiently; removing an
+     *  entry before the invoke succeeds permanently lost the user's mapping.
+     *  The layout calls `ackPendingIdentity` only after the backend accepts it. */
+    peekPendingIdentities(): SpeakerIdentity[] {
+      return [...pendingIdentities.values()];
+    },
+
+    /** Acknowledge one successfully delivered staged assignment. Identity
+     *  comparison is intentional: if the user changed the same speaker while
+     *  an older request was in flight, the newer value remains staged and the
+     *  stale completion cannot delete it. */
+    ackPendingIdentity(identity: SpeakerIdentity): boolean {
+      const key = speakerIdentityKey(identity.channel, identity.speaker_label);
+      if (pendingIdentities.get(key) !== identity) return false;
+      const next = new Map(pendingIdentities);
+      next.delete(key);
+      pendingIdentities = next;
+      return true;
     },
 
     /** Clear the buffer + coaching on a NEW session start, seeding the

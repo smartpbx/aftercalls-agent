@@ -5,24 +5,20 @@
 //! previous process crashed, was force-quit, or lost its connection
 //! partway through the pipeline. We scan for these on launch, offer
 //! the user a chance to resume them (re-run the pipeline from the
-//! top — AssemblyAI + OpenAI are idempotent for our purposes), and
-//! auto-clean anything older than 7 days so the recordings directory
-//! doesn't grow without bound.
+//! top — AssemblyAI + OpenAI are idempotent for our purposes). Local media is
+//! never age-deleted: a user may explicitly discard it, or a future immutable
+//! backend-ready generation/hash acknowledgement may authorize cleanup.
 //!
 //! A session_dir counts as an orphan when ALL of:
-//!   1. The dir contains mic.wav OR mic.opus AND is older than 5
-//!      minutes (so we don't snapshot a recording still in the act of
-//!      uploading). Age is measured against mic.wav's mtime (most
-//!      robust on filesystems where ctime can drift) with a fallback
-//!      to the dir's ctime.
-//!   2. The backend has no 'complete' row for this session_id. Two
-//!      flavours: backend-row-exists-but-not-complete (classic
-//!      mid-pipeline crash), and no-backend-row-at-all (crash before
-//!      create_call fired — the audio on disk is still a real
-//!      recording the user produced, just never registered upstream).
-//!      Both get surfaced: on-disk audio without a complete row is
-//!      recoverable intent, full stop. Discard is a user decision, not
-//!      ours.
+//!   1. The dir contains a mic/system artifact or durable media manifest AND
+//!      is older than 5 minutes (so we don't snapshot a recording still in
+//!      the act of uploading). Age prefers artifact/manifest mtime with a
+//!      fallback to the directory mtime.
+//!   2. The backend has no 'complete' row for this session_id, OR the durable
+//!      manifest still has a locally retryable media job. The former covers
+//!      both mid-pipeline crashes and crashes before create_call; the latter
+//!      preserves a failed screen/audio upload even when transcript/summary
+//!      already completed. Discard is a user decision, not ours.
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,11 +36,6 @@ use crate::portal::FailureClass;
 /// the pipeline is kicked off async from stop_recording, so a folder
 /// created 30s ago is almost certainly mid-pipeline not orphaned.
 const MIN_AGE_MINUTES: i64 = 5;
-
-/// Anything older than this gets silently deleted regardless of
-/// backend state. Keeps the recordings folder from accumulating
-/// dismissed orphans forever.
-const AUTO_CLEAN_DAYS: i64 = 7;
 
 /// #646 Layer C — auto-resume is only attempted on sessions younger
 /// than this. Older orphans fall through to the prompted-UI list
@@ -138,7 +129,7 @@ pub fn write_auto_resume_state(session_dir: &Path, state: &AutoResumeState) {
     let path = auto_resume_state_path(session_dir);
     match serde_json::to_string_pretty(state) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(&path, text) {
+            if let Err(e) = crate::session_fs::write_private_file(&path, text.as_bytes()) {
                 eprintln!(
                     "aftercalls: write auto_resume_state {} failed: {e}",
                     path.display()
@@ -189,10 +180,9 @@ fn recordings_root(app: &AppHandle) -> Option<PathBuf> {
         .map(|p| p.join("recordings"))
 }
 
-/// Iterate the recordings directory and return every dir that meets
-/// the orphan criteria. Also silently deletes anything older than
-/// AUTO_CLEAN_DAYS while we're iterating — keeps the cleanup in one
-/// pass without a separate scheduled task.
+/// Iterate the recordings directory and return every dir that meets the
+/// orphan criteria. Age never authorizes deletion: unknown or unacknowledged
+/// local media remains recoverable until the user explicitly discards it.
 ///
 /// #646 Layer C/D — as of Phase 2 this function runs both on launch
 /// AND on the 5-min sweeper tick driven by the Svelte layout. Both
@@ -221,7 +211,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
     // Collect candidate (session_dir, age) pairs up front so we can do
     // the per-folder backend check asynchronously afterward without
     // holding the ReadDir iterator open.
-    let mut candidates: Vec<(PathBuf, String, SystemTime)> = Vec::new();
+    let mut candidates: Vec<(PathBuf, String, SystemTime, bool)> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -232,11 +222,50 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        // Need audio to be considered. mic.opus (compressed) or
-        // mic.wav (raw — compression may have never run).
+        // Need local media intent to be considered. Imports are commonly
+        // system-only, and a durable manifest can represent a pending screen
+        // retry even when an audio artifact has moved or failed validation.
         let mic_wav = path.join("mic.wav");
         let mic_opus = path.join("mic.opus");
-        if !mic_wav.exists() && !mic_opus.exists() {
+        let system_wav = path.join("system.wav");
+        let system_opus = path.join("system.opus");
+        let manifest_path = path.join(crate::media_manifest::MANIFEST_FILENAME);
+        let mut manifest_terminal = false;
+        let manifest_retryable = match crate::media_manifest::read(&path) {
+            Ok(Some(manifest)) => {
+                // A session whose pipeline finished and whose every artifact is
+                // acknowledged or absent holds nothing recoverable. The media
+                // bytes are already cleaned up, but `media-state.json` itself
+                // survives, so without this the dir stays a candidate forever
+                // and any call deleted outside this agent (portal, another
+                // machine, an admin) resurfaces as a permanent "N unfinished
+                // calls" chip that the user can never clear.
+                manifest_terminal =
+                    manifest.pipeline_complete && !manifest.has_unacknowledged_media();
+                manifest.has_retryable_media()
+            }
+            Ok(None) => false,
+            Err(e) => {
+                // A corrupt checkpoint is unknown state, never evidence that
+                // cleanup/recovery can be skipped.
+                eprintln!(
+                    "aftercalls: media manifest unreadable for {}: {e:#}",
+                    path.display()
+                );
+                true
+            }
+        };
+        if manifest_terminal {
+            continue;
+        }
+        let legacy_pending_audio = crate::upload::read_pending_uploads(&path).is_some();
+        if !mic_wav.exists()
+            && !mic_opus.exists()
+            && !system_wav.exists()
+            && !system_opus.exists()
+            && !manifest_path.exists()
+            && !legacy_pending_audio
+        {
             continue;
         }
 
@@ -247,6 +276,9 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         // writing to this dir".
         let age_anchor = mtime_of(&mic_wav)
             .or_else(|| mtime_of(&mic_opus))
+            .or_else(|| mtime_of(&system_wav))
+            .or_else(|| mtime_of(&system_opus))
+            .or_else(|| mtime_of(&manifest_path))
             .or_else(|| mtime_of(&path))
             .unwrap_or(now);
 
@@ -256,30 +288,17 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
             .as_secs() as i64;
         let age_minutes = age_secs / 60;
 
-        // Auto-clean path: anything older than AUTO_CLEAN_DAYS gets
-        // nuked silently and never surfaces in the orphan list.
-        if age_minutes >= AUTO_CLEAN_DAYS * 24 * 60 {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!(
-                    "aftercalls: auto-clean remove {} failed: {e}",
-                    path.display()
-                );
-            } else {
-                eprintln!(
-                    "aftercalls: auto-cleaned stale session {} ({}d old)",
-                    session_id,
-                    age_minutes / (24 * 60)
-                );
-            }
-            continue;
-        }
-
         // Too-new gate: skip anything that could still be mid-pipeline.
         if age_minutes < MIN_AGE_MINUTES {
             continue;
         }
 
-        candidates.push((path, session_id, age_anchor));
+        candidates.push((
+            path,
+            session_id,
+            age_anchor,
+            manifest_retryable || legacy_pending_audio,
+        ));
     }
 
     // Now check the backend for each candidate. Any session whose
@@ -300,7 +319,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         None => return Vec::new(),
     };
 
-    for (session_dir, session_id, age_anchor) in candidates {
+    for (session_dir, session_id, age_anchor, local_media_retryable) in candidates {
         // Filter out anything Layer C is mid-resuming so the prompted
         // UI never races the sweeper.
         if is_in_flight(&session_id) {
@@ -318,7 +337,10 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                         .and_then(|s| s.as_str())
                         .map(|s| s != "complete")
                         .unwrap_or(true);
-                    (stuck, OrphanKind::StuckPipeline)
+                    (
+                        stuck || local_media_retryable,
+                        OrphanKind::StuckPipeline,
+                    )
                 }
                 Ok(None) => {
                     // No backend row: pipeline crashed before
@@ -330,13 +352,13 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                     (true, OrphanKind::NeverCreated)
                 }
                 Err(e) => {
-                    // Network / auth failure. Don't surface — we'd
-                    // rather under-report orphans than prompt on every
-                    // folder when the backend is briefly unreachable.
+                    // Network/auth failure cannot erase explicit local retry
+                    // intent. Surface only checkpointed pending media; avoid
+                    // prompting for every historical folder.
                     eprintln!(
                         "aftercalls: scan_orphans backend check failed for {session_id}: {e}",
                     );
-                    (false, OrphanKind::NeverCreated)
+                    (local_media_retryable, OrphanKind::StuckPipeline)
                 }
             };
         if !needs_recovery {
@@ -382,8 +404,8 @@ pub async fn resume(app: AppHandle, session_dir: PathBuf) {
     crate::pipeline::run(session_dir, app).await;
 }
 
-/// Delete the session folder on disk. Called both from the UI
-/// (user clicked Discard) and from the auto-clean branch in scan_orphans.
+/// Delete the session folder on disk only after an explicit user discard or
+/// call-deletion action.
 pub async fn discard(session_dir: &Path) -> Result<(), String> {
     tokio::fs::remove_dir_all(session_dir)
         .await
@@ -395,18 +417,7 @@ pub async fn discard(session_dir: &Path) -> Result<(), String> {
 /// commands so the frontend never needs to handle paths directly.
 pub fn resolve_session_dir(app: &AppHandle, session_id: &str) -> Option<PathBuf> {
     let root = recordings_root(app)?;
-    let p = root.join(session_id);
-    // Light sanity check — the session_id must name a direct child of
-    // root and the folder must actually exist. Blocks any attempt to
-    // smuggle "../" through the IPC boundary, even though the Tauri
-    // command signature already constrains it to a string.
-    if p.parent() != Some(&root) {
-        return None;
-    }
-    if !p.exists() {
-        return None;
-    }
-    Some(p)
+    crate::session_fs::resolve_existing_dir(&root, session_id)
 }
 
 fn mtime_of(path: &Path) -> Option<SystemTime> {
@@ -424,12 +435,10 @@ fn system_time_to_utc(t: SystemTime) -> DateTime<Utc> {
 }
 
 /// Parse a session_id that matches our standard %Y%m%dT%H%M%SZ format.
-/// Returns None for imports ("imp_...") or anything else — the caller
-/// falls back to the directory's mtime in that case.
+/// Accepts legacy, collision-suffixed, and import session ids. Anything else
+/// falls back to the directory's mtime in the caller.
 fn parse_session_timestamp(session_id: &str) -> Option<DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(session_id, "%Y%m%dT%H%M%SZ")
-        .ok()
-        .map(|ndt| ndt.and_utc())
+    crate::session_fs::parse_timestamp(session_id)
 }
 
 // ── #646 Layer C — auto-resume sweeper plumbing ──────────────────────

@@ -56,9 +56,8 @@
         const st = await invoke<{
           available: boolean;
           capturing: boolean;
-          consented: boolean | null;
           source_kind: string | null;
-        }>("screen_capture_status");
+        }>("screen_capture_local_status");
         // #302 follow-up — source_kind is null when no capture is running
         // (never picked, or it died mid-call) so the cue drops cleanly.
         if (!cancelled) callRecording.setScreenSource(st.source_kind ?? null);

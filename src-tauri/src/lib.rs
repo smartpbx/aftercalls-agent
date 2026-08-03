@@ -4,9 +4,13 @@ mod auto_recorder;
 mod config;
 mod detector;
 mod error;
+mod ipc_security;
 mod live;
 #[cfg(target_os = "macos")]
 mod macos_loopback;
+mod media_manifest;
+mod media_process;
+mod media_upload;
 mod mic_consumers;
 mod notes;
 mod notify_actions;
@@ -16,6 +20,7 @@ mod recorder;
 mod recovery;
 mod rolling_encode;
 mod screen_recorder;
+mod session_fs;
 mod summary;
 mod support;
 mod telemetry;
@@ -31,6 +36,7 @@ use screen_recorder::ScreenRecorder;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -38,12 +44,133 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // Holds references to tray menu items we need to mutate (toggle label) so we
 // can fetch them out of app state instead of hunting through the menu tree.
 struct TrayItems {
     toggle: MenuItem<Wry>,
+}
+
+/// Process-wide transaction boundary for recording lifecycle changes. Every
+/// producer (audio, rolling Opus, screen video, live relay) and the public UI
+/// state transition is started/stopped while this one mutex is held.
+///
+/// The generation token is shared with every producer. A caller captures the
+/// token it intends to stop before waiting for the mutex; if another stop +
+/// start wins the race, the stale token is rejected instead of tearing down
+/// the newer recording.
+struct RecordingLifecycle {
+    inner: Mutex<LifecycleState>,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleState {
+    next_generation: u64,
+    active: Option<LifecycleToken>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LifecycleToken {
+    generation: u64,
+    session_dir: PathBuf,
+}
+
+struct StartTransition<'a> {
+    guard: MutexGuard<'a, LifecycleState>,
+    generation: u64,
+}
+
+struct StopTransition<'a> {
+    guard: MutexGuard<'a, LifecycleState>,
+    token: LifecycleToken,
+}
+
+impl RecordingLifecycle {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(LifecycleState::default()),
+        }
+    }
+
+    fn begin_start(&self) -> Result<StartTransition<'_>, String> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(active) = &guard.active {
+            return Err(format!(
+                "recording already in progress ({})",
+                active.session_dir.display()
+            ));
+        }
+        guard.next_generation = guard
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| "recording lifecycle generation exhausted".to_string())?;
+        let generation = guard.next_generation;
+        Ok(StartTransition { guard, generation })
+    }
+
+    fn current_token(&self) -> Option<LifecycleToken> {
+        self.inner.lock().unwrap().active.clone()
+    }
+
+    fn token_for_session(&self, session_dir: &std::path::Path) -> Option<LifecycleToken> {
+        self.inner
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .filter(|active| active.session_dir == session_dir)
+            .cloned()
+    }
+
+    fn begin_stop(&self, token: &LifecycleToken) -> Result<StopTransition<'_>, String> {
+        let guard = self.inner.lock().unwrap();
+        match guard.active.as_ref() {
+            Some(active) if active == token => Ok(StopTransition {
+                guard,
+                token: token.clone(),
+            }),
+            Some(active) => Err(format!(
+                "stale stop rejected: requested generation {} for {}, active generation is {} for {}",
+                token.generation,
+                token.session_dir.display(),
+                active.generation,
+                active.session_dir.display()
+            )),
+            None => Err("no active recording".into()),
+        }
+    }
+}
+
+impl StartTransition<'_> {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn commit(mut self, session_dir: PathBuf) -> LifecycleToken {
+        let token = LifecycleToken {
+            generation: self.generation,
+            session_dir,
+        };
+        self.guard.active = Some(token.clone());
+        token
+    }
+}
+
+impl StopTransition<'_> {
+    fn token(&self) -> &LifecycleToken {
+        &self.token
+    }
+
+    /// Clear the lifecycle identity only after the audio worker has
+    /// authoritatively stopped. The guard remains held until the whole stop
+    /// transaction (auxiliary producers + UI event + pipeline handoff) ends.
+    fn mark_stopped(&mut self) {
+        if self.guard.active.as_ref() == Some(&self.token) {
+            self.guard.active = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -279,7 +406,7 @@ pub(crate) fn write_session_source(
         "app": app,
     });
     let path = session_dir.join("source.json");
-    if let Err(e) = std::fs::write(&path, payload.to_string()) {
+    if let Err(e) = session_fs::write_private_file(&path, payload.to_string().as_bytes()) {
         eprintln!(
             "aftercalls: failed to write source.json for {}: {e}",
             session_dir.display()
@@ -294,7 +421,7 @@ pub(crate) fn write_session_source(
 pub(crate) fn write_live_session(session_dir: &std::path::Path, session_uuid: &str) {
     let payload = serde_json::json!({ "session_uuid": session_uuid });
     let path = session_dir.join("live_session.json");
-    if let Err(e) = std::fs::write(&path, payload.to_string()) {
+    if let Err(e) = session_fs::write_private_file(&path, payload.to_string().as_bytes()) {
         eprintln!(
             "aftercalls: failed to write live_session.json for {}: {e}",
             session_dir.display()
@@ -355,12 +482,17 @@ fn emit_state(
 
 /// Spawns the hard-ceiling watchdog for an in-flight recording. Used
 /// by both the regular recorder path (`do_start`) and the note-to-
-/// self path (`do_start_self_note`). Captures the current session_seq
+/// self path (`do_start_self_note`). Captures the lifecycle generation
 /// so a manual stop-then-start can't let a stale watchdog nuke the
 /// new session. `minutes` is the cap the caller picks (per-user
 /// `max_recording_minutes` for regular calls, `max_self_note_minutes`
 /// for self-notes).
-fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, label: &'static str) {
+fn spawn_max_length_watchdog(
+    app: &AppHandle,
+    token: LifecycleToken,
+    minutes: u32,
+    label: &'static str,
+) {
     let app_for_watchdog = app.clone();
     let minutes_owned = minutes;
     tauri::async_runtime::spawn(async move {
@@ -371,7 +503,7 @@ fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, l
             let rec = app_for_watchdog.state::<Recorder>();
             // Session changed out from under us — manual stop (and
             // possibly a new start). Stale watchdog; bail.
-            if rec.session_seq() != captured_seq {
+            if rec.active_generation() != Some(token.generation) {
                 return;
             }
             if !rec.is_active() {
@@ -388,7 +520,7 @@ fn spawn_max_length_watchdog(app: &AppHandle, captured_seq: i64, minutes: u32, l
                     None,
                     None,
                 );
-                if let Err(e) = do_stop(&rec, &app_for_watchdog) {
+                if let Err(e) = do_stop_token(&rec, &app_for_watchdog, token.clone()) {
                     eprintln!("aftercalls: watchdog auto-stop failed: {e}");
                 }
                 return;
@@ -420,7 +552,11 @@ struct ScreenSourceRequest {
 /// NEVER blocks or fails the audio recording — it returns instantly (the
 /// ask-each-call path just emits an event; the actual capture starts later
 /// via `start_screen_source`).
-fn maybe_request_screen_source(app: &AppHandle, session_dir: &std::path::Path) {
+fn maybe_request_screen_source(
+    app: &AppHandle,
+    session_dir: &std::path::Path,
+    generation: u64,
+) {
     // Org feature flag (cached in auth.json). Absent / off → no capture.
     let feature_on = config::read_auth_file()
         .ok()
@@ -474,7 +610,13 @@ fn maybe_request_screen_source(app: &AppHandle, session_dir: &std::path::Path) {
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let _ = app
         .state::<ScreenRecorder>()
-        .start(session_dir, source, &start_cfg, audio_started_at_ms);
+        .start(
+            session_dir,
+            generation,
+            source,
+            &start_cfg,
+            audio_started_at_ms,
+        );
 }
 
 pub(crate) fn do_start(
@@ -485,7 +627,30 @@ pub(crate) fn do_start(
     // the counterpart off the audio hot path. `None` for CLI/hotkey starts
     // and whenever copilot is off or no contact was chosen.
     contact_hint: Option<String>,
+    source_kind: &'static str,
+    source_app: Option<&str>,
 ) -> Result<String, String> {
+    let lifecycle = app.state::<RecordingLifecycle>();
+    let transition = lifecycle.begin_start()?;
+    let generation = transition.generation();
+
+    // A lifecycle identity should own every auxiliary producer. Refuse to
+    // start over an orphaned producer rather than silently replacing it and
+    // risking capture/upload attribution across sessions.
+    if let Some(active) = app.state::<RollingEncoder>().active_generation() {
+        return Err(format!(
+            "rolling encoder is still active for generation {active}"
+        ));
+    }
+    if let Some(active) = app.state::<ScreenRecorder>().active_generation() {
+        return Err(format!(
+            "screen recorder is still active for generation {active}"
+        ));
+    }
+    if let Some(active) = app.state::<live::LiveRelay>().active_generation() {
+        return Err(format!("live relay is still active for generation {active}"));
+    }
+
     let base = app
         .path()
         .app_local_data_dir()
@@ -520,39 +685,63 @@ pub(crate) fn do_start(
                 app.clone(),
                 backend.url,
                 uuid.clone(),
+                generation,
                 contact_hint.clone(),
             ));
             session_uuid = Some(uuid);
         }
     }
 
-    let path = match state.start(base, saved_device, false, live_tap) {
+    let path = match state.start(base, generation, saved_device, false, live_tap) {
         Ok(p) => p,
         Err(e) => {
             // Recording never started — tear down the relay we just opened.
-            app.state::<live::LiveRelay>().end();
+            app.state::<live::LiveRelay>().end(generation);
             return Err(e);
         }
     };
+    if let Err(e) = media_manifest::initialize(&path) {
+        let cleanup = state.stop_generation(generation, &path).err();
+        app.state::<live::LiveRelay>().end(generation);
+        return Err(format!(
+            "initialize durable media checkpoint: {e:#}{}",
+            cleanup
+                .map(|error| format!("; recorder cleanup also failed: {error}"))
+                .unwrap_or_default()
+        ));
+    }
 
     // Persist the session_uuid so the post-call create_call flow can hand it
     // to the backend for live-session reconciliation.
     if let Some(uuid) = &session_uuid {
         write_live_session(&path, uuid);
     }
+    // Persist source attribution before publishing the active lifecycle token.
+    // A Stop caller cannot pass the lifecycle mutex until this write finishes,
+    // so the pipeline can never race a just-returned Start and observe a
+    // missing/default source descriptor.
+    write_session_source(&path, source_kind, source_app);
 
     // chunked-upload — start the rolling per-channel Opus encode so the
     // mic + system `.opus` are ready at stop (encode off the end-of-call
-    // path). Best-effort: a failure just means the pipeline compresses
-    // the WAVs at stop, exactly as before.
-    app.state::<RollingEncoder>().start(&path);
+    // path). Starting this producer is part of the lifecycle transaction: an
+    // invariant failure aborts the session instead of silently starting only
+    // a subset of its owned producers.
+    if let Err(error) = app.state::<RollingEncoder>().start(&path, generation) {
+        let cleanup = state.stop_generation(generation, &path).err();
+        app.state::<live::LiveRelay>().end(generation);
+        return Err(format!(
+            "start rolling media encoder: {error}{}",
+            cleanup
+                .map(|error| format!("; recorder cleanup also failed: {error}"))
+                .unwrap_or_default()
+        ));
+    }
 
-    // #302 follow-up — best-effort per-call screen-source request (Call mode
-    // only). Emits the chooser event (ask-each-call) or auto-starts the
-    // remembered screen. Returns instantly; NEVER blocks or fails the audio
-    // recording.
-    maybe_request_screen_source(app, &path);
-
+    // Publish the recording/session identity BEFORE any dependent request.
+    // Tauri preserves event order; the chooser can therefore correlate the
+    // following screen-source request with the live store instead of seeing
+    // an idle state and immediately dismissing itself.
     emit_state(
         app,
         true,
@@ -563,6 +752,12 @@ pub(crate) fn do_start(
         // address it. Same value already persisted to live_session.json.
         session_uuid.clone(),
     );
+
+    // #302 follow-up — best-effort per-call screen-source request (Call mode
+    // only). Emits the chooser event (ask-each-call) or auto-starts the
+    // remembered screen. Returns instantly; NEVER blocks or fails the audio
+    // recording.
+    maybe_request_screen_source(app, &path, generation);
     // If the saved-name preference didn't resolve, surface a one-time
     // toast on the Record page. Dedupe lives inside the Recorder
     // (HashSet<String>), so repeat Start/Stop in the same session with
@@ -575,8 +770,8 @@ pub(crate) fn do_start(
     let max_minutes = config::Config::load()
         .map(|c| c.max_recording_minutes)
         .unwrap_or(120);
-    let captured_seq = app.state::<Recorder>().session_seq();
-    spawn_max_length_watchdog(app, captured_seq, max_minutes, "recording");
+    let token = transition.commit(path.clone());
+    spawn_max_length_watchdog(app, token, max_minutes, "recording");
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -588,6 +783,22 @@ pub(crate) fn do_start(
 /// writing `source.json` with `kind = "self_note"` (see
 /// `start_self_note`).
 pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<String, String> {
+    let lifecycle = app.state::<RecordingLifecycle>();
+    let transition = lifecycle.begin_start()?;
+    let generation = transition.generation();
+    if let Some(active) = app.state::<RollingEncoder>().active_generation() {
+        return Err(format!(
+            "rolling encoder is still active for generation {active}"
+        ));
+    }
+    if let Some(active) = app.state::<ScreenRecorder>().active_generation() {
+        return Err(format!(
+            "screen recorder is still active for generation {active}"
+        ));
+    }
+    if let Some(active) = app.state::<live::LiveRelay>().active_generation() {
+        return Err(format!("live relay is still active for generation {active}"));
+    }
     let base = app
         .path()
         .app_local_data_dir()
@@ -599,7 +810,17 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
     // Note-to-self is mic-only private dictation — no live You/Them relay in
     // Phase 1 (no system channel, and the feature targets calls). Pass a
     // `None` tap so the recorder skips the live copy entirely.
-    let path = state.start(base, saved_device, true, None)?;
+    let path = state.start(base, generation, saved_device, true, None)?;
+    if let Err(e) = media_manifest::initialize(&path) {
+        let cleanup = state.stop_generation(generation, &path).err();
+        return Err(format!(
+            "initialize durable media checkpoint: {e:#}{}",
+            cleanup
+                .map(|error| format!("; recorder cleanup also failed: {error}"))
+                .unwrap_or_default()
+        ));
+    }
+    write_session_source(&path, "self_note", None);
     emit_state(
         app,
         true,
@@ -614,35 +835,238 @@ pub(crate) fn do_start_self_note(state: &Recorder, app: &AppHandle) -> Result<St
     let max_minutes = config::Config::load()
         .map(|c| c.max_self_note_minutes)
         .unwrap_or(5);
-    let captured_seq = app.state::<Recorder>().session_seq();
-    spawn_max_length_watchdog(app, captured_seq, max_minutes, "note-to-self");
+    let token = transition.commit(path.clone());
+    spawn_max_length_watchdog(app, token, max_minutes, "note-to-self");
     Ok(path.to_string_lossy().into_owned())
 }
 
 pub(crate) fn do_stop(state: &Recorder, app: &AppHandle) -> Result<String, String> {
-    let path: PathBuf = state.stop()?;
-    // #302 Slice B — stop the screen capture (SIGINT → clean mp4 finalize)
-    // and persist screen/recording.json for the pipeline's upload step.
-    // No-op when no capture was running; fully best-effort (a finalize
-    // hiccup is logged, never surfaced — the call still saves). The
-    // remux + multipart upload runs async inside pipeline::run below.
-    app.state::<ScreenRecorder>().stop_and_persist(&path);
-    // #live — flush + close the live relay (best-effort; no-op when idle).
-    app.state::<live::LiveRelay>().end();
-    emit_state(app, false, None, None, None);
-    // chunked-upload — finalize the rolling per-channel `.opus` (drain the
-    // WAV tail, close ffmpeg's stdin, wait for a clean flush) BEFORE the
-    // pipeline spawns so it sees complete files. Runs after emit_state so
-    // the UI shows "stopped" immediately; bounded so a wedged encoder
-    // can't hang the stop path — an unfinalized track just falls back to
-    // the pipeline's compress-at-stop. No-op when no rolling encode ran.
-    app.state::<RollingEncoder>().stop_and_persist(&path);
-    let session_dir = path.clone();
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        pipeline::run(session_dir, app_clone).await;
-    });
-    Ok(path.to_string_lossy().into_owned())
+    let token = app
+        .state::<RecordingLifecycle>()
+        .current_token()
+        .ok_or_else(|| "no active recording".to_string())?;
+    do_stop_token(state, app, token)
+}
+
+pub(crate) fn do_stop_session(
+    state: &Recorder,
+    app: &AppHandle,
+    expected_session_dir: &std::path::Path,
+) -> Result<String, String> {
+    let token = app
+        .state::<RecordingLifecycle>()
+        .token_for_session(expected_session_dir)
+        .ok_or_else(|| {
+            format!(
+                "stale stop rejected: {} is no longer the active recording",
+                expected_session_dir.display()
+            )
+        })?;
+    do_stop_token(state, app, token)
+}
+
+fn do_stop_token(
+    state: &Recorder,
+    app: &AppHandle,
+    token: LifecycleToken,
+) -> Result<String, String> {
+    let lifecycle = app.state::<RecordingLifecycle>();
+    let mut transition = lifecycle.begin_stop(&token)?;
+    let token = transition.token().clone();
+
+    // Every teardown is attempted even when another component reports an
+    // error. The lifecycle mutex remains held until state emission and the
+    // pipeline handoff, preventing an old stop from overwriting a new start.
+    // Native safety backstop: close/invalidate the always-on-top area picker
+    // before potentially slow media finalization. This does not depend on a
+    // responsive main webview observing `recording-state`.
+    close_region_select_window(app);
+    let recorder_result = state.stop_generation(token.generation, &token.session_dir);
+    let recorder_report = recorder_result.as_ref().ok();
+    let expected_session = Some(token.session_dir.clone());
+
+    let screen_report = app
+        .state::<ScreenRecorder>()
+        .stop_and_persist(Some(token.generation), expected_session.as_deref());
+    app.state::<live::LiveRelay>().end(token.generation);
+
+    let rolling_report = app
+        .state::<RollingEncoder>()
+        .stop_and_persist(token.generation, expected_session.as_deref());
+
+    // Repair public/UI state after all synchronous producers have received
+    // their stop signal. A resolved worker clears the authoritative active
+    // flag even when individual finalizers failed; a transport/worker failure
+    // remains visibly active and continues blocking Start until resolved.
+    let recorder_still_active = state.is_active();
+    if !recorder_still_active {
+        transition.mark_stopped();
+    }
+    let active_session = if recorder_still_active {
+        expected_session
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    emit_state(
+        app,
+        recorder_still_active,
+        None,
+        active_session,
+        None,
+    );
+
+    let path = expected_session
+        .or_else(|| rolling_report.as_ref().map(|report| report.session_dir.clone()))
+        .or_else(|| {
+            screen_report
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .and_then(|screen_dir| screen_dir.parent())
+                .map(PathBuf::from)
+        });
+    let mut issues = Vec::new();
+    if let Err(error) = &recorder_result {
+        issues.push(format!("audio recorder: {error}"));
+    }
+    if let Some(report) = recorder_report {
+        issues.extend(
+            report
+                .issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.component, issue.error)),
+        );
+    }
+    if let Some(error) = &screen_report.error {
+        issues.push(format!("screen recorder: {error}"));
+    }
+    if let Some(report) = &rolling_report {
+        for track in &report.tracks {
+            if track.state == rolling_encode::TrackPublicationState::FallbackRequired {
+                issues.push(format!(
+                    "{} rolling encoder: {}",
+                    track.track,
+                    track.error.as_deref().unwrap_or("fallback encode required")
+                ));
+            }
+        }
+    }
+
+    if let Some(session_dir) = &path {
+        let mut checkpoint = |result: anyhow::Result<()>| {
+            if let Err(error) = result {
+                issues.push(format!("media checkpoint: {error:#}"));
+            }
+        };
+        if let Some(report) = recorder_report {
+            for track in &report.tracks {
+                match track.state {
+                    recorder::RawTrackState::Finalized => checkpoint(
+                        media_manifest::mark_audio_raw(session_dir, track.track, true, None),
+                    ),
+                    recorder::RawTrackState::NotPresent => checkpoint(
+                        media_manifest::mark_audio_not_present(session_dir, track.track),
+                    ),
+                    recorder::RawTrackState::Failed => checkpoint(
+                        media_manifest::mark_audio_raw(
+                            session_dir,
+                            track.track,
+                            false,
+                            track.error.clone(),
+                        ),
+                    ),
+                }
+            }
+        }
+        if let Some(report) = &rolling_report {
+            for track in &report.tracks {
+                match track.state {
+                    rolling_encode::TrackPublicationState::Published => {
+                        if let Some(opus_path) = &track.opus_path {
+                            checkpoint(media_manifest::mark_audio_published(
+                                session_dir,
+                                &track.track,
+                                opus_path,
+                            ));
+                        }
+                    }
+                    rolling_encode::TrackPublicationState::FallbackRequired => {
+                        checkpoint(media_manifest::mark_audio_fallback(
+                            session_dir,
+                            &track.track,
+                            track
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "rolling publication failed".into()),
+                        ));
+                    }
+                    rolling_encode::TrackPublicationState::NotRecorded => {}
+                }
+            }
+        }
+        if let Some(error) = &screen_report.error {
+            let retained_path = screen_report.path.clone().unwrap_or_else(|| {
+                session_dir
+                    .join(screen_recorder::SCREEN_SUBDIR)
+                    .join(screen_recorder::RECORDING_FILENAME)
+            });
+            // Only checkpoint a retryable screen job when bytes actually
+            // exist. The ordinary degrade cases — the user cancelling the
+            // portal window picker, a 0-byte output, a gdigrab child whose
+            // window closed mid-call — all report an error with no usable
+            // file. Marking those `UploadPending` strands the manifest in a
+            // state the uploader can neither complete nor skip, which fails
+            // the whole call pipeline with no recovery path. Screen capture is
+            // opt-in and best-effort: absent is a valid terminal state.
+            let has_bytes = std::fs::metadata(&retained_path)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false);
+            if has_bytes {
+                checkpoint(media_manifest::mark_screen_upload_pending(
+                    session_dir,
+                    None,
+                    &retained_path,
+                    error.clone(),
+                ));
+            } else {
+                eprintln!(
+                    "aftercalls: screen capture produced no file ({error}); recording the call without it"
+                );
+                checkpoint(media_manifest::mark_screen_not_present(session_dir));
+            }
+        }
+
+        // Only a resolved recorder worker proves the WAV writers are closed.
+        // Transport/worker errors retain the source and block a premature
+        // pipeline read.
+        if recorder_report.is_some() {
+            let rolling = rolling_report.clone().unwrap_or_else(|| {
+                rolling_encode::RollingFinalizationReport::conservative(session_dir)
+            });
+            let session_dir = session_dir.clone();
+            let app_clone = app.clone();
+            tauri::async_runtime::spawn(async move {
+                pipeline::run_after_stop(session_dir, app_clone, rolling).await;
+            });
+        }
+    } else {
+        issues.push("unable to resolve the stopped session directory".into());
+    }
+
+    let path_display = path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown session>".into());
+    if issues.is_empty() {
+        Ok(path_display)
+    } else {
+        Err(format!(
+            "recording stopped at {path_display}, but teardown reported: {}",
+            issues.join("; ")
+        ))
+    }
 }
 
 #[tauri::command]
@@ -655,9 +1079,7 @@ fn start_recording(
     // behavior unchanged.
     contact_hint: Option<String>,
 ) -> Result<String, String> {
-    let path = do_start(&state, &app, contact_hint)?;
-    write_session_source(std::path::Path::new(&path), "manual", None);
-    Ok(path)
+    do_start(&state, &app, contact_hint, "manual", None)
 }
 
 /// #142 · v0.4.5 — Start a note-to-self dictation. Mic-only capture;
@@ -668,9 +1090,7 @@ fn start_recording(
 /// — the caller surfaces the inline notice.
 #[tauri::command]
 fn start_self_note(state: State<Recorder>, app: AppHandle) -> Result<String, String> {
-    let path = do_start_self_note(&state, &app)?;
-    write_session_source(std::path::Path::new(&path), "self_note", None);
-    Ok(path)
+    do_start_self_note(&state, &app)
 }
 
 #[tauri::command]
@@ -721,27 +1141,63 @@ fn is_processing(state: State<Recorder>) -> bool {
 }
 
 #[tauri::command]
-async fn process_imported_file(app: AppHandle, source_path: String) -> Result<String, String> {
-    let src = std::path::PathBuf::from(&source_path);
-    if !src.exists() {
-        return Err(format!("file not found: {source_path}"));
-    }
-    // New session dir named after the import moment so it sorts alongside real
-    // recordings. The "imp_" prefix is just for humans eyeballing the folder.
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let base = app
+async fn select_import_file(
+    app: AppHandle,
+    security: State<'_, ipc_security::IpcSecurity>,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter(
+            "Audio",
+            &["wav", "mp3", "m4a", "mp4", "ogg", "opus", "flac", "webm"],
+        )
+        .blocking_pick_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("resolve selected file: {e}"))?;
+    let canonical = ipc_security::canonical_existing_file(&path.to_string_lossy())?;
+    security.approve_path(ipc_security::PathPurpose::ImportAudio, canonical.clone());
+    Ok(Some(canonical.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn process_imported_file(
+    app: AppHandle,
+    security: State<'_, ipc_security::IpcSecurity>,
+    source_path: String,
+) -> Result<String, String> {
+    let src = security.consume_approved_file(
+        ipc_security::PathPurpose::ImportAudio,
+        &source_path,
+    )?;
+    // Allocate, never reuse, a private session directory. The timestamp prefix
+    // preserves sort order; the UUID suffix prevents same-second imports from
+    // overwriting each other or racing two pipelines into one backend call.
+    let recordings = app
         .path()
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
-        .join("recordings")
-        .join(format!("imp_{stamp}"));
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+        .join("recordings");
+    let base = session_fs::allocate(&recordings, session_fs::SessionKind::Import)
+        .map_err(|e| format!("allocate imported session: {e:#}"))?;
+    media_manifest::initialize(&base)
+        .map_err(|e| format!("initialize durable media checkpoint: {e:#}"))?;
 
     // Normalize whatever the user picked (mp3/m4a/mp4/etc.) into WAV so the
     // pipeline's AssemblyAI upload path (which re-encodes to Opus anyway) gets
     // a consistent input. Stored as system.wav so diarization kicks in — a
     // Zoom/Meet export usually has multiple voices mixed together.
     let dest = base.join("system.wav");
+    let staged_dest = base.join(format!(
+        "system.wav.part.{}",
+        uuid::Uuid::new_v4()
+    ));
+    let _stage_guard = media_manifest::reserve_private_stage(&staged_dest)
+        .map_err(|e| format!("reserve imported audio stage: {e:#}"))?;
     let mut cmd = tokio::process::Command::new(crate::pipeline::ffmpeg_binary());
     cmd.arg("-y")
         .arg("-i")
@@ -752,18 +1208,43 @@ async fn process_imported_file(app: AppHandle, source_path: String) -> Result<St
         .arg("16000")
         .arg("-c:a")
         .arg("pcm_s16le")
-        .arg(&dest)
+        // The private stage suffix is intentionally not a WAV extension.
+        .arg("-f")
+        .arg("wav")
+        .arg(&staged_dest)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     crate::pipeline::no_console(&mut cmd);
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| format!("run ffmpeg: {e}"))?;
+    let status = match cmd.status().await {
+        Ok(status) => status,
+        Err(e) => {
+            let message = format!("run import ffmpeg: {e}");
+            let _ = media_manifest::mark_audio_fallback(&base, "system", message.clone());
+            return Err(message);
+        }
+    };
     if !status.success() {
-        return Err(format!("ffmpeg exited with {status} (unsupported format?)"));
+        let message = format!("ffmpeg exited with {status} (unsupported format?)");
+        let _ = media_manifest::mark_audio_fallback(&base, "system", message.clone());
+        return Err(message);
     }
+    let reader = hound::WavReader::open(&staged_dest)
+        .map_err(|e| format!("validate imported WAV: {e}"))?;
+    if reader.spec().sample_rate == 0 || reader.duration() == 0 {
+        return Err("import produced an empty WAV".to_string());
+    }
+    drop(reader);
+    media_manifest::enforce_private_file(&staged_dest)
+        .map_err(|e| format!("protect imported WAV: {e:#}"))?;
+    media_manifest::sync_staged_file(&staged_dest)
+        .map_err(|e| format!("sync imported WAV: {e:#}"))?;
+    media_manifest::atomic_replace_file(&staged_dest, &dest)
+        .map_err(|e| format!("publish imported WAV: {e:#}"))?;
+    media_manifest::mark_audio_not_present(&base, "mic")
+        .map_err(|e| format!("checkpoint imported mic state: {e:#}"))?;
+    media_manifest::mark_audio_raw(&base, "system", true, None)
+        .map_err(|e| format!("checkpoint imported audio: {e:#}"))?;
 
     let source_app = src.file_name().map(|s| s.to_string_lossy().into_owned());
     write_session_source(&base, "imported", source_app.as_deref());
@@ -1082,17 +1563,27 @@ fn get_session_audio_path(
     if !matches!(track.as_str(), "mic" | "system" | "mixed") {
         return Err("invalid track".into());
     }
-    let dir = app
+    let recordings = app
         .path()
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
-        .join("recordings")
-        .join(&session_id)
-        .join(format!("{track}.wav"));
-    if !dir.exists() {
-        return Err(format!("not found: {}", dir.display()));
+        .join("recordings");
+    let session_dir = session_fs::resolve_existing_dir(&recordings, &session_id)
+        .ok_or_else(|| "recording session was not found".to_string())?;
+    let audio_path = session_dir.join(format!("{track}.wav"));
+    let metadata = audio_path
+        .symlink_metadata()
+        .map_err(|_| "recording audio was not found".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("recording audio is not a regular local file".into());
     }
-    Ok(dir.to_string_lossy().into_owned())
+    let canonical = audio_path
+        .canonicalize()
+        .map_err(|e| format!("resolve recording audio: {e}"))?;
+    if canonical.parent() != Some(session_dir.as_path()) {
+        return Err("recording audio escaped its session directory".into());
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 #[derive(Serialize)]
@@ -1359,6 +1850,43 @@ mod handoff_url_tests {
             derive_portal_base("https://staging.example/"),
             "https://staging.example",
         );
+    }
+}
+
+#[cfg(test)]
+mod recording_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn stale_stop_token_cannot_claim_a_new_generation() {
+        let lifecycle = RecordingLifecycle::new();
+        let first = lifecycle
+            .begin_start()
+            .unwrap()
+            .commit(PathBuf::from("/recordings/first"));
+        {
+            let mut stop = lifecycle.begin_stop(&first).unwrap();
+            stop.mark_stopped();
+        }
+        let second = lifecycle
+            .begin_start()
+            .unwrap()
+            .commit(PathBuf::from("/recordings/second"));
+
+        assert!(lifecycle.begin_stop(&first).is_err());
+        assert_eq!(lifecycle.current_token(), Some(second));
+    }
+
+    #[test]
+    fn concurrent_start_reservation_is_fail_closed() {
+        let lifecycle = RecordingLifecycle::new();
+        let first = lifecycle
+            .begin_start()
+            .unwrap()
+            .commit(PathBuf::from("/recordings/first"));
+        let error = lifecycle.begin_start().err().expect("second start must fail");
+        assert!(error.contains("already in progress"));
+        assert_eq!(lifecycle.current_token(), Some(first));
     }
 }
 
@@ -1829,20 +2357,53 @@ fn get_vault_settings() -> Result<VaultSettings, String> {
 }
 
 #[tauri::command]
+async fn select_vault_directory(
+    app: AppHandle,
+    security: State<'_, ipc_security::IpcSecurity>,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Select your Obsidian vault folder")
+        .blocking_pick_folder();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("resolve selected folder: {e}"))?;
+    let canonical = ipc_security::canonical_existing_dir(&path.to_string_lossy())?;
+    security.approve_path(ipc_security::PathPurpose::VaultRoot, canonical.clone());
+    Ok(Some(canonical.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
 fn set_vault_settings(
+    security: State<'_, ipc_security::IpcSecurity>,
     enabled: bool,
     path: String,
     clients_subpath: String,
 ) -> Result<(), String> {
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     if enabled {
-        let path = path.trim();
-        if path.is_empty() {
+        let supplied = path.trim();
+        if supplied.is_empty() {
             return Err("vault path is required when enabled".into());
         }
+        let canonical = ipc_security::canonical_existing_dir(supplied)?;
+        let already_configured = cfg
+            .vault
+            .as_ref()
+            .and_then(|vault| ipc_security::canonical_existing_dir(vault.path.trim()).ok())
+            .as_ref()
+            == Some(&canonical);
+        if !already_configured {
+            security.require_approved_dir(ipc_security::PathPurpose::VaultRoot, supplied)?;
+        }
+        let clients_subpath = ipc_security::normalize_relative_subpath(&clients_subpath)?;
         cfg.vault = Some(config::Vault {
-            path: path.to_string(),
-            clients_subpath: clients_subpath.trim().to_string(),
+            path: canonical.to_string_lossy().into_owned(),
+            clients_subpath,
         });
     } else {
         cfg.vault = None;
@@ -1851,12 +2412,17 @@ fn set_vault_settings(
 }
 
 #[tauri::command]
-async fn get_audio_urls(id: String) -> Result<serde_json::Value, error::PortalError> {
+async fn get_audio_urls(
+    security: State<'_, ipc_security::IpcSecurity>,
+    id: String,
+) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
         message: "no backend configured".into(),
     })?;
-    portal::get_audio_urls(backend, &id).await
+    let body = portal::get_audio_urls(backend, &id).await?;
+    security.approve_audio_urls(&body);
+    Ok(body)
 }
 
 #[derive(serde::Serialize)]
@@ -2109,6 +2675,7 @@ fn get_screen_capture_prefs() -> Result<ScreenCapturePrefs, String> {
 /// ("use primary"); an unrecognized resolution falls back to "1080p".
 #[tauri::command]
 fn set_screen_capture_prefs(
+    app: AppHandle,
     enabled: bool,
     display: Option<String>,
     fps: u32,
@@ -2137,7 +2704,31 @@ fn set_screen_capture_prefs(
     cfg.screen_capture_resolution = resolution;
     cfg.screen_capture_bitrate_kbps = bitrate_kbps;
     cfg.screen_capture_ask_each_call = ask_each_call;
-    cfg.save().map_err(|e| e.to_string())
+    cfg.save().map_err(|e| e.to_string())?;
+
+    // Disabling is a privacy action, not merely a preference for the next
+    // call. Serialize against Start/Stop and finalize the current capture
+    // immediately. With no lifecycle identity, stop any orphaned screen
+    // producer fail-closed rather than letting it continue invisibly.
+    if !enabled {
+        close_region_select_window(&app);
+        let lifecycle = app.state::<RecordingLifecycle>();
+        let _lifecycle_guard = lifecycle.inner.lock().unwrap();
+        // This is the one intentional generation-agnostic stop: disabling the
+        // privacy preference must halt whichever screen producer exists, even
+        // if an earlier invariant failure orphaned it from lifecycle state.
+        // Holding the lifecycle mutex prevents a concurrent Start from being
+        // mistaken for that orphan.
+        let report = app
+            .state::<ScreenRecorder>()
+            .stop_and_persist(None, None);
+        if let Some(error) = report.error {
+            return Err(format!(
+                "screen capture was disabled, but capture finalization reported: {error}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// #302 follow-up — list visible top-level windows for the chooser's Window
@@ -2164,22 +2755,78 @@ fn pick_region() -> Option<String> {
     }
 }
 
+#[derive(Clone)]
+struct RegionSelectRequest {
+    request_token: String,
+    session_dir: String,
+}
+
+#[derive(Default)]
+struct RegionSelectState(std::sync::Mutex<Option<RegionSelectRequest>>);
+
+#[derive(Serialize, Clone)]
+struct RegionPickedEvent {
+    request_token: String,
+    geometry: String,
+}
+
+#[derive(Serialize, Clone)]
+struct RegionCancelledEvent {
+    request_token: String,
+}
+
 /// #302 follow-up — the Windows `region-select` overlay window submits its
 /// result here. Closes the overlay and re-emits the outcome to the main
 /// window's chooser as `region-picked` (with the geometry) or
-/// `region-cancelled`. Routed through this app command (always permitted)
-/// so the overlay window needs no window/event ACL of its own.
+/// `region-cancelled`. The secondary window receives only this command through
+/// the dedicated `region-select-commands` capability.
 #[tauri::command]
-fn submit_region_selection(app: AppHandle, geometry: Option<String>) {
+fn submit_region_selection(
+    app: AppHandle,
+    state: State<RegionSelectState>,
+    request_token: String,
+    geometry: Option<String>,
+) {
+    // A replaced/late overlay must not close or answer the current selector.
+    // Token + session ownership is recorded Rust-side when the window opens.
+    let request = {
+        let mut guard = state.0.lock().unwrap();
+        match guard.as_ref() {
+            Some(active) if active.request_token == request_token => guard.take().unwrap(),
+            _ => return,
+        }
+    };
     if let Some(w) = app.get_webview_window("region-select") {
         let _ = w.close();
     }
-    match geometry.filter(|g| !g.trim().is_empty()) {
-        Some(geo) => {
-            let _ = app.emit("region-picked", geo);
+    if !recording_session_matches(&app, &request.session_dir) {
+        let _ = app.emit(
+            "region-cancelled",
+            RegionCancelledEvent { request_token },
+        );
+        return;
+    }
+    // Never forward arbitrary webview text as a capture argument. Parse and
+    // rebuild the one accepted shape so dimensions/coordinates are integral,
+    // non-zero, and free of trailing tokens.
+    match geometry
+        .as_deref()
+        .and_then(screen_recorder::parse_region_geometry)
+    {
+        Some((width, height, x, y)) => {
+            let _ = app.emit(
+                "region-picked",
+                RegionPickedEvent {
+                    request_token,
+                    geometry: format!("{width}x{height}+{x}+{y}"),
+                },
+            );
         }
         None => {
-            let _ = app.emit("region-cancelled", ());
+            let _ = app.emit(
+                "region-cancelled",
+                RegionCancelledEvent { request_token },
+            );
         }
     }
 }
@@ -2198,44 +2845,159 @@ fn submit_region_selection(app: AppHandle, geometry: Option<String>) {
 #[tauri::command]
 fn open_region_select(
     app: AppHandle,
+    state: State<RegionSelectState>,
+    session_dir: String,
+    request_token: String,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    open_region_select_window(&app, x, y, width, height).map_err(|e| e.to_string())
+    uuid::Uuid::parse_str(&request_token)
+        .map_err(|_| "invalid area-selector request token".to_string())?;
+    if !cfg!(windows) {
+        return Err("area selector is only available on Windows".to_string());
+    }
+    let feature_on = config::read_auth_file()
+        .ok()
+        .flatten()
+        .map(|auth| auth.features.screen_capture)
+        .unwrap_or(false);
+    let opted_in = config::Config::load()
+        .map(|config| config.screen_capture_enabled)
+        .unwrap_or(false);
+    if !feature_on || !opted_in || !app.state::<ScreenRecorder>().is_available() {
+        return Err("screen capture is not enabled or available".to_string());
+    }
+    open_region_select_window(
+        &app,
+        &state,
+        &session_dir,
+        &request_token,
+        x,
+        y,
+        width,
+        height,
+    )
 }
 
 fn open_region_select_window(
     app: &AppHandle,
+    state: &RegionSelectState,
+    session_dir: &str,
+    request_token: &str,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
-) -> tauri::Result<()> {
-    // Idempotent: if it's already open, refocus rather than stacking a second.
-    if let Some(w) = app.get_webview_window("region-select") {
-        let _ = w.set_focus();
-        return Ok(());
+) -> Result<(), String> {
+    if !recording_session_matches(app, session_dir) {
+        return Err("recording session is no longer active".to_string());
     }
-    let url = format!("/region-select?x={x}&y={y}");
+
+    // The chooser obtains this rect from `list_displays`, but the command is
+    // still an IPC trust boundary. Require an exact current physical monitor
+    // and use its OS scale factor; arbitrary giant/topmost windows are denied.
+    let monitor = app
+        .available_monitors()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            position.x == x
+                && position.y == y
+                && size.width == width
+                && size.height == height
+        })
+        .ok_or_else(|| "requested area-selector monitor is unavailable".to_string())?;
+    let scale = monitor.scale_factor();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("requested monitor has an invalid scale factor".to_string());
+    }
+
+    // Idempotent only for the same request. A newer token replaces a late
+    // overlay so its eventual submit cannot answer the new chooser.
+    if let Some(w) = app.get_webview_window("region-select") {
+        let same_request = state
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|active| {
+                active.request_token == request_token && active.session_dir == session_dir
+            });
+        if same_request {
+            let _ = w.set_focus();
+            return Ok(());
+        }
+        let _ = w.close();
+        *state.0.lock().unwrap() = None;
+    }
+    let url = format!(
+        "/region-select?x={x}&y={y}&scale={scale:.6}&token={request_token}"
+    );
     // Transparent is safe here: this window only ever opens on Windows (the
     // chooser gates the invoke on `platform === "windows"`), so the Linux
     // WEBKIT_DISABLE_COMPOSITING_MODE caveat that keeps the co-pilot overlay
     // opaque does not apply — the region page needs alpha to show the screen
     // through its dim.
-    WebviewWindowBuilder::new(app, "region-select", WebviewUrl::App(url.into()))
+    let window = WebviewWindowBuilder::new(app, "region-select", WebviewUrl::App(url.into()))
         .title("Select area")
         .transparent(true)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
-        .focused(true)
-        .position(x as f64, y as f64)
-        .inner_size(width as f64, height as f64)
-        .build()?;
+        // Builder dimensions are logical pixels. Build hidden, then apply the
+        // exact physical monitor rect before the overlay can paint.
+        .focused(false)
+        .visible(false)
+        .inner_size(1.0, 1.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
+        let _ = window.close();
+        return Err(error.to_string());
+    }
+    if let Err(error) = window.set_size(tauri::PhysicalSize::new(width, height)) {
+        let _ = window.close();
+        return Err(error.to_string());
+    }
+    // Stop/restart can race the native window construction. Re-check before
+    // exposing an always-on-top overlay and close the hidden window if stale.
+    if !recording_session_matches(app, session_dir) {
+        let _ = window.close();
+        return Err("recording session ended while opening selector".to_string());
+    }
+    *state.0.lock().unwrap() = Some(RegionSelectRequest {
+        request_token: request_token.to_string(),
+        session_dir: session_dir.to_string(),
+    });
+    if let Err(error) = window.show() {
+        clear_region_select_request(state, request_token, session_dir);
+        let _ = window.close();
+        return Err(error.to_string());
+    }
+    if let Err(error) = window.set_focus() {
+        clear_region_select_request(state, request_token, session_dir);
+        let _ = window.close();
+        return Err(error.to_string());
+    }
     Ok(())
+}
+
+fn clear_region_select_request(
+    state: &RegionSelectState,
+    request_token: &str,
+    session_dir: &str,
+) {
+    let mut guard = state.0.lock().unwrap();
+    if guard.as_ref().is_some_and(|active| {
+        active.request_token == request_token && active.session_dir == session_dir
+    }) {
+        *guard = None;
+    }
 }
 
 /// #302 review — force-close the `region-select` overlay if present. No-op
@@ -2245,9 +3007,24 @@ fn open_region_select_window(
 /// `submit_region_selection` already closes it on a normal pick / cancel.
 #[tauri::command]
 fn close_region_select(app: AppHandle) {
+    close_region_select_window(&app);
+}
+
+fn close_region_select_window(app: &AppHandle) {
+    if let Some(state) = app.try_state::<RegionSelectState>() {
+        *state.0.lock().unwrap() = None;
+    }
     if let Some(w) = app.get_webview_window("region-select") {
         let _ = w.close();
     }
+}
+
+fn recording_session_matches(app: &AppHandle, session_dir: &str) -> bool {
+    let recorder = app.state::<Recorder>();
+    recorder.is_active()
+        && recorder
+            .session_dir()
+            .is_some_and(|active| active.to_string_lossy() == session_dir)
 }
 
 /// #302 follow-up — start the per-call screen capture on the chosen source.
@@ -2265,16 +3042,16 @@ fn start_screen_source(
     kind: String,
     target: Option<String>,
 ) -> String {
-    let recorder = app.state::<Recorder>();
-    if !recorder.is_active() {
+    if !recording_session_matches(&app, &session_dir) {
         return "cancelled".to_string();
     }
-    // Stale-request race: the session dir the chooser was opened for must
-    // match the recorder's current session.
-    match recorder.session_dir() {
-        Some(active) if active.to_string_lossy() == session_dir => {}
-        _ => return "cancelled".to_string(),
-    }
+    let recorder = app.state::<Recorder>();
+    // Serialize the final privacy/config recheck and capture spawn with both
+    // lifecycle Stop and preference disable. If disable wins this lock, the
+    // fresh config read below sees false; if this start wins, disable waits and
+    // then immediately stops the producer.
+    let lifecycle = app.state::<RecordingLifecycle>();
+    let lifecycle_guard = lifecycle.inner.lock().unwrap();
 
     // Defense-in-depth (#302 security review): re-assert the same gates
     // `maybe_request_screen_source` applied — the org `screen_capture`
@@ -2303,7 +3080,16 @@ fn start_screen_source(
         "screen" => screen_recorder::CaptureSource::Screen { monitor: target },
         "window" => screen_recorder::CaptureSource::Window { target },
         "region" => match target {
-            Some(geo) => screen_recorder::CaptureSource::Region { geometry: geo },
+            Some(geo) => {
+                #[cfg(windows)]
+                if !screen_recorder::region_within_any_display(
+                    &geo,
+                    &screen_recorder::enumerate_displays(),
+                ) {
+                    return "unavailable".to_string();
+                }
+                screen_recorder::CaptureSource::Region { geometry: geo }
+            }
             // Region with no geometry = cancelled drag-select → audio-only.
             None => return "cancelled".to_string(),
         },
@@ -2319,8 +3105,16 @@ fn start_screen_source(
         .started_at_ms()
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let session_path = std::path::PathBuf::from(&session_dir);
+    let Some(token) = lifecycle_guard
+        .active
+        .as_ref()
+        .filter(|active| active.session_dir == session_path)
+    else {
+        return "cancelled".to_string();
+    };
     let started = app.state::<ScreenRecorder>().start(
         &session_path,
+        token.generation,
         source,
         &start_cfg,
         audio_started_at_ms,
@@ -2351,8 +3145,7 @@ async fn screen_capture_ack(
 /// Fetch the call's screen-recording metadata (Slice C player). The agent
 /// webview can't reach the backend directly (no token in the webview), so
 /// this shim proxies `GET /v1/calls/{id}/screen`. `None` on 404 → the
-/// player renders nothing. When ready, the payload carries the presigned
-/// `url` the `<video>` binds directly.
+/// player renders nothing. Playback credentials are minted separately.
 #[tauri::command]
 async fn get_screen_recording(
     id: String,
@@ -2362,6 +3155,28 @@ async fn get_screen_recording(
         message: "no backend configured".into(),
     })?;
     portal::get_screen_recording(backend, &id).await
+}
+
+/// Lazily mint a short-lived playback credential for a ready screen
+/// recording. The shared player correlates the returned generation id before
+/// binding the URL, so a publication race cannot attach the wrong object.
+#[tauri::command]
+async fn create_screen_playback_url(
+    id: String,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::create_screen_playback_url(backend, &id).await
+}
+
+#[derive(serde::Serialize)]
+struct ScreenCaptureLocalStatus {
+    available: bool,
+    capturing: bool,
+    sources: Vec<String>,
+    source_kind: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -2386,19 +3201,30 @@ struct ScreenCaptureStatus {
     source_kind: Option<String>,
 }
 
+/// Cheap, local-only capture probe for the always-visible recording floater.
+/// It intentionally performs no backend consent request, so the 2s privacy
+/// indicator poll works offline and cannot create background API traffic.
+#[tauri::command]
+fn screen_capture_local_status(app: AppHandle) -> ScreenCaptureLocalStatus {
+    let source_kind = app.state::<ScreenRecorder>().active_source_kind();
+    ScreenCaptureLocalStatus {
+        available: app.state::<ScreenRecorder>().is_available(),
+        capturing: source_kind.is_some(),
+        sources: screen_recorder::supported_source_kinds()
+            .iter()
+            .map(|source| source.to_string())
+            .collect(),
+        source_kind,
+    }
+}
+
 /// Report screen-capture readiness for the Settings UI: backend
 /// availability, whether a capture is live, and (best-effort) whether the
 /// consent ack exists. All three are advisory — the org feature flag gate
 /// + the backend consent gate remain the security boundaries.
 #[tauri::command]
 async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
-    let available = app.state::<ScreenRecorder>().is_available();
-    let capturing = app.state::<ScreenRecorder>().is_active();
-    let sources = screen_recorder::supported_source_kinds()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let source_kind = app.state::<ScreenRecorder>().active_source_kind();
+    let local = screen_capture_local_status(app.clone());
     // Best-effort consent probe — outer None on any error (offline / no
     // backend). The ack GET returns `Some({ accepted_at })` when a row
     // exists, so we surface both the boolean and the raw `accepted_at`
@@ -2414,12 +3240,12 @@ async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
             .map(str::to_owned)
     });
     ScreenCaptureStatus {
-        available,
-        capturing,
+        available: local.available,
+        capturing: local.capturing,
         consented,
         consented_at,
-        sources,
-        source_kind,
+        sources: local.sources,
+        source_kind: local.source_kind,
     }
 }
 
@@ -2441,11 +3267,9 @@ async fn screen_capture_status(app: AppHandle) -> ScreenCaptureStatus {
 // platform. True alpha transparency + real rounded corners are a documented
 // follow-up (also needs `macOSPrivateApi` on macOS).
 //
-// Creating the window from Rust needs no capability grant, and the custom
-// commands the overlay invokes (`get_live_snapshot`, `live_ask`, …) are
-// always permitted. But the `/overlay` route makes `core:window` calls
-// (start-dragging, close) and listens for events, so the "overlay" window
-// label is scoped by `capabilities/overlay.json`.
+// Creating the window from Rust needs no capability grant. The `/overlay`
+// route gets only its two custom commands, close/drag, and event-listen access
+// through the window-scoped `capabilities/overlay.json` ACL.
 
 /// Cold-start hydration cache for the overlay window. The overlay is created
 /// on demand and MISSES every `live-*` broadcast emitted before it existed
@@ -2588,37 +3412,149 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     }
 }
 
-/// Stream an audio URL to a user-chosen file path. Exists because
-/// `fetch()` from the Tauri webview (`tauri://localhost`) to Spaces
-/// is blocked by CORS — Spaces doesn't ack the origin. Native
-/// `<audio>` playback works because media elements bypass CORS, but
-/// the Download button in call-detail needs the bytes and can't get
-/// them browser-side. Going through Rust's reqwest sidesteps the
-/// whole origin check.
+fn selected_save_path(
+    app: &AppHandle,
+    suggested_filename: &str,
+    filter_name: &str,
+    extensions: &[&str],
+) -> Result<Option<PathBuf>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(ipc_security::safe_suggested_filename(
+            suggested_filename,
+            "aftercalls-export",
+        ))
+        .add_filter(filter_name, extensions)
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let picked = picked
+        .into_path()
+        .map_err(|e| format!("resolve save location: {e}"))?;
+    if !picked.is_absolute() {
+        return Err("save location must be absolute".into());
+    }
+    let filename = picked
+        .file_name()
+        .ok_or_else(|| "save location must include a filename".to_string())?;
+    let parent = picked
+        .parent()
+        .ok_or_else(|| "save location must include a parent folder".to_string())?
+        .canonicalize()
+        .map_err(|e| format!("resolve save folder: {e}"))?;
+    if !parent.is_dir() {
+        return Err("save location parent is not a folder".into());
+    }
+    Ok(Some(parent.join(filename)))
+}
+
+/// Stream an authenticated backend-issued audio URL to a location selected
+/// by the native save dialog. The webview receives neither arbitrary network
+/// fetch authority nor arbitrary filesystem write authority.
 #[tauri::command]
-async fn download_audio(url: String, dest: String) -> Result<(), String> {
-    let resp = reqwest::get(&url)
+async fn download_audio(
+    app: AppHandle,
+    security: State<'_, ipc_security::IpcSecurity>,
+    url: String,
+    suggested_filename: String,
+) -> Result<bool, String> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    const MAX_AUDIO_EXPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+    let url = security.require_approved_audio_url(&url)?;
+    let Some(dest) = selected_save_path(&app, &suggested_filename, "Opus audio", &["opus"])? else {
+        return Ok(false);
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("build download client: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("fetch failed: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_AUDIO_EXPORT_BYTES)
+    {
+        return Err("audio download exceeds the 2 GB safety limit".into());
+    }
+
+    let staged = dest.with_file_name(format!(
+        ".aftercalls-download-{}.part",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let stage_guard = media_manifest::reserve_private_stage(&staged)
+        .map_err(|e| format!("reserve download stage: {e:#}"))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&staged)
+        .map_err(|e| format!("open download stage: {e}"))?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut received = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read audio download: {e}"))?;
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| "audio download size overflow".to_string())?;
+        if received > MAX_AUDIO_EXPORT_BYTES {
+            return Err("audio download exceeds the 2 GB safety limit".into());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write audio download: {e}"))?;
+    }
+    file.sync_all()
         .await
-        .map_err(|e| format!("read body: {e}"))?;
-    std::fs::write(&dest, &bytes).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+        .map_err(|e| format!("sync audio download: {e}"))?;
+    drop(file);
+    media_manifest::atomic_replace_file(&staged, &dest)
+        .map_err(|e| format!("publish audio download: {e:#}"))?;
+    drop(stage_guard);
+    Ok(true)
 }
 
-/// Write a UTF-8 string to a user-chosen path. Mirror of `download_audio`
-/// for text payloads (e.g. transcript export). The WebView's HTML5
-/// `<a download>` is ignored by WKWebView/WebView2, so the desktop
-/// agent routes saves through a native dialog + this Rust command.
+/// Save UTF-8 text through a native dialog. No destination path crosses IPC.
 #[tauri::command]
-async fn save_text_file(dest: String, contents: String) -> Result<(), String> {
-    std::fs::write(&dest, contents.as_bytes()).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+fn save_text_file(
+    app: AppHandle,
+    suggested_filename: String,
+    contents: String,
+) -> Result<bool, String> {
+    const MAX_TEXT_EXPORT_BYTES: usize = 10 * 1024 * 1024;
+    if contents.len() > MAX_TEXT_EXPORT_BYTES {
+        return Err("text export exceeds the 10 MB safety limit".into());
+    }
+    let Some(dest) = selected_save_path(&app, &suggested_filename, "Text", &["txt"])? else {
+        return Ok(false);
+    };
+    let staged = dest.with_file_name(format!(
+        ".aftercalls-text-{}.part",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let stage_guard = media_manifest::reserve_private_stage(&staged)
+        .map_err(|e| format!("reserve text export stage: {e:#}"))?;
+    std::fs::write(&staged, contents.as_bytes())
+        .map_err(|e| format!("write text export: {e}"))?;
+    media_manifest::enforce_private_file(&staged)
+        .map_err(|e| format!("protect text export: {e:#}"))?;
+    media_manifest::sync_staged_file(&staged)
+        .map_err(|e| format!("sync text export: {e:#}"))?;
+    media_manifest::atomic_replace_file(&staged, &dest)
+        .map_err(|e| format!("publish text export: {e:#}"))?;
+    drop(stage_guard);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2996,19 +3932,19 @@ async fn patch_call_question(
     portal::patch_call_question(backend, &call_id, &qid, &body).await
 }
 
-/// DELETE /v1/calls/{id}/questions/{qid}. 404 is converted to Ok(()) on the
-/// portal helper side so the frontend's optimistic removal matches the
-/// "silent success on already-gone" behaviour. Errors arrive as `PortalError`.
+/// DELETE /v1/calls/{id}/questions/{qid}?revision=N. The revision is required
+/// for optimistic concurrency; conflicts surface for a canonical refresh.
 #[tauri::command]
 async fn delete_call_question(
     call_id: String,
     qid: String,
+    revision: i64,
 ) -> Result<(), error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
         message: "no backend configured".into(),
     })?;
-    portal::delete_call_question(backend, &call_id, &qid).await
+    portal::delete_call_question(backend, &call_id, &qid, revision).await
 }
 
 /// GET /v1/org/zoho/status — Zoho connection probe (#186). Used by
@@ -3265,12 +4201,13 @@ async fn live_linked_ticket(
 async fn zoho_push_call(
     call_id: String,
     body: serde_json::Value,
+    idempotency_key: String,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
         message: "no backend configured".into(),
     })?;
-    portal::zoho_push_call(backend, &call_id, &body).await
+    portal::zoho_push_call(backend, &call_id, &body, &idempotency_key).await
 }
 
 /// POST /v1/calls/{id}/zoho-desk/push — Zoho Desk push a finished call to a
@@ -3281,12 +4218,28 @@ async fn zoho_push_call(
 async fn zoho_desk_push_call(
     call_id: String,
     ticket_id: String,
+    idempotency_key: String,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
         message: "no backend configured".into(),
     })?;
-    portal::zoho_desk_push_call(backend, &call_id, &ticket_id).await
+    portal::zoho_desk_push_call(backend, &call_id, &ticket_id, &idempotency_key).await
+}
+
+/// GET /v1/calls/{call_id}/external-pushes/{attempt_id} — read one durable
+/// CRM/Desk push attempt. The portal module validates both UUIDs and constructs
+/// the fixed call-scoped path instead of accepting an arbitrary status URL.
+#[tauri::command]
+async fn external_push_status(
+    call_id: String,
+    attempt_id: String,
+) -> Result<portal::ExternalPushStatus, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::external_push_status(backend, &call_id, &attempt_id).await
 }
 
 /// GET /v1/calls/{id}/zoho/prior-push — the most-recent successful CRM push
@@ -3331,6 +4284,12 @@ async fn resume_orphan_session(app: AppHandle, session_id: String) -> Result<(),
 async fn discard_orphan_session(app: AppHandle, session_id: String) -> Result<(), String> {
     let path = recovery::resolve_session_dir(&app, &session_id)
         .ok_or_else(|| format!("session not found: {session_id}"))?;
+    // A local discard must not orphan a backend multipart upload. Keep the
+    // durable checkpoint/source if the abort cannot be acknowledged so a
+    // later retry can still release it.
+    media_upload::abort_checkpointed_generations(&path, "user_discarded_local_session")
+        .await
+        .map_err(|error| format!("abort pending media upload before discard: {error:#}"))?;
     recovery::discard(&path).await
 }
 
@@ -3388,10 +4347,8 @@ fn run_cli_action(app: &AppHandle, action: CliAction) {
                 return;
             }
             // CLI start has no co-pilot picker context → no contact hint.
-            match do_start(&state, app, None) {
-                Ok(path) => {
-                    write_session_source(std::path::Path::new(&path), "manual", None);
-                }
+            match do_start(&state, app, None, "manual", None) {
+                Ok(_) => {}
                 Err(e) => eprintln!("aftercalls: cli start error: {e}"),
             }
         }
@@ -3422,9 +4379,7 @@ fn start_note_to_self(app: &AppHandle) {
         return;
     }
     match do_start_self_note(&state, app) {
-        Ok(path) => {
-            write_session_source(std::path::Path::new(&path), "self_note", None);
-        }
+        Ok(_) => {}
         Err(e) => eprintln!("aftercalls: start note-to-self error: {e}"),
     }
 }
@@ -3437,11 +4392,8 @@ fn toggle_recording(app: &AppHandle) {
         }
     } else {
         // Hotkey/tray toggle has no co-pilot picker context → no contact hint.
-        match do_start(&state, app, None) {
-            Ok(path) => {
-                // Hotkey + tray-menu toggles are manual starts from the user.
-                write_session_source(std::path::Path::new(&path), "manual", None);
-            }
+        match do_start(&state, app, None, "manual", None) {
+            Ok(_) => {}
             Err(e) => eprintln!("aftercalls: hotkey start error: {e}"),
         }
     }
@@ -4184,16 +5136,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(ipc_security::IpcSecurity::default())
+        .manage(RecordingLifecycle::new())
         .manage(Recorder::new())
         // #302 Slice B — screen-capture recorder. Process-scoped so
         // do_start / do_stop reach the same in-flight capture via
         // app.state, exactly like the audio Recorder.
         .manage(ScreenRecorder::new())
+        // Correlates the secondary Windows region overlay with the exact
+        // recording/request that opened it; late overlay events are ignored.
+        .manage(RegionSelectState::default())
         // chunked-upload — rolling per-channel Opus encoder. Process-scoped
         // so do_start / do_stop reach the same in-flight encode via
         // app.state, exactly like the audio Recorder + ScreenRecorder.
@@ -4221,6 +5177,7 @@ pub fn run() {
             stop_recording,
             is_recording,
             is_processing,
+            select_import_file,
             process_imported_file,
             confirm_auto_start,
             dismiss_auto_start,
@@ -4271,8 +5228,10 @@ pub fn run() {
             get_screen_capture_prefs,
             set_screen_capture_prefs,
             screen_capture_ack,
+            screen_capture_local_status,
             screen_capture_status,
             get_screen_recording,
+            create_screen_playback_url,
             // #302 follow-up — per-call screen-source chooser: window list,
             // region drag-select (Linux slurp), the Windows region-overlay
             // result sink, and the start-on-chosen-source command.
@@ -4286,14 +5245,15 @@ pub fn run() {
             start_screen_source,
             // #659 P4 — floating always-on-top co-pilot overlay: open/close
             // the second webview + hydrate it from the cold-start snapshot
-            // cache. Custom commands need no capability grant; the /overlay
-            // window's core:window + event perms live in capabilities/overlay.json.
+            // cache. Its two custom commands and minimal core permissions live
+            // in the window-scoped capabilities/overlay.json ACL.
             open_overlay,
             close_overlay,
             get_live_snapshot,
             telemetry::log_event,
             get_peaks,
             get_vault_settings,
+            select_vault_directory,
             set_vault_settings,
             get_org_vocab,
             set_org_vocab,
@@ -4405,6 +5365,8 @@ pub fn run() {
             // own knowledge base. REST, off the audio WS; copilot-gated.
             live_knowledge,
             zoho_push_call,
+            // Durable external-push settlement: fixed call/attempt GET only.
+            external_push_status,
             // Zoho Desk — push a finished call to a linked Ticket as a private
             // internal note. Drives the ended-card "Add to ticket" action.
             zoho_desk_push_call,
@@ -4419,7 +5381,7 @@ pub fn run() {
             // #203 — stage_support_video lands webview-produced webm
             // blobs on a temp path so the existing path-based submit
             // pipeline rides unchanged.
-            support::inspect_support_attachment,
+            support::select_support_attachments,
             support::stage_support_video,
             support::submit_support_report,
             // #628 — opt-in attachment of the user's most recent

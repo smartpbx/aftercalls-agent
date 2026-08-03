@@ -1,7 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import { getVersion } from "@tauri-apps/api/app";
@@ -29,6 +28,13 @@
     SzmPriorPush,
     SzmPushResponse,
   } from "@aftercalls/shared/ui/SendToZohoModal.svelte";
+  import {
+    ExternalPushPollingCancelled,
+    createExternalPushIdempotencyKey,
+    externalHttpsUrl,
+    runAgentExternalPush,
+    type ExternalPushAccepted,
+  } from "$lib/externalPush";
   import type {
     AskChip,
     AskAnswer,
@@ -142,6 +148,7 @@
   function dismissCallEnded() {
     // Close the ended card AND suppress the co-pilot region until the next
     // record-start — never fall back to the stale ended live dashboard.
+    cancelEndedExternalPushes();
     callEnded = false;
     copilotDismissed = true;
   }
@@ -296,25 +303,16 @@
     }
   }
 
-  /** Phase 3 — link a Zoho deal to this call (mid-call). One deal at a time —
-   *  linking a new deal replaces the prior scalar. Optimistic: set the store
-   *  immediately so the CRM tile + the ended card reflect it, then invoke
-   *  `live_linked_deal` and RECONCILE from the response (the backend is the
-   *  source of truth). No session (belt + braces — the affordance is
-   *  session-gated in the tile) → the optimistic value stands. A failed write
-   *  leaves the optimistic value in place; the ended-card [Push] still targets
-   *  it. Never a red surface — a link is advisory. */
+  let linkedDealGeneration = 0;
+  let linkedTicketGeneration = 0;
+
+  /** Phase 3 — link a Zoho deal to this call (mid-call). Commit only the
+   * backend's reconciled value. A monotonic generation + session check prevents
+   * a response from an older action/session from replacing the current link. */
   async function handleLinkDeal(deal: CrmContextDeal) {
-    liveSession.setLinkedDeal({
-      module: "Deals",
-      record_id: deal.id,
-      record_name: deal.name,
-      stage: deal.stage,
-      amount: deal.amount,
-      url: deal.url,
-    });
     const su = liveSession.sessionUuid;
     if (!su) return;
+    const generation = ++linkedDealGeneration;
     try {
       const res = (await invoke("live_linked_deal", {
         sessionUuid: su,
@@ -324,19 +322,29 @@
         stage: deal.stage,
         amount: deal.amount,
       })) as LinkedDealResponse;
+      if (
+        generation !== linkedDealGeneration ||
+        liveSession.sessionUuid !== su
+      ) {
+        return;
+      }
       liveSession.setLinkedDeal(res?.linked_deal ?? null);
-    } catch {
-      // Optimistic label stands — a later link/unlink reconciles.
+    } catch (error) {
+      if (
+        generation === linkedDealGeneration &&
+        liveSession.sessionUuid === su
+      ) {
+        throw error;
+      }
     }
   }
 
-  /** Phase 3 — unlink the call's deal. Optimistic clear, then a best-effort
-   *  `clear: true` write reconciled from the response. */
+  /** Phase 3 — unlink the call's deal, again committing only the response. */
   async function handleUnlinkDeal() {
     const prev = liveSession.linkedDeal;
-    liveSession.setLinkedDeal(null);
     const su = liveSession.sessionUuid;
     if (!su || !prev) return;
+    const generation = ++linkedDealGeneration;
     try {
       const res = (await invoke("live_linked_deal", {
         sessionUuid: su,
@@ -345,26 +353,31 @@
         recordName: prev.record_name,
         clear: true,
       })) as LinkedDealResponse;
+      if (
+        generation !== linkedDealGeneration ||
+        liveSession.sessionUuid !== su
+      ) {
+        return;
+      }
       liveSession.setLinkedDeal(res?.linked_deal ?? null);
-    } catch {
-      // Optimistic clear stands.
+    } catch (error) {
+      if (
+        generation === linkedDealGeneration &&
+        liveSession.sessionUuid === su
+      ) {
+        throw error;
+      }
     }
   }
 
   /** Zoho Desk — link a support Ticket to this call (mid-call). One ticket at a
    *  time — linking a new ticket replaces the prior scalar (independent of the
-   *  linked Deal — a call can carry both). Mirrors `handleLinkDeal`: optimistic
-   *  set, then `live_linked_ticket` reconciled from the response. Never a red
-   *  surface — a link is advisory. */
+   *  linked Deal — a call can carry both). Mirrors `handleLinkDeal`: the server
+   *  response is authoritative and stale settlements are ignored. */
   async function handleLinkTicket(ticket: CrmContextTicket) {
-    liveSession.setLinkedTicket({
-      ticket_id: ticket.id,
-      ticket_number: ticket.ticket_number,
-      subject: ticket.subject,
-      web_url: ticket.web_url,
-    });
     const su = liveSession.sessionUuid;
     if (!su) return;
+    const generation = ++linkedTicketGeneration;
     try {
       const res = (await invoke("live_linked_ticket", {
         sessionUuid: su,
@@ -373,19 +386,29 @@
         subject: ticket.subject,
         webUrl: ticket.web_url,
       })) as LinkedTicketResponse;
+      if (
+        generation !== linkedTicketGeneration ||
+        liveSession.sessionUuid !== su
+      ) {
+        return;
+      }
       liveSession.setLinkedTicket(res?.linked_ticket ?? null);
-    } catch {
-      // Optimistic label stands — a later link/unlink reconciles.
+    } catch (error) {
+      if (
+        generation === linkedTicketGeneration &&
+        liveSession.sessionUuid === su
+      ) {
+        throw error;
+      }
     }
   }
 
-  /** Zoho Desk — unlink the call's ticket. Optimistic clear, then a best-effort
-   *  `clear: true` write reconciled from the response. */
+  /** Zoho Desk — unlink the call's ticket using the same reconciliation guard. */
   async function handleUnlinkTicket() {
     const prev = liveSession.linkedTicket;
-    liveSession.setLinkedTicket(null);
     const su = liveSession.sessionUuid;
     if (!su || !prev) return;
+    const generation = ++linkedTicketGeneration;
     try {
       const res = (await invoke("live_linked_ticket", {
         sessionUuid: su,
@@ -395,9 +418,20 @@
         webUrl: prev.web_url,
         clear: true,
       })) as LinkedTicketResponse;
+      if (
+        generation !== linkedTicketGeneration ||
+        liveSession.sessionUuid !== su
+      ) {
+        return;
+      }
       liveSession.setLinkedTicket(res?.linked_ticket ?? null);
-    } catch {
-      // Optimistic clear stands.
+    } catch (error) {
+      if (
+        generation === linkedTicketGeneration &&
+        liveSession.sessionUuid === su
+      ) {
+        throw error;
+      }
     }
   }
 
@@ -411,21 +445,109 @@
   let endedPushLoaded = $state(false);
   let endedPushing = $state(false);
   let endedSkipped = $state(false);
+  let endedPushSucceeded = $state(false);
+  let endedPushRemoteUrl = $state<string | null>(null);
+  let endedPushGuidance = $state("");
+  let endedPushReconcileRequired = $state(false);
+  let endedPushAction = $state<{
+    fingerprint: string;
+    key: string;
+    accepted?: ExternalPushAccepted;
+    unresolved?: "pending" | "uncertain";
+  } | null>(null);
+  let endedPushAbort: AbortController | null = null;
   // Non-reactive guard so the probe fires once per finished call.
   let endedPushProbedFor = "";
+  let endedPushGeneration = 0;
 
-  async function probeEndedPriorPush(callId: string) {
+  function durablePushGuidance(error: unknown): string {
+    if (error instanceof ExternalPushPollingCancelled) return "";
+    const value = error as {
+      code?: string;
+      retryGuidance?: string;
+    } | null;
+    if (
+      value?.code === "external_push_uncertain" ||
+      value?.retryGuidance === "contact_admin_for_reconciliation"
+    ) {
+      return "The server couldn't confirm whether this push completed. Don't retry yet; ask an admin to reconcile it.";
+    }
+    if (value?.code === "external_push_protocol") {
+      return "The server returned an invalid push status. Don't start another request; contact support for reconciliation.";
+    }
+    if (
+      value?.code === "external_push_pending" ||
+      value?.retryGuidance === "poll"
+    ) {
+      return "This push is still processing, or its response couldn't be confirmed. Retry safely checks the same request.";
+    }
+    if (value?.retryGuidance === "new_request_after_correction") {
+      return "The push failed. Correct the integration or record details, then start a new request.";
+    }
+    if (value?.retryGuidance === "new_request") {
+      return "The push was cancelled. You can start a new request.";
+    }
+    if (value?.retryGuidance === "contact_support") {
+      return "The push couldn't be settled. Contact support before trying again.";
+    }
+    return `${portalErrorToText(error)} Retry will reuse the same request.`;
+  }
+
+  function terminalPushAllowsNewRequest(error: unknown): boolean {
+    const guidance = (error as { retryGuidance?: string } | null)
+      ?.retryGuidance;
+    return (
+      guidance === "new_request" ||
+      guidance === "new_request_after_correction"
+    );
+  }
+
+  function cancelEndedExternalPushes() {
+    endedPushAbort?.abort();
+    endedPushAbort = null;
+    endedTicketAbort?.abort();
+    endedTicketAbort = null;
+    endedPushAction = null;
+    endedTicketAction = null;
+    endedPushing = false;
+    endedTicketAdding = false;
+    endedPushGuidance = "";
+    endedTicketGuidance = "";
+    endedPushReconcileRequired = false;
+    endedTicketReconcileRequired = false;
+    endedPushGeneration += 1;
+    endedTicketGeneration += 1;
+  }
+
+  async function probeEndedPriorPush(callId: string, generation: number) {
     try {
       const p = (await invoke("zoho_prior_push", { callId })) as
         | SzmPriorPush
         | null;
+      if (
+        generation !== endedPushGeneration ||
+        openableCallId !== callId
+      ) {
+        return;
+      }
       endedPriorPush = p ?? null;
     } catch {
+      if (
+        generation !== endedPushGeneration ||
+        openableCallId !== callId
+      ) {
+        return;
+      }
       // Degrade to "no prior push" — the ended card falls back to the [Push]
       // prompt when a deal was linked, never surfaces an error.
       endedPriorPush = null;
     } finally {
-      endedPushLoaded = true;
+      if (
+        generation === endedPushGeneration &&
+        openableCallId === callId
+      ) {
+        endedPushLoaded = true;
+      }
     }
   }
 
@@ -440,86 +562,311 @@
     endedPushProbedFor = cid;
     endedPriorPush = null;
     endedPushLoaded = false;
+    endedPushing = false;
     endedSkipped = false;
+    endedPushSucceeded = false;
+    endedPushRemoteUrl = null;
+    endedPushGuidance = "";
+    endedPushReconcileRequired = false;
+    endedPushAbort?.abort();
+    endedPushAbort = null;
+    endedPushAction = null;
     // Zoho Desk — reset the ticket prompt state for the fresh finished call too.
+    endedTicketAbort?.abort();
+    endedTicketAbort = null;
+    endedTicketAction = null;
+    endedTicketAdding = false;
     endedTicketAdded = false;
     endedTicketSkipped = false;
-    void probeEndedPriorPush(cid);
+    endedTicketGuidance = "";
+    endedTicketReconcileRequired = false;
+    endedTicketGeneration += 1;
+    const generation = ++endedPushGeneration;
+    void probeEndedPriorPush(cid, generation);
   });
 
   /** [Push] on the ended card — push the finished call to the linked deal,
    *  reusing the existing manual push path pre-targeted. On success, flip to the
-   *  "Pushed to <Deal>" confirmation. Best-effort: a failure leaves the [Push]
-   *  prompt in place (retryable), never a red panel. */
+   *  "Pushed to <Deal>" confirmation. Pending work stays on the same accepted
+   *  attempt; terminal guidance determines whether a new action is allowed. */
   async function pushEndedCall() {
     const deal = liveSession.linkedDeal;
-    if (!openableCallId || !deal || endedPushing) return;
-    endedPushing = true;
-    try {
-      const resp = (await invoke("zoho_push_call", {
-        callId: openableCallId,
-        body: {
-          module: deal.module,
-          record_id: deal.record_id,
-          record_name: deal.record_name,
-        },
-      })) as SzmPushResponse;
-      endedPriorPush = {
-        module: deal.module,
-        record_id: deal.record_id,
-        record_name: deal.record_name,
-        pushed_at: new Date().toISOString(),
-        zoho_url: resp.zoho_url,
+    const callId = openableCallId;
+    if (!callId || !deal || endedPushing) return;
+    const fingerprint = JSON.stringify({
+      callId,
+      module: deal.module,
+      recordId: deal.record_id,
+      recordName: deal.record_name,
+    });
+    if (
+      endedPushAction?.unresolved &&
+      endedPushAction.fingerprint !== fingerprint
+    ) {
+      endedPushReconcileRequired =
+        endedPushAction.unresolved === "uncertain";
+      endedPushGuidance =
+        endedPushAction.unresolved === "uncertain"
+          ? "The prior push must be reconciled before starting another request."
+          : "The prior push is still settling. Retry the same CRM target.";
+      return;
+    }
+    if (!endedPushAction || endedPushAction.fingerprint !== fingerprint) {
+      endedPushAbort?.abort();
+      endedPushAction = {
+        fingerprint,
+        key: createExternalPushIdempotencyKey(),
       };
-    } catch {
-      // Best-effort — leave the [Push] prompt available (retryable).
+    }
+    const action = endedPushAction;
+    const controller = new AbortController();
+    endedPushAbort = controller;
+    const generation = ++endedPushGeneration;
+    endedPushing = true;
+    endedPushGuidance = "";
+    endedPushReconcileRequired = false;
+    try {
+      const result = await runAgentExternalPush<SzmPushResponse>({
+        callId,
+        integration: "crm",
+        signal: controller.signal,
+        accepted: action.accepted,
+        onAccepted: (accepted) => {
+          if (endedPushAction === action) action.accepted = accepted;
+        },
+        submit: () =>
+          invoke("zoho_push_call", {
+            callId,
+            body: {
+              module: deal.module,
+              record_id: deal.record_id,
+              record_name: deal.record_name,
+            },
+            idempotencyKey: action.key,
+          }),
+      });
+      if (
+        generation !== endedPushGeneration ||
+        openableCallId !== callId
+      ) {
+        return;
+      }
+      endedPushAction = null;
+      endedPushSucceeded = true;
+      endedPushRemoteUrl =
+        result.kind === "external"
+          ? result.value.remote_url ?? null
+          : result.value.zoho_url || null;
+      endedPushGuidance = "";
+      endedPushReconcileRequired = false;
+
+      // Re-read the persisted association rather than fabricating record names
+      // or timestamps from the client-side choice. Readback is best-effort:
+      // delivery is already confirmed, so its failure cannot invite a retry.
+      void invoke<SzmPriorPush | null>("zoho_prior_push", { callId })
+        .then((prior) => {
+          if (
+            generation === endedPushGeneration &&
+            openableCallId === callId
+          ) {
+            endedPriorPush = prior;
+            endedPushRemoteUrl =
+              prior?.zoho_url ?? endedPushRemoteUrl;
+          }
+        })
+        .catch(() => {});
+    } catch (error) {
+      if (
+        generation === endedPushGeneration &&
+        openableCallId === callId &&
+        !(error instanceof ExternalPushPollingCancelled)
+      ) {
+        endedPushGuidance = durablePushGuidance(error);
+        const code = (error as { code?: string })?.code;
+        const retryGuidance = (error as { retryGuidance?: string })
+          ?.retryGuidance;
+        endedPushReconcileRequired =
+          code === "external_push_uncertain" ||
+          code === "external_push_protocol" ||
+          retryGuidance === "contact_admin_for_reconciliation";
+        if (endedPushAction === action) {
+          if (endedPushReconcileRequired) {
+            action.unresolved = "uncertain";
+          } else if (
+            action.accepted ||
+            code === "external_push_pending" ||
+            retryGuidance === "poll"
+          ) {
+            action.unresolved = "pending";
+          }
+        }
+        if (
+          endedPushAction === action &&
+          terminalPushAllowsNewRequest(error)
+        ) {
+          endedPushAction = null;
+        }
+      }
     } finally {
-      endedPushing = false;
+      if (generation === endedPushGeneration) endedPushing = false;
+      if (endedPushAbort === controller) endedPushAbort = null;
     }
   }
 
   /** [Skip] — dismiss the push prompt (keeps the rest of the ended card). */
   function skipEndedPush() {
+    endedPushAbort?.abort();
+    endedPushAbort = null;
+    endedPushAction = null;
+    endedPushGuidance = "";
+    endedPushReconcileRequired = false;
+    endedPushGeneration += 1;
+    endedPushing = false;
     endedSkipped = true;
   }
 
   // Zoho Desk — call-end ticket-push state, INDEPENDENT of the deal prompt (a
   // call can carry both). There's no desk prior-push read, so auto-mode
   // "already added" isn't detected here (see report — the backend idempotency
-  // guard makes an accidental [Add] harmless); the prompt shows whenever a
-  // ticket was linked, and [Add] flips it to a local confirmation.
+  // guard makes an accidental [Add] harmless). Manual pushes use the durable
+  // settlement protocol; the prompt shows whenever a ticket was linked, and a
+  // confirmed [Add] flips it to a local confirmation.
   let endedTicketAdding = $state(false);
   let endedTicketAdded = $state(false);
   let endedTicketSkipped = $state(false);
+  let endedTicketGuidance = $state("");
+  let endedTicketReconcileRequired = $state(false);
+  let endedTicketAction = $state<{
+    fingerprint: string;
+    key: string;
+    accepted?: ExternalPushAccepted;
+    unresolved?: "pending" | "uncertain";
+  } | null>(null);
+  let endedTicketAbort: AbortController | null = null;
+  let endedTicketGeneration = 0;
 
   /** [Add] on the ended card — add the finished call to the linked ticket as a
    *  private internal note. On success, flip to the "Added to ticket #N ↗"
-   *  confirmation (deep-linked from the ticket's own web_url). Best-effort: a
-   *  failure leaves the [Add] prompt in place (retryable), never a red panel. */
+   *  confirmation (deep-linked from the ticket's own web_url). Pending work
+   *  resumes through status GETs; uncertain work requires reconciliation. */
   async function addEndedTicket() {
     const ticket = liveSession.linkedTicket;
-    if (!openableCallId || !ticket || endedTicketAdding) return;
+    const callId = openableCallId;
+    if (!callId || !ticket || endedTicketAdding) return;
+    const fingerprint = JSON.stringify({
+      callId,
+      ticketId: ticket.ticket_id,
+    });
+    if (
+      endedTicketAction?.unresolved &&
+      endedTicketAction.fingerprint !== fingerprint
+    ) {
+      endedTicketReconcileRequired =
+        endedTicketAction.unresolved === "uncertain";
+      endedTicketGuidance =
+        endedTicketAction.unresolved === "uncertain"
+          ? "The prior push must be reconciled before starting another request."
+          : "The prior push is still settling. Retry the same ticket.";
+      return;
+    }
+    if (
+      !endedTicketAction ||
+      endedTicketAction.fingerprint !== fingerprint
+    ) {
+      endedTicketAbort?.abort();
+      endedTicketAction = {
+        fingerprint,
+        key: createExternalPushIdempotencyKey(),
+      };
+    }
+    const action = endedTicketAction;
+    const controller = new AbortController();
+    endedTicketAbort = controller;
+    const generation = ++endedTicketGeneration;
     endedTicketAdding = true;
+    endedTicketGuidance = "";
+    endedTicketReconcileRequired = false;
     try {
-      (await invoke("zoho_desk_push_call", {
-        callId: openableCallId,
-        ticketId: ticket.ticket_id,
-      })) as ZohoDeskPushResponse;
-      endedTicketAdded = true;
-    } catch {
-      // Best-effort — leave the [Add] prompt available (retryable).
+      await runAgentExternalPush<ZohoDeskPushResponse>({
+        callId,
+        integration: "desk",
+        signal: controller.signal,
+        accepted: action.accepted,
+        onAccepted: (accepted) => {
+          if (endedTicketAction === action) action.accepted = accepted;
+        },
+        submit: () =>
+          invoke("zoho_desk_push_call", {
+            callId,
+            ticketId: ticket.ticket_id,
+            idempotencyKey: action.key,
+          }),
+      });
+      if (
+        generation === endedTicketGeneration &&
+        openableCallId === callId
+      ) {
+        endedTicketAction = null;
+        endedTicketAdded = true;
+        endedTicketGuidance = "";
+        endedTicketReconcileRequired = false;
+      }
+    } catch (error) {
+      if (
+        generation === endedTicketGeneration &&
+        openableCallId === callId &&
+        !(error instanceof ExternalPushPollingCancelled)
+      ) {
+        endedTicketGuidance = durablePushGuidance(error);
+        const code = (error as { code?: string })?.code;
+        const retryGuidance = (error as { retryGuidance?: string })
+          ?.retryGuidance;
+        endedTicketReconcileRequired =
+          code === "external_push_uncertain" ||
+          code === "external_push_protocol" ||
+          retryGuidance === "contact_admin_for_reconciliation";
+        if (endedTicketAction === action) {
+          if (endedTicketReconcileRequired) {
+            action.unresolved = "uncertain";
+          } else if (
+            action.accepted ||
+            code === "external_push_pending" ||
+            retryGuidance === "poll"
+          ) {
+            action.unresolved = "pending";
+          }
+        }
+        if (
+          endedTicketAction === action &&
+          terminalPushAllowsNewRequest(error)
+        ) {
+          endedTicketAction = null;
+        }
+      }
     } finally {
-      endedTicketAdding = false;
+      if (generation === endedTicketGeneration) {
+        endedTicketAdding = false;
+      }
+      if (endedTicketAbort === controller) endedTicketAbort = null;
     }
   }
 
   /** [Skip] — dismiss the ticket prompt (keeps the rest of the ended card). */
   function skipEndedTicket() {
+    endedTicketAbort?.abort();
+    endedTicketAbort = null;
+    endedTicketAction = null;
+    endedTicketGuidance = "";
+    endedTicketReconcileRequired = false;
+    endedTicketGeneration += 1;
+    endedTicketAdding = false;
     endedTicketSkipped = true;
   }
 
   function openZohoUrl(url: string) {
-    void openUrl(url).catch((e) => console.warn("openUrl failed", e));
+    const safeUrl = externalHttpsUrl(url);
+    if (!safeUrl) return;
+    void openUrl(safeUrl).catch((e) => console.warn("openUrl failed", e));
   }
 
   /** True when a failed-pipeline error string carries the backend's
@@ -909,10 +1256,15 @@
           // Phase 3 — reset the call-end CRM push surface so a fresh call never
           // inherits the previous call's push prompt/confirmation. (The store's
           // `linkedDeal` is reset in `resetForNewSession` on the layout side.)
+          cancelEndedExternalPushes();
           endedPriorPush = null;
           endedPushLoaded = false;
           endedSkipped = false;
+          endedPushSucceeded = false;
+          endedPushRemoteUrl = null;
           endedPushProbedFor = "";
+          endedTicketAdded = false;
+          endedTicketSkipped = false;
           // #659 — the per-session live-draft reset (clear segments +
           // coaching, seed status) now lives in the layout's
           // recording-state handler via liveSession.resetForNewSession(),
@@ -1107,6 +1459,9 @@
   });
 
   onDestroy(() => {
+    linkedDealGeneration += 1;
+    linkedTicketGeneration += 1;
+    cancelEndedExternalPushes();
     unlisten?.();
     unlistenState?.();
     unlistenAuto?.();
@@ -1351,16 +1706,14 @@
 
   async function importRecording() {
     error = "";
-    const picked = await openDialog({
-      multiple: false,
-      filters: [
-        {
-          name: "Audio",
-          extensions: ["wav", "mp3", "m4a", "mp4", "ogg", "opus", "flac", "webm"],
-        },
-      ],
-    });
-    if (!picked || Array.isArray(picked)) return;
+    let picked: string | null = null;
+    try {
+      picked = await invoke<string | null>("select_import_file");
+    } catch (e) {
+      error = portalErrorToText(e);
+      return;
+    }
+    if (!picked) return;
     importing = true;
     pipelineStage = "";
     pipelineError = "";
@@ -1837,17 +2190,22 @@
                no prior push → nothing (the Phase-1 card is unchanged). Copy is
                vendor-opaque — "Zoho" is the sanctioned name. -->
           {#if pipelineStage === "done" && endedPushLoaded}
-            {#if endedPriorPush}
+            {#if endedPriorPush || endedPushSucceeded}
               <div class="ce-crm" role="status" aria-live="polite">
                 <span class="ce-crm-pip" aria-hidden="true"></span>
                 <span class="ce-crm-text">
-                  Pushed to {endedPriorPush.record_name ?? "your CRM"}
+                  Pushed to {endedPriorPush?.record_name ??
+                    liveSession.linkedDeal?.record_name ??
+                    "your CRM"}
                 </span>
-                {#if endedPriorPush.zoho_url}
+                {#if endedPriorPush?.zoho_url || endedPushRemoteUrl}
                   <button
                     type="button"
                     class="ce-crm-link"
-                    onclick={() => openZohoUrl(endedPriorPush!.zoho_url!)}
+                    onclick={() =>
+                      openZohoUrl(
+                        endedPriorPush?.zoho_url ?? endedPushRemoteUrl!,
+                      )}
                   >
                     View in Zoho ↗
                   </button>
@@ -1862,10 +2220,14 @@
                   <button
                     type="button"
                     class="ce-crm-push"
-                    disabled={endedPushing}
+                    disabled={endedPushing || endedPushReconcileRequired}
                     onclick={pushEndedCall}
                   >
-                    {endedPushing ? "Pushing…" : "Push"}
+                    {endedPushing
+                      ? "Pushing…"
+                      : endedPushAction?.unresolved === "pending"
+                        ? "Check status"
+                        : "Push"}
                   </button>
                   <button
                     type="button"
@@ -1876,6 +2238,15 @@
                     Skip
                   </button>
                 </div>
+                {#if endedPushGuidance}
+                  <p
+                    class="ce-crm-guidance"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {endedPushGuidance}
+                  </p>
+                {/if}
               </div>
             {/if}
           {/if}
@@ -1916,10 +2287,15 @@
                   <button
                     type="button"
                     class="ce-crm-push"
-                    disabled={endedTicketAdding}
+                    disabled={endedTicketAdding ||
+                      endedTicketReconcileRequired}
                     onclick={addEndedTicket}
                   >
-                    {endedTicketAdding ? "Adding…" : "Add"}
+                    {endedTicketAdding
+                      ? "Adding…"
+                      : endedTicketAction?.unresolved === "pending"
+                        ? "Check status"
+                        : "Add"}
                   </button>
                   <button
                     type="button"
@@ -1930,6 +2306,15 @@
                     Skip
                   </button>
                 </div>
+                {#if endedTicketGuidance}
+                  <p
+                    class="ce-crm-guidance"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {endedTicketGuidance}
+                  </p>
+                {/if}
               </div>
             {/if}
           {/if}
@@ -2989,6 +3374,13 @@
     font-size: 0.85rem;
     color: var(--bone-1);
     min-width: 0;
+  }
+  .ce-crm-guidance {
+    flex-basis: 100%;
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--bone-2);
   }
   .ce-crm-link {
     display: inline-flex;

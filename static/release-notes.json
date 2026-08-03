@@ -1,4 +1,65 @@
 {
+  "0.30.0": {
+    "headline": "Large recordings upload more reliably, after-call questions are editable, and completed calls are protected from duplicate sends.",
+    "changes": [
+      "More reliable uploads for large recordings. The desktop app now prepares audio throughout the call and uploads it in resumable parts. If that preparation cannot finish, it safely falls back to the existing end-of-call path so the recording can still be processed.",
+      "Edit the question list after a call. You can now add, edit, mark answered, reopen, and remove questions from a completed call. Your manual changes are kept when the call is processed again."
+    ]
+  },
+  "0.29.0": {
+    "headline": "Support calls can now stay connected to their help-desk ticket from the live conversation through the completed call.",
+    "changes": [
+      "Link support tickets while the call is live. For organizations with the help-desk connection enabled, the live call view can find and link the relevant ticket, keep that link on the completed call, and send the call summary back as an internal note. The ticket lane is separate from the CRM lane, so a call can keep both links when both are useful."
+    ]
+  },
+  "0.28.0": {
+    "headline": "The live co-pilot now keeps a simple list of questions, who asked them, and the answers captured during the call.",
+    "changes": [
+      "Open questions carry from the live call into call detail. Questions raised by either side now appear in the live transcript drawer with an open count. When an answer is captured, the question is checked off and keeps the answer beneath it. The same list carries into the completed call so you can review what was resolved and what still needs follow-up."
+    ]
+  },
+  "0.27.0": {
+    "headline": "Link a live call to its CRM deal, then choose whether completed calls are sent automatically or with a prompt.",
+    "changes": [
+      "Link a deal during the call and keep it through follow-up. The live CRM lane can now attach the conversation to the right deal. That link remains visible on the completed call, and you can choose in Settings whether linked calls are sent automatically at the end or wait for your confirmation."
+    ]
+  },
+  "0.26.0": {
+    "headline": "Assign real people to live speakers once, and aftercalls carries those identities into the transcript and completed call.",
+    "changes": [
+      "Live speaker identity assignment. When a speaker label is unclear, you can assign it to a teammate, a CRM contact, or a typed name while the call is still happening. The live transcript updates immediately, and the confirmed identity is applied again when the completed transcript is prepared."
+    ]
+  },
+  "0.25.0": {
+    "headline": "The co-pilot now ends in a clear Call ended state, with tidy list-shaped answers and a direct path to the completed call.",
+    "changes": [
+      "A calmer handoff when the call ends. List-shaped answers in the co-pilot are now easier to scan. When recording stops, the live dashboard changes into a stable Call ended card with a direct Open call action instead of leaving the live controls on screen."
+    ]
+  },
+  "0.24.0": {
+    "headline": "The in-call dashboard is easier to scan: reference information stays put, coaching uses one clear cue, and the transcript opens only when you need it.",
+    "changes": [
+      "A focused business-intelligence dashboard. The co-pilot has been reorganized around a stable reference rail, one concise coaching cue at a time, and an on-demand transcript drawer. Full-screen mode now covers the app correctly, and the quieter layout leaves more room for the conversation itself."
+    ]
+  },
+  "0.23.0": {
+    "headline": "Choose exactly what to share for each call: a display, an application window, or a selected region.",
+    "changes": [
+      "Per-call screen-source picker. When screen recording is enabled, each call now asks what you want to capture. You can pick a full display, an individual application window, or draw a region, with the available choices adapted to your operating system."
+    ]
+  },
+  "0.22.0": {
+    "headline": "Optionally record the shared screen with a call and replay it in sync with the transcript and audio.",
+    "changes": [
+      "Screen recording, controlled by your organization. Organizations can enable optional screen recording for calls. The desktop app asks for consent before capture, shows a clear active indicator, uploads longer recordings in resumable parts, and lets the completed call replay video alongside its transcript and audio."
+    ]
+  },
+  "0.21.0": {
+    "headline": "Meet the in-call co-pilot: live context, concise coaching, speaker help, Support mode, and an optional always-on-top view.",
+    "changes": [
+      "An in-call co-pilot that stays out of the way. The desktop app can now show a live transcript with customer context, concise coaching cards, ask-and-highlight tools, speaker naming help, and an agenda that checks itself off as the conversation progresses. Support mode adds case and knowledge context, while the optional always-on-top view keeps the essentials visible beside the call."
+    ]
+  },
   "0.20.0": {
     "headline": "aftercalls is now self-serve: pick a plan, start a free 14-day trial, and manage billing yourself — and the desktop app shows your subscription status.",
     "changes": [

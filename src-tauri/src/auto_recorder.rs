@@ -76,6 +76,7 @@ struct Pending {
 #[derive(Debug, Clone)]
 struct ActiveAuto {
     bundle_id: String,
+    session_dir: std::path::PathBuf,
 }
 
 /// Cloneable handle the IPC commands clutch. Internally an Arc around
@@ -289,20 +290,21 @@ impl AutoRecorder {
         if !stop_on {
             return;
         }
-        let should_stop = {
+        let stop_session = {
             let mut a = self.inner.active_auto.lock().unwrap();
             match a.as_ref() {
                 Some(active) if active.bundle_id == ev.bundle_id => {
+                    let session_dir = active.session_dir.clone();
                     *a = None;
-                    true
+                    Some(session_dir)
                 }
-                _ => false,
+                _ => None,
             }
         };
-        if should_stop {
+        if let Some(session_dir) = stop_session {
             let rec = app.state::<Recorder>();
             if rec.is_active() {
-                if let Err(e) = crate::do_stop(&rec, app) {
+                if let Err(e) = crate::do_stop_session(&rec, app, &session_dir) {
                     eprintln!("aftercalls: auto-stop failed: {e}");
                 }
             }
@@ -370,15 +372,17 @@ impl AutoRecorder {
             return;
         }
         // Auto-app-triggered start has no co-pilot picker context → no hint.
-        match crate::do_start(&rec, app, None) {
+        match crate::do_start(
+            &rec,
+            app,
+            None,
+            "auto_app",
+            Some(&pending.friendly_name),
+        ) {
             Ok(path) => {
-                crate::write_session_source(
-                    std::path::Path::new(&path),
-                    "auto_app",
-                    Some(&pending.friendly_name),
-                );
                 *self.inner.active_auto.lock().unwrap() = Some(ActiveAuto {
                     bundle_id: pending.bundle_id.clone(),
+                    session_dir: std::path::PathBuf::from(path),
                 });
                 let _ = app.emit(
                     "auto-record-fired",

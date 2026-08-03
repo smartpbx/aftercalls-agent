@@ -93,9 +93,9 @@
 </script>
 
 <script lang="ts">
-  // Send-to-CRM (Zoho) modal — mirror pair (#186).
+  // Send-to-CRM (Zoho) modal — canonical shared component (#186).
   //
-  // Two surfaces share this byte-identically. Surface-specific
+  // Two surfaces consume this one source file. Surface-specific
   // operations (HTTP transport, external-link open) ride in via
   // props on the `api` object + `zohoUrlHandler`. The portal calls
   // its REST helpers; the agent goes through Tauri commands that
@@ -113,7 +113,7 @@
   // All Zoho-returned strings render via {value} interpolation only.
   // NEVER `{@html}`. Per learnings #97 / #102 XSS-safe pattern.
 
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
 
   interface Props {
     callId: string;
@@ -168,7 +168,7 @@
   // — opening the modal is always a fresh decision; if the parent
   // wants to re-render with a different prior push, it can unmount
   // and remount via {#if zohoModalOpen}.
-  let step = $state<Step>((priorPush ? 0 : 1) as Step);
+  let step = $state<Step>((untrack(() => priorPush) ? 0 : 1) as Step);
   let modalEl = $state<HTMLDivElement | null>(null);
   const titleId = `szm-title-${Math.random().toString(36).slice(2, 9)}`;
   const liveId = `szm-live-${Math.random().toString(36).slice(2, 9)}`;
@@ -267,7 +267,9 @@
   // user can add them manually if they want them on the Zoho side.
   // Snapshot once at mount — the modal owns the editable list from
   // that moment forward.
-  let extraTags = $state<string[]>(seedExtraTags(existingTags));
+  let extraTags = $state<string[]>(
+    seedExtraTags(untrack(() => existingTags)),
+  );
   let newTagInput = $state("");
 
   function seedExtraTags(seed: SzmTag[]): string[] {
@@ -278,6 +280,11 @@
   let pushInFlight = $state(false);
   let pushResponse = $state<SzmPushResponse | null>(null);
   let pushErrorMsg = $state<string | null>(null);
+  let pushRetryBlocked = $state(false);
+  let pushResumeOnly = $state(false);
+  let pushErrorHint = $state(
+    "The push did not complete. Zoho was not modified.",
+  );
 
   // Minimum chars before firing a Zoho search. Mirrors backend
   // `SEARCH_MIN_CHARS` (#219); Zoho rejects shorter values from
@@ -289,6 +296,7 @@
     // Reactive search effect. Re-runs on query change with a 250ms
     // debounce; older in-flight requests get superseded by checking
     // `searchToken` after await.
+    const token = ++searchToken;
     if (step !== 2) return;
     const q = query.trim();
     if (q.length === 0) {
@@ -304,7 +312,6 @@
       searchInFlight = false;
       return;
     }
-    const token = ++searchToken;
     searchInFlight = true;
     searchError = null;
     const handle = setTimeout(async () => {
@@ -492,6 +499,9 @@
     if (!isUnlinked && !chosenRecord) return;
     pushInFlight = true;
     pushErrorMsg = null;
+    pushRetryBlocked = false;
+    pushResumeOnly = false;
+    pushErrorHint = "The push did not complete. Zoho was not modified.";
     pushResponse = null;
     await gotoStep(4);
 
@@ -513,7 +523,35 @@
       await gotoStep(5);
     } catch (e: any) {
       const status = e?.status as number | undefined;
-      if (status === 429) {
+      const code = e?.code as string | undefined;
+      const retryGuidance = e?.retryGuidance as string | undefined;
+      if (retryGuidance === "new_request_after_correction") {
+        pushErrorMsg = "The push failed before completion.";
+        pushErrorHint =
+          "Correct the integration or record details before trying again.";
+      } else if (retryGuidance === "new_request") {
+        pushErrorMsg = "The push was cancelled.";
+        pushErrorHint =
+          "You can start a new push if you still want to send this call.";
+      } else if (code === "external_push_uncertain") {
+        pushRetryBlocked = true;
+        pushErrorMsg =
+          "The server could not confirm whether the push completed.";
+        pushErrorHint =
+          "Do not start another push yet. Ask an admin to reconcile the call first.";
+      } else if (code === "external_push_pending") {
+        pushResumeOnly = true;
+        pushErrorMsg =
+          "The push is still processing or its response could not be confirmed.";
+        pushErrorHint =
+          "Retrying here safely reuses the same request; it will not start a second push.";
+      } else if (code === "external_push_protocol") {
+        pushRetryBlocked = true;
+        pushErrorMsg =
+          "The server returned an invalid push status.";
+        pushErrorHint =
+          "Do not start another push. Contact support so the attempt can be reconciled.";
+      } else if (status === 429) {
         pushErrorMsg =
           "You've pushed too many calls recently. Try again in a few minutes.";
       } else if (status === 404) {
@@ -973,21 +1011,21 @@
               activity.
             {/if}
           </p>
-          <button
-            type="button"
-            class="szm-link-btn"
-            onclick={() => zohoUrlHandler(pushResponse!.zoho_url)}
-          >
-            View in Zoho ↗
-          </button>
+          {#if pushResponse.zoho_url}
+            <button
+              type="button"
+              class="szm-link-btn"
+              onclick={() => zohoUrlHandler(pushResponse!.zoho_url)}
+            >
+              View in Zoho ↗
+            </button>
+          {/if}
         </div>
       {:else if step === 51}
         <div class="szm-error" role="alert">
           {pushErrorMsg ?? "The push did not complete. Zoho was not modified."}
         </div>
-        <p class="szm-error-hint">
-          The push did not complete. Zoho was not modified.
-        </p>
+        <p class="szm-error-hint">{pushErrorHint}</p>
       {/if}
     </div>
 
@@ -1051,17 +1089,27 @@
           onclick={onClose}
         >Close</button>
       {:else if step === 51}
-        <button
-          type="button"
-          class="rn-link"
-          onclick={() => gotoStep(3)}
-        >Retry</button>
+        {#if pushRetryBlocked}
+          <span></span>
+        {:else if pushResumeOnly}
+          <button
+            type="button"
+            class="rn-link"
+            onclick={doPush}
+          >Check status</button>
+        {:else}
+          <button
+            type="button"
+            class="rn-link"
+            onclick={() => gotoStep(3)}
+          >Retry</button>
+        {/if}
         <button
           type="button"
           class="rn-dismiss"
           data-step5-close
           onclick={onClose}
-        >Cancel</button>
+        >Close</button>
       {/if}
     </div>
   </div>

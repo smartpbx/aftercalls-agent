@@ -21,6 +21,8 @@
 
   let originX = 0;
   let originY = 0;
+  let scaleFactor = 1;
+  let requestToken = "";
   let submitted = false;
 
   let dragging = $state(false);
@@ -33,6 +35,12 @@
     const params = new URLSearchParams(page.url.search);
     originX = parseInt(params.get("x") ?? "0", 10) || 0;
     originY = parseInt(params.get("y") ?? "0", 10) || 0;
+    requestToken = params.get("token") ?? "";
+    const suppliedScale = Number.parseFloat(params.get("scale") ?? "");
+    scaleFactor =
+      Number.isFinite(suppliedScale) && suppliedScale > 0
+        ? suppliedScale
+        : Math.max(1, window.devicePixelRatio || 1);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
@@ -42,6 +50,7 @@
   }
 
   function onDown(e: PointerEvent) {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     dragging = true;
     sx = e.clientX;
     sy = e.clientY;
@@ -53,8 +62,10 @@
     cx = e.clientX;
     cy = e.clientY;
   }
-  async function onUp() {
+  async function onUp(e: PointerEvent) {
     if (!dragging) return;
+    cx = e.clientX;
+    cy = e.clientY;
     dragging = false;
     const x = Math.min(sx, cx);
     const y = Math.min(sy, cy);
@@ -65,7 +76,30 @@
       await cancel();
       return;
     }
-    const geometry = `${w}x${h}+${originX + x}+${originY + y}`;
+    // Pointer/client coordinates are CSS-logical pixels while Win32/gdigrab
+    // geometry is physical. Round both endpoints (rather than width alone)
+    // so fractional DPI scales produce an integral, gap-free rectangle.
+    const left = Math.round(
+      Math.max(0, Math.min(window.innerWidth, x)) * scaleFactor,
+    );
+    const top = Math.round(
+      Math.max(0, Math.min(window.innerHeight, y)) * scaleFactor,
+    );
+    const right = Math.round(
+      Math.max(0, Math.min(window.innerWidth, x + w)) * scaleFactor,
+    );
+    const bottom = Math.round(
+      Math.max(0, Math.min(window.innerHeight, y + h)) * scaleFactor,
+    );
+    const physicalWidth = right - left;
+    const physicalHeight = bottom - top;
+    if (physicalWidth <= 0 || physicalHeight <= 0) {
+      await cancel();
+      return;
+    }
+    const geometry =
+      `${physicalWidth}x${physicalHeight}` +
+      `+${originX + left}+${originY + top}`;
     await submit(geometry);
   }
 
@@ -73,7 +107,10 @@
     if (submitted) return;
     submitted = true;
     try {
-      await invoke("submit_region_selection", { geometry });
+      await invoke("submit_region_selection", {
+        requestToken,
+        geometry,
+      });
     } catch {
       // The window closes from the Rust side regardless; nothing to do.
     }

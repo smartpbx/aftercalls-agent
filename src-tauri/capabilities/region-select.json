@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "region-select",
+  "description": "Single-command capability for the Windows region selection window.",
+  "windows": ["region-select"],
+  "permissions": ["region-select-commands"]
+}

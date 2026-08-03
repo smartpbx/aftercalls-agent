@@ -29,6 +29,7 @@
   import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { externalHttpsUrl } from "$lib/externalPush";
   import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
   import { zohoStore } from "$lib/stores/zoho.svelte";
   import SpeakerIdentityPicker from "$lib/SpeakerIdentityPicker.svelte";
@@ -109,8 +110,8 @@
     // Phase 3 — raise a link (one deal at a time — a new link replaces the prior)
     // / unlink to the parent, which owns the `live_linked_deal` invoke + store.
     // Both are only surfaced mid-call (a session must exist to persist the link).
-    onlinkdeal?: (deal: CrmContextDeal) => void;
-    onunlinkdeal?: () => void;
+    onlinkdeal?: (deal: CrmContextDeal) => void | Promise<void>;
+    onunlinkdeal?: () => void | Promise<void>;
     // Zoho Desk — whether `features.zoho_desk` is on. Gates the whole Tickets
     // section (rendered BESIDE Deals/Cases, NOT swapped by the mode toggle). Off
     // → no ticket chrome at all, byte-identical to the pre-Desk lane.
@@ -122,14 +123,15 @@
     // Zoho Desk — raise a link (one ticket at a time — a new link replaces the
     // prior) / unlink to the parent, which owns the `live_linked_ticket` invoke
     // + store. Only surfaced mid-call (a session must exist to persist the link).
-    onlinkticket?: (ticket: CrmContextTicket) => void;
-    onunlinkticket?: () => void;
+    onlinkticket?: (ticket: CrmContextTicket) => void | Promise<void>;
+    onunlinkticket?: () => void | Promise<void>;
   } = $props();
 
   // ── Hydration state ────────────────────────────────────────────────
   let crm = $state<CrmContext | null>(null);
   let hydrating = $state(false);
   let hydrateError = $state(false);
+  let hydrateGeneration = 0;
   // Polite SR announcement for assign → hydrate transitions.
   let announce = $state("");
 
@@ -279,17 +281,26 @@
 
   // ── Hydrate ────────────────────────────────────────────────────────
   async function hydrate(contactId: string) {
+    const generation = ++hydrateGeneration;
+    const requestedSession = sessionUuid;
+    const requestedMode = mode;
     hydrating = true;
     hydrateError = false;
     crm = null;
     try {
       const ctx = (await invoke("live_crm_context", {
         contactId,
-        sessionUuid: sessionUuid ?? undefined,
+        sessionUuid: requestedSession ?? undefined,
         // #659 P5a — carry the persona so the backend persists it to
         // state.copilot.mode; it does NOT change what's fetched.
-        mode,
+        mode: requestedMode,
       })) as CrmContext;
+      if (
+        generation !== hydrateGeneration ||
+        primaryContactId !== contactId
+      ) {
+        return;
+      }
       crm = ctx;
       // #662 — feed the panel's inference from the fresh envelope.
       raiseCounts(ctx);
@@ -307,6 +318,12 @@
         }.`;
       }
     } catch {
+      if (
+        generation !== hydrateGeneration ||
+        primaryContactId !== contactId
+      ) {
+        return;
+      }
       hydrateError = true;
       announce = "Couldn't load contact details.";
       // #662 (N-1) — a failed hydrate leaves no fresh envelope; raise
@@ -314,7 +331,7 @@
       // acting on the PREVIOUS contact's stale counts. Counts-only (no PII).
       raiseCounts(null);
     } finally {
-      hydrating = false;
+      if (generation === hydrateGeneration) hydrating = false;
     }
   }
 
@@ -338,6 +355,8 @@
       if (cid) {
         void hydrate(cid);
       } else {
+        hydrateGeneration += 1;
+        hydrating = false;
         crm = null;
         hydrateError = false;
         raiseCounts(null);
@@ -395,16 +414,27 @@
   // time — linking a new deal replaces the prior one (the parent + backend own
   // that; here we only raise the intent).
   let canLinkDeal = $derived(!!sessionUuid && !!onlinkdeal);
+  let dealLinkBusy = $state(false);
   function isLinkedDeal(deal: CrmContextDeal): boolean {
     return !!linkedDeal && linkedDeal.record_id === deal.id;
   }
-  function toggleLinkDeal(deal: CrmContextDeal) {
-    if (isLinkedDeal(deal)) {
-      onunlinkdeal?.();
-      announce = `${deal.name} unlinked from this call.`;
-    } else {
-      onlinkdeal?.(deal);
-      announce = `${deal.name} linked to this call.`;
+  async function toggleLinkDeal(deal: CrmContextDeal) {
+    if (dealLinkBusy) return;
+    const unlinking = isLinkedDeal(deal);
+    dealLinkBusy = true;
+    announce = "Updating the call link.";
+    try {
+      if (unlinking) {
+        await onunlinkdeal?.();
+        announce = `${deal.name} unlinked from this call.`;
+      } else {
+        await onlinkdeal?.(deal);
+        announce = `${deal.name} linked to this call.`;
+      }
+    } catch {
+      announce = "Couldn't update the call link.";
+    } finally {
+      dealLinkBusy = false;
     }
   }
 
@@ -441,16 +471,27 @@
   // Mid-call "Link to call" is session-gated (same as deals). One ticket at a
   // time — linking a new ticket replaces the prior (parent + backend own that).
   let canLinkTicket = $derived(!!sessionUuid && !!onlinkticket);
+  let ticketLinkBusy = $state(false);
   function isLinkedTicket(ticket: CrmContextTicket): boolean {
     return !!linkedTicket && linkedTicket.ticket_id === ticket.id;
   }
-  function toggleLinkTicket(ticket: CrmContextTicket) {
-    if (isLinkedTicket(ticket)) {
-      onunlinkticket?.();
-      announce = `${ticketTitle(ticket)} unlinked from this call.`;
-    } else {
-      onlinkticket?.(ticket);
-      announce = `${ticketTitle(ticket)} linked to this call.`;
+  async function toggleLinkTicket(ticket: CrmContextTicket) {
+    if (ticketLinkBusy) return;
+    const unlinking = isLinkedTicket(ticket);
+    ticketLinkBusy = true;
+    announce = "Updating the ticket link.";
+    try {
+      if (unlinking) {
+        await onunlinkticket?.();
+        announce = `${ticketTitle(ticket)} unlinked from this call.`;
+      } else {
+        await onlinkticket?.(ticket);
+        announce = `${ticketTitle(ticket)} linked to this call.`;
+      }
+    } catch {
+      announce = "Couldn't update the ticket link.";
+    } finally {
+      ticketLinkBusy = false;
     }
   }
 
@@ -477,7 +518,9 @@
   }
 
   function openDeal(url: string) {
-    void openUrl(url).catch((e) => console.warn("openUrl failed", e));
+    const safeUrl = externalHttpsUrl(url);
+    if (!safeUrl) return;
+    void openUrl(safeUrl).catch((e) => console.warn("openUrl failed", e));
   }
 
   function connectZoho() {
@@ -715,6 +758,7 @@
                         class:on={isLinkedDeal(deal)}
                         aria-pressed={isLinkedDeal(deal)}
                         onclick={() => toggleLinkDeal(deal)}
+                        disabled={dealLinkBusy}
                       >
                         {#if isLinkedDeal(deal)}
                           <span class="crm-deal-link-check" aria-hidden="true">✓</span>
@@ -796,6 +840,7 @@
                         class:on={isLinkedTicket(t)}
                         aria-pressed={isLinkedTicket(t)}
                         onclick={() => toggleLinkTicket(t)}
+                        disabled={ticketLinkBusy}
                       >
                         {#if isLinkedTicket(t)}
                           <span class="crm-deal-link-check" aria-hidden="true">✓</span>
@@ -1146,6 +1191,10 @@
   .crm-deal-link:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+  .crm-deal-link:disabled {
+    cursor: wait;
+    opacity: 0.58;
   }
   .crm-deal-link:focus-visible {
     outline: 2px solid var(--accent);

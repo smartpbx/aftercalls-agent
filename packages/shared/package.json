@@ -17,6 +17,22 @@
       "types": "./processing-thresholds.ts",
       "default": "./processing-thresholds.ts"
     },
+    "./screenPlayback": {
+      "types": "./screenPlayback.ts",
+      "default": "./screenPlayback.ts"
+    },
+    "./questionMutations": {
+      "types": "./questionMutations.ts",
+      "default": "./questionMutations.ts"
+    },
+    "./releaseNotes": {
+      "types": "./releaseNotes.ts",
+      "default": "./releaseNotes.ts"
+    },
+    "./externalPush": {
+      "types": "./externalPush.ts",
+      "default": "./externalPush.ts"
+    },
     "./shortcuts": {
       "types": "./shortcuts.svelte.ts",
       "default": "./shortcuts.svelte.ts"
