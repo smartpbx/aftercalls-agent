@@ -534,17 +534,39 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: read
+      # write is required by the final undraft step; the job still reads
+      # assets through the API rather than mutating anything before Spaces.
+      contents: write
     steps:
       - name: Download release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           mkdir -p /tmp/release
           cd /tmp/release
-          gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*'
+          # `gh release download` resolves by tag and cannot see a DRAFT
+          # release, but bootstrap-release deliberately creates one and
+          # tauri-action uploads into it (releaseDraft: true). Resolve the
+          # release by id and pull each asset through the API instead, which
+          # works for drafts. Publishing happens only after Spaces succeeds.
+          REPO="${{ github.repository }}"
+          REL_ID=$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+          if [ -z "$REL_ID" ]; then
+            echo "::error::No release found for tag $TAG"
+            exit 1
+          fi
+          gh api "repos/$REPO/releases/$REL_ID/assets" --paginate \
+            --jq '.[] | "\(.id)\t\(.name)"' \
+          | while IFS=$'\t' read -r asset_id asset_name; do
+              echo "downloading $asset_name"
+              gh api -H "Accept: application/octet-stream" \
+                "repos/$REPO/releases/assets/$asset_id" > "$asset_name"
+            done
           ls -la
+          test -f latest.json
 
       - name: Rewrite latest.json URLs to Spaces + inject Linux entry
         env:
@@ -611,3 +633,13 @@ jobs:
             --acl public-read \
             --cache-control "max-age=60, public"
           echo "Published update channel: https://${BUCKET}.${REGION}.digitaloceanspaces.com/latest.json"
+
+      # Only now is the release real: the updater channel is live and every
+      # asset is mirrored. Undrafting last means a failed Spaces upload never
+      # surfaces a release users can half-download. Nothing published this
+      # before, so every release stayed a permanent draft.
+      - name: Publish the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release edit "$TAG" --repo "${{ github.repository }}" --draft=false
