@@ -1,29 +1,29 @@
 name: release
 
-# Signed installers + updater manifests on every `v*` tag. tauri-action
+# Operational safety gate: the first job fails unless a repository administrator
+# records review of this exact FFmpeg + build-recipe revision in the repository
+# variable described below. The checks are defence in depth, not a substitute
+# for that distribution/compliance review.
+# Signed installers + updater manifests from an explicit master-branch manual
+# dispatch. Creating a tag alone never exposes signing or publication secrets.
+#
+# This lives in the PUBLIC repo on purpose. Two reasons, and both matter:
+#   1. Cost — public repositories get unlimited free GitHub-hosted Actions
+#      minutes. A private-repo release burns ~300 billable minutes per tag
+#      (Windows bills 2x), which does not fit the release cadence.
+#   2. Security — environment protection rules (required reviewers) are
+#      available on public repositories at every plan tier, and were NOT
+#      available on the private repo's plan.
+# The v0.21 audit's hardening (manual dispatch, master-ref guard, exact-tip tag
+# validation, SHA-pinned actions, scoped per-job tokens, and the FFmpeg
+# distribution gate) is preserved verbatim — only the host repo differs.
+# tauri-action
 # signs with TAURI_SIGNING_PRIVATE_KEY + _PASSWORD from repo secrets,
 # uploads installers + .sig files + latest.json to a draft GitHub
 # release, and the follow-up publish-to-spaces job mirrors everything
 # to the DO Spaces updater channel the installed apps poll.
-#
-# macOS (Apple Silicon) builds run `pnpm tauri build` directly (NOT
-# tauri-action) and are Developer-ID-signed + notarized + stapled:
-# tauri-bundler reads the APPLE_* secrets itself (temp keychain,
-# `notarytool submit --wait`, `stapler staple` — verified against
-# tauri-bundler v2.9.2 source, 2026-06-10). A hard verification step
-# (`spctl --assess` + `stapler validate`) guards the two silent
-# failure modes: missing notarization creds only WARN in the bundler,
-# and stapler's exit status is unchecked upstream. Signed bundles
-# attach to the GH release and publish to Spaces like Linux/Windows.
-#
-# Windows Authenticode signing is pre-wired but INERT until the
-# AZURE_* secrets exist (Azure Artifact Signing, #67 in the private
-# repo) — see the "Enable Windows code signing" step.
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -31,95 +31,133 @@ on:
         required: true
 
 permissions:
-  contents: write
-
-env:
-  VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
-  VITE_SENTRY_ENVIRONMENT: production
-  # Windows Authenticode via Azure Artifact Signing flips on when all
-  # six secrets exist; until then the Windows build ships unsigned
-  # exactly as before. `secrets` isn't usable in step `if:` directly,
-  # hence the env indirection.
-  HAS_AZURE_SIGNING: ${{ secrets.AZURE_ARTIFACT_ENDPOINT != '' && secrets.AZURE_ARTIFACT_ACCOUNT != '' && secrets.AZURE_ARTIFACT_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  # Create the GitHub release once, before the matrix fans out, so
-  # all three matrix jobs (Linux, Windows, macOS) operate on a release
-  # that already exists. v0.18.0 ran without this and we hit two
-  # parallel-matrix races:
-  #   1. macOS's "Attach macOS bundles" ran before tauri-action on
-  #      Linux had created the release → `gh release upload` 404'd.
-  #   2. Both Linux and Windows tauri-action invocations tried to
-  #      PATCH latest.json on the same release → the second one's
-  #      asset-id was stale and 404'd.
-  # Bootstrap-first removes (1) entirely; the `includeUpdaterJson`
-  # gating below removes (2).
-  bootstrap-release:
+  ffmpeg-compliance-gate:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Create release if missing
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+
+      - name: Require review of the exact FFmpeg distribution inputs
+        env:
+          EXPECTED_REVIEW: ffmpeg-1fdbca85aaea513c9cc6c14d347f76543346d3da+btbn-a99e8230eae00d1cee38f23076a7a1f55cd984e2
+          RECORDED_REVIEW: ${{ vars.FFMPEG_DISTRIBUTION_REVIEW }}
+        run: |
+          set -euo pipefail
+          if [[ "$RECORDED_REVIEW" != "$EXPECTED_REVIEW" ]]; then
+            echo "::error title=FFmpeg distribution review required::Set FFMPEG_DISTRIBUTION_REVIEW to the exact reviewed revision after completing the license/corresponding-source inventory"
+            exit 1
+          fi
+          grep -Fq '1fdbca85aaea513c9cc6c14d347f76543346d3da' THIRD_PARTY_NOTICES.md
+          grep -Fq 'a99e8230eae00d1cee38f23076a7a1f55cd984e2' THIRD_PARTY_NOTICES.md
+          grep -Fq '58057a52db17bd2fefa87f271956f04aa2277d55efc13f288594cc2c65c59479' scripts/fetch-ffmpeg-sidecar.sh
+          grep -Fq 'b7c1c846dacca68ee4ebf5c390742c973b3d5d14a6d44b061f500d8e4ac74fc0' scripts/fetch-ffmpeg-sidecar.ps1
+
+  bootstrap-release:
+    needs: ffmpeg-compliance-gate
+    # Create the draft exactly once before the platform matrix fans out. Both
+    # tauri-action jobs otherwise race to create/update the same release.
+    if: github.ref == 'refs/heads/master'
+    environment: production-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+
+      - name: Validate and create the draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
-          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          TRUSTED_MASTER_SHA: ${{ github.sha }}
         run: |
-          set -eu
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "release $TAG already exists; matrix jobs will reuse it"
-            exit 0
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag: $TAG"
+            exit 1
           fi
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "aftercalls $TAG" \
-            --notes "Installers and auto-updater manifests for aftercalls $TAG.
-
-          ### Install
-
-          - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
-          - **Windows**: .msi or .exe.
-          - **macOS**: .dmg (Apple Silicon; Intel Macs run it via Rosetta 2).
-
-          All platforms auto-update from a running instance.
-
-          See [aftercalls.io/releases](https://aftercalls.io/releases/) for the full changelog."
+          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+          test "$(git rev-parse HEAD)" = "$TRUSTED_MASTER_SHA"
+          APP_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          test "v${APP_VERSION}" = "$TAG"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --draft \
+              --title "aftercalls $TAG" \
+              --notes "Signed aftercalls desktop installers and updater metadata."
+          fi
 
   release:
     needs: bootstrap-release
+    # workflow_dispatch can target another ref; fail closed unless the trusted
+    # workflow definition was dispatched from master.
+    if: github.ref == 'refs/heads/master'
+    # Anchor release deployments to one named environment. This repository is
+    # public, so environment protection rules (required reviewers, wait timers)
+    # ARE available and should stay configured on `production-release` — that is
+    # a control the private repo's plan could not offer. The workflow keeps its
+    # own belt-and-braces checks regardless: manual dispatch only, master ref,
+    # and an exact-tip tag match.
+    environment: production-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          # `experimental: true` flips per-job continue-on-error so the
-          # publish-to-spaces job can fire after Linux + Windows even
-          # when a macOS runner is queued or Apple's notary service is
-          # down. Cost of that resilience: a failed mac job ships the
-          # release WITHOUT mac assets and latest.json omits
-          # darwin-aarch64 until the next tag — check the job status
-          # after every release.
-          #
-          # 2026-04-25: macos-13 (Intel) dropped from the matrix —
-          # GitHub deprecated the label in late 2025 and our jobs sat
-          # in queue 7+ hours. Apple Silicon (macos-14, aarch64) covers
-          # native ARM builds; Intel-Mac users run via Rosetta 2.
-          - os: macos-14
-            target: aarch64-apple-darwin
-            experimental: true
+        os: [ubuntu-24.04, windows-latest]
 
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Validate exact release tag and application version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          # workflow_dispatch was admitted only from refs/heads/master above.
+          # This context value remains the trusted master tip even though the
+          # working tree was subsequently checked out at the requested tag.
+          TRUSTED_MASTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag: $TAG"
+            exit 1
+          fi
+          if [ "$(git describe --tags --exact-match HEAD)" != "$TAG" ]; then
+            echo "::error::Checked-out commit is not the requested exact tag $TAG"
+            exit 1
+          fi
+          APP_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          if [ "v${APP_VERSION}" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match tauri.conf.json version v${APP_VERSION}"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$TRUSTED_MASTER_SHA" ]; then
+            echo "::error::Release tag $TAG must point at the master tip selected for this dispatch"
+            exit 1
+          fi
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-24.04'
@@ -150,50 +188,27 @@ jobs:
           rustflags = ["-C", "link-arg=-fuse-ld=mold"]
           EOF
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          targets: ${{ matrix.target }}
+          toolchain: 1.95.0
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri -> target
           cache-on-failure: true
-          # Bucket the cache by target triple so the two macOS runners
-          # don't fight over the same key.
-          key: ${{ matrix.target }}
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 10
+          version: 10.33.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
+          node-version: 24.11.0
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
       - run: pnpm install --frozen-lockfile
 
-      # Provision the ffmpeg sidecar for the current target.
-      #
-      # Linux + Windows both delegate to scripts/fetch-ffmpeg-sidecar.*,
-      # which are MIRRORED from the private repo and are the single source
-      # of truth for which build ships. They pin the same BtbN LGPL
-      # archive per platform (sha256-verified), assert the exact
-      # `ffmpeg -version` identity, require libopus, refuse any
-      # --enable-gpl / --enable-nonfree configuration, and — critically —
-      # populate src-tauri/resources/ with the archive's own LICENSE.txt
-      # plus THIRD_PARTY_NOTICES.md.
-      #
-      # That resources/ step is not optional: tauri.conf.json declares
-      # bundle.resources, and tauri-build copies declared resources
-      # unconditionally in strict mode, so a missing file panics the build
-      # script on every platform. Do NOT reintroduce an inline fetch here —
-      # it will drift from the notices table and break the bundle.
-      #
-      # Tauri's externalBin picks up
-      # src-tauri/binaries/ffmpeg-aftercalls-<triple> at bundle time and
-      # drops it next to the main binary, so users need no ffmpeg on PATH.
       - name: Fetch pinned ffmpeg sidecar (Linux)
         if: matrix.os == 'ubuntu-24.04'
         run: bash scripts/fetch-ffmpeg-sidecar.sh
@@ -203,268 +218,93 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-ffmpeg-sidecar.ps1
 
-      # macOS sidecar — osxexperts.net ships LGPL-only static builds
-      # for Apple Silicon (and Intel; Intel matrix entry currently
-      # disabled, see top-of-file comment). Same license posture as
-      # the Linux/Windows sidecars above. The archive layout is a flat
-      # zip containing a single `ffmpeg` binary.
-      #
-      # The osxexperts URLs are *already* version-pinned in the
-      # filename (`ffmpeg711arm.zip` = 7.1.1 arm). #69 adds the
-      # matching sha256 fail-loud check so a silent re-tag at the
-      # same URL would break CI before shipping.
-      - name: Fetch ffmpeg sidecar (macOS)
-        if: startsWith(matrix.os, 'macos-')
-        env:
-          # Pinned per #69. Bump URL + SHA256 together (and notices)
-          # when rolling forward.
-          FFMPEG_URL_ARM: "https://www.osxexperts.net/ffmpeg711arm.zip"
-          FFMPEG_SHA256_ARM: "59e39a5cec2e5d2307ed079c53227a9181e64b87454ed4de998349e044bfdc70"
-          FFMPEG_URL_INTEL: "https://www.osxexperts.net/ffmpeg711intel.zip"
-          # Intel matrix entry is currently dropped (macos-13 deprecated).
-          # When re-added, compute + pin its sha256 here too.
-          FFMPEG_SHA256_INTEL: ""
+      - name: Expose verified ffmpeg to Rust tests (Linux)
+        if: matrix.os == 'ubuntu-24.04'
         run: |
-          set -eux
-          mkdir -p src-tauri/binaries
-          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            URL="$FFMPEG_URL_ARM"
-            EXPECTED_SHA="$FFMPEG_SHA256_ARM"
-          else
-            URL="$FFMPEG_URL_INTEL"
-            EXPECTED_SHA="$FFMPEG_SHA256_INTEL"
-          fi
-          curl -sSL "$URL" -o /tmp/ffmpeg.zip
-          echo "ffmpeg archive sha256:"
-          shasum -a 256 /tmp/ffmpeg.zip
-          if [ -n "$EXPECTED_SHA" ]; then
-            echo "${EXPECTED_SHA}  /tmp/ffmpeg.zip" | shasum -a 256 -c -
-          else
-            echo "WARN: no pinned sha256 for this macOS arch — recording for later pin"
-          fi
-          mkdir -p /tmp/ffmpeg-stage
-          unzip -o /tmp/ffmpeg.zip -d /tmp/ffmpeg-stage
-          # The zip contains a single top-level `ffmpeg` binary.
-          FFMPEG_BIN=$(find /tmp/ffmpeg-stage -name ffmpeg -type f | head -n1)
-          cp "$FFMPEG_BIN" \
-            "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
-          chmod +x "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
-          echo "bundled binary sha256:"
-          shasum -a 256 "src-tauri/binaries/ffmpeg-aftercalls-${{ matrix.target }}"
-          ls -lh src-tauri/binaries/
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/aftercalls-test-tools"
+          mkdir -p "$TOOLS_DIR"
+          install -m 0755 \
+            src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
+            "$TOOLS_DIR/ffmpeg"
+          echo "$TOOLS_DIR" >> "$GITHUB_PATH"
 
-          # tauri.conf.json declares bundle.resources, and tauri-build
-          # copies declared resources unconditionally in strict mode — a
-          # missing file panics the build script. Linux/Windows get these
-          # from scripts/fetch-ffmpeg-sidecar.*, which lift LICENSE.txt out
-          # of the pinned BtbN archive. The osxexperts zip is a flat archive
-          # holding only the binary, so there is no builder-supplied license
-          # to bundle and this leg cannot satisfy the same standard.
-          #
-          # THIRD_PARTY_NOTICES.md currently states we publish no macOS
-          # installer or macOS sidecar, and v0.30.0 shipped Linux + Windows
-          # only. This job is `experimental: true`, so failing here does not
-          # block the release — it fails loudly and legibly instead of as an
-          # opaque Rust panic 20 minutes later. To actually ship macOS:
-          # source a verified LGPL mac build that carries its license, add a
-          # macOS branch to fetch-ffmpeg-sidecar.sh, and update the notices
-          # table + site/licenses in the same commit.
-          mkdir -p src-tauri/resources
-          cp THIRD_PARTY_NOTICES.md src-tauri/resources/THIRD_PARTY_NOTICES.md
-          MAC_LICENSE=$(find /tmp/ffmpeg-stage \
-            \( -iname 'LICENSE*' -o -iname 'COPYING*' \) -type f | head -n1)
-          if [ -z "$MAC_LICENSE" ]; then
-            echo "::error::macOS ffmpeg archive carries no license file, so"
-            echo "::error::src-tauri/resources/FFmpeg-LICENSE.txt cannot be"
-            echo "::error::populated and the bundle would ship without the"
-            echo "::error::LGPL text. Not shipping a macOS installer — see"
-            echo "::error::THIRD_PARTY_NOTICES.md. This job is non-blocking."
-            exit 1
-          fi
-          cp "$MAC_LICENSE" src-tauri/resources/FFmpeg-LICENSE.txt
-          grep -Fq 'GNU LESSER GENERAL PUBLIC LICENSE' \
-            src-tauri/resources/FFmpeg-LICENSE.txt \
-            || { echo "::error::macOS ffmpeg license is not LGPL"; exit 1; }
-          ls -lh src-tauri/resources/
-
-      # Inert until the founder finishes Azure Artifact Signing setup
-      # (#67 in the private repo) and sets six secrets on THIS repo:
-      # AZURE_ARTIFACT_ENDPOINT (e.g. https://eus.codesigning.azure.net),
-      # AZURE_ARTIFACT_ACCOUNT, AZURE_ARTIFACT_PROFILE (cert profile
-      # name), AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET.
-      # Once present, this step installs the signing CLI and drops a
-      # tauri.windows.conf.json overlay (auto-merged by Tauri) whose
-      # signCommand signs the inner .exe AND the NSIS/MSI installers
-      # during bundling. Account/profile names stay out of this public
-      # file by living in secrets.
-      - name: Enable Windows code signing (Azure Artifact Signing)
-        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING == 'true'
+      - name: Expose verified ffmpeg to Rust tests (Windows)
+        if: matrix.os == 'windows-latest'
         shell: pwsh
-        env:
-          AZURE_ARTIFACT_ENDPOINT: ${{ secrets.AZURE_ARTIFACT_ENDPOINT }}
-          AZURE_ARTIFACT_ACCOUNT: ${{ secrets.AZURE_ARTIFACT_ACCOUNT }}
-          AZURE_ARTIFACT_PROFILE: ${{ secrets.AZURE_ARTIFACT_PROFILE }}
         run: |
-          cargo install artifact-signing-cli --locked
-          $signCommand = "artifact-signing-cli -e $env:AZURE_ARTIFACT_ENDPOINT -a $env:AZURE_ARTIFACT_ACCOUNT -c $env:AZURE_ARTIFACT_PROFILE -d aftercalls %1"
-          @{ bundle = @{ windows = @{ signCommand = $signCommand } } } |
-            ConvertTo-Json -Depth 4 |
-            Set-Content -Path src-tauri/tauri.windows.conf.json -Encoding UTF8
-          Write-Host "signCommand overlay written"
+          $toolsDir = Join-Path $env:RUNNER_TEMP "aftercalls-test-tools"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          Copy-Item "src-tauri/binaries/ffmpeg-aftercalls-x86_64-pc-windows-msvc.exe" (Join-Path $toolsDir "ffmpeg.exe")
+          Add-Content -Path $env:GITHUB_PATH -Value $toolsDir
 
-      - name: Build + publish signed release (Linux + Windows)
-        if: matrix.os == 'ubuntu-24.04' || matrix.os == 'windows-latest'
-        uses: tauri-apps/tauri-action@v0
+      - name: Type-check frontend
+        run: pnpm check
+
+      - name: Audit production JS dependencies
+        if: matrix.os == 'ubuntu-24.04'
+        run: pnpm audit --prod --audit-level high
+
+      - name: Test Rust core
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo test --locked --lib
+
+      - name: Test atomic ffmpeg publication
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: >-
+          cargo test --locked --lib
+          rolling_encode::tests::fallback_round_trip_publishes_only_after_full_decode
+          -- --ignored --exact
+
+      - name: Install RustSec scanner
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: src-tauri
+        run: cargo audit --file Cargo.lock
+
+      - name: Build + publish signed release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Auth for artifact-signing-cli (no-ops while unset).
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: "aftercalls ${{ github.event.inputs.tag || github.ref_name }}"
+          projectPath: .
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "aftercalls ${{ inputs.tag || github.ref_name }}"
           releaseBody: |
             Installers and auto-updater manifests for aftercalls
-            ${{ github.event.inputs.tag || github.ref_name }}.
+            ${{ inputs.tag || github.ref_name }}.
 
             ### Install
+            - **Linux**: `.AppImage` is the default — slim, links against
+              system `libwebkit2gtk-4.1` + `libgtk-3`. Also available:
+              `.deb` (Debian / Ubuntu / Pop), `.rpm` (Fedora / RHEL).
+            - **Windows**: `.msi` or `.exe` (NSIS).
 
-            - **Linux**: AppImage (default), .deb (Debian / Ubuntu / Pop), .rpm (Fedora / RHEL).
-            - **Windows**: .msi or .exe.
-            - **macOS**: .dmg (Apple Silicon; Intel Macs run it via Rosetta 2).
-
-            All platforms auto-update from a running instance.
-
-            See [aftercalls.io/releases](https://aftercalls.io/releases/) for the full changelog.
-          releaseDraft: false
+            Both shipped desktop platforms auto-update from a running
+            instance (Linux updates via AppImage-in-place swap).
+          releaseDraft: true
           prerelease: false
-          # Only Windows emits latest.json. v0.18.0 had both Linux and
-          # Windows tauri-action invocations set to true, and they raced
-          # on the PATCH of the latest.json release asset — the second
-          # job's asset-id was stale and 404'd. Linux contributes
-          # nothing to the updater manifest anyway (we ship deb/rpm
-          # only via tauri-bundler; the slim AppImage updater entry is
-          # injected by publish-to-spaces downstream), so dropping it
-          # here is lossless.
+          # Only one matrix leg may own latest.json; parallel writes race on the
+          # release asset ID. Linux is injected after the slim AppImage is signed.
           includeUpdaterJson: ${{ matrix.os == 'windows-latest' }}
           # Skip tauri-bundler's AppImage on Linux — it invokes
           # linuxdeploy-plugin-gtk.sh which bundles a forked webkit that
           # SIGABRTs on Arch / NixOS / some Ubuntu combos. We build a
           # slim system-webkit AppImage ourselves in the next step.
           args: ${{ matrix.os == 'ubuntu-24.04' && '--bundles deb rpm' || '' }}
-
-      # macOS — build .dmg + .app via tauri-bundler directly (NOT
-      # tauri-action; we keep our own staging/attach steps so asset
-      # names carry the target triple). With the APPLE_* env present,
-      # tauri-bundler imports the cert into a temp keychain, signs
-      # everything inside-out (ffmpeg sidecar first, then the .app),
-      # runs `xcrun notarytool submit --wait`, and staples the ticket
-      # — no extra keychain/notary steps needed. The .p12 in
-      # APPLE_CERTIFICATE must contain ONLY the Developer ID
-      # Application identity (bundler picks the first identity it
-      # finds); APPLE_SIGNING_IDENTITY is a substring cross-check.
-      #
-      # Pass --target so the runner produces a single-arch bundle
-      # matching the matrix triple.
-      - name: Build signed + notarized macOS bundles
-        if: startsWith(matrix.os, 'macos-')
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -eux
-          pnpm tauri build --target ${{ matrix.target }}
-          ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/dmg/" || true
-          ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/macos/" || true
-
-      # Hard gate against the two silent failure modes in tauri-bundler:
-      # missing/incomplete notarization creds only log a WARNING (the
-      # build stays green and ships un-notarized), and `stapler staple`'s
-      # exit status is never checked. A release only attaches mac
-      # bundles if the .app genuinely passes Gatekeeper.
-      - name: Verify macOS signature + notarization
-        if: startsWith(matrix.os, 'macos-')
-        run: |
-          set -eux
-          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/aftercalls.app"
-          codesign -dvv "$APP" 2>&1 | grep "Developer ID Application"
-          codesign -d --verbose=2 "$APP" 2>&1 | grep -E "flags=.*runtime"
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign -dvv "$APP/Contents/MacOS/ffmpeg-aftercalls" 2>&1 \
-            | grep "Developer ID Application"
-          spctl --assess --type exec --verbose=2 "$APP" 2>&1 | grep "accepted"
-          xcrun stapler validate "$APP"
-
-      - name: Stage macOS bundles
-        if: startsWith(matrix.os, 'macos-')
-        run: |
-          set -eux
-          STAGE=/tmp/macos-stage
-          mkdir -p "$STAGE"
-          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
-          # First-install installer: .dmg — Developer-ID-signed, app
-          # inside is notarized + stapled.
-          if [ -d "$BUNDLE_DIR/dmg" ]; then
-            cp "$BUNDLE_DIR/dmg/"*.dmg "$STAGE/" 2>/dev/null || true
-          fi
-          # Updater bundle: Tauri auto-produces a minisign-signed
-          # *.app.tar.gz + .sig in bundle/macos/ when
-          # createUpdaterArtifacts=true (set in tauri.conf.json). Copy
-          # both, renaming with the target triple so the GH release
-          # listing identifies the arch.
-          if [ -d "$BUNDLE_DIR/macos" ]; then
-            cd "$BUNDLE_DIR/macos"
-            for app_tgz in *.app.tar.gz; do
-              [ -f "$app_tgz" ] || continue
-              TAR_NAME="${app_tgz%.app.tar.gz}-${{ matrix.target }}.app.tar.gz"
-              cp "$app_tgz" "$STAGE/$TAR_NAME"
-              if [ -f "${app_tgz}.sig" ]; then
-                cp "${app_tgz}.sig" "$STAGE/${TAR_NAME}.sig"
-              fi
-            done
-            cd -
-          fi
-          ls -la "$STAGE"
-
-      - name: Upload macOS workflow artifact
-        if: startsWith(matrix.os, 'macos-')
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.target }}-${{ github.event.inputs.tag || github.ref_name }}
-          path: /tmp/macos-stage/*
-          if-no-files-found: warn
-          retention-days: 30
-
-      # Attach mac bundles to the GitHub release so publish-to-spaces
-      # picks them up. Bundles are signed + notarized (the verify step
-      # above fails the job otherwise, so nothing un-notarized lands
-      # here).
-      - name: Attach macOS bundles to GH release
-        if: startsWith(matrix.os, 'macos-')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: |
-          set -eux
-          shopt -s nullglob
-          cd /tmp/macos-stage
-          files=( *.dmg *.tar.gz *.tar.gz.sig )
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no macOS bundles to attach"
-            exit 0
-          fi
-          # Job runs in /tmp/macos-stage with no checkout, so gh can't
-          # infer the repo from .git — pass it explicitly.
-          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
       # Slim system-webkit AppImage. tauri-bundler's AppImage target
       # unconditionally runs linuxdeploy-plugin-gtk.sh, which bundles a
@@ -477,57 +317,49 @@ jobs:
       # installed on the user's system (preinstalled on Debian/Ubuntu;
       # one package on Arch/Fedora).
       #
-      # Signed with the same Tauri minisign key as the Windows/macOS
+      # Signed with the same Tauri minisign key as the other updater
       # bundles so tauri-plugin-updater can in-place-swap it. That
       # closes the "Linux has no one-click update" gap (#31).
       - name: Package slim (system-webkit) Linux AppImage
         if: matrix.os == 'ubuntu-24.04'
         env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          # The upstream `continuous` asset is mutable. Never execute it
+          # unless it matches the exact artifact audited for this workflow.
+          LINUXDEPLOY_SHA256: 421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           VERSION="${TAG#v}"
           APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
 
-          # Use appimagetool directly — NOT linuxdeploy. linuxdeploy
-          # runs ldd on the binary and bundles every "non-system" lib
-          # it finds, including libwebkit2gtk-4.1.so.0. That bundled
-          # webkit has its helper-process paths (WebKitNetworkProcess
-          # et al) HARDCODED at compile time pointing at Ubuntu's
-          # /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/ layout — which
-          # doesn't exist on Arch / Fedora / NixOS. Result: AppImage
-          # launches but webkit crashes spawning its child processes.
-          # Going direct with appimagetool skips the ldd step entirely:
-          # the AppImage ships ONLY the binary + .desktop + icon, and
-          # at runtime dlopen resolves webkit/gtk from the host's own
-          # package (whose helper paths match its own layout).
-          curl -sSL -o appimagetool.AppImage \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool.AppImage
+          # linuxdeploy is the lower-level tool tauri-bundler wraps;
+          # running it directly lets us skip --plugin gtk.
+          curl --fail --show-error --location --retry 3 \
+            --output linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          printf '%s  %s\n' "$LINUXDEPLOY_SHA256" linuxdeploy.AppImage \
+            | sha256sum --check --strict -
+          chmod +x linuxdeploy.AppImage
 
+          # Fresh AppDir, assembled from the already-built binary.
           APPDIR=slim-appdir
           rm -rf "$APPDIR" "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig"
           mkdir -p "$APPDIR/usr/bin" \
                    "$APPDIR/usr/share/applications" \
-                   "$APPDIR/usr/share/icons/hicolor/128x128/apps"
+                   "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
+                   "$APPDIR/usr/share/doc/aftercalls"
           cp src-tauri/target/release/agent "$APPDIR/usr/bin/aftercalls"
           chmod +x "$APPDIR/usr/bin/aftercalls"
-          # Sidecar ffmpeg next to the main binary so ffmpeg_binary()
-          # in pipeline.rs resolves it at runtime. Tauri's externalBin
-          # does this automatically for .deb/.rpm/.msi but our hand-
-          # rolled AppImage path bypasses tauri-bundler, so we copy
-          # manually here.
           cp src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
              "$APPDIR/usr/bin/ffmpeg-aftercalls"
           chmod +x "$APPDIR/usr/bin/ffmpeg-aftercalls"
+          cp src-tauri/resources/FFmpeg-LICENSE.txt \
+             "$APPDIR/usr/share/doc/aftercalls/FFmpeg-LICENSE.txt"
+          cp src-tauri/resources/THIRD_PARTY_NOTICES.md \
+             "$APPDIR/usr/share/doc/aftercalls/THIRD_PARTY_NOTICES.md"
           cp src-tauri/icons/128x128.png \
              "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png"
-          # appimagetool expects the .desktop + icon at the AppDir root.
-          cp src-tauri/icons/128x128.png "$APPDIR/aftercalls.png"
-          cat > "$APPDIR/aftercalls.desktop" <<DESKTOP
+          cat > "$APPDIR/usr/share/applications/aftercalls.desktop" <<DESKTOP
           [Desktop Entry]
           Name=aftercalls
           Comment=Call recording + transcription
@@ -537,37 +369,81 @@ jobs:
           Type=Application
           Categories=AudioVideo;Recorder;
           DESKTOP
-          # AppRun is the entrypoint appimagetool wires up. Exec the
-          # agent binary with all args forwarded.
-          cat > "$APPDIR/AppRun" <<'APPRUN'
-          #!/bin/bash
-          HERE="$(dirname "$(readlink -f "${0}")")"
-          exec "$HERE/usr/bin/aftercalls" "$@"
-          APPRUN
-          chmod +x "$APPDIR/AppRun"
+          test -x "$APPDIR/usr/bin/ffmpeg-aftercalls"
+          test -s "$APPDIR/usr/share/doc/aftercalls/FFmpeg-LICENSE.txt"
+          test -s "$APPDIR/usr/share/doc/aftercalls/THIRD_PARTY_NOTICES.md"
 
-          # ARCH= is required by appimagetool. --no-appstream skips
-          # the AppStream metadata warning (we don't publish there).
-          ARCH=x86_64 ./appimagetool.AppImage --no-appstream \
-            "$APPDIR" "$APPIMAGE_NAME"
-          chmod +x "$APPIMAGE_NAME"
+          # OUTPUT= renames the final AppImage to match Tauri's naming.
+          OUTPUT="$APPIMAGE_NAME" ./linuxdeploy.AppImage \
+            --appdir "$APPDIR" \
+            --desktop-file "$APPDIR/usr/share/applications/aftercalls.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png" \
+            --executable "$APPDIR/usr/bin/aftercalls" \
+            --output appimage
           ls -la "$APPIMAGE_NAME"
 
+      - name: Sign slim Linux AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
           # Sign with the Tauri minisign key. `-k` takes the base64
           # key *content* (not a path) — a tempfile path trips the
           # base64 decode with `Invalid symbol 46 at offset 8` (the
-          # `.` in `/tmp/tmp.XXX`). The secret is already masked in
-          # Actions logs; /proc/cmdline exposure on an ephemeral runner
-          # is the same posture tauri-action uses internally.
+          # `.` in `/tmp/tmp.XXX`). This step never executes the downloaded
+          # packaging binary and has no repository-write token.
           pnpm exec tauri signer sign \
             -k "$TAURI_SIGNING_PRIVATE_KEY" \
             -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
             "$APPIMAGE_NAME"
           ls -la "$APPIMAGE_NAME.sig"
 
+      - name: Upload slim Linux AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
           # Attach to the draft release. --clobber handles reruns.
           gh release upload "$TAG" \
             "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig" \
+            --clobber
+
+      - name: Attach pinned FFmpeg corresponding source
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$RUNNER_TEMP/aftercalls-ffmpeg-source"
+          mkdir -p "$SOURCE_DIR"
+          FFMPEG_SOURCE="$SOURCE_DIR/ffmpeg-source-1fdbca85aaea513c9cc6c14d347f76543346d3da.tar.gz"
+          BUILD_SOURCE="$SOURCE_DIR/ffmpeg-build-scripts-a99e8230eae00d1cee38f23076a7a1f55cd984e2.tar.gz"
+          curl --fail --show-error --location --retry 3 \
+            --output "$FFMPEG_SOURCE" \
+            https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/1fdbca85aaea513c9cc6c14d347f76543346d3da
+          curl --fail --show-error --location --retry 3 \
+            --output "$BUILD_SOURCE" \
+            https://codeload.github.com/BtbN/FFmpeg-Builds/tar.gz/a99e8230eae00d1cee38f23076a7a1f55cd984e2
+          printf '%s  %s\n' \
+            1312ecd4b87383182530278450c204c27e6787d033b190a28072a149cca59ed3 \
+            "$FFMPEG_SOURCE" \
+            | sha256sum --check --strict -
+          printf '%s  %s\n' \
+            7deac4a5190b2be84d4d548db2885d05152f9e3d77069d0e34841a46efd95e2b \
+            "$BUILD_SOURCE" \
+            | sha256sum --check --strict -
+          gh release upload "$TAG" \
+            "$FFMPEG_SOURCE" "$BUILD_SOURCE" \
             --clobber
 
       # Keep the sysweblink tarball too for users who prefer a plain
@@ -577,7 +453,7 @@ jobs:
       - name: Package system-linked Linux tarball
         if: matrix.os == 'ubuntu-24.04'
         env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
@@ -588,6 +464,10 @@ jobs:
           cp src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
              "$STAGE/ffmpeg-aftercalls"
           chmod +x "$STAGE/ffmpeg-aftercalls"
+          cp src-tauri/resources/FFmpeg-LICENSE.txt \
+             "$STAGE/FFmpeg-LICENSE.txt"
+          cp src-tauri/resources/THIRD_PARTY_NOTICES.md \
+             "$STAGE/THIRD_PARTY_NOTICES.md"
           cp src-tauri/icons/128x128.png "$STAGE/aftercalls.png"
           cat > "$STAGE/aftercalls.desktop" <<DESKTOP
           [Desktop Entry]
@@ -611,9 +491,8 @@ jobs:
           - libwebkit2gtk-4.1 (Arch: `webkit2gtk-4.1`; Debian:
             `libwebkit2gtk-4.1-0`)
           - libgtk-3
-
-          ffmpeg is bundled with the app (`ffmpeg-aftercalls` sits
-          next to the main binary) — no separate install needed.
+          A checksum-verified LGPL FFmpeg sidecar is included next to the
+          aftercalls executable; no system FFmpeg install is required.
 
           ## Install
 
@@ -623,6 +502,8 @@ jobs:
           sudo cp ffmpeg-aftercalls /opt/aftercalls/ffmpeg-aftercalls
           sudo cp aftercalls.png /opt/aftercalls/aftercalls.png
           sudo cp aftercalls.desktop /usr/share/applications/aftercalls.desktop
+          sudo mkdir -p /usr/share/doc/aftercalls
+          sudo cp FFmpeg-LICENSE.txt THIRD_PARTY_NOTICES.md /usr/share/doc/aftercalls/
           sudo chmod +x /opt/aftercalls/aftercalls /opt/aftercalls/ffmpeg-aftercalls
           ```
 
@@ -647,30 +528,27 @@ jobs:
   # entry (we passed --bundles deb rpm to skip its crashy AppImage),
   # so we add it here from the .sig file produced by the slim-
   # AppImage step above.
-  #
-  # macOS bundles (signed + notarized) attach to the GH release, so
-  # the .dmg + .app.tar.gz/.sig land here via `gh release download`
-  # and get mirrored to Spaces + injected into latest.json as
-  # `darwin-aarch64`.
   publish-to-spaces:
     needs: release
+    environment: production-release
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p /tmp/release
           cd /tmp/release
           gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*'
           ls -la
 
-      - name: Rewrite latest.json URLs to Spaces + inject Linux + macOS entries
+      - name: Rewrite latest.json URLs to Spaces + inject Linux entry
         env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           BUCKET: ${{ secrets.SPACES_BUCKET }}
           REGION: ${{ secrets.SPACES_REGION }}
         run: |
@@ -692,42 +570,24 @@ jobs:
           # Linux updater check would fail signature verification.
           LINUX_SIG=$(cat "/tmp/release/${SLIM_APPIMAGE}.sig")
 
-          # macOS Apple Silicon updater bundle — Tauri's
-          # *.app.tar.gz + .sig from bundle/macos/. The .dmg is the
-          # first-install path (surfaced via /v1/downloads); the
-          # updater channel only cares about the .app.tar.gz. Optional
-          # so a runner outage doesn't FATAL the whole publish.
-          DARWIN_AARCH64_TGZ="aftercalls-aarch64-apple-darwin.app.tar.gz"
-          if [ -f "/tmp/release/${DARWIN_AARCH64_TGZ}.sig" ]; then
-            DARWIN_AARCH64_SIG=$(cat "/tmp/release/${DARWIN_AARCH64_TGZ}.sig")
-            DARWIN_AARCH64_URL="$BASE/$DARWIN_AARCH64_TGZ"
-          else
-            DARWIN_AARCH64_SIG=""
-            DARWIN_AARCH64_URL=""
-          fi
-
           # 1. Rewrite every existing platform URL to point at Spaces
           #    instead of github.com (running apps hit Spaces since the
           #    GitHub release is private).
-          # 2. Inject linux-x86_64 entry for the slim AppImage.
-          # 3. Inject darwin-aarch64 entry for the mac .dmg (when present).
+          # 2. Inject linux-x86_64 entry for the slim AppImage —
+          #    tauri-action didn't emit one since we built AppImage
+          #    ourselves outside its pipeline.
           jq --arg base "$BASE" \
              --arg linuxurl "$BASE/$SLIM_APPIMAGE" \
-             --arg linuxsig "$LINUX_SIG" \
-             --arg macarmurl "$DARWIN_AARCH64_URL" \
-             --arg macarmsig "$DARWIN_AARCH64_SIG" '
+             --arg linuxsig "$LINUX_SIG" '
             .platforms |= (
               with_entries(
                 .value.url = ($base + "/" + (.value.url | split("/") | .[-1]))
               )
             )
             | .platforms["linux-x86_64"] = { signature: $linuxsig, url: $linuxurl }
-            | if $macarmurl != "" then
-                .platforms["darwin-aarch64"] = { signature: $macarmsig, url: $macarmurl }
-              else . end
           ' /tmp/release/latest.json > /tmp/release/latest.rewritten.json
           mv /tmp/release/latest.rewritten.json /tmp/release/latest.json
-          echo "--- latest.json after rewrites ---"
+          echo "--- latest.json after rewrite + linux-inject ---"
           cat /tmp/release/latest.json
 
       - name: Upload to Spaces
@@ -735,7 +595,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_KEY }}
           AWS_EC2_METADATA_DISABLED: "true"
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           BUCKET: ${{ secrets.SPACES_BUCKET }}
           REGION: ${{ secrets.SPACES_REGION }}
         run: |
