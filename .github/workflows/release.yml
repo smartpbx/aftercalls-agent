@@ -311,9 +311,9 @@ jobs:
       # forked libwebkit2gtk-4.1 that SIGABRTs renderer-side on Arch,
       # NixOS, and some Ubuntu combos (see #1). We've skipped that
       # target via `--bundles deb rpm` above and build our own AppImage
-      # here using linuxdeploy *without* the gtk plugin — the binary
-      # dynamic-links against the host's webkit at runtime, same as
-      # the sysweblink tarball. Requires libwebkit2gtk-4.1 + libgtk-3
+      # here with appimagetool, which does no dependency scanning at all —
+      # the binary dynamic-links against the host's webkit at runtime, same
+      # as the sysweblink tarball. Requires libwebkit2gtk-4.1 + libgtk-3
       # installed on the user's system (preinstalled on Debian/Ubuntu;
       # one package on Arch/Fedora).
       #
@@ -326,22 +326,35 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
           # The upstream `continuous` asset is mutable. Never execute it
           # unless it matches the exact artifact audited for this workflow.
-          LINUXDEPLOY_SHA256: 421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e
+          APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
           APPIMAGE_NAME="aftercalls_${VERSION}_amd64.AppImage"
 
-          # linuxdeploy is the lower-level tool tauri-bundler wraps;
-          # running it directly lets us skip --plugin gtk.
+          # Use appimagetool directly — NOT linuxdeploy. linuxdeploy runs
+          # ldd on the binary and bundles every "non-system" lib it finds,
+          # including libwebkit2gtk-4.1.so.0. That bundled webkit has its
+          # helper-process paths (WebKitNetworkProcess et al) HARDCODED at
+          # compile time against Ubuntu's
+          # /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/ layout, which does not
+          # exist on Arch / Fedora / NixOS. The app then launches and
+          # SIGTRAPs the moment webkit spawns a child process.
+          #
+          # v0.31.0 shipped a linuxdeploy-built AppImage and reproduced
+          # exactly that: a 123 MB image bundling 90 MB of webkit that
+          # crashed on launch on Arch. Going direct with appimagetool skips
+          # the ldd step entirely — the image carries only our own binaries,
+          # and dlopen resolves webkit/gtk from the host package whose
+          # helper paths match its own layout. Do not "modernize" this back
+          # to linuxdeploy.
           curl --fail --show-error --location --retry 3 \
-            --output linuxdeploy.AppImage \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          printf '%s  %s\n' "$LINUXDEPLOY_SHA256" linuxdeploy.AppImage \
+            --output appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          printf '%s  %s\n' "$APPIMAGETOOL_SHA256" appimagetool.AppImage \
             | sha256sum --check --strict -
-          chmod +x linuxdeploy.AppImage
+          chmod +x appimagetool.AppImage
 
-          # Fresh AppDir, assembled from the already-built binary.
           APPDIR=slim-appdir
           rm -rf "$APPDIR" "$APPIMAGE_NAME" "$APPIMAGE_NAME.sig"
           mkdir -p "$APPDIR/usr/bin" \
@@ -350,16 +363,24 @@ jobs:
                    "$APPDIR/usr/share/doc/aftercalls"
           cp src-tauri/target/release/agent "$APPDIR/usr/bin/aftercalls"
           chmod +x "$APPDIR/usr/bin/aftercalls"
+          # Sidecar ffmpeg next to the main binary so ffmpeg_binary() in
+          # pipeline.rs resolves it at runtime. Tauri's externalBin does this
+          # for .deb/.rpm/.msi, but this hand-rolled AppImage bypasses
+          # tauri-bundler, so copy it manually.
           cp src-tauri/binaries/ffmpeg-aftercalls-x86_64-unknown-linux-gnu \
              "$APPDIR/usr/bin/ffmpeg-aftercalls"
           chmod +x "$APPDIR/usr/bin/ffmpeg-aftercalls"
+          # The bundled FFmpeg's own licence + our notices ride inside the
+          # image, matching what the .deb/.rpm/.msi bundle via resources.
           cp src-tauri/resources/FFmpeg-LICENSE.txt \
              "$APPDIR/usr/share/doc/aftercalls/FFmpeg-LICENSE.txt"
           cp src-tauri/resources/THIRD_PARTY_NOTICES.md \
              "$APPDIR/usr/share/doc/aftercalls/THIRD_PARTY_NOTICES.md"
           cp src-tauri/icons/128x128.png \
              "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png"
-          cat > "$APPDIR/usr/share/applications/aftercalls.desktop" <<DESKTOP
+          # appimagetool expects the .desktop + icon at the AppDir root.
+          cp src-tauri/icons/128x128.png "$APPDIR/aftercalls.png"
+          cat > "$APPDIR/aftercalls.desktop" <<DESKTOP
           [Desktop Entry]
           Name=aftercalls
           Comment=Call recording + transcription
@@ -369,18 +390,32 @@ jobs:
           Type=Application
           Categories=AudioVideo;Recorder;
           DESKTOP
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "$HERE/usr/bin/aftercalls" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+
           test -x "$APPDIR/usr/bin/ffmpeg-aftercalls"
           test -s "$APPDIR/usr/share/doc/aftercalls/FFmpeg-LICENSE.txt"
           test -s "$APPDIR/usr/share/doc/aftercalls/THIRD_PARTY_NOTICES.md"
 
-          # OUTPUT= renames the final AppImage to match Tauri's naming.
-          OUTPUT="$APPIMAGE_NAME" ./linuxdeploy.AppImage \
-            --appdir "$APPDIR" \
-            --desktop-file "$APPDIR/usr/share/applications/aftercalls.desktop" \
-            --icon-file "$APPDIR/usr/share/icons/hicolor/128x128/apps/aftercalls.png" \
-            --executable "$APPDIR/usr/bin/aftercalls" \
-            --output appimage
+          ARCH=x86_64 ./appimagetool.AppImage --no-appstream \
+            "$APPDIR" "$APPIMAGE_NAME"
+          chmod +x "$APPIMAGE_NAME"
           ls -la "$APPIMAGE_NAME"
+
+          # Fail closed if the host GUI stack leaked back in: a bundled
+          # webkit/gtk is the exact regression this step exists to prevent.
+          if ./"$APPIMAGE_NAME" --appimage-offset >/dev/null 2>&1; then
+            "./$APPIMAGE_NAME" --appimage-extract 'usr/lib/*' >/dev/null 2>&1 || true
+            if find squashfs-root -name 'libwebkit2gtk*' -o -name 'libgtk-3*' 2>/dev/null | grep -q .; then
+              echo "::error::AppImage bundled webkit/gtk — it will crash on non-Ubuntu hosts"
+              exit 1
+            fi
+            rm -rf squashfs-root
+          fi
 
       - name: Sign slim Linux AppImage
         if: matrix.os == 'ubuntu-24.04'
