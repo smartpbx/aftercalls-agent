@@ -766,28 +766,37 @@ select {
   overflow-y: auto;
   padding-right: 0.2rem;
 }
+/* The label column is sized in `ch` off a real name, not a mono abbreviation:
+   a fixed 3.2rem forced "LEA LADISLAO" to wrap onto two cramped lines. It
+   flexes up to a readable width and ellipsizes past that, so one line per turn
+   holds however long the assigned name is. */
 .live-seg {
   display: grid;
-  grid-template-columns: 3.2rem 1fr;
+  grid-template-columns: minmax(0, 11ch) 1fr;
   gap: 0.55rem;
   align-items: baseline;
   transition:
     opacity 0.35s ease,
     color 0.35s ease;
 }
+/* Colour-coded initials disc + name on ONE row — the after-call transcript's
+   `.utt-speaker` chrome, so the same person reads the same live and after the
+   call. `--c` is set per line from the shared speaker palette. */
 .live-seg-label {
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  color: var(--c, var(--bone-2));
+  font-size: 0.72rem;
+  font-weight: 500;
   padding-top: 0.05rem;
 }
-.live-seg-you .live-seg-label {
-  color: var(--accent);
-}
-.live-seg-them .live-seg-label {
-  color: var(--bone-2);
+.live-seg-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .live-seg-text {
   font-size: 0.9rem;

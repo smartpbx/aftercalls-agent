@@ -309,11 +309,25 @@ pub async fn upload_audio(
         )
         .await
         {
-            Ok(ready) => {
-                eprintln!(
-                    "aftercalls: audio {track} generation {} is ready/current",
-                    ready.generation_id
-                );
+            // Audio treats both outcomes as uploaded. `Ready` is the backend's
+            // confirmation; `Finalizing` means every byte is stored and the
+            // backend is still validating. Audio validation measures ~12s
+            // against a ~60s budget so the second arm is rare, but when it does
+            // happen the bytes are just as safe as in the first — re-uploading
+            // them would be pure waste.
+            Ok(outcome) => {
+                match &outcome {
+                    crate::media_upload::GenerationOutcome::Ready(ready) => eprintln!(
+                        "aftercalls: audio {track} generation {} is ready/current",
+                        ready.generation_id
+                    ),
+                    crate::media_upload::GenerationOutcome::Finalizing {
+                        generation_id,
+                        state,
+                    } => eprintln!(
+                        "aftercalls: audio {track} generation {generation_id} uploaded; backend still {state}"
+                    ),
+                }
                 outcomes.push(TrackOutcome {
                     track,
                     uploaded: true,
@@ -513,6 +527,10 @@ pub fn current_auth() -> Option<AuthFile> {
 pub enum ScreenUploadOutcome {
     NotPresent,
     ReadyAcknowledged { generation_id: String },
+    /// Fully uploaded; the backend is still assembling/validating. The pipeline
+    /// completes on this — the call and its audio are usable immediately and
+    /// the video attaches itself once validation lands.
+    Finalizing { generation_id: String },
 }
 
 /// Upload the captured screen video for `call_id`, if this session
@@ -724,7 +742,7 @@ async fn upload_screen_source(
     )
     .await
     {
-        Ok(ready) => {
+        Ok(crate::media_upload::GenerationOutcome::Ready(ready)) => {
             eprintln!(
                 "aftercalls: screen generation {} is ready/current for call {call_id}",
                 ready.generation_id
@@ -733,6 +751,31 @@ async fn upload_screen_source(
             Ok(ScreenUploadOutcome::ReadyAcknowledged {
                 generation_id: ready.generation_id,
             })
+        }
+        // Uploaded in full; the backend is still validating it. This is the
+        // common shape for a long call — a 1.6 GB capture took the backend
+        // 2m43s to re-hash and probe, well past the ~60s poll budget — so it
+        // must NOT read as a failure. The call is complete and usable now; the
+        // video attaches itself when validation finishes.
+        //
+        // The local source is deliberately RETAINED here (unlike the ready
+        // arm, which cleans it up): until the backend confirms the generation,
+        // the local file is still the only verified copy.
+        Ok(crate::media_upload::GenerationOutcome::Finalizing {
+            generation_id,
+            state,
+        }) => {
+            eprintln!(
+                "aftercalls: screen generation {generation_id} uploaded for call {call_id}; backend still {state}"
+            );
+            crate::telemetry::log(
+                "info",
+                "pipeline::screen_upload_finalizing",
+                "screen recording uploaded; backend still processing".to_string(),
+                Some(serde_json::json!({ "generation_id": generation_id, "state": state })),
+                session_id_for_telemetry.map(str::to_string),
+            );
+            Ok(ScreenUploadOutcome::Finalizing { generation_id })
         }
         Err(error) => {
             let message = format!("{error:#}");

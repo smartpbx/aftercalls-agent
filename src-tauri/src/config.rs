@@ -180,9 +180,19 @@ pub struct Config {
     /// "native"`. Default `"1080p"` (fit-within cap, native-capped).
     #[serde(default = "default_screen_capture_resolution")]
     pub screen_capture_resolution: Option<String>,
-    /// #302 Slice B — CBR bitrate ceiling in kbps. Default ~3000 keeps a
-    /// 30-min 1080p@15 call ≈ 0.7 GB and bounds the worst case (a shared
-    /// 4K video playback can't blow the storage budget).
+    /// #302 Slice B — CBR bitrate ceiling in kbps.
+    ///
+    /// Default 1500 (was 3000). Screen content is mostly static UI and text at
+    /// 15 fps, which h264 encodes far below the old ceiling; 3000 kbps was
+    /// paying for motion detail that isn't there. A measured 76-minute 1080p@15
+    /// capture came out at 1.6 GB — and because the client's upstream is the
+    /// binding constraint (~10 Mbit/s measured), that cost 21m33s to upload,
+    /// against 8s of actual backend validation work. Halving the bitrate halves
+    /// both the storage and that upload wall-clock.
+    ///
+    /// Still user-tunable (clamped 500..=20000 in `set_screen_capture_config`):
+    /// raise it for video-heavy screen shares, lower it toward ~1000 for pure
+    /// document/terminal work.
     #[serde(default = "default_screen_capture_bitrate_kbps")]
     pub screen_capture_bitrate_kbps: u32,
     /// #302 follow-up — when true (DEFAULT), record-start asks the user to
@@ -209,7 +219,7 @@ fn default_screen_capture_resolution() -> Option<String> {
 }
 
 fn default_screen_capture_bitrate_kbps() -> u32 {
-    3000
+    1500
 }
 
 fn default_max_recording_minutes() -> u32 {

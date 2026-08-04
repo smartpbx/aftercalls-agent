@@ -33,6 +33,7 @@
   } from "@aftercalls/shared/types";
   import type { AskAnswerState } from "$lib/stores/liveSession.svelte";
   import { speakerIdentityKey } from "$lib/stores/liveSession.svelte";
+  import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
 
@@ -100,6 +101,42 @@
     const canonical = s.speaker || (s.channel === "mic" ? "You" : "Them");
     const idn = speakerIdentities.get(speakerIdentityKey(s.channel, canonical));
     return idn ? idn.display_name : canonical;
+  }
+
+  // ── Speaker colour (after-call transcript parity) ───────────────────────
+  // A real name ("Lea Ladislao") never fit the old fixed mono label column and
+  // wrapped onto two cramped lines. The lane now renders the after-call
+  // transcript's chrome instead: a colour-coded initials disc plus the name on
+  // ONE row. Same palette + order-based allocation as the portal's call detail
+  // view, so the same person reads the same colour live and after the call.
+  // "You" keeps the accent.
+  const PALETTE = ["#c9a24a", "#8faf72", "#d07e4e", "#b06a8c", "#8aa2c0"];
+
+  // First-seen speaker claims palette[0], next [1], … Once the palette is
+  // exhausted the least-used slot wins, so back-to-back new speakers still
+  // alternate rather than collapsing onto one colour.
+  let speakerColorMap = $derived.by(() => {
+    const m = new Map<string, string>();
+    const usage = PALETTE.map(() => 0);
+    for (const s of segments) {
+      const name = labelFor(s).trim();
+      if (!name || m.has(name)) continue;
+      if (name === "You") {
+        m.set(name, "var(--accent)");
+        continue;
+      }
+      let bestIdx = 0;
+      for (let i = 1; i < PALETTE.length; i++) {
+        if (usage[i] < usage[bestIdx]) bestIdx = i;
+      }
+      m.set(name, PALETTE[bestIdx]);
+      usage[bestIdx]++;
+    }
+    return m;
+  });
+
+  function colorFor(name: string): string {
+    return speakerColorMap.get(name.trim()) ?? "var(--bone-2)";
   }
 
   // ── Ask-chip row (ui.md §1) ─────────────────────────────────────────────
@@ -420,11 +457,15 @@
       >
         {#each display as seg (seg.channel + ":" + seg.start_ms + ":" + (seg.provisional ? "p" : "f"))}
           {@const starred = highlighted.has(segKey(seg))}
+          {@const who = labelFor(seg)}
           <div
             class="live-seg live-seg-{seg.channel === 'mic' ? 'you' : 'them'}"
             class:live-seg-provisional={seg.provisional}
           >
-            <span class="live-seg-label">{labelFor(seg)}</span>
+            <span class="live-seg-label" style="--c: {colorFor(who)}">
+              <Avatar name={who} color={colorFor(who)} size={18} />
+              <span class="live-seg-name" title={who}>{who}</span>
+            </span>
             <span class="live-seg-text">{seg.text}</span>
             {#if onhighlight && !seg.provisional}
               <button

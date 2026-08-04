@@ -2397,6 +2397,10 @@
         linkedTicket={liveSession.linkedTicket}
         onlinkticket={handleLinkTicket}
         onunlinkticket={handleUnlinkTicket}
+        extraSpeakerLabels={liveSession.extraSpeakerLabels}
+        onaddspeaker={(taken) => liveSession.addExtraSpeaker(taken)}
+        onremovespeaker={(label) => liveSession.removeExtraSpeaker(label)}
+        onquestions={(next) => liveSession.setQuestions(next)}
       />
     {/if}
   {:else if liveTranscriptEnabled && (recording || liveSession.segments.length > 0 || liveSession.status === "error")}

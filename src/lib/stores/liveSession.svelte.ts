@@ -119,7 +119,10 @@ export type DetectedSpeaker = {
  *  partial is dropped once named labels exist so it can't add a duplicate row
  *  beside the named speakers. Extracted (not inlined in the panel) so it stays
  *  testable + the lane/roster share one truth. */
-export function deriveDetectedSpeakers(segments: LiveSegment[]): DetectedSpeaker[] {
+export function deriveDetectedSpeakers(
+  segments: LiveSegment[],
+  extraLabels: string[] = [],
+): DetectedSpeaker[] {
   const rows: DetectedSpeaker[] = [
     { channel: "mic", speakerLabel: "", diarizationLabel: "You", isRecorder: true },
   ];
@@ -136,6 +139,12 @@ export function deriveDetectedSpeakers(segments: LiveSegment[]): DetectedSpeaker
   // Separation ON → the named speakers; OFF / pre-call → one merged "Them"
   // (the canonical far label the backend emits + the assignable/lookup key).
   const effective = named.length > 0 ? named : ["Them"];
+  // Rows the rep added by hand, appended after whatever was actually detected
+  // and de-duplicated against it — a manually-claimed label that the far side
+  // later genuinely speaks under must render ONCE, carrying its assignment.
+  for (const label of extraLabels) {
+    if (!effective.includes(label)) effective.push(label);
+  }
   for (const label of effective) {
     rows.push({
       channel: "system",
@@ -145,6 +154,24 @@ export function deriveDetectedSpeakers(segments: LiveSegment[]): DetectedSpeaker
     });
   }
   return rows;
+}
+
+/** The far-side label space the upstream diarizer hands out: "Speaker A",
+ *  "Speaker B", … Manual roster rows claim from the SAME space (rather than
+ *  inventing a parallel one) so a hand-added person automatically owns the
+ *  transcript lines once the diarizer starts emitting that letter. */
+const SPEAKER_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+
+/** Next unclaimed `"Speaker X"` label given everything already on the roster.
+ *  Returns `null` once the whole letter space is spoken for (26 people on one
+ *  call is well past any real use, and the caller hides the affordance). */
+export function nextSpeakerLabel(taken: string[]): string | null {
+  const used = new Set(taken);
+  for (const letter of SPEAKER_LETTERS) {
+    const label = `Speaker ${letter}`;
+    if (!used.has(label)) return label;
+  }
+  return null;
 }
 
 /** #659 (P2) — cap concurrent on-screen battlecards to the newest few (plan
@@ -185,6 +212,15 @@ function createStore() {
   // answered); the agent just mirrors the newest snapshot. Retained through
   // `ended` (frozen final list); cleared on the next session start.
   let questions = $state<QuestionsSnapshot | null>(null);
+
+  // Far-side roster rows the rep added by hand ("Speaker B", "Speaker C", …),
+  // for the case the diarizer merges two people onto one label — or hasn't
+  // heard the second person yet. They claim from the SAME label space the
+  // diarizer uses, so a manually-named person automatically takes ownership of
+  // the transcript lines once that letter starts arriving, and lands on the
+  // durable roster (`call_participants`) via their identity assignment either
+  // way. Client-only + per call: cleared on the next session start.
+  let extraSpeakerLabels = $state<string[]>([]);
 
   // #659 (P2) — the fast-lane cue list (battlecards + deal-risk cues), rendered
   // in the IntelligenceLane ABOVE the reflective coaching. A single interval
@@ -327,6 +363,9 @@ function createStore() {
     get questions(): QuestionsSnapshot | null {
       return questions;
     },
+    get extraSpeakerLabels(): string[] {
+      return extraSpeakerLabels;
+    },
     get liveCues(): LiveCueEntry[] {
       return liveCues;
     },
@@ -468,6 +507,27 @@ function createStore() {
      *  cleared on the next session start. */
     setQuestions(next: QuestionsSnapshot | null) {
       questions = next;
+    },
+
+    /** Add one hand-created far-side roster row, claiming the next unused
+     *  `"Speaker X"` label. Returns the claimed label so the caller can open
+     *  its identity picker straight away, or `null` when the label space is
+     *  exhausted. Existing detected labels are passed in (not read from the
+     *  segment buffer here) so the roster's own view of what's taken — detected
+     *  plus already-added — is the single arbiter. */
+    addExtraSpeaker(taken: string[]): string | null {
+      const label = nextSpeakerLabel([...taken, ...extraSpeakerLabels]);
+      if (!label) return null;
+      extraSpeakerLabels = [...extraSpeakerLabels, label];
+      return label;
+    },
+
+    /** Drop a hand-created roster row. A row the far side has since genuinely
+     *  spoken under stays on the roster (it's now a DETECTED speaker); this
+     *  only forgets the manual claim. */
+    removeExtraSpeaker(label: string) {
+      if (!extraSpeakerLabels.includes(label)) return;
+      extraSpeakerLabels = extraSpeakerLabels.filter((l) => l !== label);
     },
 
     /** #660 — record the live session_uuid surfaced from Rust. Called by
@@ -673,6 +733,9 @@ function createStore() {
       // Phase 4 — drop the previous call's extracted questions so a new call
       // starts from an empty ledger.
       questions = null;
+      // …and the previous call's hand-added roster rows: who was on the LAST
+      // call says nothing about who is on this one.
+      extraSpeakerLabels = [];
       status = liveEnabled ? "live" : "idle";
       sessionUuid = null;
       askAnswer = null;

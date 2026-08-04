@@ -210,6 +210,32 @@ pub struct ReadyGeneration {
     pub generation_id: String,
 }
 
+/// How far a generation got before this client stopped waiting on it.
+///
+/// The bytes are durable in object storage the moment the provider confirms the
+/// last part; everything after that is the backend validating what it already
+/// holds (re-hash + probe). For a large screen capture that validation is
+/// legitimately minutes of work — a 1.6 GB recording measured 2m43s — while the
+/// finalize poll budget here is ~60s. Treating "still finalizing" as an upload
+/// failure therefore reported a red failure for a recording that was intact and
+/// went on to publish normally.
+///
+/// So the two cases are now distinct: [`Self::Ready`] means the backend
+/// confirmed it, and [`Self::Finalizing`] means the upload is done and the
+/// backend is still working. Only a genuinely terminal state is an error.
+#[derive(Debug, Clone)]
+pub enum GenerationOutcome {
+    Ready(ReadyGeneration),
+    /// Uploaded + accepted; the backend was still assembling/validating when
+    /// the poll budget ran out. NOT a failure — the caller hands off and the
+    /// generation publishes on its own.
+    Finalizing {
+        generation_id: String,
+        /// The last state observed (`assembling` / `validating`), for logs.
+        state: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CreateUploadBody {
     kind: &'static str,
@@ -315,9 +341,14 @@ fn classify_state(state: &str) -> Result<StateClass> {
     }
 }
 
-/// Upload or resume one immutable source. The call returns success only after
-/// the backend reports the same generation ready/current with matching actual
-/// bytes and SHA-256.
+/// Upload or resume one immutable source.
+///
+/// Succeeds as [`GenerationOutcome::Ready`] only once the backend reports the
+/// same generation ready/current with matching actual bytes and SHA-256. If the
+/// bytes are fully uploaded but the backend is still assembling/validating when
+/// the poll budget runs out, this yields [`GenerationOutcome::Finalizing`] —
+/// still a success, because nothing is left for the client to do. Only a
+/// terminal generation state or a transport failure is an `Err`.
 pub async fn ensure_generation_ready(
     session_dir: &Path,
     call_id: &str,
@@ -325,7 +356,7 @@ pub async fn ensure_generation_ready(
     guard: &RetryGuard,
     session_id_for_telemetry: Option<&str>,
     source: &MediaSource,
-) -> Result<ReadyGeneration> {
+) -> Result<GenerationOutcome> {
     let mut source = source.clone();
     source.path = validated_session_path(session_dir, &source.path)?;
     source.raw_path = source
@@ -363,10 +394,10 @@ pub async fn ensure_generation_ready(
         match classify_state(&current.state)? {
             StateClass::Ready => {
                 let ready = finish_ready(session_dir, source, current).await?;
-                return Ok(ready);
+                return Ok(GenerationOutcome::Ready(ready));
             }
             StateClass::Finalizing => {
-                let ready = drive_to_ready(
+                return drive_to_ready(
                     session_dir,
                     call_id,
                     backend,
@@ -375,8 +406,7 @@ pub async fn ensure_generation_ready(
                     source,
                     current.clone(),
                 )
-                .await?;
-                return Ok(ready);
+                .await;
             }
             StateClass::Terminal => {
                 // The backend generation is dead — aborted, failed, or
@@ -544,7 +574,11 @@ pub async fn ensure_generation_ready(
 
     let mut status = status.context("media generation status missing after create")?;
     match classify_state(&status.state)? {
-        StateClass::Ready => return finish_ready(session_dir, source, &status).await,
+        StateClass::Ready => {
+            return finish_ready(session_dir, source, &status)
+                .await
+                .map(GenerationOutcome::Ready)
+        }
         StateClass::Finalizing => {
             return drive_to_ready(
                 session_dir,
@@ -754,12 +788,16 @@ async fn drive_to_ready(
     session_id_for_telemetry: Option<&str>,
     source: &MediaSource,
     mut status: UploadStatus,
-) -> Result<ReadyGeneration> {
+) -> Result<GenerationOutcome> {
     let mut submissions = 0u8;
     let mut poll_index = 0usize;
     loop {
         match classify_state(&status.state)? {
-            StateClass::Ready => return finish_ready(session_dir, source, &status).await,
+            StateClass::Ready => {
+                return finish_ready(session_dir, source, &status)
+                    .await
+                    .map(GenerationOutcome::Ready)
+            }
             StateClass::Terminal => {
                 return Err(record_generation_error(
                     session_dir,
@@ -769,14 +807,15 @@ async fn drive_to_ready(
             }
             StateClass::Finalizing => {
                 let Some(delay_ms) = FINALIZE_POLL_DELAYS_MS.get(poll_index).copied() else {
-                    return Err(record_generation_error(
-                        session_dir,
-                        source.kind.as_str(),
-                        format!(
-                            "operation timed out while backend generation remained {}",
-                            status.state
-                        ),
-                    ));
+                    // Budget spent, but the bytes are safely stored and the
+                    // backend is still validating them. Hand off rather than
+                    // record a failure: the generation publishes on its own,
+                    // and calling this an error stranded intact recordings
+                    // behind a red banner.
+                    return Ok(GenerationOutcome::Finalizing {
+                        generation_id: status.generation_id.clone(),
+                        state: status.state.clone(),
+                    });
                 };
                 poll_index += 1;
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;

@@ -4200,6 +4200,41 @@ async fn live_speaker_identity(
     .await
 }
 
+/// POST /v1/live/questions — apply ONE manual edit to the live Questions
+/// ledger. `op` is `"add"` | `"edit"` | `"delete"` | `"answer"` | `"reopen"`;
+/// `id` targets a ledger entry for every op but `"add"`. Returns the FULL
+/// post-edit snapshot in the `{"type":"questions"}` frame shape so the frontend
+/// swaps its list wholesale. Copilot- + impersonation-write-gated. NOT
+/// fire-and-forget — the rep is watching their own edit, so the caller surfaces
+/// failures. Mirrors the `live_speaker_identity` shim.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn live_question_edit(
+    session_uuid: String,
+    op: String,
+    id: Option<String>,
+    text: Option<String>,
+    asker_side: Option<String>,
+    asker_display: Option<String>,
+    answer_text: Option<String>,
+) -> Result<serde_json::Value, error::PortalError> {
+    let cfg = config::Config::load().map_err(error::PortalError::from)?;
+    let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
+        message: "no backend configured".into(),
+    })?;
+    portal::live_question_edit(
+        backend,
+        &session_uuid,
+        &op,
+        id.as_deref(),
+        text.as_deref(),
+        asker_side.as_deref(),
+        asker_display.as_deref(),
+        answer_text.as_deref(),
+    )
+    .await
+}
+
 /// POST /v1/live/linked-deal — Phase 3 link (or clear, `clear=true`) the
 /// call's Zoho Deal mid-call. Writes the scalar `state.copilot.linked_deal`;
 /// enrichment projects it onto `call_links` + the call-end auto-push reads
@@ -5429,6 +5464,7 @@ pub fn run() {
             // #663 Phase 2 — per-speaker identity assignment (live rename →
             // after-call continuity). REST, off the audio WS; copilot-gated.
             live_speaker_identity,
+            live_question_edit,
             // Phase 3 — link a Zoho Deal to the live call (→ call_links +
             // call-end auto-push). REST, off the audio WS; copilot-gated.
             live_linked_deal,

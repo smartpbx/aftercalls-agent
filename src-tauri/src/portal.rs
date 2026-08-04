@@ -1403,6 +1403,44 @@ pub async fn live_speaker_identity(
     .await
 }
 
+/// POST /v1/live/questions — apply ONE manual edit to the live co-pilot
+/// Questions ledger (`state.copilot.questions`). `op` is `"add"` | `"edit"` |
+/// `"delete"` | `"answer"` | `"reopen"`; `id` targets a ledger entry for every
+/// op but `"add"`. Returns the FULL post-edit snapshot in the same shape as the
+/// `{"type":"questions"}` WS frame, so the caller replaces its list wholesale
+/// on either path. Copilot- + impersonation-write-gated.
+///
+/// Unlike the other live shims this is NOT fire-and-forget: the rep is watching
+/// their own edit, so the caller surfaces a failure and rolls back its
+/// optimistic update. Mirrors `live_speaker_identity`'s `post_json_typed`
+/// transport.
+#[allow(clippy::too_many_arguments)]
+pub async fn live_question_edit(
+    backend: &Backend,
+    session_uuid: &str,
+    op: &str,
+    id: Option<&str>,
+    text: Option<&str>,
+    asker_side: Option<&str>,
+    asker_display: Option<&str>,
+    answer_text: Option<&str>,
+) -> std::result::Result<Value, PortalError> {
+    post_json_typed(
+        backend,
+        "/v1/live/questions",
+        serde_json::json!({
+            "session_uuid": session_uuid,
+            "op": op,
+            "id": id,
+            "text": text,
+            "asker_side": asker_side,
+            "asker_display": asker_display,
+            "answer_text": answer_text,
+        }),
+    )
+    .await
+}
+
 /// POST /v1/live/linked-deal — Phase 3 link (or clear, `clear=true`) the
 /// call's Zoho Deal mid-call. Writes the scalar `state.copilot.linked_deal`;
 /// post-call enrichment projects it onto the durable `call_links` table and

@@ -66,6 +66,9 @@
     linkedTicket = null,
     onlinkticket = undefined,
     onunlinkticket = undefined,
+    extraSpeakerLabels = [],
+    onaddspeaker = undefined,
+    onremovespeaker = undefined,
   }: {
     // #646 (Phase 2) — the detected-speaker roster rows (mic recorder + the
     // distinct far-side speakers), derived by CoPilotPanel from the segments.
@@ -125,6 +128,15 @@
     // + store. Only surfaced mid-call (a session must exist to persist the link).
     onlinkticket?: (ticket: CrmContextTicket) => void | Promise<void>;
     onunlinkticket?: () => void | Promise<void>;
+    // Far-side roster rows the rep added by hand (already folded into
+    // `speakers` by the parent). Held here only so the row can offer "Remove"
+    // for a manual row while a genuinely-detected row can't be removed.
+    extraSpeakerLabels?: string[];
+    // Claim the next free far-side label / drop a manual row. The parent owns
+    // the store write; `onaddspeaker` gets the labels already on the roster so
+    // the store picks the next unused one.
+    onaddspeaker?: (taken: string[]) => void;
+    onremovespeaker?: (label: string) => void;
   } = $props();
 
   // ── Hydration state ────────────────────────────────────────────────
@@ -178,60 +190,160 @@
     openPickerKey = null;
   }
 
+  // ── Merge voices that resolve to the SAME person ───────────────────
+  // Diarization over-segments: one speaker who pauses, changes tone, or shares
+  // a noisy line routinely comes back as "Speaker A" + "Speaker B" + "Speaker
+  // C". Naming each of them is the rep telling us they are one person — so the
+  // roster has to collapse them, not keep three identical rows (which also made
+  // three rows each claim the PRIMARY chip, since that test keys on the shared
+  // contact id).
+  //
+  // The group key is the IDENTITY, not the label: same Zoho contact, same
+  // teammate, or same typed name (case-insensitively) → one row. Unassigned
+  // rows never merge — an anonymous "Speaker B" is not yet known to be anyone.
+  // The recorder ("You") is always its own row.
+  type SpeakerGroup = {
+    key: string;
+    rows: DetectedSpeaker[];
+    lead: DetectedSpeaker;
+    identity: SpeakerIdentity | undefined;
+  };
+
+  function identityGroupKey(
+    row: DetectedSpeaker,
+    idn: SpeakerIdentity | undefined,
+  ): string {
+    if (row.isRecorder) return "self";
+    if (!idn) return "un:" + speakerIdentityKey(row.channel, row.speakerLabel);
+    if (idn.kind === "zoho_contact" && idn.contact_id)
+      return "contact:" + idn.contact_id;
+    if (idn.kind === "internal_user" && idn.user_id)
+      return "user:" + idn.user_id;
+    return "name:" + (idn.display_name ?? "").trim().toLowerCase();
+  }
+
+  let speakerGroups = $derived.by<SpeakerGroup[]>(() => {
+    const out: SpeakerGroup[] = [];
+    const byKey = new Map<string, SpeakerGroup>();
+    for (const row of speakers) {
+      const idn = identityFor(row);
+      const key = identityGroupKey(row, idn);
+      const existing = byKey.get(key);
+      if (existing) {
+        existing.rows.push(row);
+        continue;
+      }
+      const group: SpeakerGroup = { key, rows: [row], lead: row, identity: idn };
+      byKey.set(key, group);
+      out.push(group);
+    }
+    return out;
+  });
+
+  // ── Manual roster rows ─────────────────────────────────────────────
+  // The roster is derived from speakers the diarizer actually SPLIT OUT. When
+  // two people share a handset — or the diarizer merges them onto one label —
+  // there is no second row to assign, so the second person can't be named at
+  // all. "Add person" claims the next free label in the same space the diarizer
+  // uses, giving an assignable row now; if that letter later starts arriving on
+  // real turns, the assignment already owns those lines. Either way the person
+  // lands on the durable call roster via their identity.
+  let rosterLabels = $derived(
+    speakers.filter((s) => !s.isRecorder).map((s) => s.speakerLabel),
+  );
+  // 26 letters in the label space; past that there is nothing left to claim.
+  let canAddSpeaker = $derived(!!onaddspeaker && rosterLabels.length < 26);
+  function isManualRow(row: DetectedSpeaker): boolean {
+    return extraSpeakerLabels.includes(row.speakerLabel);
+  }
+  function addSpeaker() {
+    onaddspeaker?.(rosterLabels);
+    announce = "Added a person to the call. Assign who they are.";
+  }
+  // Dropping a manual row also clears any identity assigned to it, so a
+  // half-removed row can't leave a phantom name on the after-call roster.
+  function removeSpeaker(row: DetectedSpeaker) {
+    // Clear only THIS label, not the whole merged group: removing one
+    // hand-added voice must leave the other voices of that person named.
+    const idn = identityFor(row);
+    if (idn) {
+      onassign({
+        channel: row.channel,
+        speakerLabel: row.speakerLabel,
+        kind: idn.kind,
+        displayName: idn.display_name,
+        clear: true,
+      });
+    }
+    onremovespeaker?.(row.speakerLabel);
+    openPickerKey = null;
+    announce = `${row.diarizationLabel} removed.`;
+  }
+
   // Commit a pick from the inline picker. A zoho_contact becomes the primary
   // (grounds the card + contact_hint). Optimistic + backend write live in the
   // parent's `onassign`.
-  function commitAssign(row: DetectedSpeaker, picked: PickedIdentity) {
+  function commitAssign(group: SpeakerGroup, picked: PickedIdentity) {
     const isZoho = picked.kind === "zoho_contact";
-    onassign({
-      channel: row.channel,
-      speakerLabel: row.speakerLabel,
-      kind: picked.kind,
-      displayName: picked.display_name,
-      contactId: picked.contact_id,
-      userId: picked.user_id,
-      isPrimary: isZoho ? true : undefined,
-    });
+    // Assign EVERY voice already merged into this row. Re-naming a merged row
+    // must not silently strand the other labels on the old identity — they'd
+    // split back apart on the next snapshot.
+    for (const row of group.rows) {
+      onassign({
+        channel: row.channel,
+        speakerLabel: row.speakerLabel,
+        kind: picked.kind,
+        displayName: picked.display_name,
+        contactId: picked.contact_id,
+        userId: picked.user_id,
+        isPrimary: isZoho ? true : undefined,
+      });
+    }
     if (isZoho && picked.contact_id) onpick(picked.contact_id);
     openPickerKey = null;
-    announce = `${row.diarizationLabel} assigned to ${picked.display_name}.`;
+    announce = `${groupLabel(group)} assigned to ${picked.display_name}.`;
   }
 
   // Clear one speaker's identity (revert to the diarization label). If it held
   // the primary contact, hand the card + contact_hint to the next remaining
   // zoho_contact (or null).
-  function clearAssign(row: DetectedSpeaker) {
-    const idn = identityFor(row);
+  function clearAssign(group: SpeakerGroup) {
+    const idn = group.identity;
     const wasPrimary = isPrimaryRow(idn);
-    onassign({
-      channel: row.channel,
-      speakerLabel: row.speakerLabel,
-      kind: idn?.kind ?? "adhoc",
-      displayName: idn?.display_name ?? "",
-      clear: true,
-    });
+    // Clearing a merged row un-names every voice in it, splitting them back
+    // into the separate anonymous speakers they were detected as.
+    const cleared = new Set(
+      group.rows.map((row) => speakerIdentityKey(row.channel, row.speakerLabel)),
+    );
+    for (const row of group.rows) {
+      onassign({
+        channel: row.channel,
+        speakerLabel: row.speakerLabel,
+        kind: idn?.kind ?? "adhoc",
+        displayName: idn?.display_name ?? "",
+        clear: true,
+      });
+    }
     if (wasPrimary) {
       const next = [...speakerIdentities.values()].find(
         (i) =>
           i.kind === "zoho_contact" &&
           i.contact_id &&
-          !(
-            i.channel === row.channel && i.speaker_label === row.speakerLabel
-          ),
+          !cleared.has(speakerIdentityKey(i.channel, i.speaker_label)),
       );
       onpick(next?.contact_id ?? null);
     }
     openPickerKey = null;
-    announce = `${row.diarizationLabel} identity cleared.`;
+    announce = `${groupLabel(group)} identity cleared.`;
   }
 
   // Promote an already-assigned zoho_contact to primary (re-hydrates the card).
-  function makePrimary(row: DetectedSpeaker) {
-    const idn = identityFor(row);
+  function makePrimary(group: SpeakerGroup) {
+    const idn = group.identity;
     if (!idn || idn.kind !== "zoho_contact" || !idn.contact_id) return;
     onassign({
-      channel: row.channel,
-      speakerLabel: row.speakerLabel,
+      channel: group.lead.channel,
+      speakerLabel: group.lead.speakerLabel,
       kind: "zoho_contact",
       displayName: idn.display_name,
       contactId: idn.contact_id,
@@ -239,6 +351,13 @@
     });
     onpick(idn.contact_id);
     announce = `${idn.display_name} is now the primary contact.`;
+  }
+
+  /** What to call a group in an announcement: the person's name once assigned,
+   *  else the diarization label(s) it covers. */
+  function groupLabel(group: SpeakerGroup): string {
+    if (group.identity?.display_name) return group.identity.display_name;
+    return group.rows.map((row) => row.diarizationLabel).join(" + ");
   }
 
   // ── Primary contact (grounds the card) ─────────────────────────────
@@ -452,8 +571,17 @@
   }
 
   // ── Tickets helpers (Zoho Desk) ────────────────────────────────────
-  // The Tickets section renders BESIDE Deals/Cases (NOT swapped by the mode
-  // toggle) when `zohoDesk` is on AND the envelope carries a tickets section.
+  // Where Tickets render depends on whether the org actually runs Desk:
+  //   • Desk org, SUPPORT mode → Tickets ARE the support section, in place of
+  //     CRM Cases. A shop with a Desk queue does not track live support work in
+  //     CRM Cases, so showing Cases there is showing the wrong system of record.
+  //   • Desk org, SALES mode   → Tickets render BESIDE Deals, as secondary
+  //     context ("heads up, they have two open tickets").
+  //   • No Desk               → no ticket chrome at all; Support mode falls
+  //     back to CRM Cases exactly as before.
+  // `"unavailable"` still counts as a Desk org (Desk is set up, this fetch just
+  // failed) — it renders the degraded ticket lane rather than silently swapping
+  // the rep to a different system of record.
   const TICKET_CAP = 5;
   let visibleTickets = $derived(crm?.tickets?.items.slice(0, TICKET_CAP) ?? []);
   let extraTickets = $derived(
@@ -472,6 +600,14 @@
   // time — linking a new ticket replaces the prior (parent + backend own that).
   let canLinkTicket = $derived(!!sessionUuid && !!onlinkticket);
   let ticketLinkBusy = $state(false);
+
+  // Does this org actually run Desk? Flag on + the envelope reports anything
+  // other than "not_connected".
+  let hasDesk = $derived(
+    zohoDesk && !!crm?.tickets && crm.tickets.status !== "not_connected",
+  );
+  // Support mode on a Desk org → Tickets replace Cases as the primary section.
+  let ticketsArePrimary = $derived(hasDesk && mode === "support");
   function isLinkedTicket(ticket: CrmContextTicket): boolean {
     return !!linkedTicket && linkedTicket.ticket_id === ticket.id;
   }
@@ -543,21 +679,25 @@
   <span class="sr-only" aria-live="polite">{announce}</span>
 
   <!-- ── Speaker → identity roster ──
-       One row per detected speaker. "You" (mic recorder) is read-only; the far
-       side is one merged "Them" (separation OFF) or the "Speaker A/B/…" rows
-       (ON). Assigning opens the inline SpeakerIdentityPicker; the picked
-       identity re-labels ALL of that speaker's transcript lines instantly. -->
+       One row per PERSON, not per detected voice. "You" (mic recorder) is
+       read-only. Diarization routinely splits one speaker into several labels,
+       so rows that resolve to the same identity are merged into one (see
+       `speakerGroups`) and carry a "N voices" chip so the merge is visible
+       rather than silent. Assigning opens the inline SpeakerIdentityPicker and
+       applies to every voice in the row; the picked identity re-labels all of
+       their transcript lines instantly. -->
   <div class="spk-roster" aria-label="Speakers on this call">
     <div class="spk-head">Speakers</div>
-    {#each speakers as row (speakerIdentityKey(row.channel, row.speakerLabel))}
+    {#each speakerGroups as group (group.key)}
+      {@const row = group.lead}
       {@const rowKey = speakerIdentityKey(row.channel, row.speakerLabel)}
-      {@const idn = identityFor(row)}
+      {@const idn = group.identity}
       {@const primary = isPrimaryRow(idn)}
       <div class="spk-row" class:picking={openPickerKey === rowKey}>
         {#if openPickerKey === rowKey}
           <SpeakerIdentityPicker
             speakerLabel={row.diarizationLabel}
-            onpick={(picked) => commitAssign(row, picked)}
+            onpick={(picked) => commitAssign(group, picked)}
             oncancel={closePicker}
           />
         {:else}
@@ -571,6 +711,14 @@
             </span>
             {#if idn}
               <span class="spk-kind">{kindLabel(idn.kind)}</span>
+            {/if}
+            {#if group.rows.length > 1}
+              <span
+                class="spk-voices"
+                title={`Merged from ${group.rows
+                  .map((member) => member.diarizationLabel)
+                  .join(", ")}`}>{group.rows.length} voices</span
+              >
             {/if}
             {#if primary}
               <span class="spk-primary" title="Grounds the deal card below"
@@ -586,7 +734,7 @@
                 <button
                   type="button"
                   class="spk-btn"
-                  onclick={() => makePrimary(row)}
+                  onclick={() => makePrimary(group)}
                 >
                   Make primary
                 </button>
@@ -603,7 +751,7 @@
                 class="spk-btn spk-clear"
                 aria-label="Clear identity"
                 title="Clear identity"
-                onclick={() => clearAssign(row)}
+                onclick={() => clearAssign(group)}
               >
                 <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
               </button>
@@ -616,10 +764,31 @@
                 Assign
               </button>
             {/if}
+            {#if isManualRow(row) && onremovespeaker}
+              <!-- Only a HAND-ADDED row can be removed. A row the far side
+                   genuinely spoke under is a fact about the call, not a
+                   preference. -->
+              <button
+                type="button"
+                class="spk-btn spk-clear"
+                aria-label="Remove this person"
+                title="Remove this person"
+                onclick={() => removeSpeaker(row)}
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/></svg>
+              </button>
+            {/if}
           </div>
         {/if}
       </div>
     {/each}
+
+    {#if canAddSpeaker}
+      <button type="button" class="spk-add" onclick={addSpeaker}>
+        <span class="spk-add-glyph" aria-hidden="true">+</span>
+        Add person
+      </button>
+    {/if}
   </div>
 
   <!-- ── Contact card — grounded on the PRIMARY zoho_contact ── -->
@@ -665,10 +834,16 @@
           </p>
         {/if}
 
-        <!-- #659 P5a — Contact grounding swaps with the persona: open Cases
-             in Support mode, open Deals in Sales mode. Both come from the one
-             crm-context envelope and degrade independently. -->
-        {#if mode === "support"}
+        <!-- Contact grounding swaps with the persona: the support queue in
+             Support mode, open Deals in Sales mode. On a Desk org the support
+             queue IS Desk tickets (rendered by the shared `ticketList` snippet
+             below); otherwise it falls back to CRM Cases. All three come from
+             the one crm-context envelope and degrade independently. -->
+        {#if ticketsArePrimary}
+          <div class="crm-deals" aria-live="polite">
+            {@render ticketList()}
+          </div>
+        {:else if mode === "support"}
           <!-- Open Cases -->
           <div class="crm-deals" aria-live="polite">
             {#if crm.cases.status === "unavailable"}
@@ -799,26 +974,40 @@
           </div>
         {/if}
 
-        <!-- Zoho Desk — Open Tickets, rendered BESIDE Deals/Cases (independent
-             of the Sales/Support mode toggle). Gated on `zohoDesk` + the
-             envelope carrying a tickets section; each open ticket gets the same
-             "Link to call" affordance as a deal (one linked ticket at a time,
-             coexisting with a linked deal). Subject may carry PII — lane-only.
-             "Zoho" is the sanctioned name; the deep-link uses the Desk web_url. -->
-        {#if zohoDesk && crm.tickets}
+        <!-- Zoho Desk — Open Tickets as the SECONDARY section (Sales mode on a
+             Desk org): "heads up, they have open tickets" beside the deals. In
+             Support mode the same `ticketList` snippet renders ABOVE as the
+             primary section instead of CRM Cases, so it is not repeated here. -->
+        {#if hasDesk && !ticketsArePrimary}
           <div class="crm-tickets" aria-live="polite">
             <div class="crm-section-head">Support tickets</div>
-            {#if crm.tickets.status === "unavailable"}
-              <div class="crm-error-row">
-                <span>Tickets didn't load.</span>
-                <button type="button" class="ghost-btn" onclick={retryHydrate}>
-                  Retry
-                </button>
-              </div>
-            {:else if crm.tickets.status === "empty"}
-              <p class="crm-status">No open tickets.</p>
-            {:else}
-              {#each visibleTickets as t (t.id)}
+            {@render ticketList()}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+</div>
+
+<!-- The open-Desk-tickets list. Rendered as the PRIMARY support section in
+     Support mode and as a secondary section in Sales mode — one definition so
+     the two placements can't drift. Each ticket gets the same "Link to call"
+     affordance as a deal (one linked ticket at a time, coexisting with a linked
+     deal). Subject may carry PII — lane-only. "Zoho" is the sanctioned name;
+     the deep-link uses the Desk web_url. -->
+{#snippet ticketList()}
+  {#if crm?.tickets}
+    {#if crm.tickets.status === "unavailable"}
+      <div class="crm-error-row">
+        <span>Tickets didn't load.</span>
+        <button type="button" class="ghost-btn" onclick={retryHydrate}>
+          Retry
+        </button>
+      </div>
+    {:else if crm.tickets.status === "empty"}
+      <p class="crm-status">No open tickets.</p>
+    {:else}
+      {#each visibleTickets as t (t.id)}
                 <div class="crm-deal" class:linked={isLinkedTicket(t)}>
                   <div class="crm-deal-top">
                     <button
@@ -851,34 +1040,30 @@
                       </button>
                     {/if}
                   </div>
-                  <div class="crm-deal-meta">
-                    {#if t.ticket_number}
-                      <span class="crm-stage">#{t.ticket_number}</span>
-                    {/if}
-                    {#if t.status}
-                      <span class="crm-stage">{t.status}</span>
-                    {/if}
-                    {#if t.priority}
-                      <span class="crm-stage">{t.priority}</span>
-                    {/if}
-                    {#if t.created_time}
-                      <span class="crm-close">{fmtClose(t.created_time)}</span>
-                    {/if}
-                  </div>
-                </div>
-              {/each}
-              {#if extraTickets > 0}
-                <p class="crm-more crm-more-plain">
-                  +{extraTickets} more open tickets
-                </p>
-              {/if}
+          <div class="crm-deal-meta">
+            {#if t.ticket_number}
+              <span class="crm-stage">#{t.ticket_number}</span>
+            {/if}
+            {#if t.status}
+              <span class="crm-stage">{t.status}</span>
+            {/if}
+            {#if t.priority}
+              <span class="crm-stage">{t.priority}</span>
+            {/if}
+            {#if t.created_time}
+              <span class="crm-close">{fmtClose(t.created_time)}</span>
             {/if}
           </div>
-        {/if}
+        </div>
+      {/each}
+      {#if extraTickets > 0}
+        <p class="crm-more crm-more-plain">
+          +{extraTickets} more open tickets
+        </p>
       {/if}
-    </div>
+    {/if}
   {/if}
-</div>
+{/snippet}
 
 {#snippet connectPrompt()}
   <div class="crm-connect">
@@ -1039,6 +1224,53 @@
   }
   .spk-clear:hover {
     color: var(--bone-0);
+  }
+
+  /* "Add person" — a dashed, quiet affordance under the roster rows. Dashed
+     because the row it creates is a CLAIM on a voice, not an observed one. */
+  .spk-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    align-self: flex-start;
+    margin-top: 0.1rem;
+    padding: 0.18rem 0.5rem 0.18rem 0.35rem;
+    border: 1px dashed var(--hairline);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--bone-3);
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .spk-add:hover {
+    color: var(--bone-1);
+    border-color: var(--hairline-hi);
+  }
+  .spk-add:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .spk-add-glyph {
+    color: var(--accent);
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  /* "N voices" — how many diarization labels this one person absorbed. Quiet
+     and mono, so it reads as metadata rather than a status. */
+  .spk-voices {
+    flex-shrink: 0;
+    padding: 0.02rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-2);
+    color: var(--bone-3);
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    white-space: nowrap;
   }
 
   /* No-primary hint beneath the roster (soft, muted). */

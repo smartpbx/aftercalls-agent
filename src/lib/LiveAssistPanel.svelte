@@ -15,6 +15,7 @@
 -->
 <script lang="ts">
   import type { LiveSegment } from "@aftercalls/shared/types";
+  import Avatar from "@aftercalls/shared/ui/Avatar.svelte";
 
   type LiveStatus = "idle" | "live" | "ended" | "error";
 
@@ -49,6 +50,34 @@
   function labelFor(s: LiveSegment): string {
     if (s.speaker) return s.speaker;
     return s.channel === "mic" ? "You" : "Them";
+  }
+
+  // Speaker colour — the same palette + order-based allocation the co-pilot
+  // lane and the after-call transcript use, so a speaker reads the same colour
+  // everywhere. "You" keeps the accent. (This panel has no identity map: its
+  // labels are the raw channel/diarization ones.)
+  const PALETTE = ["#c9a24a", "#8faf72", "#d07e4e", "#b06a8c", "#8aa2c0"];
+  let speakerColorMap = $derived.by(() => {
+    const m = new Map<string, string>();
+    const usage = PALETTE.map(() => 0);
+    for (const s of segments) {
+      const name = labelFor(s).trim();
+      if (!name || m.has(name)) continue;
+      if (name === "You") {
+        m.set(name, "var(--accent)");
+        continue;
+      }
+      let bestIdx = 0;
+      for (let i = 1; i < PALETTE.length; i++) {
+        if (usage[i] < usage[bestIdx]) bestIdx = i;
+      }
+      m.set(name, PALETTE[bestIdx]);
+      usage[bestIdx]++;
+    }
+    return m;
+  });
+  function colorFor(name: string): string {
+    return speakerColorMap.get(name.trim()) ?? "var(--bone-2)";
   }
 
   // Auto-scroll to the newest line as segments stream in, but only when the
@@ -99,11 +128,15 @@
       aria-live="polite"
     >
       {#each display as seg (seg.channel + ":" + seg.start_ms + ":" + (seg.provisional ? "p" : "f"))}
+        {@const who = labelFor(seg)}
         <div
           class="live-seg live-seg-{seg.channel === 'mic' ? 'you' : 'them'}"
           class:live-seg-provisional={seg.provisional}
         >
-          <span class="live-seg-label">{labelFor(seg)}</span>
+          <span class="live-seg-label" style="--c: {colorFor(who)}">
+            <Avatar name={who} color={colorFor(who)} size={18} />
+            <span class="live-seg-name" title={who}>{who}</span>
+          </span>
           <span class="live-seg-text">{seg.text}</span>
         </div>
       {/each}

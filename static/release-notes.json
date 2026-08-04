@@ -1,4 +1,15 @@
 {
+  "0.32.0": {
+    "headline": "The in-call co-pilot now tells people apart, lets you correct what it heard, and stops reporting a finished screen recording as failed.",
+    "changes": [
+      "The co-pilot tells people on the other end apart. During a call, everyone on the far end was grouped together as a single unknown speaker, so there was no way to say who was who. The co-pilot now separates the voices it hears and you can put a name to each one. Naming someone relabels everything they have already said, not just what comes next.",
+      "Several voices that turn out to be one person merge into one. Separating voices is not perfect — one person can come back as two or three, especially over a noisy line. When you give those voices the same name, they now collapse into a single person on the call instead of sitting there as duplicates, and that person appears once in the call record afterwards.",
+      "Questions can be corrected while the call is still going. The co-pilot picks out questions as they are asked, but it does not always get them right. You can now fix a question's wording, change who asked it, mark one answered or reopen it, delete one it invented, and add one it missed — all without waiting for the call to end.",
+      "Speakers in the live transcript are easier to read. Names in the live transcript were squeezed into a narrow column and wrapped onto two lines. Each speaker now has a coloured initials badge and their name on one line, matching how the transcript looks after the call, so the same person is the same colour in both places.",
+      "You can add someone the co-pilot has not heard yet. If two people share one line, or someone has not spoken yet, you can now add them to the call by hand and name them. They are recorded as part of the call either way, and if their voice is picked out later it is already attributed to them.",
+      "Screen recordings are about half the size. Screen recordings were larger than they needed to be, which made them slow to upload on a typical connection. The default quality setting is now tuned for screen sharing — text and interfaces still read clearly — which roughly halves both the file size and the time it takes to send. You can still raise or lower it in Settings."
+    ]
+  },
   "0.30.0": {
     "headline": "Large recordings upload more reliably, after-call questions are editable, and completed calls are protected from duplicate sends.",
     "changes": [

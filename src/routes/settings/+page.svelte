@@ -759,7 +759,12 @@
         display: scrDisplay,
         fps: parseInt(scrFps, 10) || 15,
         resolution: scrResolution,
-        bitrateKbps: Math.round(Number(scrBitrate) || 8000),
+        // Blank/invalid falls back to the SAME default the agent config uses
+        // (1500). The previous 8000 fallback silently set a bitrate over five
+        // times the default — clearing the field to "reset" it quietly made
+        // recordings much larger, which on a slow uplink is minutes of extra
+        // upload per call.
+        bitrateKbps: Math.round(Number(scrBitrate) || 1500),
         askEachCall: scrAskEachCall,
       });
       scrEnabled = enabled;
@@ -2298,8 +2303,9 @@
             <div class="pref-label">
               <span class="pref-title">Bitrate (kbps)</span>
               <span class="pref-hint">
-                Advanced. Higher bitrate is sharper but larger. Between
-                500 and 20000.
+                Advanced. Higher is sharper but makes the file larger and
+                slower to upload. Between 500 and 20000; 1500 suits most
+                screen sharing.
               </span>
             </div>
             <input

@@ -536,6 +536,16 @@ async fn run_inner(
                 "aftercalls: screen recording generation {generation_id} is authoritative ready/current"
             );
         }
+        // Uploaded, backend still validating. The pipeline does NOT block on
+        // it: the call, its audio, transcript and summary are all complete and
+        // usable now, and the video attaches when validation finishes. Waiting
+        // here meant a long screen capture reported a hard failure for a
+        // recording that was intact.
+        Ok(upload::ScreenUploadOutcome::Finalizing { generation_id }) => {
+            eprintln!(
+                "aftercalls: screen recording generation {generation_id} uploaded; backend still processing — not blocking the call"
+            );
+        }
         Err(e) => return Err(e.context("screen recording upload remains pending")),
     }
 

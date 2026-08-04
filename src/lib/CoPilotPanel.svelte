@@ -149,6 +149,10 @@
     linkedTicket = null,
     onlinkticket = undefined,
     onunlinkticket = undefined,
+    extraSpeakerLabels = [],
+    onaddspeaker = undefined,
+    onremovespeaker = undefined,
+    onquestions = undefined,
   }: {
     segments?: LiveSegment[];
     status?: LiveStatus;
@@ -225,11 +229,26 @@
      *  tile; +page owns the `live_linked_ticket` invoke + the store write. */
     onlinkticket?: (ticket: CrmContextTicket) => void;
     onunlinkticket?: () => void;
+    /** Far-side roster rows the rep added by hand, for when the diarizer merges
+     *  two people onto one label. Threaded into `deriveDetectedSpeakers` so they
+     *  render as assignable rows beside the detected ones. */
+    extraSpeakerLabels?: string[];
+    /** Add / drop one manual roster row; +page owns the store write. `onaddspeaker`
+     *  is handed the labels currently on the roster so the store claims the next
+     *  free one. */
+    onaddspeaker?: (taken: string[]) => void;
+    onremovespeaker?: (label: string) => void;
+    /** Raised with the full post-edit questions snapshot from a manual live
+     *  edit; +page swaps it into the store exactly like a WS frame. */
+    onquestions?: (next: QuestionsSnapshot) => void;
   } = $props();
 
   // #646 (Phase 2) — the distinct-speaker roster set, derived from the live
-  // segments (mic recorder + far-side speakers). Passed to the rail CRM tile.
-  let detectedSpeakers = $derived(deriveDetectedSpeakers(segments));
+  // segments (mic recorder + far-side speakers) plus any row the rep added by
+  // hand. Passed to the rail CRM tile.
+  let detectedSpeakers = $derived(
+    deriveDetectedSpeakers(segments, extraSpeakerLabels),
+  );
 
   // ── Layout (#662) ─────────────────────────────────────────────────────────
   // Panel-local, NOT persisted: default compact each session (expand is a
@@ -615,6 +634,9 @@
         {linkedTicket}
         {onlinkticket}
         {onunlinkticket}
+        {extraSpeakerLabels}
+        {onaddspeaker}
+        {onremovespeaker}
       />
     </div>
     {#if talkMetric && talkMetric.youPct + talkMetric.themPct > 0}
@@ -705,8 +727,16 @@
 
         <div id="cp-drawer-body" class="cp-drawer-body" hidden={!drawerOpen}>
           <!-- Phase 4 — auto-extracted questions, pinned at the TOP of the
-               drawer (open-first). Renders nothing until a snapshot arrives. -->
-          <LiveQuestions {questions} {status} />
+               drawer (open-first). `speakerIdentities` lets it re-resolve an
+               asker the instant a speaker is assigned; `sessionUuid` + the
+               snapshot callback enable the rep's own live corrections. -->
+          <LiveQuestions
+            {questions}
+            {status}
+            {speakerIdentities}
+            {sessionUuid}
+            onsnapshot={onquestions}
+          />
           {#if liveTranscriptEnabled}
             <LiveTranscriptLane
               {segments}

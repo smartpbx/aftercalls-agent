@@ -164,14 +164,17 @@ export type CrmContext = {
     status: "ok" | "empty" | "unavailable";
     items: CrmContextCase[];
   };
-  /** Zoho Desk — the contact's open Tickets, surfaced BESIDE Deals/Cases (NOT
-   *  swapped by the Sales/Support mode toggle). Same per-section degrade
-   *  posture as `deals`/`cases`; `"unavailable"` covers a Desk fetch that
-   *  failed or a contact that couldn't be cross-resolved into Desk. Optional
-   *  on the wire so a backend/proxy that predates the field decodes cleanly —
-   *  the lane simply renders no Tickets section. */
+  /** Zoho Desk — the contact's open Tickets. In Support mode these REPLACE
+   *  CRM Cases whenever the org actually runs Desk; in Sales mode they render
+   *  beside Deals as a secondary section. Same per-section degrade posture as
+   *  `deals`/`cases`, plus `"not_connected"` — the org has no Desk at all
+   *  (flag off / no connection), as opposed to `"unavailable"`, which means
+   *  Desk IS set up but this fetch failed. Support mode promotes Tickets on
+   *  everything but `"not_connected"`, so a transient Desk hiccup never
+   *  silently swaps the rep to a different system of record. Optional on the
+   *  wire so a backend that predates the field decodes cleanly. */
   tickets?: {
-    status: "ok" | "empty" | "unavailable";
+    status: "ok" | "empty" | "unavailable" | "not_connected";
     items: CrmContextTicket[];
   };
   zoho: "connected" | "not_connected";
@@ -351,10 +354,17 @@ export type LiveQuestion = {
   text: string;
   /** Which party asked: the rep (`"you"`) or the counterpart (`"them"`). */
   asker_side: "you" | "them";
-  /** The raw diarization/transcript label the model saw (debug/trace only). */
+  /** The raw diarization label the question was captured under ("Speaker A",
+   *  "Them"); absent for the near "You" side. The lane keys the live identity
+   *  map on this so assigning a speaker renames the asker on the spot, rather
+   *  than waiting for the backend's next coach pass to re-resolve the ledger. */
   asker_label?: string;
   /** The resolved display label the UI renders ("You" / assigned name / label). */
   asker_display: string;
+  /** True once the rep set the asker by hand. The lane must NOT override a
+   *  pinned display from the identity map — a manual correction outranks
+   *  whatever the map would derive. Absent on frames from older backends. */
+  asker_pinned?: boolean;
   status: "open" | "answered";
   /** The captured answer once the transcript answers the question. */
   answer_text?: string;
