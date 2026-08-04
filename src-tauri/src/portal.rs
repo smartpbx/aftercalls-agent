@@ -2920,13 +2920,48 @@ impl RetryGuard {
 /// revoke). Reads the current `auth.json`, posts to `/v1/auth/refresh`
 /// via the existing `do_refresh` helper, persists the new bundle, and
 /// returns `Ok(())`. Errors bubble — the caller drops the retry.
+/// Whether a `do_refresh` failure means the session itself is dead rather
+/// than the network being unhappy. Only a rejected refresh token counts —
+/// a 5xx or a connect error must NOT sign the user out mid-call.
+fn refresh_was_rejected(error: &anyhow::Error) -> bool {
+    let msg = format!("{error:#}").to_lowercase();
+    msg.contains("refresh failed (401") || msg.contains("refresh failed (403")
+}
+
+/// The session is definitively gone (refresh token rejected or expired).
+/// Wipe the local credential so the next launch lands on /login, and tell
+/// the running webview so it can route there now instead of leaving the
+/// user on a signed-in-looking surface where every request 401s.
+///
+/// Without this the route guard in `+layout.svelte` — which runs once at
+/// mount and only reads auth.json — keeps believing the session is live
+/// after a server-side invalidation (password reset, revoked session), and
+/// every page just renders "Not signed in. Please log in again." inline.
+fn signal_session_expired() {
+    if let Err(e) = crate::config::delete_auth_file() {
+        eprintln!("aftercalls: could not clear auth.json after session expiry: {e:#}");
+    }
+    crate::telemetry::emit_app_event("auth::session-expired", &serde_json::json!({}));
+}
+
 pub(crate) async fn force_refresh_auth(backend: &Backend) -> Result<()> {
-    let auth = read_auth_file()?
-        .ok_or_else(|| anyhow!("not logged in — cannot refresh auth"))?;
+    let Some(auth) = read_auth_file()? else {
+        signal_session_expired();
+        return Err(anyhow!("not logged in — cannot refresh auth"));
+    };
     if auth.refresh_expires_at <= Utc::now() {
+        signal_session_expired();
         return Err(anyhow!("refresh token expired — please log in again"));
     }
-    let refreshed = do_refresh(backend, &auth.refresh_token).await?;
+    let refreshed = match do_refresh(backend, &auth.refresh_token).await {
+        Ok(refreshed) => refreshed,
+        Err(e) => {
+            if refresh_was_rejected(&e) {
+                signal_session_expired();
+            }
+            return Err(e);
+        }
+    };
     let merged = merge_auth(refreshed);
     write_auth_file(&merged)?;
     Ok(())

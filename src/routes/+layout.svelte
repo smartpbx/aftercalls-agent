@@ -151,6 +151,7 @@
   const identityReplayTimers = new Set<ReturnType<typeof setTimeout>>();
   const IDENTITY_REPLAY_DELAYS_MS = [750, 2_000, 5_000] as const;
   let unlistenState: UnlistenFn | null = null;
+  let unlistenSessionExpired: UnlistenFn | null = null;
   let unlistenPipeline: UnlistenFn | null = null;
   // #659 — live-transcript stream listeners. Registered ONCE here (the
   // layout never unmounts across route nav) so `live-segment` /
@@ -1002,6 +1003,18 @@
     // shape: redirect on entry to any non-public route, and bounce
     // away from /accept-terms when the gate is already clear.
     applyTosGate();
+
+    // The route guard above runs once at mount and only reads auth.json,
+    // so a session invalidated server-side (password reset, revoked
+    // session) left the app looking signed in while every request 401'd
+    // and each page rendered "Not signed in" inline. Rust emits this the
+    // moment a refresh is definitively rejected; bounce to /login.
+    unlistenSessionExpired = await listen("auth::session-expired", () => {
+      me = null;
+      if (!page.url.pathname.startsWith("/login")) {
+        void goto("/login");
+      }
+    });
 
     unlistenState = await listen<{
       recording: boolean;
@@ -2021,6 +2034,7 @@
   onDestroy(() => {
     cancelIdentityReplay();
     unlistenState?.();
+    unlistenSessionExpired?.();
     unlistenPipeline?.();
     unlistenLiveSegment?.();
     unlistenLiveSession?.();

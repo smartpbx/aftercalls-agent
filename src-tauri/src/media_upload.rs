@@ -338,7 +338,7 @@ pub async fn ensure_generation_ready(
     validate_call_id(call_id)?;
     let kind = source.kind.as_str();
 
-    let existing = media_manifest::artifact(session_dir, kind)?;
+    let mut existing = media_manifest::artifact(session_dir, kind)?;
     let mut status = if let Some(upload) = existing.as_ref().and_then(|item| item.upload.as_ref()) {
         if let Some(generation_id) = upload.generation_id.as_deref() {
             let status = fetch_status(
@@ -379,11 +379,45 @@ pub async fn ensure_generation_ready(
                 return Ok(ready);
             }
             StateClass::Terminal => {
-                return Err(record_generation_error(
+                // The backend generation is dead — aborted, failed, or
+                // superseded. The local source is untouched and immutable, so
+                // the recoverable move is to start a NEW generation, not to
+                // give up on the call forever.
+                //
+                // Returning an error here meant any interrupted upload became
+                // permanently unresumable: "Resume" re-fetched the same dead
+                // generation and re-reported the same error every time, and
+                // the only fix was hand-editing this manifest. Drop the dead
+                // checkpoint and fall through to the fresh-upload path below,
+                // which mints a new client_operation_id from the same bytes.
+                eprintln!(
+                    "aftercalls: {kind} generation is {} — discarding it and starting a fresh upload",
+                    current.state
+                );
+                crate::telemetry::log(
+                    "info",
+                    "media::generation_restarted",
+                    format!("{kind} generation {} — restarting upload", current.state),
+                    Some(serde_json::json!({
+                        "kind": kind,
+                        "terminal_state": current.state,
+                    })),
+                    session_id_for_telemetry.map(|s| s.to_string()),
+                );
+                media_manifest::reset_aborted_upload(
                     session_dir,
                     kind,
-                    terminal_error(current),
-                ));
+                    format!(
+                        "backend generation {} — starting a fresh upload",
+                        current.state
+                    ),
+                )?;
+                status = None;
+                // `existing` still describes the discarded checkpoint; the
+                // fresh path below compares it against the re-hashed source
+                // and would reject the stale operation id as an immutability
+                // violation. Re-read so it reflects the reset.
+                existing = media_manifest::artifact(session_dir, kind)?;
             }
             StateClass::Uploading => {}
         }
