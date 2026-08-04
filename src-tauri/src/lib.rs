@@ -1006,6 +1006,28 @@ fn do_stop_token(
                 }
             }
         }
+        // The system loopback can open successfully and still capture nothing —
+        // the wrong monitor source, or an app routing audio somewhere the
+        // monitor cannot see. The recording then contains only the local
+        // speaker, which reads as "it only recorded my audio" and has been
+        // reported twice months apart, each time discovered long after the
+        // call. Say so now, while the user is still in front of the app.
+        let system_wav = session_dir.join("system.wav");
+        if system_wav.exists() && wav_is_silent(&system_wav) {
+            eprintln!("aftercalls: system audio track captured no sound this session");
+            crate::telemetry::log(
+                "warn",
+                "recorder::system_audio_silent",
+                "system loopback captured no audible sound for the whole call",
+                None,
+                session_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned),
+            );
+            crate::telemetry::emit_app_event("system-audio-silent", &serde_json::json!({}));
+        }
+
         if let Some(error) = &screen_report.error {
             let retained_path = screen_report.path.clone().unwrap_or_else(|| {
                 session_dir
@@ -1643,6 +1665,59 @@ async fn login(email: String, password: String) -> Result<LoginResult, error::Po
         features: auth.features,
         pending_tos: auth.pending_tos,
     })
+}
+
+/// Peak amplitude floor below which a whole track counts as "captured nothing".
+/// -50 dBFS. Room tone and dither sit under this; any real speech is far above.
+const SILENT_TRACK_PEAK: i16 = 104;
+
+/// Whether a 16-bit PCM WAV carries no audible content anywhere.
+///
+/// Returns `false` the instant a sample clears the floor, so a normal recording
+/// costs a few kilobytes of read. Only a genuinely dead track is scanned end to
+/// end, which is exactly the case worth being certain about. A file we cannot
+/// read or parse returns `false` — never claim silence we did not observe.
+fn wav_is_silent(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // Walk the RIFF chunks to find `data`; the header is not always 44 bytes.
+    let mut header = [0u8; 12];
+    if file.read_exact(&mut header).is_err() || &header[0..4] != b"RIFF" {
+        return false;
+    }
+    loop {
+        let mut chunk = [0u8; 8];
+        if file.read_exact(&mut chunk).is_err() {
+            return false; // ran out before finding `data` — treat as unknown
+        }
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if &chunk[0..4] == b"data" {
+            break;
+        }
+        if std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(i64::from(size))).is_err() {
+            return false;
+        }
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    let mut saw_any_sample = false;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        for pair in buffer[..read - (read % 2)].chunks_exact(2) {
+            saw_any_sample = true;
+            let sample = i16::from_le_bytes([pair[0], pair[1]]);
+            if sample.saturating_abs() >= SILENT_TRACK_PEAK {
+                return false;
+            }
+        }
+    }
+    // An empty data chunk is "nothing recorded", handled elsewhere as absent.
+    saw_any_sample
 }
 
 #[tauri::command]

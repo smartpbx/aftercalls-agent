@@ -1026,6 +1026,10 @@
   };
   let micFallback = $state<MicFallback | null>(null);
   let micFallbackTimer = 0;
+  // Raised at stop when the system loopback opened but captured nothing all
+  // call — the recording holds only this machine's microphone. Sticky (no
+  // auto-dismiss): finding out later is the whole complaint.
+  let systemAudioSilent = $state(false);
   let showHotkeyNote = $derived(
     hotkeyNoteOS === "linux" && !hotkeyNoteDismissed,
   );
@@ -1154,6 +1158,7 @@
   let unlistenState: UnlistenFn | null = null;
   let unlistenAuto: UnlistenFn | null = null;
   let unlistenMicFallback: UnlistenFn | null = null;
+  let unlistenSystemSilent: UnlistenFn | null = null;
   let timer = 0;
   let startAt = 0;
 
@@ -1283,6 +1288,9 @@
         }
       },
     );
+    unlistenSystemSilent = await listen("system-audio-silent", () => {
+      systemAudioSilent = true;
+    });
     unlistenMicFallback = await listen<MicFallback>("mic-fallback", (evt) => {
       // Rust dedupes per-session-per-name, so every event we receive
       // is one the user hasn't seen yet this run. Reset the auto-
@@ -1466,6 +1474,7 @@
     unlistenState?.();
     unlistenAuto?.();
     unlistenMicFallback?.();
+    unlistenSystemSilent?.();
     if (micFallbackTimer) {
       clearTimeout(micFallbackTimer);
       micFallbackTimer = 0;
@@ -1853,6 +1862,27 @@
       </div>
       <div class="banner-actions">
         <button class="btn ghost" onclick={dismissMicFallback}>Dismiss</button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- System audio captured nothing. Surfaced at stop rather than left for
+       the user to discover on playback — twice now that discovery arrived as
+       a support ticket months later ("it only recorded my audio"). -->
+  {#if systemAudioSilent}
+    <div class="banner" style="--i: 0.5" role="alert" aria-live="assertive">
+      <div class="banner-body">
+        <p class="banner-label">Only your microphone was recorded</p>
+        <p class="banner-text">
+          No sound came through from the other side of this call, so the
+          recording has your voice only. Check that the call app is playing
+          through your normal output device before the next one.
+        </p>
+      </div>
+      <div class="banner-actions">
+        <button class="btn ghost" onclick={() => (systemAudioSilent = false)}>
+          Dismiss
+        </button>
       </div>
     </div>
   {/if}
