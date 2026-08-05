@@ -135,10 +135,23 @@ export function deriveDetectedSpeakers(
     seen.add(label);
     labels.push(label);
   }
+  // "Speaker ?" is not a participant — it is the backend's honest marker for
+  // far-side audio the diarizer could not attribute, which in practice is the
+  // opening seconds of a call before attribution warms up (measured: the first
+  // three turns of a real call, one of them 1275ms, came back with no label at
+  // all). Once a REAL speaker is known, listing "?" beside them implies a
+  // second person who does not exist and invites the rep to identify an
+  // unknown. Those lines still render honestly in the transcript; they just
+  // don't claim a seat on the roster. With nothing else detected it is kept —
+  // it is then the only evidence anyone else is on the call.
   const named = labels.filter((l) => l.length > 0);
-  // Separation ON → the named speakers; OFF / pre-call → one merged "Them"
-  // (the canonical far label the backend emits + the assignable/lookup key).
-  const effective = named.length > 0 ? named : ["Them"];
+  const attributed = named.filter((l) => l !== UNATTRIBUTED_LABEL);
+  const effective =
+    attributed.length > 0
+      ? attributed
+      : named.length > 0
+        ? named
+        : ["Them"];
   // Rows the rep added by hand, appended after whatever was actually detected
   // and de-duplicated against it — a manually-claimed label that the far side
   // later genuinely speaks under must render ONCE, carrying its assignment.
@@ -155,6 +168,11 @@ export function deriveDetectedSpeakers(
   }
   return rows;
 }
+
+/** The label the backend emits for far-side speech it could not attribute to
+ *  anyone (mirrors `transcription.rs`). Not a person — see
+ *  `deriveDetectedSpeakers`. */
+const UNATTRIBUTED_LABEL = "Speaker ?";
 
 /** The far-side label space the upstream diarizer hands out: "Speaker A",
  *  "Speaker B", … Manual roster rows claim from the SAME space (rather than
