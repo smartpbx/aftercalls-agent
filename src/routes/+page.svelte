@@ -2207,12 +2207,27 @@
           </button>
         </div>
         {#if openableCallId}
-          <p class="ce-body">Your call is ready to review.</p>
-          <div class="ce-actions">
-            <button type="button" class="ce-open" onclick={openCallInApp}>
-              Open post-call
-            </button>
-          </div>
+          <!-- The CTA appears only once the pipeline is `done`.
+               `openableCallId` lands earlier, at `transcribed`, and the card
+               used to announce "ready to review" from that moment — which both
+               contradicted the status lane below it (still reporting "Drafting
+               summary") and led somewhere useless: the call page renders
+               shimmer placeholders for Summary and Action items until the
+               status flips to complete, so opening early just showed a page
+               that looked like it was still loading.
+               Offering an early "Open transcript" was tried and withdrawn for
+               the same reason — a button that lands on placeholders is worse
+               than no button. Making that page genuinely useful mid-pipeline
+               (real transcript, honest per-section states) is the fix worth
+               doing, and it belongs on the call page, not here. -->
+          {#if pipelineStage === "done"}
+            <p class="ce-body">Your call is ready to review.</p>
+            <div class="ce-actions">
+              <button type="button" class="ce-open" onclick={openCallInApp}>
+                Open post-call
+              </button>
+            </div>
+          {/if}
           <!-- Phase 3 — call-end CRM push. One prior-push probe (fired once
                `done`) drives BOTH states: a prior push (auto mode fired it, or a
                manual push) → the "Pushed to <Deal>" confirmation; else a deal
@@ -2353,12 +2368,13 @@
             We couldn't finish preparing this call. It'll appear in your calls
             list if it becomes available.
           </p>
-        {:else}
-          <p class="ce-body ce-body-muted" role="status" aria-live="polite">
-            {(pipelineStage && pipelineLabels[pipelineStage]) ||
-              "Preparing your call"}…
-          </p>
         {/if}
+        <!-- No progress line here on purpose. This card used to echo
+             `pipelineLabels[pipelineStage]`, which is the exact string the
+             status lane renders a few rows below — two sections reporting the
+             same progress, and they disagreed whenever this one ran ahead. The
+             lane owns progress; this card owns the hand-off (open the call, push
+             it to the CRM or a ticket), which the lane has no equivalent for. -->
       </section>
     {:else if !copilotDismissed}
       <CoPilotPanel
