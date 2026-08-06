@@ -292,7 +292,21 @@
   }
   .notes-panel.expanded {
     position: fixed;
-    inset: 1rem;
+    /* Fill the content column, not the raw viewport.
+       `inset: 1rem` did cover the whole window, but it could never paint over
+       the chrome: the Record page's `main.page` is `position: relative;
+       z-index: 2`, which is a stacking context, and the rail (z-index 10) and
+       topstrip (5) are its siblings inside `.shell`. A descendant cannot
+       out-stack its ancestor's context however high its own z-index, so the
+       maximized editor slid under the rail and the titlebar — the placeholder
+       visibly cut to "e call…" behind the rail.
+       Insetting past the chrome keeps the whole editor on screen and leaves
+       the titlebar and the recording controls reachable, which matters while
+       a call is running. */
+    top: calc(var(--topbar-h) + 0.75rem);
+    left: calc(var(--rail-w) + 0.75rem);
+    right: 0.75rem;
+    bottom: 0.75rem;
     z-index: 90;
     margin: 0;
     padding: 1rem;

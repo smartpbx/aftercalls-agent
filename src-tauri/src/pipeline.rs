@@ -781,9 +781,16 @@ async fn ensure_track_opus(
             // track with no raw WAV and no Opus as genuinely not recorded
             // rather than failing the resume permanently. The bail below stays
             // for the real fault: raw audio present but unencodable.
-            let raw_missing = !session_dir.join(format!("{track}.wav")).exists()
-                && !session_dir.join(format!("{track}.opus")).exists();
-            if explicitly_absent || raw_missing {
+            let raw_wav = session_dir.join(format!("{track}.wav"));
+            let raw_missing =
+                !raw_wav.exists() && !session_dir.join(format!("{track}.opus")).exists();
+            // A WAV that exists but carries no audio frames is the same
+            // situation as one that was never written — there is nothing to
+            // encode or upload. Without this the resume bailed here instead,
+            // leaving the session Incomplete and offering it for resume again
+            // to fail the same way forever.
+            let raw_empty = raw_wav.exists() && crate::rolling_encode::wav_is_empty(&raw_wav);
+            if explicitly_absent || raw_missing || raw_empty {
                 if !explicitly_absent {
                     crate::media_manifest::mark_audio_not_present(session_dir, track)?;
                 }

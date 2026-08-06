@@ -65,7 +65,13 @@ impl TrackFinalization {
     }
 
     fn fallback(track: &str, wav_path: PathBuf, error: impl Into<String>) -> Self {
-        let state = if wav_path.exists() {
+        // A WAV that exists but holds no audio frames is "not recorded", not a
+        // fallback failure. Keying purely on `exists()` made an empty capture
+        // unresumable forever: encoding bailed with "finalized WAV has zero
+        // duration", the resume failed, and the session was offered for resume
+        // again to fail identically — an endless Incomplete -> Failed loop with
+        // no way out from the UI.
+        let state = if wav_path.exists() && !wav_is_empty(&wav_path) {
             TrackPublicationState::FallbackRequired
         } else {
             TrackPublicationState::NotRecorded
@@ -618,6 +624,19 @@ fn assess_validation(expected_duration_ms: u64, evidence: &ValidationEvidence) -
         );
     }
     Ok(())
+}
+
+/// True only when the WAV is readable AND provably carries no audio.
+///
+/// Deliberately conservative: a WAV we cannot parse is NOT reported empty.
+/// "Unreadable" and "silent" are different problems, and treating the first as
+/// the second would quietly discard a recording that merely failed to open,
+/// which is the one outcome worse than a loud failure.
+pub fn wav_is_empty(wav: &Path) -> bool {
+    match hound::WavReader::open(wav) {
+        Ok(reader) => reader.spec().sample_rate == 0 || reader.duration() == 0,
+        Err(_) => false,
+    }
 }
 
 fn wav_duration_ms(wav: &Path) -> Result<u64> {
