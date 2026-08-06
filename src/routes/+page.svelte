@@ -986,10 +986,18 @@
   // Resets when the session changes so a new recording always starts
   // at the Settings-driven default. If the Settings pref is already
   // on, the inline toggle is redundant but stays consistent.
-  let sessionNotesOpen = $state(false);
-  let showNotes = $derived(
-    manualNotesEnabled || sessionNotesOpen,
-  );
+  // null = follow the Settings pref, true/false = this session's explicit
+  // choice. It was a plain boolean OR'd with the pref, which meant the inline
+  // toggle could turn notes ON but never OFF once `manual_notes_enabled` was
+  // set: `showNotes` read `manualNotesEnabled || sessionNotesOpen`, so with the
+  // pref on it was pinned true and the button did nothing. The old handler even
+  // tried to compensate by re-clearing the flag, which could not help — the
+  // pref alone already forced the panel open. A session override has to be able
+  // to say "closed", not just "open".
+  let sessionNotesOpen = $state<boolean | null>(null);
+  let showNotes = $derived(sessionNotesOpen ?? manualNotesEnabled);
+  // Set while the notes editor is maximized; see `.notes.notes-expanded`.
+  let notesExpanded = $state(false);
 
   // Linux-only in-app note that explains why Super+Shift+R doesn't
   // fire when the app is unfocused on most desktop environments (the
@@ -1120,7 +1128,9 @@
       notesInitial = "";
       notesInitialFor = "";
       notesUserTyped = false;
-      sessionNotesOpen = false;
+      // Back to "follow the Settings pref", not "forced closed".
+      sessionNotesOpen = null;
+      notesExpanded = false;
       return;
     }
     if (notesInitialFor === sid) return;
@@ -2163,9 +2173,13 @@
        gets a fresh editor state. #194: value={notesInitial} seeds the
        editor from notes.md on re-entry. Unmounts on done/failed. -->
   {#if showNotes && currentSessionId && (recording || (pipelineStage && pipelineStage !== "done" && pipelineStage !== "failed"))}
-    <section class="notes" style="--i: 3">
+    <section class="notes" class:notes-expanded={notesExpanded} style="--i: 3">
       {#key currentSessionId}
-        <NotesPanel value={notesInitial} onchange={scheduleNotesSave} />
+        <NotesPanel
+          value={notesInitial}
+          onchange={scheduleNotesSave}
+          onexpandchange={(v) => (notesExpanded = v)}
+        />
       {/key}
     </section>
   {/if}
@@ -2437,14 +2451,11 @@
           class="notes-toggle"
           class:notes-toggle-on={showNotes}
           onclick={() => {
+            // Record an explicit choice for this session. It outranks the
+            // Settings pref for as long as the session lasts and is cleared
+            // when the session changes, so the pref still decides where the
+            // next recording starts. Settings itself is never mutated here.
             sessionNotesOpen = !showNotes;
-            // If the Settings pref is already on, turning the toggle
-            // "off" here only kills the session flag; the Settings
-            // pref wins on the next recording. That's the correct
-            // behaviour — we don't mutate Settings from this button.
-            if (manualNotesEnabled) {
-              sessionNotesOpen = !manualNotesEnabled;
-            }
           }}
           title={showNotes ? "Hide notes" : "Open notes"}
           aria-pressed={showNotes}
@@ -3152,6 +3163,22 @@
   /* ── Notes panel (#73) ─────────────────────────────────────────────── */
   .notes {
     display: block;
+  }
+  /* The maximized notes editor is `position: fixed`, which resolves against
+     the viewport only while no ancestor carries a transform. This section is
+     a `.reveal > *` child, and that entrance animation is
+     `transform: translateY(4px)` under `animation-fill-mode: both` — a real
+     transform for the whole delay plus duration, and app.css documents a
+     webkit2gtk failure mode where these animations can stick rather than
+     settle to the `to` keyframe's `transform: none`.
+     A transform here makes this section the containing block AND a stacking
+     context, so the maximized panel sized itself to this little section
+     instead of the screen and rendered underneath `.status`, which follows it
+     in DOM order. Dropping the animation while maximized returns the panel to
+     the viewport. */
+  .notes.notes-expanded {
+    animation: none;
+    transform: none;
   }
 
   /* ── Status lane ───────────────────────────────────────────────────── */

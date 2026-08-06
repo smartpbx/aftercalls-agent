@@ -278,6 +278,12 @@
   // opt-in from CRM, so it's its own flag (a call can carry both a linked Deal
   // and a linked Ticket).
   let zohoDeskFeatureEnabled = $derived(!!me?.features?.zoho_desk);
+  // Questions are an in-call co-pilot surface (#659 P4). Gate the
+  // *empty* state on the co-pilot flag so an org without it doesn't see
+  // an orphaned "Questions" block with nothing but an Add button — the
+  // portal effectively behaves this way already, since it renders the
+  // section only when questions exist.
+  let copilotFeatureEnabled = $derived(!!me?.features?.copilot);
   let zohoFallbackOwnerName = $derived(zohoStore.connectedByDisplayName);
   let zohoModalOpen = $state(false);
   let zohoPushAction: {
@@ -2233,10 +2239,47 @@
       // Pull current_user first so the tags edit gate is correct on
       // first paint — otherwise members see the + Add pill flash in
       // before canEditTags updates.
-      try {
-        me = await invoke<Me | null>("current_user");
-      } catch {}
-      call = await invoke<Call>("get_call", { id: page.params.id });
+      // Everything below needs only `page.params.id`, so it goes out in one
+      // flight instead of seven. This chain used to be strictly sequential —
+      // current_user → get_call → get_audio_urls → get_peaks →
+      // list_highlights → speaker suggestions → loadAudio — and every step is
+      // an IPC hop into Rust and then an HTTPS round trip to the backend. At a
+      // typical ~110 ms per round trip that was roughly three quarters of a
+      // second of nothing but waiting before the page could stop showing its
+      // skeleton, which is what made opening a call feel slow even though the
+      // server answers each request in single-digit milliseconds and the
+      // payloads are tiny.
+      //
+      // `loadAudio` is the one genuine dependency — it needs the resolved
+      // `audioUrls` — so it stays behind the batch.
+      //
+      // `get_peaks` is a plain GET of the stored document (it never triggers
+      // generation), so requesting it before `peaks_available` is known costs
+      // at most one wasted read on a call that has no waveform yet.
+      const callId = page.params.id;
+      const [meR, callR, audioR, peaksR, highlightsR] = await Promise.allSettled([
+        invoke<Me | null>("current_user"),
+        invoke<Call>("get_call", { id: callId }),
+        invoke<{
+          mic?: string;
+          system?: string;
+          mixed?: string;
+          peaks_available?: boolean;
+        }>("get_audio_urls", { id: callId }),
+        invoke<{ peaks: number[]; silence_ranges?: [number, number][] }>("get_peaks", {
+          id: callId,
+        }),
+        invoke<Highlight[]>("list_highlights", { callId }),
+      ]);
+
+      // `me` only gates the tags-edit affordance; a failure there must not
+      // take the page down, same as before.
+      if (meR.status === "fulfilled") me = meR.value;
+
+      // `get_call` is the one fatal fetch — rethrow into the outer catch so
+      // the error surface is unchanged.
+      if (callR.status === "rejected") throw callR.reason;
+      call = callR.value;
       // #634 — backend `get_call` upserts into `call_reads` so this
       // call is now read for the caller. Nudge the layout's sidebar
       // chip without waiting for the next 60s `/auth/me` poll. The
@@ -2258,24 +2301,30 @@
       // collapsing linked teammates to italic fallback + "unassigned"
       // pills. Idempotent (`memberRosterLoaded` guard inside).
       void ensureMemberRoster();
+      // #661 — never-silent naming suggestions. Deliberately NOT in the batch
+      // above: it opens with `if (!call) return`, so firing it before `call`
+      // resolves would make it a silent no-op. It is non-fatal and nothing
+      // below reads its result, so it runs detached rather than adding a
+      // seventh round trip to the critical path.
+      void loadSpeakerSuggestions();
       // Seed the notes editor once — subsequent poll refreshes keep
       // the local buffer authoritative so mid-type saves aren't
       // clobbered by a stale server value.
       notesBuffer = call.notes ?? "";
       notesInitialized = true;
-      try {
-        audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+      if (audioR.status === "fulfilled") {
+        audioUrls = audioR.value;
         audioUrlsError = false;
         trace("get_audio_urls ok", audioUrls);
-      } catch (e) {
+      } else {
         // Transient 5xx / token refresh race is the common cause. Retry
         // once after a short delay before falling through — without this
         // a single blip permanently hides the remote audio on the detail
         // page (the detail page doesn't reload get_audio_urls otherwise).
-        trace("get_audio_urls FAILED, retrying once", e);
+        trace("get_audio_urls FAILED, retrying once", audioR.reason);
         await new Promise((r) => setTimeout(r, 1000));
         try {
-          audioUrls = await invoke("get_audio_urls", { id: page.params.id });
+          audioUrls = await invoke("get_audio_urls", { id: callId });
           audioUrlsError = false;
           trace("get_audio_urls ok (retry)", audioUrls);
         } catch (e2) {
@@ -2283,35 +2332,27 @@
           audioUrlsError = true;
         }
       }
-      if (audioUrls.peaks_available) {
-        try {
-          const doc = await invoke<{
-            peaks: number[];
-            silence_ranges?: [number, number][];
-          }>("get_peaks", {
-            id: page.params.id,
-          });
-          if (Array.isArray(doc.peaks) && doc.peaks.length > 0) {
-            peaks = new Float32Array(doc.peaks);
-          }
-          silenceRanges = readSilenceRanges(doc);
-          trace("get_peaks ok", { bytes: doc.peaks?.length ?? 0 });
-        } catch (e) {
-          trace("get_peaks FAILED", e);
+
+      // Apply the speculative peaks read only once `audioUrls` says the call
+      // actually has a waveform, so a stale or half-written document can never
+      // paint over a call that has none.
+      if (audioUrls.peaks_available && peaksR.status === "fulfilled") {
+        const doc = peaksR.value;
+        if (Array.isArray(doc?.peaks) && doc.peaks.length > 0) {
+          peaks = new Float32Array(doc.peaks);
         }
+        silenceRanges = readSilenceRanges(doc);
+        trace("get_peaks ok", { bytes: doc?.peaks?.length ?? 0 });
+      } else if (peaksR.status === "rejected") {
+        trace("get_peaks FAILED", peaksR.reason);
       }
-      try {
-        const hs = await invoke<Highlight[]>("list_highlights", {
-          callId: page.params.id,
-        });
-        if (Array.isArray(hs)) highlights = hs;
+
+      if (highlightsR.status === "fulfilled") {
+        if (Array.isArray(highlightsR.value)) highlights = highlightsR.value;
         trace("list_highlights ok", { count: highlights.length });
-      } catch (e) {
-        trace("list_highlights FAILED", e);
+      } else {
+        trace("list_highlights FAILED", highlightsR.reason);
       }
-      // #661 — never-silent naming suggestions for this call (unresolved
-      // only). Non-fatal secondary fetch; the loader swallows failures.
-      await loadSpeakerSuggestions();
       trace("loadAudio start");
       await loadAudio();
       trace("loadAudio done", { src: audioSrc, err: audioError });
@@ -5458,7 +5499,10 @@
       </li>
     {/snippet}
 
-    {#if (call.questions && call.questions.length > 0) || canEditSummary}
+    <!-- Existing questions always render, even if the co-pilot flag was
+         later turned off — never hide data an org already has. Only the
+         empty add-a-question affordance is gated. -->
+    {#if (call.questions && call.questions.length > 0) || (copilotFeatureEnabled && canEditSummary)}
       {@const allQs = call.questions ?? []}
       {@const openQs = allQs.filter((q) => q.status === "open")}
       {@const answeredQs = allQs.filter((q) => q.status === "answered")}

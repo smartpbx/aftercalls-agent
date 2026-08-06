@@ -17,6 +17,12 @@
     placeholder?: string;
     showHeader?: boolean;
     onchange: (value: string) => void;
+    /// Fires whenever the panel is maximized or restored. The maximized
+    /// panel is `position: fixed`, which only resolves against the viewport
+    /// if no ancestor carries a transform — so the page needs to know, and
+    /// drop the reveal animation's transform off the wrapping section while
+    /// this is true. See `.notes.notes-expanded` on the Record page.
+    onexpandchange?: (expanded: boolean) => void;
   };
   let {
     value = '',
@@ -24,6 +30,7 @@
     placeholder = 'Take notes during or after the call…',
     showHeader = true,
     onchange,
+    onexpandchange,
   }: Props = $props();
 
   let host: HTMLDivElement | undefined = $state();
@@ -142,7 +149,10 @@
       <button
         type="button"
         class="maximize-btn"
-        onclick={() => (expanded = !expanded)}
+        onclick={() => {
+          expanded = !expanded;
+          onexpandchange?.(expanded);
+        }}
         aria-label={expanded ? 'Restore notes panel' : 'Maximize notes panel'}
         title={expanded ? 'Restore' : 'Maximize'}
       >

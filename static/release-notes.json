@@ -1,4 +1,11 @@
 {
+  "0.32.3": {
+    "headline": "Calls no longer get stuck part-way, older calls have their waveforms and audio back, and the notes panel behaves.",
+    "changes": [
+      "Signing out or quitting mid-call asks first. Signing out or quitting while a recording or a call still being processed was in flight would abandon it without warning. Both now ask first, and tell you what is still running.",
+      "Opening a call is quicker. Opening a call took about three quarters of a second longer than it needed to before anything appeared. It now asks for everything it needs at once instead of one thing at a time."
+    ]
+  },
   "0.32.0": {
     "headline": "The in-call co-pilot now tells people apart, lets you correct what it heard, and stops reporting a finished screen recording as failed.",
     "changes": [

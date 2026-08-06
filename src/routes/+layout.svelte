@@ -159,6 +159,9 @@
   // `liveSession` store even while the user is off the Record route.
   // The Record page reads the store instead of owning these listeners.
   let unlistenLiveSegment: UnlistenFn | null = null;
+  // Rust asks the webview to confirm a quit while work is in flight; see the
+  // BusyPrompt block for why this is not a native dialog.
+  let unlistenQuitConfirm: UnlistenFn | null = null;
   let unlistenLiveSession: UnlistenFn | null = null;
   let unlistenLiveCoaching: UnlistenFn | null = null;
   // #659 (P2) — fast-lane cue stream (battlecards + deal-risk cues). Same
@@ -1117,6 +1120,18 @@
     // three write into the persistent `liveSession` store; the Record
     // page reads from it. Best-effort — the draft is advisory, the
     // batch pipeline is authoritative.
+    unlistenQuitConfirm = await listen<{ recording?: boolean; processing?: boolean }>(
+      "quit-confirm-request",
+      async (evt) => {
+        signOutBusy = {
+          recording: !!evt.payload?.recording,
+          processing: !!evt.payload?.processing,
+          action: "quit",
+        };
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        signOutConfirmBtn?.focus();
+      },
+    );
     unlistenLiveSegment = await listen<LiveSegment>("live-segment", (evt) => {
       liveSession.pushSegment(evt.payload);
     });
@@ -2036,6 +2051,7 @@
     unlistenState?.();
     unlistenSessionExpired?.();
     unlistenPipeline?.();
+    unlistenQuitConfirm?.();
     unlistenLiveSegment?.();
     unlistenLiveSession?.();
     unlistenLiveCoaching?.();
@@ -2436,8 +2452,94 @@
       refreshStaleNudge(),
     ]);
   }
+  // Sign-out guard. Signing out revokes the token the pipeline is uploading
+  // and transcribing with, so doing it mid-flight abandons the call — the
+  // backend never sees a failure and the row sat as "processing" until the
+  // orphan-reaper caught it. Quit and window-close already ask first; this
+  // path never did.
+  //
+  // Rendered in the webview rather than through `@tauri-apps/plugin-dialog`.
+  // The native dialog never appears on Wayland/wlroots (#605), which would
+  // make sign-out look like it silently did nothing.
+  // Shared by sign-out and quit. Quit used to ask through
+  // `tauri-plugin-dialog`, which never renders on Wayland/wlroots (#605) —
+  // and because the close handler calls `api.prevent_close()` first, the
+  // window just refused to close there with nothing on screen to explain it.
+  // Both paths render here instead.
+  type BusyPrompt = {
+    recording: boolean;
+    processing: boolean;
+    action: "signout" | "quit";
+  };
+  let signOutBusy = $state<BusyPrompt | null>(null);
+  let signOutConfirmBtn = $state<HTMLButtonElement | null>(null);
+
+  const signOutBusyMessage = $derived.by(() => {
+    if (!signOutBusy) return "";
+    const verb =
+      signOutBusy.action === "quit"
+        ? { both: "Quitting stops both and the call will not finish.",
+            rec: "Quitting stops the recording.",
+            proc: "Quitting abandons it before it finishes." }
+        : { both: "Signing out stops both and the call will not finish.",
+            rec: "Signing out stops the recording.",
+            proc: "Signing out abandons it before it finishes." };
+    if (signOutBusy.recording && signOutBusy.processing)
+      return `aftercalls is recording and still processing a call. ${verb.both}`;
+    if (signOutBusy.recording)
+      return `aftercalls is recording right now. ${verb.rec}`;
+    return `aftercalls is still processing a call in the background. ${verb.proc}`;
+  });
+
+  const signOutBusyTitle = $derived(
+    signOutBusy?.action === "quit" ? "Quit aftercalls?" : "Still working on a call",
+  );
+  const signOutConfirmLabel = $derived(
+    signOutBusy?.action === "quit" ? "Quit anyway" : "Sign out anyway",
+  );
+  const signOutCancelLabel = $derived(
+    signOutBusy?.action === "quit" ? "Keep running" : "Stay signed in",
+  );
+
+  function cancelSignOut() {
+    signOutBusy = null;
+  }
+
+  async function confirmBusyPrompt() {
+    const action = signOutBusy?.action ?? "signout";
+    if (action === "quit") {
+      signOutBusy = null;
+      try {
+        await invoke("confirm_quit");
+      } catch (e) {
+        console.warn("confirm_quit failed", e);
+      }
+      return;
+    }
+    await performSignOut();
+  }
+
   async function signOut() {
     closeUserMenu();
+    try {
+      const busy = await invoke<{ recording: boolean; processing: boolean }>("busy_detail");
+      if (busy.recording || busy.processing) {
+        signOutBusy = { ...busy, action: "signout" };
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        signOutConfirmBtn?.focus();
+        return;
+      }
+    } catch (e) {
+      // Probe failure must not strand the user in a session they asked to
+      // leave. Fall through and sign out, same posture the update-check
+      // probe takes.
+      console.warn("busy_detail probe failed", e);
+    }
+    await performSignOut();
+  }
+
+  async function performSignOut() {
+    signOutBusy = null;
     // #646 Layer C — stop the sweeper before the auth token goes
     // away so a stale `me` reference doesn't drive a background
     // IPC against a now-logged-out session.
@@ -3334,6 +3436,56 @@
      windows (those load the app at their own route). -->
 {#if !isOverlay && !isRegionSelect}
   <ScreenSourceChooser />
+{/if}
+
+<!-- Sign-out guard. Quit and window-close already confirm through
+     `quit_with_confirm`; sign-out revokes the same token the pipeline is
+     using and had no prompt at all. Reuses the .rn-backdrop / .rn-modal
+     shell so it matches the other confirmations. -->
+{#if signOutBusy}
+  <div
+    class="rn-backdrop"
+    role="button"
+    tabindex="-1"
+    onclick={cancelSignOut}
+    onkeydown={(e) => {
+      if (e.key === "Escape") cancelSignOut();
+    }}
+  >
+    <div
+      class="rn-modal auto-ack-slim"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="signout-busy-title"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => {
+        if (e.key === "Escape") { cancelSignOut(); return; }
+        e.stopPropagation();
+      }}
+      tabindex="-1"
+    >
+      <div class="rn-head">
+        <h2 id="signout-busy-title">{signOutBusyTitle}</h2>
+      </div>
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div class="rn-body" tabindex="0" role="region" aria-label="Confirmation">
+        <p class="auto-ack-slim-body">{signOutBusyMessage}</p>
+      </div>
+      <div class="rn-actions">
+        <div class="auto-ack-buttons">
+          <button type="button" class="auto-secondary" onclick={cancelSignOut}
+            >{signOutCancelLabel}</button
+          >
+          <button
+            type="button"
+            class="rn-dismiss"
+            bind:this={signOutConfirmBtn}
+            onclick={confirmBusyPrompt}>{signOutConfirmLabel}</button
+          >
+        </div>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <style>

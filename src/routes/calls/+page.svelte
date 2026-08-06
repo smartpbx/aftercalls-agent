@@ -1718,6 +1718,18 @@
                         <span class="status-chip">{sourceKindLabel(call.ingest_source)}</span>
                       {:else if call.source_kind}
                         <span class="status-chip">{sourceKindLabel(call.source_kind)}</span>
+                        <!-- #412 dropped the standalone source_app chip as
+                             redundant with ingest_source. That holds for
+                             IMPORTED calls, but an agent-recorded call has
+                             ingest_source = 'agent' (which badges nothing),
+                             so the row showed only Auto/Manual and you had
+                             to open the call to see whether it was Zoom,
+                             Teams or Meet. Re-added on this branch only. -->
+                        {#if prettyApp(call.source_app)}
+                          <span class="status-chip" title="Recorded in {prettyApp(call.source_app)}">
+                            {prettyApp(call.source_app)}
+                          </span>
+                        {/if}
                       {/if}
                       {#if call.status === "available"}
                         <!-- #303 — placeholder external recording.

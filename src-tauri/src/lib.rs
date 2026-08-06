@@ -1162,6 +1162,26 @@ fn is_processing(state: State<Recorder>) -> bool {
     state.is_active() || pipeline::is_pipeline_active()
 }
 
+/// The same two signals `is_processing` collapses, reported separately.
+///
+/// The quit path can word its prompt precisely because it reads the pair
+/// directly in Rust; anything in the webview only had the collapsed bool and
+/// would have to say something vague. Sign-out needs to tell a user mid-call
+/// apart from one whose call is still uploading, so it needs the pair too.
+#[derive(serde::Serialize)]
+struct BusyDetail {
+    recording: bool,
+    processing: bool,
+}
+
+#[tauri::command]
+fn busy_detail(state: State<Recorder>) -> BusyDetail {
+    BusyDetail {
+        recording: state.is_active(),
+        processing: pipeline::is_pipeline_active(),
+    }
+}
+
 #[tauri::command]
 async fn select_import_file(
     app: AppHandle,
@@ -4540,39 +4560,46 @@ fn quit_with_confirm(app: AppHandle) {
         app.exit(0);
         return;
     }
-    let body = if recorder_busy && pipeline_busy {
-        "aftercalls is recording and still processing a call. Quit anyway?"
-    } else if recorder_busy {
-        "aftercalls is recording right now. Quit anyway?"
-    } else {
-        "aftercalls is still processing a call in the background. Quit anyway?"
-    };
-    // tauri-plugin-dialog::ask pops a native OS dialog. Running it on
-    // the async runtime so the tray menu callback returns promptly
-    // rather than blocking the event loop.
-    let app_for_dialog = app.clone();
-    tauri::async_runtime::spawn(async move {
-        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-        // Show the window so the dialog has a visible parent on Linux
-        // (GTK dialogs can land offscreen when the parent is hidden).
-        show_main_window(&app_for_dialog);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app_for_dialog
-            .dialog()
-            .message(body)
-            .title("Quit aftercalls?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Quit anyway".into(),
-                "Keep running".into(),
-            ))
-            .show(move |confirmed| {
-                let _ = tx.send(confirmed);
-            });
-        if rx.await.unwrap_or(false) {
-            app_for_dialog.exit(0);
+    // Ask through the webview, not `tauri-plugin-dialog`.
+    //
+    // The native dialog never appears on Wayland under wlroots-derived
+    // compositors (#605, the same thing that broke the settings "Forget"
+    // confirm). Here the consequence was worse than a dead button: the close
+    // handler calls `api.prevent_close()` first, so on those compositors the
+    // window refused to close and no prompt ever explained why.
+    //
+    // The webview owns the prompt now — including its wording — and calls
+    // `confirm_quit` if the user agrees.
+    show_main_window(&app);
+    match app.get_webview_window("main") {
+        Some(win) => {
+            if win
+                .emit(
+                    "quit-confirm-request",
+                    serde_json::json!({
+                        "recording": recorder_busy,
+                        "processing": pipeline_busy,
+                    }),
+                )
+                .is_err()
+            {
+                // Emit failed — there is no reachable UI to ask through, so
+                // honour the quit rather than trapping the user in an app that
+                // will not close.
+                app.exit(0);
+            }
         }
-    });
+        // No main webview at all (already torn down): nothing to protect and
+        // nothing to ask with.
+        None => app.exit(0),
+    }
+}
+
+/// Webview's answer to `quit-confirm-request`. The prompt itself lives in the
+/// layout so it renders on every platform; this is only the commit step.
+#[tauri::command]
+fn confirm_quit(app: AppHandle) {
+    app.exit(0);
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -5287,6 +5314,8 @@ pub fn run() {
             stop_recording,
             is_recording,
             is_processing,
+            busy_detail,
+            confirm_quit,
             select_import_file,
             process_imported_file,
             confirm_auto_start,
