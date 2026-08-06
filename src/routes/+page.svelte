@@ -65,7 +65,10 @@
     | { stage: "writing_note" }
     | { stage: "uploading" }
     | { stage: "done"; session_dir: string; note_path: string; call_id: string }
-    | { stage: "failed"; error: string };
+    | { stage: "failed"; error: string }
+    // #646 Layer A — a retry wait. Carried either as its own stage value or
+    // as a `retrying` flag riding a normal stage event.
+    | { stage: "retrying" };
 
   type AutoDetectEvent =
     | { kind: "prompt_start"; app: string }
@@ -1165,6 +1168,15 @@
   }
 
   let unlisten: UnlistenFn | null = null;
+  // #646 Layer A — a retry wait is a MODIFIER on the current stage, not a
+  // stage of its own. Assigning it to `pipelineStage` put the raw string
+  // "retrying" straight into the status row (no `pipelineLabels` entry, so the
+  // `?? pipelineStage` fallback rendered it verbatim) and, worse, the retry
+  // ends on the separate `pipeline-retry` channel that only the layout was
+  // listening to — so the topstrip went idle while this row stayed pinned at
+  // "retrying" with nothing able to clear it.
+  let pipelineRetrying = $state(false);
+  let unlistenPipelineRetry: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
   let unlistenAuto: UnlistenFn | null = null;
   let unlistenMicFallback: UnlistenFn | null = null;
@@ -1181,11 +1193,34 @@
   }
 
   onMount(async () => {
+    // The retry wait can end on this dedicated channel rather than with a
+    // fresh `pipeline` stage event. Without it this page never learns the wait
+    // is over — the exact reason the row stuck.
+    try {
+      unlistenPipelineRetry = await listen<{ active: boolean }>(
+        "pipeline-retry",
+        (evt) => {
+          pipelineRetrying = !!evt.payload?.active;
+        },
+      );
+    } catch (e) {
+      console.debug("pipeline-retry listener wiring noop", e);
+    }
     unlisten = await listen<PipelineEvent>("pipeline", (evt) => {
       const p = evt.payload;
       pipelineError = "";
       subGate = false;
-      pipelineStage = p.stage;
+      const rawStage = p.stage ?? "";
+      const retrying = rawStage === "retrying" || (p as { retrying?: boolean }).retrying === true;
+      if (retrying) {
+        // Hold the prior stage so the pip class stays put; only the label
+        // swaps. Same rule the layout's topstrip follows.
+        pipelineRetrying = true;
+        if (rawStage !== "retrying" && rawStage) pipelineStage = rawStage;
+      } else {
+        pipelineStage = rawStage;
+        pipelineRetrying = false;
+      }
       if (p.stage === "failed") {
         if (isSubscriptionInactive(p.error)) {
           // #602/WS-G — recording creation was billing-gated (402
@@ -1258,6 +1293,7 @@
         }
         if (recording) {
           pipelineStage = "";
+          pipelineRetrying = false;
           pipelineError = "";
           subGate = false;
           openableCallId = "";
@@ -1481,6 +1517,7 @@
     linkedTicketGeneration += 1;
     cancelEndedExternalPushes();
     unlisten?.();
+    unlistenPipelineRetry?.();
     unlistenState?.();
     unlistenAuto?.();
     unlistenMicFallback?.();
@@ -1530,6 +1567,7 @@
 
   async function actuallyStartRecording() {
     pipelineStage = "";
+    pipelineRetrying = false;
     pipelineError = "";
     subGate = false;
     openableCallId = "";
@@ -1556,6 +1594,7 @@
   // self-note has only one participant.
   async function actuallyStartSelfNote() {
     pipelineStage = "";
+    pipelineRetrying = false;
     pipelineError = "";
     subGate = false;
     openableCallId = "";
@@ -1735,6 +1774,7 @@
     if (!picked) return;
     importing = true;
     pipelineStage = "";
+    pipelineRetrying = false;
     pipelineError = "";
     subGate = false;
     openableCallId = "";
@@ -2479,7 +2519,9 @@
         <span class="row-dot {pipelineStage}"></span>
         <div class="row-body">
           <p class="row-title">
-            {pipelineLabels[pipelineStage] ?? pipelineStage}
+            {pipelineRetrying
+              ? "Retrying…"
+              : (pipelineLabels[pipelineStage] ?? pipelineStage)}
           </p>
         </div>
         <!-- #351 — Open buttons held until the pipeline reaches done.
