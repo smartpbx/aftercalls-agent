@@ -17,7 +17,15 @@
     title: string;
     body: string;
     chips?: string[];
-    kind: "record" | "tray" | "shortcuts" | "detect" | "settings";
+    // `permissions` has no slide yet — it is the reserved seam for the
+    // first conditional slide. Keep it; it is not dead code.
+    kind:
+      | "record"
+      | "tray"
+      | "shortcuts"
+      | "detect"
+      | "settings"
+      | "permissions";
   };
 
   let index = $state(0);
@@ -31,41 +39,47 @@
       : "Shortcuts are optional. You can set recording and note shortcuts in Settings, and press ? to see every in-app shortcut.",
   );
 
-  const slides = $derived<Slide[]>([
+  // Slides are authored without a step label; `slides` below stamps
+  // "Step N of M" from the live list. A slide that only appears on some
+  // platforms or plans can then be spliced in or out here without
+  // leaving every other label wrong.
+  const baseSlides = $derived<Omit<Slide, "step">[]>([
     {
-      step: "Step 1 of 5",
       title: "Start with Record.",
       body: "Capture a call, import an existing recording, or make a note to yourself from the Record screen.",
       chips: ["Call recording", "Import audio", "Note to self"],
       kind: "record",
     },
     {
-      step: "Step 2 of 5",
       title: "The tray keeps aftercalls nearby.",
       body: "Closing the window can keep the agent available in the tray, depending on your Settings. The tray menu includes Start recording, Note to self, Settings, and Quit.",
       chips: ["Start recording", "Note to self", "Settings", "Quit"],
       kind: "tray",
     },
     {
-      step: "Step 3 of 5",
       title: "Shortcuts work from the keyboard.",
       body: shortcutBody,
       kind: "shortcuts",
     },
     {
-      step: "Step 4 of 5",
       title: "Call detection asks first.",
       body: "Auto-detect can notice likely calls and ask before recording. Auto-record is separate, opt-in, and only starts for apps you allow.",
       chips: ["Ask before recording", "Auto-record is opt-in", "Allowed apps only"],
       kind: "detect",
     },
     {
-      step: "Step 5 of 5",
       title: "You control the agent in Settings.",
       body: "Choose your microphone, startup and close behavior, sounds, recording limits, telemetry, shortcuts, call detection, auto-record, and recording policy.",
       kind: "settings",
     },
   ]);
+
+  const slides = $derived<Slide[]>(
+    baseSlides.map((s, i) => ({
+      ...s,
+      step: `Step ${i + 1} of ${baseSlides.length}`,
+    })),
+  );
 
   const current = $derived(slides[index]);
   const isLast = $derived(index === slides.length - 1);

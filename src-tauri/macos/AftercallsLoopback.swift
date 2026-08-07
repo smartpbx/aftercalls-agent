@@ -18,6 +18,7 @@
 // session, it just falls back to mic-only (matching Linux/Windows).
 
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -326,4 +327,43 @@ public class AftercallsLoopback: NSObject, SCStreamOutput, SCStreamDelegate {
         var le = v.littleEndian
         return Data(bytes: &le, count: 2)
     }
+}
+
+// MARK: - TCC permission pre-flight (#623, free functions)
+//
+// Bridged into Rust as free functions via the `ffi` module in
+// `src/macos_loopback.rs`. Kept outside the `@available(macOS 13.0, *)`
+// class because the permission APIs (AVFoundation since 10.14,
+// CoreGraphics screen-capture preflight since 10.15) have a lower
+// floor than ScreenCaptureKit and the agent should report grant state
+// even on a macOS older than the SCK loopback floor.
+
+/// Current microphone authorization, as the raw `AVAuthorizationStatus`
+/// value: .notDetermined=0, .restricted=1, .denied=2, .authorized=3.
+/// The Rust side maps these to `PermStatus`.
+public func micAuthStatus() -> Int32 {
+    return Int32(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
+}
+
+/// Whether the app already has screen-recording (system-audio loopback)
+/// access. `CGPreflightScreenCaptureAccess` is non-prompting — it just
+/// reads the current TCC grant.
+public func screenCaptureAuthStatus() -> Bool {
+    return CGPreflightScreenCaptureAccess()
+}
+
+/// Prompt for screen-recording access (or no-op if a decision already
+/// exists) and return the resulting grant. The macOS prompt directs the
+/// user to System Settings; the grant only takes effect on the next
+/// capture attempt, so callers should re-check after the user returns.
+public func requestScreenCaptureAccess() -> Bool {
+    return CGRequestScreenCaptureAccess()
+}
+
+/// Fire the AVFoundation microphone-permission prompt. Async on the OS
+/// side; we don't surface the completion bool here — the Rust caller
+/// re-reads `micAuthStatus()` for the authoritative value once the user
+/// has answered.
+public func requestMicAccess() {
+    AVCaptureDevice.requestAccess(for: .audio) { _ in }
 }

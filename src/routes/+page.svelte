@@ -22,6 +22,11 @@
   import LiveAssistPanel from "$lib/LiveAssistPanel.svelte";
   import CoPilotPanel from "$lib/CoPilotPanel.svelte";
   import { portalErrorToText } from "$lib/portalError";
+  import {
+    checkCapturePermissions,
+    openPrivacySettings,
+    type PrivacyPane,
+  } from "$lib/permissions";
   import { openBilling } from "$lib/billing";
   import { liveSession } from "$lib/stores/liveSession.svelte";
   import type {
@@ -99,6 +104,30 @@
   // friendly "subscribe to keep recording" block; never surface the raw
   // 402 string for this case.
   let subGate = $state(false);
+
+  // #623 S-1/S-2 — macOS capture-permission pre-flight state. Capture
+  // is native (cpal mic + system loopback), so macOS gates it per-app
+  // rather than through a webview prompt. Two very different failures
+  // come out of that gate:
+  //   - mic denied → the recorder can't start at all, and master
+  //     surfaces the raw device error at the record aha-moment.
+  //   - screen recording denied → far worse, because it's SILENT:
+  //     `recorder.rs` swallows the loopback-constructor failure and
+  //     deletes `system.wav`, so the recording quietly captures one
+  //     side and the post-hoc "only your microphone was recorded"
+  //     detector — which is gated on that file existing — can never
+  //     fire. Reading the grants before Start is what actually closes
+  //     that hole.
+  // `permError` is the blocking case, `screenNote` the soft degrade.
+  // Both are macOS-only by construction: every status is
+  // `not_applicable` on Linux / Windows, so neither can ever render
+  // there.
+  let permError = $state<{
+    label: string;
+    message: string;
+    pane: PrivacyPane;
+  } | null>(null);
+  let screenNote = $state(false);
 
   // #live — Live-transcript draft (Phase 1). `liveTranscriptEnabled` gates
   // the whole panel on the org feature flag (read from current_user on
@@ -897,6 +926,45 @@
       .replace(/\bDigitalOcean\b/gi, "the storage provider")
       .replace(/\bSpaces\b/g, "object storage");
   }
+
+  /** #623 S-2 — markers that identify a system-audio capture failure
+   *  as a *permission* problem. These are the internal API names the
+   *  recorder puts in the error string verbatim, plus the phrasings
+   *  the OS uses in its own denial message.
+   *
+   *  Deliberately narrow. A bare "not authorized" / "denied" also
+   *  appears in backend 401/403 strings, and sending someone to the
+   *  screen-recording settings over an expired session would be a
+   *  worse outcome than showing them the raw error. */
+  const SCREEN_CAPTURE_DENIED =
+    /ScreenCaptureKit|SCStream|screen recording|record the screen|\bTCC\b/i;
+
+  /** #623 S-2 — true when a start failure is a screen-recording
+   *  denial rather than something the user can fix by changing audio
+   *  devices. Master passes the raw string to `portalErrorToText`,
+   *  which returns it unchanged, and the post-hoc silent-system-audio
+   *  banner then recommends checking output routing — the wrong
+   *  remedy for a revoked grant. Normalised through the same helper
+   *  so a structured PortalError, an Error and a bare string all
+   *  match the same way. */
+  function isScreenCaptureError(e: unknown): boolean {
+    return SCREEN_CAPTURE_DENIED.test(portalErrorToText(e));
+  }
+
+  /** #623 — open the relevant OS privacy pane. Best-effort: an opener
+   *  failure is logged and swallowed, never allowed to block the
+   *  record flow.
+   *
+   *  The command is registered but its body lands with #623 S-4, so
+   *  until that ships this resolves without opening anything. The
+   *  message above the button stands on its own without it. */
+  async function openPrivacyPane(pane: PrivacyPane) {
+    try {
+      await openPrivacySettings(pane);
+    } catch (e) {
+      console.warn("open_privacy_settings failed", e);
+    }
+  }
   // Latest known call id for the in-flight pipeline. Populated on
   // `transcribed` — before summary/action-items finish — so the
   // user can pop the call open while the rest of the pipeline
@@ -1541,8 +1609,54 @@
     }
   });
 
+  /** #623 S-1 — read the live capture grants BEFORE touching the
+   *  recorder. Returns true when it's safe to proceed.
+   *
+   *  - mic `denied` → hard stop. `permError` explains it and offers
+   *    the settings pane; recording never starts, so the user gets a
+   *    sentence instead of a device error.
+   *  - screen recording `denied` (Call mode only) → non-blocking. The
+   *    recorder would degrade to mic-only anyway; `screenNote` makes
+   *    that visible up front instead of leaving it to be discovered
+   *    on playback.
+   *  - off macOS every status is `not_applicable`, so this is a
+   *    pass-through and Start stays instant.
+   *
+   *  A failed read is swallowed and treated as "proceed": the OS
+   *  prompt on first capture is the backstop, and a pre-flight that
+   *  can itself block a recording would be worse than no pre-flight.
+   */
+  async function preflightCapturePermissions(opts: {
+    needsScreen: boolean;
+  }): Promise<boolean> {
+    permError = null;
+    screenNote = false;
+    let perms;
+    try {
+      perms = await checkCapturePermissions();
+    } catch (e) {
+      console.warn("check_capture_permissions failed", e);
+      return true; // never block a recording on a failed pre-flight
+    }
+    if (perms.microphone === "denied") {
+      permError = {
+        label: "Microphone blocked",
+        message:
+          "aftercalls can't reach your microphone. Allow microphone access in System Settings, then start recording again.",
+        pane: "microphone",
+      };
+      return false;
+    }
+    if (opts.needsScreen && perms.screen_recording === "denied") {
+      // Soft degrade — record the mic and say what's missing.
+      screenNote = true;
+    }
+    return true;
+  }
+
   async function toggle() {
     error = "";
+    permError = null;
     try {
       if (recording) {
         sessionDir = await invoke<string>("stop_recording");
@@ -1561,7 +1675,22 @@
       if (!ok) return; // Modal opened (or aborted) — resume happens later.
       await actuallyStartRecording();
     } catch (e) {
-      error = portalErrorToText(e);
+      if (isScreenCaptureError(e)) {
+        // #623 S-2 — the grant was revoked between the pre-flight and
+        // the recorder, or the OS refused for a reason the preflight
+        // read as granted. Point at the pane that fixes it instead of
+        // rendering the internal capture error verbatim. Supersedes
+        // the softer pre-flight note so the two never stack.
+        screenNote = false;
+        permError = {
+          label: "Screen recording blocked",
+          message:
+            "aftercalls can't capture the other side of the call. Allow screen recording in System Settings to include it, or keep recording your microphone only.",
+          pane: "screen",
+        };
+      } else {
+        error = portalErrorToText(e);
+      }
     }
   }
 
@@ -1571,6 +1700,10 @@
     pipelineError = "";
     subGate = false;
     openableCallId = "";
+    // #623 S-1 — short-circuit an already-denied mic before the cue
+    // and the recorder, so a blocked start costs no beep and no
+    // half-created session.
+    if (!(await preflightCapturePermissions({ needsScreen: true }))) return;
     // Play the start cue BEFORE invoking the recorder so the system
     // loopback doesn't capture the beep. Await blocks for ~350ms
     // when sounds are enabled; no-op when off. Any failure here is
@@ -1598,6 +1731,8 @@
     pipelineError = "";
     subGate = false;
     openableCallId = "";
+    // #623 S-1 — a note is mic-only, so only the mic grant gates it.
+    if (!(await preflightCapturePermissions({ needsScreen: false }))) return;
     try {
       // #56 — selfNote: true plays the chime but suppresses the
       // spoken consent announcement. A self-note has only one
@@ -1931,6 +2066,55 @@
       </div>
       <div class="banner-actions">
         <button class="btn ghost" onclick={() => (systemAudioSilent = false)}>
+          Dismiss
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- #623 S-1 — capture permission is blocking the start. Replaces the
+       raw device error master would have shown with a sentence plus the
+       one button that fixes it. Not dismissible: it clears itself on the
+       next start attempt, and dismissing it would just hide the reason
+       the record button appeared to do nothing. macOS-only in practice
+       (every grant reads not_applicable elsewhere). -->
+  {#if permError}
+    <div class="banner" style="--i: 0.5" role="alert" aria-live="assertive">
+      <div class="banner-body">
+        <p class="banner-label">{permError.label}</p>
+        <p class="banner-text">{permError.message}</p>
+      </div>
+      <div class="banner-actions">
+        <button
+          class="btn primary"
+          onclick={() => permError && openPrivacyPane(permError.pane)}
+        >
+          Open System Settings
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- #623 S-2 — soft degrade. Screen recording is denied but the mic is
+       fine, so the call still records; this says so before the fact
+       rather than leaving it to be found on playback. The recorder drops
+       the system track and deletes system.wav in this case, which is
+       exactly why the post-hoc silent-system-audio banner above can't
+       catch it. -->
+  {#if screenNote}
+    <div class="banner" style="--i: 0.5" role="status" aria-live="polite">
+      <div class="banner-body">
+        <p class="banner-label">Microphone only</p>
+        <p class="banner-text">
+          Screen recording isn't allowed, so this call captures your
+          microphone only. Allow it to include the other side next time.
+        </p>
+      </div>
+      <div class="banner-actions">
+        <button class="btn primary" onclick={() => openPrivacyPane("screen")}>
+          Allow screen recording
+        </button>
+        <button class="btn ghost" onclick={() => (screenNote = false)}>
           Dismiss
         </button>
       </div>

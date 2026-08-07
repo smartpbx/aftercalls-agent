@@ -232,6 +232,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         let manifest_path = path.join(crate::media_manifest::MANIFEST_FILENAME);
         let mut manifest_terminal = false;
         let mut manifest_client_pending = false;
+        let mut manifest_authoritative = false;
         let manifest_retryable = match crate::media_manifest::read(&path) {
             Ok(Some(manifest)) => {
                 // A session whose pipeline finished and whose every artifact is
@@ -244,6 +245,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                 manifest_terminal =
                     manifest.pipeline_complete && !manifest.has_unacknowledged_media();
                 manifest_client_pending = manifest.has_client_pending_media();
+                manifest_authoritative = true;
                 manifest.has_retryable_media()
             }
             Ok(None) => false,
@@ -261,7 +263,25 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         if manifest_terminal {
             continue;
         }
-        let legacy_pending_audio = crate::upload::read_pending_uploads(&path).is_some();
+        // `pending_uploads.json` predates the durable manifest and is cleared in
+        // exactly one place — `upload_audio`'s all-tracks-landed path. A session
+        // that now bails BEFORE that call (nothing left to upload, because its
+        // sources were legitimately cleaned up) can never clear it, so the
+        // sentinel becomes immortal and re-offers the session forever. Observed
+        // on 0.33.0: a call the backend had already completed was re-prompted on
+        // every launch and failed with "no validated audio tracks are available
+        // for upload", because the sentinel alone forced it back into the
+        // candidate set.
+        //
+        // The v2 manifest is authoritative wherever it exists; the sentinel only
+        // speaks for sessions that predate it. When the manifest is present and
+        // says the client owes nothing, the sentinel is stale — drop it so the
+        // session stops resurfacing.
+        let legacy_sentinel = crate::upload::read_pending_uploads(&path).is_some();
+        if legacy_sentinel && manifest_authoritative && !manifest_client_pending {
+            crate::upload::clear_pending_uploads(&path);
+        }
+        let legacy_pending_audio = legacy_sentinel && !manifest_authoritative;
         if !mic_wav.exists()
             && !mic_opus.exists()
             && !system_wav.exists()

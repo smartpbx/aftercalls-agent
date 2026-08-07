@@ -1,4 +1,10 @@
 {
+  "0.34.0": {
+    "headline": "A finished call can no longer lose its transcript to an empty one, a new workspace arrives with a welcome email that takes its first owner straight to choosing a password, and a call that has already finished stops offering to finish itself.",
+    "changes": [
+      "A new workspace owner is emailed their way in. When a new workspace is set up, the first person on it now receives an email that takes them straight to choosing their own password. The page they land on says they are choosing a password for the first time rather than resetting one they never had, and the link stays good for three days. If it lapses or never arrives, a fresh one can be sent."
+    ]
+  },
   "0.33.0": {
     "headline": "In-call co-pilot edits save again, Transcript and Questions each get their own tab, and a call that finished stops reporting a failure.",
     "changes": [

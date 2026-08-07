@@ -1558,6 +1558,14 @@
       </p>
       <a href="/" class="empty-cta">Go to Record →</a>
     </div>
+  {:else if filtered.length === 0 && filteredCandidates.length === 0 && listView === "unread"}
+    <!-- #634 — Unread filter empty state. Sparse copy + no CTA, same
+         posture as the portal branch and the existing pinned/snoozed
+         states. -->
+    <div class="empty">
+      <p class="empty-title">You're all caught up.</p>
+      <p class="empty-sub">No unread calls in this view.</p>
+    </div>
   {:else if filtered.length === 0 && filteredCandidates.length === 0}
     <div class="empty">
       <p class="empty-title">
@@ -1567,17 +1575,12 @@
           No pinned calls
         {:else if listView === "snoozed"}
           No snoozed calls
-        {:else if listView === "unread"}
-          You're all caught up.
         {:else if (fromDate || toDate) && tagFilters.length === 0 && !userFilter && !query.trim()}
           No calls in the selected range
         {:else}
           No calls match these filters
         {/if}
       </p>
-      {#if listView === "unread"}
-        <p class="empty-sub">No unread calls in this view.</p>
-      {/if}
       <p class="empty-sub">
         <button type="button" class="empty-clear" onclick={clearFilters}>
           Clear filters

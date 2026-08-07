@@ -18,13 +18,19 @@ fn main() {
 // behind `cfg(target_os = "macos")` so non-Mac targets see a stock
 // `tauri_build::build()` and nothing else.
 //
-// NOTE: this build script has not been validated on a real macOS
-// host yet — the Phase 2 plan (issue #621) explicitly hands off the
-// real-hardware build to the user. The swiftc invocation, the
-// architecture flag (`-target arm64-apple-macosx13.0`), and the
-// generated-header include path are best-effort defaults from the
-// `swift-bridge` examples; tweak as needed when the first Mac build
-// surfaces an error. TODO(#621): validate on Mac and lock down.
+// VALIDATED 2026-08-07 on `macos-latest` in CI (#681). This was
+// previously flagged as unverified guesswork carried over from the
+// `swift-bridge` examples, with a TODO(#621) to check it on real
+// hardware. It needed no changes: the bridge scan, the swiftc
+// invocation, the `-target arm64-apple-macosx13.0` flag, the
+// generated-header include path, and the framework links all worked
+// untouched on the first Mac build.
+//
+// The `macos-compile-check` job in `.github/workflows/build-agent.yml`
+// now runs this on every PR, so a regression here fails CI rather than
+// reaching a Mac user. Note that job stubs the ffmpeg sidecar and does
+// not bundle — it proves this script compiles and links, not that
+// packaging or a signed installer works.
 #[cfg(target_os = "macos")]
 mod macos {
     use std::env;

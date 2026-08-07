@@ -14,6 +14,7 @@ mod media_upload;
 mod mic_consumers;
 mod notes;
 mod notify_actions;
+mod permissions;
 mod pipeline;
 mod portal;
 mod recorder;
@@ -46,6 +47,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 
 // Holds references to tray menu items we need to mutate (toggle label) so we
 // can fetch them out of app state instead of hunting through the menu tree.
@@ -2716,6 +2718,81 @@ fn platform_os() -> &'static str {
     std::env::consts::OS
 }
 
+// ── macOS capture-permission pre-flight (#623) ───────────────────────
+//
+// Thin IPC wrappers over `permissions.rs`. Callers read
+// `check_capture_permissions` before `start_recording` so an
+// already-*denied* mic permission can short-circuit with an actionable
+// message instead of a raw `cpal` error string at the record
+// aha-moment. Off macOS every command degrades to a no-op /
+// `not_applicable` so the JS contract stays uniform across builds.
+//
+// The Start-path gating and the mic-only screen-note banner are
+// separate work items on #623.
+//
+// Every command here is also listed under `main-commands` in
+// `permissions/app.toml` — without that the webview cannot reach them.
+
+/// Read the live grant state for mic + screen-recording capture.
+/// Cheap status read (never prompts) so it's safe on the hot Start
+/// path.
+#[tauri::command]
+fn check_capture_permissions() -> permissions::CapturePermissions {
+    permissions::check_capture_permissions()
+}
+
+/// Fire the OS mic-permission prompt (macOS) and return the resulting
+/// status. `not_applicable` off macOS.
+#[tauri::command]
+fn request_mic_permission() -> permissions::PermStatus {
+    permissions::request_mic_permission()
+}
+
+/// Prompt for screen-recording access (macOS `CGRequestScreenCaptureAccess`)
+/// and return whether it's now granted. Always `true` off macOS.
+#[tauri::command]
+fn request_screen_capture_access() -> bool {
+    permissions::request_screen_capture_access()
+}
+
+/// Open the relevant macOS Privacy & Security pane so the user can flip
+/// a denied grant. `pane` is "microphone" or "screen".
+///
+/// This is the only remedy for an already-*denied* grant: macOS will
+/// not re-prompt once the user has said no, so `request_mic_permission`
+/// / `request_screen_capture_access` return the same `denied` forever
+/// and the user has to flip the switch in System Settings by hand.
+///
+/// The URL allowlist lives here (Rust) rather than widening the JS
+/// opener capability scope: `app.opener().open_url(..)` called from a
+/// command is not subject to the `opener:allow-open-url` scope in
+/// `capabilities/default.json`, so the `x-apple.systempreferences:`
+/// scheme does not need to be added there. Keeping the match in Rust
+/// also means no caller-supplied text is ever interpolated into the
+/// URL — an unrecognized `pane` is rejected, not passed through.
+///
+/// A failure to open is non-fatal: it surfaces as an `Err` the callers
+/// swallow, never as a crash on the record path.
+#[tauri::command]
+fn open_privacy_settings(app: AppHandle, pane: String) -> Result<(), String> {
+    // `pane` is named (not `_pane`) on purpose: Tauri derives the IPC
+    // payload key from the parameter ident, so renaming it would break
+    // the `{ pane }` call the TS mirror already sends. `app` is
+    // injected by Tauri and is *not* part of that payload.
+    let url = match pane.as_str() {
+        "microphone" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        }
+        "screen" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        }
+        other => return Err(format!("unknown privacy pane: {other}")),
+    };
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 // ── #302 Slice B — screen capture: displays, prefs, consent ──────────
 //
 // The Settings UI (Slice C) drives these: `list_displays` populates the
@@ -3037,9 +3114,8 @@ fn open_region_select_window(
     // WEBKIT_DISABLE_COMPOSITING_MODE caveat that keeps the co-pilot overlay
     // opaque does not apply — the region page needs alpha to show the screen
     // through its dim.
-    let window = WebviewWindowBuilder::new(app, "region-select", WebviewUrl::App(url.into()))
+    let builder = WebviewWindowBuilder::new(app, "region-select", WebviewUrl::App(url.into()))
         .title("Select area")
-        .transparent(true)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
@@ -3048,9 +3124,16 @@ fn open_region_select_window(
         // exact physical monitor rect before the overlay can paint.
         .focused(false)
         .visible(false)
-        .inner_size(1.0, 1.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+        .inner_size(1.0, 1.0);
+    // `.transparent()` only exists on macOS behind Tauri's `macos-private-api`
+    // feature, which we deliberately do not enable — it bars Mac App Store
+    // submission. Per the note above this window is Windows-only at runtime,
+    // so gating the call is free rather than paying that cost for a window no
+    // Mac ever opens. Without this the agent does not compile on macOS at all
+    // (E0599), which went unnoticed until macOS joined CI.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.transparent(true);
+    let window = builder.build().map_err(|e| e.to_string())?;
     if let Err(error) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
         let _ = window.close();
         return Err(error.to_string());
@@ -5371,6 +5454,15 @@ pub fn run() {
             set_app_prefs,
             list_input_devices,
             platform_os,
+            // #623 — macOS capture-permission pre-flight. Status read
+            // gates the Start path; the request + open-settings shims
+            // back the onboarding permissions slide and the actionable
+            // "Open System Settings" error affordance. No-op off macOS.
+            // Mirrored in `permissions/app.toml` `main-commands`.
+            check_capture_permissions,
+            request_mic_permission,
+            request_screen_capture_access,
+            open_privacy_settings,
             // #302 Slice B — screen capture: monitor picker, per-user
             // prefs, the (distinct) consent ack, + a readiness probe.
             // The org feature flag gate lives on me.features.screen_capture.

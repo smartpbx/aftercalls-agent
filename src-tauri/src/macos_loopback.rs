@@ -20,8 +20,12 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
+// `pub(crate)` so the capture-permission pre-flight (`permissions.rs`)
+// can call the free TCC-status functions below without a second
+// bridge. The `AftercallsLoopback` type stays internal-by-convention
+// — only this module constructs it.
 #[swift_bridge::bridge]
-mod ffi {
+pub(crate) mod ffi {
     extern "Swift" {
         // Mirror of `AftercallsLoopback` in
         // `macos/AftercallsLoopback.swift`. The Swift class is
@@ -38,6 +42,23 @@ mod ffi {
         fn start(&mut self) -> bool;
         fn stop(&mut self) -> bool;
         fn lastError(&self) -> String;
+
+        // ── TCC permission pre-flight (#623) ─────────────────────
+        // Free functions (no `self`) mirroring the same-named free
+        // funcs in `AftercallsLoopback.swift`. `permissions.rs` maps
+        // the raw values to the serialisable `PermStatus` enum.
+        //
+        // `micAuthStatus` returns the raw AVAuthorizationStatus
+        // (.notDetermined=0, .restricted=1, .denied=2, .authorized=3).
+        // `screenCaptureAuthStatus` returns the CGPreflight bool.
+        // `requestScreenCaptureAccess` calls CGRequestScreenCaptureAccess
+        // (prompts then returns the grant). `requestMicAccess` fires
+        // the AVFoundation request prompt; the caller re-reads
+        // `micAuthStatus` afterwards for the authoritative value.
+        fn micAuthStatus() -> i32;
+        fn screenCaptureAuthStatus() -> bool;
+        fn requestScreenCaptureAccess() -> bool;
+        fn requestMicAccess();
     }
 }
 
