@@ -763,11 +763,12 @@ fn ws_url_from_base(base: &str) -> String {
 
 /// Forward a backend text frame to the webview. `segment` → `live-segment`,
 /// `session` → `live-session`, `coaching` → `live-coaching`, `live_cue` →
-/// `live-cue`, `checklist` → `live-checklist`, `questions` → `live-questions`;
-/// the raw JSON rides through so the UI type stays the single wire-shape
-/// authority. Unknown types are ignored (older agents drop the #654 `coaching`
-/// + #659-P2 `live_cue` + #659-P3 `checklist` + Phase-4 `questions` frames —
-/// additive, non-breaking).
+/// `live-cue`, `checklist` → `live-checklist`, `questions` → `live-questions`,
+/// `speaker_identities` → `live-speaker-identities`; the raw JSON rides through
+/// so the UI type stays the single wire-shape authority. Unknown types are
+/// ignored (older agents drop the #654 `coaching` + #659-P2 `live_cue` +
+/// #659-P3 `checklist` + Phase-4 `questions` + #676 `speaker_identities`
+/// frames — additive, non-breaking).
 fn normalize_terminal_session(v: &mut serde_json::Value) -> bool {
     let terminal = v.get("type").and_then(|value| value.as_str()) == Some("session")
         && v.get("status").and_then(|value| value.as_str()) == Some("terminal_error");
@@ -826,6 +827,13 @@ fn forward_incoming(app: &AppHandle, text: &str) -> bool {
         // no Tauri command; the raw JSON rides through to the UI type.
         Some("questions") => {
             let _ = app.emit("live-questions", v);
+        }
+        // #676 — the FULL reconciled speaker-identity set, pushed when the
+        // backend binds the rep's pre-picked contact to the far label the
+        // diarizer established. Read-only, server-pushed — no Tauri command;
+        // the raw JSON rides through to the UI type.
+        Some("speaker_identities") => {
+            let _ = app.emit("live-speaker-identities", v);
         }
         _ => {}
     }

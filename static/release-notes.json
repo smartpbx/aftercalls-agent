@@ -1,4 +1,11 @@
 {
+  "0.33.0": {
+    "headline": "In-call co-pilot edits save again, Transcript and Questions each get their own tab, and a call that finished stops reporting a failure.",
+    "changes": [
+      "Transcript and Questions each get their own tab. The questions list and the live transcript used to sit stacked on top of each other in the co-pilot panel. On a busy call a long list of questions pushed the transcript right out of sight. They are now two tabs you switch between, each using the full height of the panel with its own scrolling. Switching back and forth keeps your place in both, and Catch me up opens straight to the transcript.",
+      "A contact you pick before the call is now matched to the right voice. On a one-to-one call where you had already chosen the contact, the speaker list could show that single other person as two separate unnamed speakers, even though their details card underneath was correct. The contact you picked is now offered against the voice it belongs to, as a suggestion you can confirm or change."
+    ]
+  },
   "0.32.3": {
     "headline": "Calls no longer get stuck part-way, older calls have their waveforms and audio back, and the notes panel behaves.",
     "changes": [

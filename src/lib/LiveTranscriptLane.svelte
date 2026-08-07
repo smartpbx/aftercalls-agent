@@ -54,6 +54,7 @@
     onask = undefined,
     ondismissAsk = undefined,
     onhighlight = undefined,
+    visible = true,
   }: {
     segments?: LiveSegment[];
     status?: LiveStatus;
@@ -62,6 +63,12 @@
     askInFlight?: AskChip | null;
     highlighted?: Set<string>;
     speakerIdentities?: Map<string, SpeakerIdentity>;
+    /** Whether the lane is actually on screen. The co-pilot drawer keeps this
+     *  component MOUNTED but `hidden` when another pane is showing (BC-1), and
+     *  a `display:none` element has no scrollHeight — so the auto-follow below
+     *  writes `scrollTop = 0` while hidden and the lane would come back at the
+     *  TOP. Flipping this false→true re-follows to the newest line. */
+    visible?: boolean;
     onask?: (chip: AskChip) => void;
     ondismissAsk?: () => void;
     onhighlight?: (seg: LiveSegment, starred: boolean) => void;
@@ -97,10 +104,19 @@
   // therefore keys on "Them", matching the roster row + the assign POST, so a
   // "Them → contact" assignment (even pre-call) relabels the far lines the
   // instant they arrive. Falls back to that same canonical label when unassigned.
+  //
+  // #676 — NOTHING RENAMES SILENTLY. A `source: "suggested"` identity is the
+  // backend's guess (the rep's pre-picked contact, bound to the first far label
+  // the diarizer established), not something the rep asserted. It grounds the
+  // CRM card and renders as an editable row in the roster, but the transcript
+  // keeps the raw diarization label until the rep confirms it — the same rule
+  // the after-call speaker-suggestion chip follows. Absent `source` ⇒
+  // rep-assigned, so every pre-#676 row and every older backend relabels
+  // exactly as before.
   function labelFor(s: LiveSegment): string {
     const canonical = s.speaker || (s.channel === "mic" ? "You" : "Them");
     const idn = speakerIdentities.get(speakerIdentityKey(s.channel, canonical));
-    return idn ? idn.display_name : canonical;
+    return idn && idn.source !== "suggested" ? idn.display_name : canonical;
   }
 
   // ── Speaker colour (after-call transcript parity) ───────────────────────
@@ -314,13 +330,30 @@
       prevFinal = fc;
       return;
     }
+    // A hidden lane has no scrollHeight — following it there would just park
+    // scrollTop at 0 (see `visible`); the reveal effect below re-follows.
     if (!pinned) {
-      el.scrollTop = el.scrollHeight;
+      if (visible) el.scrollTop = el.scrollHeight;
     } else if (fc > prevFinal) {
       newSincePinned += fc - prevFinal;
     }
     prevFinal = fc;
     void total;
+  });
+
+  // Revealed again (drawer re-opened / switched back to the transcript pane) →
+  // jump back to the newest line, unless the rep had pinned themselves to an
+  // earlier point (their read position is theirs to keep).
+  // Starts false so a lane that mounts already-visible follows on first run,
+  // exactly as the auto-follow above would.
+  let wasVisible = false;
+  $effect(() => {
+    const now = visible;
+    const el = streamEl;
+    if (now && !wasVisible && el && !pinned) {
+      el.scrollTop = el.scrollHeight;
+    }
+    wasVisible = now;
   });
 
   function jumpToLive() {

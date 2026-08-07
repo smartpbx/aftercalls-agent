@@ -211,7 +211,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
     // Collect candidate (session_dir, age) pairs up front so we can do
     // the per-folder backend check asynchronously afterward without
     // holding the ReadDir iterator open.
-    let mut candidates: Vec<(PathBuf, String, SystemTime, bool)> = Vec::new();
+    let mut candidates: Vec<(PathBuf, String, SystemTime, bool, bool)> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -231,6 +231,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         let system_opus = path.join("system.opus");
         let manifest_path = path.join(crate::media_manifest::MANIFEST_FILENAME);
         let mut manifest_terminal = false;
+        let mut manifest_client_pending = false;
         let manifest_retryable = match crate::media_manifest::read(&path) {
             Ok(Some(manifest)) => {
                 // A session whose pipeline finished and whose every artifact is
@@ -242,6 +243,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                 // calls" chip that the user can never clear.
                 manifest_terminal =
                     manifest.pipeline_complete && !manifest.has_unacknowledged_media();
+                manifest_client_pending = manifest.has_client_pending_media();
                 manifest.has_retryable_media()
             }
             Ok(None) => false,
@@ -252,6 +254,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                     "aftercalls: media manifest unreadable for {}: {e:#}",
                     path.display()
                 );
+                manifest_client_pending = true;
                 true
             }
         };
@@ -298,6 +301,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
             session_id,
             age_anchor,
             manifest_retryable || legacy_pending_audio,
+            manifest_client_pending || legacy_pending_audio,
         ));
     }
 
@@ -319,7 +323,7 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
         None => return Vec::new(),
     };
 
-    for (session_dir, session_id, age_anchor, local_media_retryable) in candidates {
+    for (session_dir, session_id, age_anchor, local_media_retryable, client_pending) in candidates {
         // Filter out anything Layer C is mid-resuming so the prompted
         // UI never races the sweeper.
         if is_in_flight(&session_id) {
@@ -337,10 +341,15 @@ pub async fn scan_orphans(app: &AppHandle) -> Vec<OrphanSession> {
                         .and_then(|s| s.as_str())
                         .map(|s| s != "complete")
                         .unwrap_or(true);
-                    (
-                        stuck || local_media_retryable,
-                        OrphanKind::StuckPipeline,
-                    )
+                    // A completed call qualifies only on media the CLIENT still
+                    // owes bytes for — not on anything merely `has_retryable_media`.
+                    // An artifact the backend already holds but has not finished
+                    // validating is retryable, and gating on that re-ran the whole
+                    // pipeline against a call that was already transcribed and
+                    // summarized. Worse, its local sources are legitimately gone by
+                    // then, so the re-run failed on a missing source and reported
+                    // "all track uploads failed" for a call that was perfectly fine.
+                    (stuck || client_pending, OrphanKind::StuckPipeline)
                 }
                 Ok(None) => {
                     // No backend row: pipeline crashed before

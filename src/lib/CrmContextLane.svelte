@@ -13,6 +13,16 @@
   `contact_hint` (raised via `onpick`); switching primary re-hydrates the card
   via the SAME `live_crm_context` fetch (no new endpoint).
 
+  #676 adds a THIRD row state: SEEDED-UNCONFIRMED. When the rep pre-picked a
+  contact, the backend re-keys that identity onto the first far label the
+  diarizer establishes and marks it `source:"suggested"`. Such a row renders as
+  a visible guess (dimmed avatar, italic "{name}?", mono "Pre-selected contact"
+  caption) with Confirm / Edit / × — and, critically, does NOT rename the
+  transcript until confirmed (`LiveTranscriptLane.labelFor` skips it). The CRM
+  card IS grounded by it immediately: that part already worked, and gating it
+  would be a regression. Absent `source` ⇒ rep-assigned, so nothing about the
+  pre-#676 render changes.
+
   Bottom: the existing matched-contact card + open Deals (Sales) / Cases
   (Support), hydrated from the primary contact. Reuses
   `invoke("live_crm_context", { contactId })`.
@@ -182,6 +192,15 @@
       idn.contact_id === primaryContactId
     );
   }
+  /** #676 — a row the BACKEND bound, not the rep: the contact picked before
+   *  dialing, re-keyed onto the first far label the diarizer established. It
+   *  renders as a visibly-unconfirmed suggestion (dimmed avatar, italic
+   *  "{name}?", Confirm / Edit / ×) and does NOT rename the transcript until
+   *  confirmed. Absent `source` ⇒ rep-assigned, so every pre-#676 row and every
+   *  older backend renders exactly as before. */
+  function isSeeded(idn: SpeakerIdentity | undefined): boolean {
+    return idn?.source === "suggested";
+  }
 
   function openPicker(row: DetectedSpeaker) {
     openPickerKey = speakerIdentityKey(row.channel, row.speakerLabel);
@@ -336,6 +355,53 @@
     openPickerKey = null;
     announce = `${groupLabel(group)} identity cleared.`;
   }
+
+  // #676 — CONFIRM a backend-seeded suggestion. There is no confirm endpoint:
+  // the rep re-picking the same identity IS the confirmation, so this hands the
+  // seeded row's own identity straight to `commitAssign`. That stamps
+  // `source:"assigned"` server-side, flips the row to the ordinary confirmed
+  // look, and lets `LiveTranscriptLane.labelFor` start applying the name — all
+  // through the path the picker already uses. No new invoke, no new prop.
+  function confirmSeeded(group: SpeakerGroup) {
+    const idn = group.identity;
+    if (!idn) return;
+    commitAssign(group, {
+      kind: idn.kind,
+      display_name: idn.display_name,
+      contact_id: idn.contact_id,
+      user_id: idn.user_id,
+    });
+  }
+
+  // #676 — announce a suggestion ONCE, the first time its row appears. The
+  // identity map is reconciled wholesale on every write, so keying the
+  // announcement off the row alone would re-read the same suggestion aloud on
+  // each reconcile; the seen-set makes it arrival-only. Confirm and Clear reuse
+  // `commitAssign` / `clearAssign`'s existing announcements verbatim.
+  const announcedSeeded = new Set<string>();
+  // …but only once PER CALL. The lane stays mounted for the life of the window,
+  // so an un-cleared set would mute the announcement on every call after the
+  // first that seeds the same `system:Speaker A`. `resetForNewSession` nulls the
+  // store's `sessionUuid` on the recording-state start edge and the fresh one
+  // arrives immediately after, so this turns over exactly once per new session.
+  let announcedSeededSession: string | null = null;
+  $effect(() => {
+    if (sessionUuid !== announcedSeededSession) {
+      announcedSeededSession = sessionUuid;
+      announcedSeeded.clear();
+    }
+    for (const group of speakerGroups) {
+      const idn = group.identity;
+      if (!isSeeded(idn) || !idn) continue;
+      const key = speakerIdentityKey(
+        group.lead.channel,
+        group.lead.speakerLabel,
+      );
+      if (announcedSeeded.has(key)) continue;
+      announcedSeeded.add(key);
+      announce = `We think this is ${idn.display_name}. Confirm or edit in Speakers.`;
+    }
+  });
 
   // Promote an already-assigned zoho_contact to primary (re-hydrates the card).
   function makePrimary(group: SpeakerGroup) {
@@ -693,7 +759,12 @@
       {@const rowKey = speakerIdentityKey(row.channel, row.speakerLabel)}
       {@const idn = group.identity}
       {@const primary = isPrimaryRow(idn)}
-      <div class="spk-row" class:picking={openPickerKey === rowKey}>
+      {@const seeded = isSeeded(idn) && openPickerKey !== rowKey}
+      <div
+        class="spk-row"
+        class:picking={openPickerKey === rowKey}
+        class:spk-row-seeded={seeded}
+      >
         {#if openPickerKey === rowKey}
           <SpeakerIdentityPicker
             speakerLabel={row.diarizationLabel}
@@ -707,9 +778,10 @@
               class="spk-name"
               title={idn?.display_name ?? row.diarizationLabel}
             >
-              {idn?.display_name ?? row.diarizationLabel}
+              {#if seeded}{idn?.display_name}?{:else}{idn?.display_name ??
+                  row.diarizationLabel}{/if}
             </span>
-            {#if idn}
+            {#if idn && !seeded}
               <span class="spk-kind">{kindLabel(idn.kind)}</span>
             {/if}
             {#if group.rows.length > 1}
@@ -726,9 +798,43 @@
               >
             {/if}
           </div>
+          {#if seeded}
+            <!-- Names the actual mechanism: this is the contact the rep picked
+                 before dialing, not a transcript name-match. Wraps to its own
+                 line when the rail is too narrow to carry it beside the name. -->
+            <span class="spk-suggest-meta">Pre-selected contact</span>
+          {/if}
           <div class="spk-actions">
             {#if row.isRecorder}
               <span class="spk-you">You</span>
+            {:else if seeded && idn}
+              <!-- #676 — one click each: it's right / it's the wrong person /
+                   it's nobody. No dialog on the exit path — the row is showing
+                   a stranger's name to the rep the moment it's wrong. -->
+              <button
+                type="button"
+                class="spk-btn spk-confirm"
+                onclick={() => confirmSeeded(group)}
+              >
+                Confirm
+              </button>
+              <button
+                type="button"
+                class="spk-btn"
+                aria-label={`Edit suggested identity for ${row.diarizationLabel}`}
+                onclick={() => openPicker(row)}
+              >
+                Edit
+              </button>
+              <button
+                type="button"
+                class="spk-btn spk-clear"
+                title="Not this person"
+                aria-label={`Clear suggested identity for ${idn.display_name}`}
+                onclick={() => clearAssign(group)}
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
             {:else if idn}
               {#if idn.kind === "zoho_contact" && !primary}
                 <button
@@ -1134,6 +1240,49 @@
     flex-direction: column;
     align-items: stretch;
   }
+  /* #676 — seeded-unconfirmed row. Compresses the after-call
+     `.speaker-suggestion` visual language (design.md §"Speaker-suggestion chip
+     + banner") into the roster's one-row-per-speaker grammar: there is no
+     separate chip to leave untouched beneath a sub-row here, so the row itself
+     carries the treatment. `--sig` left-marker = "in flight / needs a decision",
+     the same semantic it carries on the update pill. */
+  .spk-row-seeded {
+    flex-wrap: wrap;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--hairline);
+    border-left: 2px solid var(--sig);
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    animation: crm-fade-in 150ms ease-out both;
+  }
+  /* The suggestion is a GUESS, so it reads as one: dimmed avatar, italic name,
+     trailing "?" (rendered in the markup). Same recipe as the after-call
+     `.speaker-suggestion :global(.avatar)` rule. */
+  .spk-row-seeded :global(.avatar) {
+    opacity: 0.6;
+  }
+  .spk-row-seeded .spk-name {
+    font-style: italic;
+  }
+  /* Mono caption naming the provenance. Metadata, not a status — no ground, no
+     semantic colour. */
+  .spk-suggest-meta {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.02em;
+    color: var(--bone-3);
+  }
+  /* Three actions never fit beside the name in a rail this narrow, so they take
+     their own line unconditionally. This is the one deliberate divergence from
+     the after-call chip, which only wraps below 520px: the co-pilot tile is
+     narrower than that at EVERY width it ships in, so a media query would just
+     be a breakpoint that is always true. */
+  .spk-row-seeded .spk-actions {
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
   .spk-id {
     display: flex;
     align-items: center;
@@ -1205,12 +1354,16 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
-  .spk-assign {
+  /* #676 — Confirm is the seeded row's CTA and Assign is the anonymous row's,
+     so they share one accent recipe. One primary action per row. */
+  .spk-assign,
+  .spk-confirm {
     border-color: var(--accent);
     background: var(--accent-soft);
     color: var(--accent-hi);
   }
-  .spk-assign:hover {
+  .spk-assign:hover,
+  .spk-confirm:hover {
     background: var(--accent);
     color: var(--ink-0);
     border-color: var(--accent);
@@ -1295,7 +1448,8 @@
     animation: crm-fade-in 150ms ease-out both;
   }
   @media (prefers-reduced-motion: reduce) {
-    .crm-card {
+    .crm-card,
+    .spk-row-seeded {
       animation: none;
     }
   }

@@ -1,7 +1,10 @@
 <!--
   LiveQuestions — Phase 4 (live↔after-call continuity). A very simple "open
-  questions / who asked / answered + what the answer was" strip, pinned at the
-  TOP of the on-demand transcript drawer in `CoPilotPanel`. Both sides count: a
+  questions / who asked / answered + what the answer was" list. It owns the
+  "Questions" pane of `CoPilotPanel`'s on-demand drawer — a peer of the
+  transcript pane, not a strip stacked above it (a long ledger used to squeeze
+  the transcript out of the fixed-height dashboard drawer; the pane scrolls
+  itself). Both sides count: a
   question the rep OR the counterpart asks that should get answered, each
   attributed to who asked it.
 

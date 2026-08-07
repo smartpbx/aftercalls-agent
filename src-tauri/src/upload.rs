@@ -377,7 +377,25 @@ pub async fn upload_audio(
     if failed_tracks.is_empty() {
         // Aggregate cleanup boundary: do not delete the first ready track if
         // another recorded track failed later in the same run.
+        //
+        // `uploaded` is NOT the deletion boundary — a `Finalizing` track counts
+        // as uploaded so the pipeline can move on, but the backend has not yet
+        // confirmed the generation. Deleting on that signal destroys the only
+        // verified copy while validation could still go terminal, so every
+        // cleanup below is gated on the artifact reaching `ReadyAcknowledged`.
+        let manifest = crate::media_manifest::read(session_dir)?;
+        let acknowledged = |track: &str| {
+            manifest
+                .as_ref()
+                .and_then(|manifest| manifest.audio.get(track))
+                .is_some_and(|item| {
+                    item.state == crate::media_manifest::ArtifactState::ReadyAcknowledged
+                })
+        };
         for candidate in prepared {
+            if !acknowledged(candidate.track) {
+                continue;
+            }
             let kind = crate::media_upload::MediaKind::from_audio_track(candidate.track)?;
             let source = crate::media_upload::MediaSource::audio(
                 kind,
@@ -390,23 +408,15 @@ pub async fn upload_audio(
         // ready while their local bytes survived a crash before aggregate
         // cleanup. Once this run proves there are no pending tracks, remove
         // the canonical local sources for every acknowledged audio kind too.
-        if let Some(manifest) = crate::media_manifest::read(session_dir)? {
-            for track in ["mic", "system"] {
-                let ready = manifest
-                    .audio
-                    .get(track)
-                    .is_some_and(|item| {
-                        item.state == crate::media_manifest::ArtifactState::ReadyAcknowledged
-                    });
-                if ready {
-                    let kind = crate::media_upload::MediaKind::from_audio_track(track)?;
-                    let source = crate::media_upload::MediaSource::audio(
-                        kind,
-                        session_dir.join(format!("{track}.opus")),
-                        session_dir.join(format!("{track}.wav")),
-                    )?;
-                    crate::media_upload::cleanup_ready_source(session_dir, &source);
-                }
+        for track in ["mic", "system"] {
+            if acknowledged(track) {
+                let kind = crate::media_upload::MediaKind::from_audio_track(track)?;
+                let source = crate::media_upload::MediaSource::audio(
+                    kind,
+                    session_dir.join(format!("{track}.opus")),
+                    session_dir.join(format!("{track}.wav")),
+                )?;
+                crate::media_upload::cleanup_ready_source(session_dir, &source);
             }
         }
         clear_pending_uploads(session_dir);

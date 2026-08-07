@@ -14,8 +14,11 @@
        3-cell strip; dashboard = a ~300px vertical left column.
     2. EPHEMERAL CUE SLOT — a single one-at-a-time cue with an auto-dismiss drain
        bar (IntelligenceLane): battlecard > monologue > coaching, higher preempts.
-    3. ON-DEMAND TRANSCRIPT DRAWER (collapsed by default) — LiveTranscriptLane +
-       a one-click "Catch me up" shortcut + (Support) the Knowledge affordance.
+    3. ON-DEMAND DRAWER (collapsed by default) — TWO exclusive panes behind a
+       tablist, each owning the full drawer height and its own scroll:
+       "Transcript" (LiveTranscriptLane + "Catch me up" + (Support) Knowledge)
+       and "Questions" (LiveQuestions). They used to stack, and a long questions
+       ledger squeezed the transcript out of the fixed-height dashboard drawer.
 
   #662 — two shapes, ONE set of live-state instances:
     • COMPACT (default): the in-page panel; rail strip + cue + collapsed drawer.
@@ -170,8 +173,8 @@
     /** #659 (P3) — auto-checking agenda checklist; rendered in the rail. */
     checklist?: ChecklistSnapshot | null;
     /** Phase 4 (live↔after-call continuity) — auto-extracted questions;
-     *  rendered at the TOP of the transcript drawer, with the open count
-     *  surfaced on the drawer toggle. */
+     *  rendered in their OWN drawer pane, with the open count surfaced on that
+     *  pane's tab. */
     questions?: QuestionsSnapshot | null;
     /** Whether the org's live_transcript flag is ON. The transcript drawer is
      *  only meaningful when it is (the relay is gated on that flag alone), so
@@ -480,20 +483,84 @@
   });
 
   // ── Transcript drawer (collapsed by default) ───────────────────────────────
+  // The drawer hosts TWO EXCLUSIVE panes behind a tablist, not one stacked
+  // column: a long questions ledger used to sit above the transcript and, in
+  // the dashboard (where the drawer body is a fixed-height `overflow:hidden`
+  // box), pushed the transcript clean out of view. Each pane now owns the full
+  // drawer height and its own scroll. Both stay MOUNTED (`hidden`, never
+  // `{#if}` on the active tab) — BC-1: transcript scroll, pin state and the
+  // questions editor survive every switch.
+  type DrawerTab = "transcript" | "questions";
   let drawerOpen = $state(false);
+  let activeTab = $state<DrawerTab>("transcript");
   function toggleDrawer() {
     drawerOpen = !drawerOpen;
   }
-  // The drawer hosts the transcript (+ ask chips) and, in Support, Knowledge.
-  let hasDrawer = $derived(liveTranscriptEnabled || isSupport);
+  // Pane 1 — the transcript (+ ask chips) and, in Support, Knowledge. Pane 2 —
+  // the questions ledger. `hasQuestionsPane` mirrors LiveQuestions' OWN render
+  // gate (it draws nothing with no questions and nothing editable), so the tab
+  // never opens onto an empty pane.
+  let hasTranscriptPane = $derived(liveTranscriptEnabled || isSupport);
+  let questionCount = $derived(questions?.questions.length ?? 0);
+  let hasQuestionsPane = $derived(
+    !!questions && (questionCount > 0 || (!!sessionUuid && status !== "ended")),
+  );
+  let hasDrawer = $derived(hasTranscriptPane || hasQuestionsPane);
+  let tabs = $derived<DrawerTab[]>([
+    ...(hasTranscriptPane ? (["transcript"] as DrawerTab[]) : []),
+    ...(hasQuestionsPane ? (["questions"] as DrawerTab[]) : []),
+  ]);
+  // With live transcript off, the first pane is Support's Knowledge pull alone.
+  let transcriptTabLabel = $derived(
+    liveTranscriptEnabled ? "Transcript" : "Knowledge",
+  );
   // Count of finals behind the collapsed drawer — a quiet "there's transcript".
   let finalCount = $derived(
     segments.reduce((n, s) => n + (s.provisional ? 0 : 1), 0),
   );
-  // Phase 4 — open (unanswered) questions count, surfaced on the drawer toggle
-  // ("Transcript · N open") so the rep sees there's something to answer without
-  // opening the drawer. Reads the backend's authoritative `open_count`.
+  // Phase 4 — open (unanswered) questions count, surfaced on the Questions tab
+  // so the rep sees there's something to answer without opening the drawer.
+  // Reads the backend's authoritative `open_count`.
   let openQuestionCount = $derived(questions?.open_count ?? 0);
+
+  // Never leave the selection on a pane that went away (mode flip, call end).
+  $effect(() => {
+    const t = hasTranscriptPane;
+    const q = hasQuestionsPane;
+    untrack(() => {
+      if (activeTab === "transcript" && !t && q) activeTab = "questions";
+      else if (activeTab === "questions" && !q && t) activeTab = "transcript";
+    });
+  });
+
+  let tabEls: HTMLButtonElement[] = [];
+  function selectTab(t: DrawerTab) {
+    // Re-clicking the showing pane collapses the drawer (the old single-toggle
+    // gesture); anything else opens it on that pane.
+    if (drawerOpen && activeTab === t) {
+      drawerOpen = false;
+      return;
+    }
+    activeTab = t;
+    drawerOpen = true;
+  }
+  function onTabKeydown(e: KeyboardEvent) {
+    const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+    if (!keys.includes(e.key)) return;
+    const list = tabs;
+    if (list.length === 0) return;
+    e.preventDefault();
+    const i = list.indexOf(activeTab);
+    const n = list.length;
+    let next: number;
+    if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = n - 1;
+    else if (i < 0) next = 0;
+    else if (e.key === "ArrowRight") next = (i + 1) % n;
+    else next = (i - 1 + n) % n;
+    activeTab = list[next];
+    queueMicrotask(() => tabEls[next]?.focus());
+  }
 
   // "Catch me up" one-click shortcut — reuses the ask-chip mechanism. Ready once
   // there's a live session to address; opens the drawer so the answer shows.
@@ -508,6 +575,8 @@
   function catchMeUp() {
     if (!askReady || askBusy) return;
     onask?.("catch_me_up");
+    // The answer lands in the transcript lane's ask slot — show that pane.
+    activeTab = "transcript";
     drawerOpen = true;
   }
 
@@ -686,6 +755,8 @@
             class="cp-drawer-toggle"
             aria-expanded={drawerOpen}
             aria-controls="cp-drawer-body"
+            aria-label={drawerOpen ? "Collapse panel" : "Expand panel"}
+            title={drawerOpen ? "Collapse" : "Expand"}
             onclick={toggleDrawer}
           >
             <svg
@@ -701,17 +772,35 @@
               stroke-linejoin="round"
               aria-hidden="true"><polyline points="9 6 15 12 9 18" /></svg
             >
-            <span>Transcript</span>
-            {#if openQuestionCount > 0}
-              <!-- Phase 4 — open-question badge: the reason to open the drawer.
-                   Accent-tinted (there's something unanswered), always shown
-                   when >0 (open or closed). -->
-              <span class="cp-drawer-open-q">{openQuestionCount} open</span>
-            {/if}
-            {#if !drawerOpen && finalCount > 0}
-              <span class="cp-drawer-count">{finalCount}</span>
-            {/if}
           </button>
+          <!-- One pane at a time: the transcript and the questions ledger are
+               peers, not a stack. Roving tabindex + arrow keys (APG tabs). -->
+          <div class="cp-drawer-tabs" role="tablist" aria-label="Drawer view">
+            {#each tabs as t, i (t)}
+              <button
+                bind:this={tabEls[i]}
+                type="button"
+                role="tab"
+                id="cp-tab-{t}"
+                class="cp-tab"
+                class:on={activeTab === t && drawerOpen}
+                aria-selected={activeTab === t}
+                aria-controls="cp-pane-{t}"
+                tabindex={activeTab === t ? 0 : -1}
+                onclick={() => selectTab(t)}
+                onkeydown={onTabKeydown}
+              >
+                <span>{t === "questions" ? "Questions" : transcriptTabLabel}</span>
+                {#if t === "questions" && openQuestionCount > 0}
+                  <!-- Phase 4 — open-question badge: the reason to open the
+                       drawer. Accent-tinted (there's something unanswered). -->
+                  <span class="cp-drawer-open-q">{openQuestionCount} open</span>
+                {:else if t === "transcript" && finalCount > 0}
+                  <span class="cp-drawer-count">{finalCount}</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
           {#if onask && liveTranscriptEnabled}
             <button
               type="button"
@@ -726,66 +815,89 @@
         </div>
 
         <div id="cp-drawer-body" class="cp-drawer-body" hidden={!drawerOpen}>
-          <!-- Phase 4 — auto-extracted questions, pinned at the TOP of the
-               drawer (open-first). `speakerIdentities` lets it re-resolve an
-               asker the instant a speaker is assigned; `sessionUuid` + the
-               snapshot callback enable the rep's own live corrections. -->
-          <LiveQuestions
-            {questions}
-            {status}
-            {speakerIdentities}
-            {sessionUuid}
-            onsnapshot={onquestions}
-          />
-          {#if liveTranscriptEnabled}
-            <LiveTranscriptLane
-              {segments}
-              {status}
-              {sessionUuid}
-              {askAnswer}
-              {askInFlight}
-              {highlighted}
-              {speakerIdentities}
-              {onask}
-              {ondismissAsk}
-              {onhighlight}
-            />
-          {/if}
-          {#if isSupport}
-            <!-- Support-mode grounded knowledge (rep-initiated pull). Vendor-
-                 opaque; answer + citations are LLM/org text → plain `{...}`. -->
-            <div class="cp-kb" role="group" aria-label="Knowledge answers">
-              <div class="cp-kb-head">
-                <span class="cp-kb-label">Knowledge</span>
-                <button
-                  type="button"
-                  class="cp-kb-ask"
-                  onclick={() => onknowledge?.()}
-                  disabled={knowledgeInFlight}
-                >
-                  {knowledgeInFlight ? "Searching…" : "Get an answer"}
-                </button>
-              </div>
-              {#if knowledgeAnswer}
-                <div class="cp-kb-answer">
-                  <button
-                    type="button"
-                    class="cp-kb-dismiss"
-                    aria-label="Dismiss answer"
-                    onclick={() => ondismissKnowledge?.()}>×</button
-                  >
-                  <p class="cp-kb-answer-text" aria-live="polite">
-                    {knowledgeAnswer.answer}
-                  </p>
-                  {#if knowledgeAnswer.sources.length > 0}
-                    <div class="cp-kb-sources">
-                      {#each knowledgeAnswer.sources as s (s.id)}
-                        <span class="cp-kb-source">{s.title}</span>
-                      {/each}
+          {#if hasTranscriptPane}
+            <div
+              id="cp-pane-transcript"
+              class="cp-pane cp-pane-transcript"
+              role="tabpanel"
+              aria-labelledby="cp-tab-transcript"
+              hidden={activeTab !== "transcript"}
+            >
+              {#if liveTranscriptEnabled}
+                <LiveTranscriptLane
+                  {segments}
+                  {status}
+                  {sessionUuid}
+                  {askAnswer}
+                  {askInFlight}
+                  {highlighted}
+                  {speakerIdentities}
+                  {onask}
+                  {ondismissAsk}
+                  {onhighlight}
+                  visible={drawerOpen && activeTab === "transcript"}
+                />
+              {/if}
+              {#if isSupport}
+                <!-- Support-mode grounded knowledge (rep-initiated pull).
+                     Vendor-opaque; answer + citations are LLM/org text → plain
+                     `{...}`. -->
+                <div class="cp-kb" role="group" aria-label="Knowledge answers">
+                  <div class="cp-kb-head">
+                    <span class="cp-kb-label">Knowledge</span>
+                    <button
+                      type="button"
+                      class="cp-kb-ask"
+                      onclick={() => onknowledge?.()}
+                      disabled={knowledgeInFlight}
+                    >
+                      {knowledgeInFlight ? "Searching…" : "Get an answer"}
+                    </button>
+                  </div>
+                  {#if knowledgeAnswer}
+                    <div class="cp-kb-answer">
+                      <button
+                        type="button"
+                        class="cp-kb-dismiss"
+                        aria-label="Dismiss answer"
+                        onclick={() => ondismissKnowledge?.()}>×</button
+                      >
+                      <p class="cp-kb-answer-text" aria-live="polite">
+                        {knowledgeAnswer.answer}
+                      </p>
+                      {#if knowledgeAnswer.sources.length > 0}
+                        <div class="cp-kb-sources">
+                          {#each knowledgeAnswer.sources as s (s.id)}
+                            <span class="cp-kb-source">{s.title}</span>
+                          {/each}
+                        </div>
+                      {/if}
                     </div>
                   {/if}
                 </div>
               {/if}
+            </div>
+          {/if}
+
+          {#if hasQuestionsPane}
+            <!-- Phase 4 — auto-extracted questions (open-first), now their own
+                 full-height pane. `speakerIdentities` lets it re-resolve an
+                 asker the instant a speaker is assigned; `sessionUuid` + the
+                 snapshot callback enable the rep's own live corrections. -->
+            <div
+              id="cp-pane-questions"
+              class="cp-pane cp-pane-questions"
+              role="tabpanel"
+              aria-labelledby="cp-tab-questions"
+              hidden={activeTab !== "questions"}
+            >
+              <LiveQuestions
+                {questions}
+                {status}
+                {speakerIdentities}
+                {sessionUuid}
+                onsnapshot={onquestions}
+              />
             </div>
           {/if}
         </div>
@@ -1422,8 +1534,8 @@
   .cp-drawer-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    padding: 0.28rem 0.4rem;
+    justify-content: center;
+    padding: 0.28rem;
     border: none;
     background: transparent;
     color: var(--bone-2);
@@ -1432,6 +1544,7 @@
     cursor: pointer;
     border-radius: var(--radius-sm);
     transition: color 0.15s;
+    flex-shrink: 0;
   }
   .cp-drawer-toggle:hover {
     color: var(--bone-0);
@@ -1439,6 +1552,45 @@
   .cp-drawer-toggle:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+
+  /* ── Drawer tabs — transcript / questions as peers, one showing ────────── */
+  .cp-drawer-tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .cp-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.28rem 0.55rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--bone-3);
+    font: inherit;
+    font-size: 0.78rem;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+  .cp-tab:hover {
+    color: var(--bone-0);
+  }
+  .cp-tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* Only the SHOWING pane's tab reads as selected — with the drawer collapsed
+     nothing is on screen, so nothing should look active. */
+  .cp-tab.on {
+    color: var(--bone-0);
+    background: var(--ink-2);
+    border-color: var(--hairline);
   }
   .cp-drawer-chevron {
     color: var(--bone-3);
@@ -1513,6 +1665,23 @@
     display: none;
   }
 
+  /* One pane per tab; the inactive one stays MOUNTED behind `hidden`. */
+  .cp-pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .cp-pane[hidden] {
+    display: none;
+  }
+  /* Compact: the ledger scrolls on its own rather than stretching the in-page
+     panel to the length of the call (the transcript stream already caps itself
+     via the shared `.live-stream` max-height). */
+  .cp-pane-questions {
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
   /* Dashboard: an open drawer fills the remaining height and the transcript
      stream scrolls internally (ask-chips pinned at top). Contextual :global
      restyles only — no lane-internal change, no app.css touch. */
@@ -1524,6 +1693,16 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
+  }
+  /* The showing pane owns the whole drawer height and scrolls inside it — this
+     is what stopped a long questions ledger from squeezing the transcript out
+     of the fixed-height dashboard drawer. */
+  .cp-main.dashboard .cp-drawer.open .cp-pane {
+    flex: 1;
+    min-height: 0;
+  }
+  .cp-main.dashboard .cp-drawer.open .cp-pane-questions {
+    max-height: none;
   }
   .cp-main.dashboard .cp-drawer.open :global(.live-panel) {
     flex: 1;
@@ -1667,6 +1846,9 @@
       overflow: visible;
     }
     .cp-main.dashboard .cp-drawer.open :global(.live-stream) {
+      max-height: 50vh;
+    }
+    .cp-main.dashboard .cp-drawer.open .cp-pane-questions {
       max-height: 50vh;
     }
   }

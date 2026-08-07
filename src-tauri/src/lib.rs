@@ -4198,8 +4198,14 @@ async fn live_speaker_identity(
     display_name: String,
     contact_id: Option<String>,
     user_id: Option<String>,
-    is_primary: bool,
-    clear: bool,
+    // Optional on the wire: the TS `SpeakerIdentityAssignArgs` declares both as
+    // `?:`, and every assign path omits at least one (a non-Zoho pick sends no
+    // `isPrimary`, an assign sends no `clear`). A bare `bool` makes Tauri reject
+    // the whole IPC call with "missing required key" BEFORE the command body
+    // runs — no HTTP request, and the caller's empty `catch` swallows it, so the
+    // optimistic label stands while nothing is ever persisted.
+    is_primary: Option<bool>,
+    clear: Option<bool>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -4214,8 +4220,8 @@ async fn live_speaker_identity(
         &display_name,
         contact_id.as_deref(),
         user_id.as_deref(),
-        is_primary,
-        clear,
+        is_primary.unwrap_or(false),
+        clear.unwrap_or(false),
     )
     .await
 }
@@ -4271,7 +4277,10 @@ async fn live_linked_deal(
     record_name: String,
     stage: Option<String>,
     amount: Option<String>,
-    clear: bool,
+    // Optional on the wire — only the UNLINK path sends `clear: true`; linking a
+    // Deal omits it entirely. A bare `bool` fails the IPC call outright (see
+    // `live_speaker_identity`), so linking never reached the backend at all.
+    clear: Option<bool>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -4285,7 +4294,7 @@ async fn live_linked_deal(
         &record_name,
         stage.as_deref(),
         amount.as_deref(),
-        clear,
+        clear.unwrap_or(false),
     )
     .await
 }
@@ -4306,7 +4315,9 @@ async fn live_linked_ticket(
     ticket_number: Option<String>,
     subject: Option<String>,
     web_url: Option<String>,
-    clear: bool,
+    // Optional on the wire — only the UNLINK path sends `clear: true`. Same
+    // IPC-rejection trap as `live_linked_deal`.
+    clear: Option<bool>,
 ) -> Result<serde_json::Value, error::PortalError> {
     let cfg = config::Config::load().map_err(error::PortalError::from)?;
     let backend = cfg.backend.as_ref().ok_or_else(|| error::PortalError::Other {
@@ -4319,7 +4330,7 @@ async fn live_linked_ticket(
         ticket_number.as_deref(),
         subject.as_deref(),
         web_url.as_deref(),
-        clear,
+        clear.unwrap_or(false),
     )
     .await
 }
@@ -5648,4 +5659,75 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod ipc_acl_guard {
+    /// Registering a command in `generate_handler!` is only half of exposing
+    /// it — Tauri's ACL denies any command absent from a `commands.allow` list
+    /// in `permissions/app.toml`, and it does so at the IPC boundary, BEFORE
+    /// the command body runs. The frontend then sees a bare rejection with no
+    /// HTTP request behind it, which reads exactly like a backend failure.
+    ///
+    /// `live_question_edit` shipped that way in v0.32.0: every Questions edit
+    /// (delete / mark-answered / edit / add) failed with "Couldn't save that
+    /// just now" while nothing ever reached the backend. This test is the
+    /// cheap guard that keeps the two lists in step.
+    #[test]
+    fn every_registered_command_is_allowlisted() {
+        const SRC: &str = include_str!("lib.rs");
+        const ACL: &str = include_str!("../permissions/app.toml");
+
+        let handler = SRC
+            .split_once("generate_handler!")
+            .expect("generate_handler! is present")
+            .1;
+        let start = handler.find('[').expect("handler list opens with [");
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in handler[start..].char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > start, "handler list never closed");
+
+        let registered: Vec<String> = handler[start + 1..end]
+            .lines()
+            // Strip line comments — the list is heavily annotated.
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(|line| line.split(','))
+            // `recovery::auto_resume_orphans` registers as `auto_resume_orphans`.
+            .map(|tok| tok.trim().rsplit("::").next().unwrap_or("").trim().to_string())
+            .filter(|tok| {
+                !tok.is_empty() && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .collect();
+        // Sanity floor: if the parse breaks, fail loudly rather than pass empty.
+        assert!(
+            registered.len() > 100,
+            "parsed only {} commands — the handler-list parse is broken",
+            registered.len()
+        );
+
+        let missing: Vec<&str> = registered
+            .iter()
+            .filter(|cmd| !ACL.contains(&format!("\"{cmd}\"")))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registered but absent from permissions/app.toml — Tauri will deny \
+             these at the IPC boundary, so the frontend gets a rejection with no \
+             request behind it: {missing:?}"
+        );
+    }
 }

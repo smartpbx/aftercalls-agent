@@ -172,6 +172,29 @@ impl LocalMediaManifest {
             })
             .unwrap_or(false)
     }
+
+    /// Media the *client* still owes bytes for. Distinct from
+    /// [`Self::has_unacknowledged_media`]: `UploadedAwaitingBackendReady` means
+    /// every byte is stored and the backend is validating, so nothing is left
+    /// for this run to do even though the artifact is not acknowledged yet.
+    ///
+    /// Only this weaker predicate gates pipeline completion. The strict one
+    /// still governs recovery terminality and the local-cleanup boundary, so a
+    /// finalizing generation is revisited and driven to ready later.
+    pub fn has_client_pending_media(&self) -> bool {
+        fn pending(state: ArtifactState) -> bool {
+            matches!(
+                state,
+                ArtifactState::Recording
+                    | ArtifactState::RawReady
+                    | ArtifactState::EncodingFailed
+                    | ArtifactState::Published
+                    | ArtifactState::UploadPending
+            )
+        }
+        self.audio.values().any(|a| pending(a.state))
+            || self.screen.as_ref().map(|s| pending(s.state)).unwrap_or(false)
+    }
 }
 
 fn manifest_lock() -> &'static Mutex<()> {
@@ -426,18 +449,27 @@ pub fn mark_screen_not_present(session_dir: &Path) -> Result<()> {
     .map(|_| ())
 }
 
+/// Checkpoint the pipeline as finished. Gated on
+/// [`LocalMediaManifest::has_client_pending_media`], not the strict
+/// acknowledgement predicate: a generation the backend is still assembling or
+/// validating has all of its bytes stored, so failing the run here reported a
+/// complete, usable call as a hard failure and stranded intact recordings
+/// behind a red banner. `pipeline_complete` alone is not terminal — recovery
+/// still requires every artifact acknowledged or absent — so a finalizing
+/// generation is polled to ready and its local source cleaned up on a later
+/// sweep.
 pub fn mark_pipeline_complete(session_dir: &Path, call_id: &str) -> Result<LocalMediaManifest> {
     bind_call(session_dir, call_id)?;
-    let mut unacknowledged = false;
+    let mut pending = false;
     let manifest = update(session_dir, |manifest| {
-        if manifest.has_unacknowledged_media() {
-            unacknowledged = true;
+        if manifest.has_client_pending_media() {
+            pending = true;
         } else {
             manifest.pipeline_complete = true;
         }
     })?;
-    if unacknowledged {
-        anyhow::bail!("refusing to complete pipeline while recorded media is unacknowledged");
+    if pending {
+        anyhow::bail!("refusing to complete pipeline while recorded media is still unuploaded");
     }
     Ok(manifest)
 }
@@ -944,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_completion_requires_all_media_acknowledged_or_absent() {
+    fn pipeline_completion_requires_all_media_uploaded_or_absent() {
         let scratch = Scratch::new();
         initialize(&scratch.0).unwrap();
         assert!(mark_pipeline_complete(&scratch.0, CALL_ID).is_err());
@@ -956,6 +988,45 @@ mod tests {
         assert!(mark_pipeline_complete(&scratch.0, CALL_ID)
             .unwrap()
             .pipeline_complete);
+    }
+
+    /// A generation the backend is still assembling has nothing left for the
+    /// client to do, so it must not fail the run — but it stays retryable so a
+    /// later sweep drives it to acknowledged before local bytes are released.
+    #[test]
+    fn pipeline_completes_while_the_backend_is_still_validating() {
+        let scratch = Scratch::new();
+        let video = scratch.0.join("screen").join("recording.mp4");
+        std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+        std::fs::write(&video, b"video").unwrap();
+        mark_audio_upload(&scratch.0, "mic", true, None).unwrap();
+        mark_audio_not_present(&scratch.0, "system").unwrap();
+        mark_screen_uploaded(&scratch.0, CALL_ID, &video).unwrap();
+
+        assert!(mark_pipeline_complete(&scratch.0, CALL_ID)
+            .unwrap()
+            .pipeline_complete);
+        let loaded = read(&scratch.0).unwrap().unwrap();
+        assert!(!loaded.has_client_pending_media());
+        assert!(
+            loaded.has_unacknowledged_media(),
+            "completion must not fake acknowledgement"
+        );
+        assert!(
+            loaded.has_retryable_media(),
+            "a finalizing generation is still swept to ready"
+        );
+        assert!(video.exists(), "local source is retained until acknowledged");
+    }
+
+    /// The inverse: bytes the client never handed over still fail the run.
+    #[test]
+    fn pipeline_completion_still_blocks_on_a_failed_upload() {
+        let scratch = Scratch::new();
+        mark_audio_upload(&scratch.0, "mic", false, Some("network".into())).unwrap();
+        mark_audio_not_present(&scratch.0, "system").unwrap();
+        assert!(mark_pipeline_complete(&scratch.0, CALL_ID).is_err());
+        assert!(!read(&scratch.0).unwrap().unwrap().pipeline_complete);
     }
 
     #[test]

@@ -466,6 +466,17 @@ export type LiveHighlight = {
  *  every optional field decodes cleanly from an older/absent backend. */
 export type SpeakerIdentityKind = "zoho_contact" | "internal_user" | "adhoc";
 
+/** #676 — how an identity row came to be bound to its speaker.
+ *  `"assigned"` means the REP said so (every write through
+ *  `live_speaker_identity`, including the one that confirms a suggestion).
+ *  `"suggested"` means the BACKEND bound it: the contact the rep pre-picked
+ *  before dialing, re-keyed onto the first far label the diarizer established.
+ *  A suggestion renders as an editable, visibly-unconfirmed row and does NOT
+ *  rename the transcript until confirmed. ABSENT ⇒ treat as `"assigned"` — rows
+ *  written before #676, and any older backend, predate the discriminant and
+ *  could only have come from a rep assign. */
+export type SpeakerIdentitySource = "assigned" | "suggested";
+
 export type SpeakerIdentity = {
   channel: "mic" | "system";
   speaker_label: string;
@@ -477,6 +488,8 @@ export type SpeakerIdentity = {
   user_id?: string;
   /** The single primary zoho_contact; grounds the deal/case card. */
   is_primary?: boolean;
+  /** #676 — confirmed-vs-guessed. Absent ⇒ `"assigned"`. */
+  source?: SpeakerIdentitySource;
   assigned_at?: string;
 };
 
@@ -501,6 +514,23 @@ export type SpeakerIdentityAssignArgs = {
  *  identity set for the session (the store replaces its map wholesale, so a
  *  server-side primary re-shuffle stays consistent client-side). */
 export type SpeakerIdentitiesResponse = {
+  identities: SpeakerIdentity[];
+};
+
+/** #676 — server-pushed reconciliation of the session's identity set, forwarded
+ *  to the webview as the `live-speaker-identities` event. Emitted when the
+ *  backend binds the rep's pre-picked contact to the far label the diarizer
+ *  established (`reason: "contact_bound"`), which the client cannot do for
+ *  itself — the far label doesn't exist until the far side speaks.
+ *  `identities` is the FULL reconciled set, element-identical to
+ *  `SpeakerIdentitiesResponse`, so it applies through the same wholesale
+ *  replace: a re-key means the old `"Them"` row must DISAPPEAR, which a partial
+ *  merge cannot express. Read-only, server-pushed — no Tauri command. */
+export type LiveSpeakerIdentitiesFrame = {
+  type: "speaker_identities";
+  /** Why the backend pushed this set. `"contact_bound"` today; the agent does
+   *  not branch on it. */
+  reason?: string;
   identities: SpeakerIdentity[];
 };
 

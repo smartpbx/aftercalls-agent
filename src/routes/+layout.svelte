@@ -45,6 +45,7 @@
     ChecklistSnapshot,
     QuestionsSnapshot,
     SpeakerIdentity,
+    LiveSpeakerIdentitiesFrame,
   } from "@aftercalls/shared/types";
   import { autoRecordStore } from "$lib/stores/autoRecord.svelte";
   import { autoRecord, type AutoRecordPendingPayload } from "$lib/api";
@@ -176,6 +177,10 @@
   // Same layout-owned lifetime so question snapshots land in the persistent
   // store regardless of the mounted route.
   let unlistenLiveQuestions: UnlistenFn | null = null;
+  // #676 — server-pushed speaker-identity reconciliation. Same layout-owned
+  // lifetime so a backend-bound suggestion lands in the persistent store
+  // regardless of the mounted route.
+  let unlistenLiveSpeakerIdentities: UnlistenFn | null = null;
   let unlistenTray: UnlistenFn | null = null;
   let unlistenUpdatePoll: (() => void) | null = null;
   let unlistenAutoDetect: UnlistenFn | null = null;
@@ -1176,6 +1181,20 @@
         liveSession.setQuestions(evt.payload);
       },
     );
+    // #676 — a `live-speaker-identities` frame carries the FULL reconciled
+    // identity set, pushed when the backend binds the rep's pre-picked contact
+    // to the far label the diarizer established (the client can't do this
+    // itself — that label doesn't exist until the far side speaks). Applied
+    // through the same wholesale replace as the assign response: a re-key means
+    // the old "Them" row must DISAPPEAR, which a partial merge can't express.
+    unlistenLiveSpeakerIdentities = await listen<LiveSpeakerIdentitiesFrame>(
+      "live-speaker-identities",
+      (evt) => {
+        const identities = evt.payload?.identities;
+        if (!Array.isArray(identities)) return;
+        liveSession.reconcileSpeakerIdentities(identities);
+      },
+    );
     unlistenPipeline = await listen<{
       stage: string;
       call_id?: string;
@@ -2058,6 +2077,7 @@
     unlistenLiveCue?.();
     unlistenLiveChecklist?.();
     unlistenLiveQuestions?.();
+    unlistenLiveSpeakerIdentities?.();
     unlistenTray?.();
     unlistenUpdatePoll?.();
     unlistenAutoDetect?.();
