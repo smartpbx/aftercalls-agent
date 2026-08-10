@@ -75,3 +75,34 @@ export function portalErrorToText(e: unknown): string {
     return String(e);
   }
 }
+
+/// The underlying technical cause, when there is one worth showing —
+/// intended for a collapsed "details" disclosure next to the
+/// `portalErrorToText` line, not for the banner itself.
+///
+/// `portalErrorToText` keys its copy on `kind`, which is right for the
+/// user-facing sentence but discards the one field that distinguishes
+/// causes sharing a kind. Every `network` failure reads "Can't reach
+/// the server" whether the real fault is `invalid peer certificate:
+/// UnknownIssuer` (a TLS-inspecting proxy — the machine's trust store
+/// has a CA we don't), `dns error`, `connection refused`, or a timeout.
+/// Those want very different answers from support, and without this the
+/// only evidence is a screenshot of identical copy.
+///
+/// `network` is the only variant that hides anything: every other
+/// message-carrying kind (`bad_request`, `server`, `other`) already
+/// renders its message — or, for an empty one, copy that states the
+/// status — through `portalErrorToText`. A disclosure that repeats the
+/// line above it is noise, so those return null.
+///
+/// CAUTION when adding callsites: this returns a raw transport error,
+/// which embeds the URL that failed. That is safe on the login screen
+/// (it only ever talks to our own backend) but NOT automatically safe
+/// elsewhere — an upload failure would name the object-storage host,
+/// putting an infrastructure vendor into user-facing copy and breaking
+/// the vendor-opaque rule in CLAUDE.md. Check what host a given caller
+/// can fail against before surfacing this.
+export function portalErrorDetail(e: unknown): string | null {
+  if (!isPortalError(e) || e.kind !== "network") return null;
+  return e.message?.trim() || null;
+}

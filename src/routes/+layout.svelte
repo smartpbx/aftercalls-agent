@@ -2631,6 +2631,88 @@
   <div class="booting"></div>
 {:else if isLoginPage}
   <div class="bare">
+    <!-- The update affordance on the one screen that could not show it.
+         `isLoginPage` renders without the shell, and the .update cluster
+         lives in the topstrip — so a user who cannot SIGN IN sat in front
+         of the remedy with no way to reach it. That is not hypothetical:
+         the v0.35.0 TLS-trust-store bug blocked login on networks that
+         inspect encrypted connections, and those users could not update
+         out of it despite the updater itself working fine there (it is a
+         separate reqwest major that verifies against the OS trust store).
+         The hourly poll already runs on this screen — onMount deliberately
+         does not return after bouncing to /login — so the only thing
+         missing was somewhere to render the result.
+         Same cluster and same precedence as the topstrip: the stale nudge
+         wins over the install pill, which wins over the Linux
+         manual-download pill. No data-tauri-drag-region here; this view
+         has no custom titlebar to drag. -->
+    {#if staleNudge || updateAvailable || linuxUpdateAvailable}
+      <div class="bare-update">
+        {#if staleNudge}
+          <div class="update nudge">
+            <span class="pip nudge-pip"></span>
+            <span
+              class="update-label"
+              title={`Update available — v${staleNudge.manifestVersion}. You're running v${version}.`}
+            >
+              Update available — v{staleNudge.manifestVersion}.
+              You're running v{version}.
+            </span>
+            <button class="update-install" onclick={openDownloadsPage}>
+              Get it ↗
+            </button>
+          </div>
+        {:else if updateAvailable}
+          <div class="update">
+            {#if updateState === "downloading"}
+              <span class="pip working"></span>
+              <span
+                class="update-label"
+                title={`Updating to v${updateAvailable.version}…${updateTotal > 0 ? ` ${Math.min(100, Math.round((updateDownloaded / updateTotal) * 100))}%` : ""}`}
+              >
+                Updating to v{updateAvailable.version}…
+                {#if updateTotal > 0}
+                  {Math.min(100, Math.round((updateDownloaded / updateTotal) * 100))}%
+                {/if}
+              </span>
+            {:else if updateState === "ready"}
+              <span class="pip done"></span>
+              <span class="update-label" title="Restarting…">Restarting…</span>
+            {:else if updateState === "error"}
+              <span class="pip failed"></span>
+              <span class="update-label" title={updateError}>Update failed</span>
+              <button class="update-dismiss" onclick={dismissUpdate}>Dismiss</button>
+            {:else}
+              <span class="pip sig"></span>
+              <span
+                class="update-label"
+                title={`v${updateAvailable.version} available`}
+              >
+                v{updateAvailable.version} available
+              </span>
+              <button class="update-install" onclick={installUpdate}>Install</button>
+              <button class="update-dismiss" onclick={dismissUpdate}>Later</button>
+            {/if}
+          </div>
+        {:else if linuxUpdateAvailable}
+          <div class="update">
+            <span class="pip sig"></span>
+            <span
+              class="update-label"
+              title={`v${linuxUpdateAvailable} available`}
+            >
+              v{linuxUpdateAvailable} available
+            </span>
+            <button class="update-install" onclick={openDownloadsPage}>
+              Get it ↗
+            </button>
+            <button class="update-dismiss" onclick={dismissLinuxUpdate}>
+              Later
+            </button>
+          </div>
+        {/if}
+      </div>
+    {/if}
     {@render children()}
   </div>
 {:else}
@@ -3517,6 +3599,20 @@
     min-height: 100vh;
     display: flex;
     flex-direction: column;
+  }
+
+  /* The update cluster on the login screen. Reuses the topstrip's
+     .update / .pip classes verbatim — they are declared at the top
+     level of this stylesheet, not nested under .topstrip, so the
+     pill reads identically in both places and there is no parallel
+     to keep in sync. Non-shrinking and pinned to the top so the
+     sign-in card below still centres itself in the space that's
+     left, exactly as it does when no update is pending. */
+  .bare-update {
+    display: flex;
+    justify-content: center;
+    flex: 0 0 auto;
+    padding: 1rem 1rem 0;
   }
 
   .shell {

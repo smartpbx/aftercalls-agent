@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.34.0"
+version = "0.35.0"
 description = "aftercalls desktop agent — records calls, transcribes, summarizes."
 authors = ["Clayton Mannerow <cmannerow@gmail.com>"]
 license = "LicenseRef-Proprietary"
@@ -36,10 +36,27 @@ hound = "3.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 anyhow = "1"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# TLS roots: BOTH bundled webpki roots AND the OS trust store.
+#
+# `rustls-tls` alone is an alias for `rustls-tls-webpki-roots`, i.e. a
+# Mozilla root list compiled into the binary. That ignores the machine's
+# trust store entirely, so on a corporate network that terminates TLS at
+# an inspecting proxy the handshake fails with UnknownIssuer — the proxy
+# CA is trusted by the OS (so the user's browser is fine) and invisible
+# to us. The user sees "Can't reach the server", which reads like an
+# outage and isn't one.
+#
+# Enabling both features is additive, not either/or: reqwest extends one
+# RootCertStore from webpki roots and then from the native store
+# (async_impl/client.rs), and tokio-tungstenite does the same and
+# explicitly treats an empty native store as non-fatal when webpki roots
+# are also on. So bundled roots stay the guaranteed floor — a broken or
+# empty system store can't regress anyone — and corporate CAs are picked
+# up on top.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "stream"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "process"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 rubato = "4"
 earshot = "1"
 uuid = { version = "1", features = ["v4"] }

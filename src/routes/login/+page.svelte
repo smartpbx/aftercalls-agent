@@ -2,7 +2,11 @@
   import { invoke } from "@tauri-apps/api/core";
   import { goto } from "$app/navigation";
   import { onMount } from "svelte";
-  import { portalErrorToText, isPortalError } from "$lib/portalError";
+  import {
+    portalErrorToText,
+    portalErrorDetail,
+    isPortalError,
+  } from "$lib/portalError";
 
   const REMEMBERED_EMAIL_KEY = "aftercalls.login.rememberedEmail";
 
@@ -11,6 +15,11 @@
   let rememberEmail = $state(false);
   let submitting = $state(false);
   let error = $state("");
+  /// Technical cause behind a `network` failure, shown collapsed under
+  /// the banner. "Can't reach the server" is the same sentence whether
+  /// the machine can't resolve DNS or is behind a proxy whose CA we
+  /// don't trust; this is the line that tells support which.
+  let errorDetail = $state<string | null>(null);
 
   type PendingTos = {
     id: string;
@@ -59,6 +68,7 @@
   async function submit(e: Event) {
     e.preventDefault();
     error = "";
+    errorDetail = null;
     submitting = true;
     try {
       const trimmed = email.trim();
@@ -89,6 +99,7 @@
         error = "Incorrect email or password.";
       } else {
         error = portalErrorToText(e).replace(/^Error:\s*/, "");
+        errorDetail = portalErrorDetail(e);
       }
     } finally {
       submitting = false;
@@ -137,7 +148,15 @@
       </label>
 
       {#if error}
-        <p class="error">{error}</p>
+        <div class="error">
+          <p class="error-line">{error}</p>
+          {#if errorDetail}
+            <details class="detail">
+              <summary>Technical details</summary>
+              <p class="detail-body">{errorDetail}</p>
+            </details>
+          {/if}
+        </div>
       {/if}
 
       <button type="submit" class="primary" disabled={submitting}>
@@ -252,12 +271,43 @@
   }
 
   .error {
-    margin: 0;
     padding: 0.5rem 0.7rem;
     border-radius: 6px;
     background: var(--live-soft);
     color: var(--live);
     font-size: 0.82rem;
+  }
+
+  .error-line {
+    margin: 0;
+  }
+
+  .detail {
+    margin-top: 0.4rem;
+  }
+
+  .detail summary {
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.76rem;
+    opacity: 0.85;
+  }
+
+  .detail summary:hover {
+    opacity: 1;
+  }
+
+  /* Geist Mono per design.md — this is a technical readout, and the
+     cause often turns on exact punctuation the user is reading back
+     to support over the phone. `break-word` because these strings
+     carry a full URL and overflow a 360px card otherwise. */
+  .detail-body {
+    margin: 0.35rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--bone-2);
+    overflow-wrap: break-word;
   }
 
   .primary {
