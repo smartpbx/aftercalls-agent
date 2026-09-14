@@ -3304,6 +3304,50 @@ fn start_screen_source(
     }
 }
 
+/// Abandon a screen capture that was started for this call but never got
+/// anywhere — the window handoff whose picker never appeared, or one the
+/// user decided against while it waited.
+///
+/// The audio call is untouched: this is the "just audio after all" escape
+/// hatch behind the chooser's waiting state, and without it a handoff that
+/// hangs leaves a producer running invisibly until Stop. Generation- and
+/// session-scoped like every other lifecycle op, so a stale webview cannot
+/// cancel a newer call's capture.
+#[tauri::command]
+fn cancel_screen_source(app: AppHandle, session_dir: String) -> bool {
+    if !recording_session_matches(&app, &session_dir) {
+        return false;
+    }
+    let lifecycle = app.state::<RecordingLifecycle>();
+    let lifecycle_guard = lifecycle.inner.lock().unwrap();
+    let session_path = std::path::PathBuf::from(&session_dir);
+    let Some(token) = lifecycle_guard
+        .active
+        .as_ref()
+        .filter(|active| active.session_dir == session_path)
+    else {
+        return false;
+    };
+    let report = app
+        .state::<ScreenRecorder>()
+        .stop_and_persist(Some(token.generation), Some(&session_path));
+    if !report.attempted {
+        return false;
+    }
+    // An abandoned capture wrote nothing worth keeping; clear the stub so a
+    // later Stop reads an absent file rather than a zero-byte one.
+    if let Some(path) = &report.path {
+        let empty = std::fs::metadata(path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        if empty {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    eprintln!("aftercalls: screen capture abandoned before it produced video");
+    true
+}
+
 /// POST the screen-capture consent ack. The Settings toggle calls this
 /// before it enables capture (screen video is a distinct, heavier consent
 /// than the audio recording). Frontend passes the running agent version +
@@ -3352,9 +3396,15 @@ async fn create_screen_playback_url(
 #[derive(serde::Serialize)]
 struct ScreenCaptureLocalStatus {
     available: bool,
+    /// A capture producer is alive. NOT the same as "video is being
+    /// recorded" — see `producing`.
     capturing: bool,
     sources: Vec<String>,
     source_kind: Option<String>,
+    /// Frames are actually reaching the file. False while a window handoff
+    /// waits on the desktop's picker, which is the window the chooser holds
+    /// itself open for and the indicator stays quiet through.
+    producing: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -3384,15 +3434,16 @@ struct ScreenCaptureStatus {
 /// indicator poll works offline and cannot create background API traffic.
 #[tauri::command]
 fn screen_capture_local_status(app: AppHandle) -> ScreenCaptureLocalStatus {
-    let source_kind = app.state::<ScreenRecorder>().active_source_kind();
+    let active = app.state::<ScreenRecorder>().active_status();
     ScreenCaptureLocalStatus {
         available: app.state::<ScreenRecorder>().is_available(),
-        capturing: source_kind.is_some(),
+        capturing: active.is_some(),
         sources: screen_recorder::supported_source_kinds()
             .iter()
             .map(|source| source.to_string())
             .collect(),
-        source_kind,
+        producing: active.as_ref().is_some_and(|a| a.producing),
+        source_kind: active.map(|a| a.kind),
     }
 }
 
@@ -5485,6 +5536,7 @@ pub fn run() {
             open_region_select,
             close_region_select,
             start_screen_source,
+            cancel_screen_source,
             // #659 P4 — floating always-on-top co-pilot overlay: open/close
             // the second webview + hydrate it from the cold-start snapshot
             // cache. Its two custom commands and minimal core permissions live

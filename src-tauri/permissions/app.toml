@@ -63,6 +63,7 @@ commands.allow = [
   "open_region_select",
   "close_region_select",
   "start_screen_source",
+  "cancel_screen_source",
   "open_overlay",
   "close_overlay",
   "get_live_snapshot",

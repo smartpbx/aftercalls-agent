@@ -87,6 +87,12 @@ function createStore() {
    *  "region"), or null when no screen capture is running. Makes the floater
    *  label kind-aware ("Recording call + window"). */
   let screenKind = $state<string | null>(null);
+  /** True once a screen capture that WAS recording stopped on its own while
+   *  the call carried on — a shared window closed, a permission revoked, a
+   *  capture process that died. The call is still fine; the video just ends
+   *  early, and the user is entitled to know that before they find out at
+   *  playback. Cleared if capture resumes and by every fresh session. */
+  let screenLost = $state(false);
 
   let timerHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -148,6 +154,9 @@ function createStore() {
     get screenKind(): string | null {
       return screenKind;
     },
+    get screenLost(): boolean {
+      return screenLost;
+    },
 
     /** Transition into the live recording state. Called from the
      *  layout's `recording-state` listener when `recording=true`.
@@ -165,6 +174,7 @@ function createStore() {
       errorMessage = "";
       screenActive = false;
       screenKind = null;
+      screenLost = false;
       state = "recording";
       startTimer(seedAtMs);
     },
@@ -226,6 +236,11 @@ function createStore() {
      *  running (never picked, or it died mid-call), which drops the cue. */
     setScreenSource(kind: string | null) {
       if (state !== "recording") return;
+      // Recording → not recording, without the call ending, is the capture
+      // dropping out from under us. Latch it so the live row can say so
+      // rather than letting the cue quietly disappear.
+      if (screenKind !== null && kind === null) screenLost = true;
+      if (kind !== null) screenLost = false;
       screenKind = kind;
       screenActive = kind !== null;
     },
@@ -244,6 +259,7 @@ function createStore() {
       errorMessage = "";
       screenActive = false;
       screenKind = null;
+      screenLost = false;
     },
 
     /** Floater calls this when the user clicks Stop. The Record page

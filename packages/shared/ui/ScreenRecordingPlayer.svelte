@@ -65,6 +65,7 @@
   let playbackExpiresAt = $state<string | null>(null);
   // `failed` is dismissable inline — it must never block the page.
   let failedDismissed = $state(false);
+  let stalledDismissed = $state(false);
 
   let pollHandle: ReturnType<typeof setTimeout> | null = null;
   let playbackRefreshHandle: ReturnType<typeof setTimeout> | null = null;
@@ -76,8 +77,17 @@
     1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 30_000, 30_000,
   ] as const;
 
+  // An upload the backend still holds open but whose client stopped pushing
+  // bytes long ago. It is NOT progress, and showing it as progress is how a
+  // recording that died hours ago kept claiming it was still on its way.
+  function isStalled(m: ScreenRecording | null | undefined): boolean {
+    return m?.status === "uploading" && m?.stalled === true;
+  }
+
   function isProcessing(m: ScreenRecording | null | undefined): boolean {
-    return m?.status === "recording" || m?.status === "uploading";
+    return (
+      (m?.status === "recording" || m?.status === "uploading") && !isStalled(m)
+    );
   }
 
   function stopPlaybackRefresh() {
@@ -124,7 +134,11 @@
       transientFailures = 0;
       applyMetadata(next);
       // Keep polling while the row is still finalizing; stop otherwise.
+      // A stalled upload keeps a slow poll rather than none: the generation is
+      // still open, so if the recording machine comes back and finishes it,
+      // this surface should notice without needing a reload.
       if (isProcessing(next)) schedulePoll(5_000);
+      else if (isStalled(next)) schedulePoll(60_000);
       else stopPoll();
     } catch {
       // A transient fetch error shouldn't fabricate an error surface on
@@ -519,6 +533,23 @@
     <span class="scr-pip scr-pip-proc" aria-hidden="true"></span>
     {@render monitorGlyph(15)}
     <span class="scr-bar-title">Screen recording still uploading…</span>
+  </div>
+{:else if isStalled(meta) && !stalledDismissed}
+  <div class="scr-stage scr-bar scr-failed" role="note">
+    <span class="scr-pip scr-pip-failed" aria-hidden="true"></span>
+    {@render monitorGlyph(15)}
+    <span class="scr-bar-title">
+      Screen recording stopped before it finished uploading. The call,
+      transcript, and summary are unaffected.
+    </span>
+    <button
+      type="button"
+      class="scr-dismiss"
+      onclick={() => (stalledDismissed = true)}
+      aria-label="Dismiss screen-recording notice"
+    >
+      Dismiss
+    </button>
   </div>
 {:else if meta.status === "expired"}
   <div class="scr-stage scr-expired" role="note">

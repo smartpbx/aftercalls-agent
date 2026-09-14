@@ -57,10 +57,18 @@
           available: boolean;
           capturing: boolean;
           source_kind: string | null;
+          producing: boolean;
         }>("screen_capture_local_status");
         // #302 follow-up — source_kind is null when no capture is running
         // (never picked, or it died mid-call) so the cue drops cleanly.
-        if (!cancelled) callRecording.setScreenSource(st.source_kind ?? null);
+        //
+        // `producing` gates it further: a window handoff keeps a capture
+        // process alive while the desktop's picker waits for the user, and
+        // during that stretch no video exists. An on-air cue over nothing
+        // being recorded is the one lie this indicator must not tell.
+        if (!cancelled) {
+          callRecording.setScreenSource(st.producing ? st.source_kind : null);
+        }
       } catch {
         // Advisory only — a failed probe never surfaces an error.
       }
@@ -82,13 +90,29 @@
   );
 
   // #302 follow-up — the captured source kind, as plain user-facing words
-  // (vendor-opaque). Widens the floater to "+ screen / + window / + area".
+  // (vendor-opaque). This is the mini-chip's text: SCREEN / WINDOW / AREA.
+  // The chip carries the kind so the label doesn't have to repeat it —
+  // "Recording call + area" next to a SCREEN chip said the same thing twice
+  // and pushed the pill to three cramped rows.
   let screenKindLabel = $derived.by(() => {
     switch (callRecording.screenKind) {
       case "window":
         return "window";
       case "region":
         return "area";
+      default:
+        return "screen";
+    }
+  });
+
+  // Spoken form for the screen reader, where a bare "area" has no chip or
+  // monitor glyph next to it to lean on.
+  let screenKindPhrase = $derived.by(() => {
+    switch (callRecording.screenKind) {
+      case "window":
+        return "window";
+      case "region":
+        return "screen area";
       default:
         return "screen";
     }
@@ -122,9 +146,7 @@
   let callLabel = $derived.by(() => {
     if (callRecording.state === "recording") {
       if (callRecording.mode === "self_note") return "Self-note recording";
-      return screenCue
-        ? `Recording call + ${screenKindLabel}`
-        : "Recording call";
+      return "Recording call";
     }
     if (callRecording.state === "stopping") return "Wrapping up…";
     if (callRecording.state === "done") return "Saved";
@@ -211,43 +233,49 @@
     aria-label={callRecording.mode === "self_note"
       ? "Self-note recording in progress"
       : screenCue
-        ? `Call and ${screenKindLabel} recording in progress`
+        ? `Call and ${screenKindPhrase} recording in progress`
         : "Call recording in progress"}
     aria-live="polite"
   >
-    {#if screenCue}
-      <svg
-        class="rec-screen-glyph"
-        viewBox="0 0 20 20"
-        width="15"
-        height="15"
-        aria-hidden="true"
-      >
-        <rect
-          x="2.2"
-          y="3.5"
-          width="15.6"
-          height="10"
-          rx="1.4"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.4"
-        />
-        <path
-          d="M7.5 16.5 h5 M10 13.5 v3"
-          stroke="currentColor"
-          stroke-width="1.4"
-          stroke-linecap="round"
-          fill="none"
-        />
-      </svg>
-    {/if}
-    <span class="rec-dot rec-dot-{callPipClass}" aria-hidden="true"></span>
-    <span class="rec-meta">
-      <span class="rec-label">{callLabel}</span>
+    <!-- Dot leads (it's the on-air signal); the monitor glyph rides tight
+         beside it rather than taking a full pill gap of its own. -->
+    <span class="rec-cue">
+      <span class="rec-dot rec-dot-{callPipClass}" aria-hidden="true"></span>
       {#if screenCue}
-        <span class="rec-screen-badge">SCREEN</span>
+        <svg
+          class="rec-screen-glyph"
+          viewBox="0 0 20 20"
+          width="15"
+          height="15"
+          aria-hidden="true"
+        >
+          <rect
+            x="2.2"
+            y="3.5"
+            width="15.6"
+            height="10"
+            rx="1.4"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+          />
+          <path
+            d="M7.5 16.5 h5 M10 13.5 v3"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            fill="none"
+          />
+        </svg>
       {/if}
+    </span>
+    <span class="rec-meta">
+      <span class="rec-label-row">
+        <span class="rec-label">{callLabel}</span>
+        {#if screenCue}
+          <span class="rec-screen-badge">{screenKindLabel}</span>
+        {/if}
+      </span>
       {#if callRecording.state === "recording" || callRecording.state === "stopping"}
         <span class="rec-time">{fmtTime(callRecording.elapsedMs)}</span>
       {/if}
@@ -288,8 +316,8 @@
     z-index: 80;
     display: inline-flex;
     align-items: center;
-    gap: 0.6rem;
-    padding: 0.5rem 0.7rem;
+    gap: 0.65rem;
+    padding: 0.5rem 0.65rem 0.5rem 0.8rem;
     background: var(--ink-1);
     border: 1px solid var(--live);
     border-radius: 999px;
@@ -393,8 +421,16 @@
   .rec-meta {
     display: inline-flex;
     flex-direction: column;
+    gap: 0.15rem;
     line-height: 1.15;
     font-variant-numeric: tabular-nums;
+  }
+  /* Label and the kind chip share a row, so a screen-capturing call is
+   * still a two-row pill — same height as an audio-only one. */
+  .rec-label-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
   }
   .rec-time {
     color: var(--bone-0);
@@ -416,26 +452,34 @@
     letter-spacing: -0.005em;
   }
 
-  /* #302 Slice C — screen-capture cue. The monitor glyph sits before
-   * the pulsing dot; the SCREEN mini-chip reads the screen state at a
-   * glance. `--live` on `--live-soft` (the on-air law), mono uppercase. */
+  /* #302 Slice C — screen-capture cue. The monitor glyph rides beside
+   * the pulsing dot; the mini-chip names what's on screen (SCREEN /
+   * WINDOW / AREA) at a glance. `--live` on `--live-soft` (the on-air
+   * law), mono uppercase. */
+  .rec-cue {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-shrink: 0;
+  }
   .rec-screen-glyph {
     color: var(--live);
     flex-shrink: 0;
   }
   .rec-screen-badge {
-    display: inline-block;
-    margin-top: 0.1rem;
-    padding: 0.02rem 0.32rem;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.14rem 0.4rem;
     border-radius: var(--radius-sm);
     background: var(--live-soft);
     color: var(--live);
     font-family: var(--font-mono);
-    font-size: 0.6rem;
+    font-size: 0.58rem;
     font-weight: 600;
-    letter-spacing: 0.08em;
+    line-height: 1;
+    letter-spacing: 0.09em;
     text-transform: uppercase;
-    align-self: flex-start;
+    flex-shrink: 0;
   }
 
   .rec-form-btn,

@@ -28,16 +28,24 @@
     is_primary: boolean;
     x: number;
     y: number;
+    // The panel's own name ("DELL U2723QE") when the desktop reports one.
+    description: string | null;
   };
   type WindowInfo = { title: string };
   type RegionPicked = { request_token: string; geometry: string };
   type RegionCancelled = { request_token: string };
+  type CaptureStatus = {
+    capturing: boolean;
+    source_kind: string | null;
+    producing: boolean;
+  };
   type Mode =
     | "hidden"
     | "choosing"
     | "screen-list"
     | "window-list"
     | "resolving"
+    | "waiting-window"
     | "error";
 
   let mode = $state<Mode>("hidden");
@@ -230,16 +238,30 @@
 
   function justAudio() {
     void invoke("close_region_select").catch(() => {});
+    // A pending window handoff has a live capture behind it that has to be
+    // told to stop; every other state has nothing to unwind.
+    if (mode === "waiting-window") {
+      void abandonWindowWait();
+      return;
+    }
     close();
   }
 
+  // Ask Rust to start capture. Returns "started" only when the capture
+  // producer survived its startup check — every other outcome has already
+  // been turned into a closed card or an error line here.
+  //
+  // `hold` keeps the card open on success, for the one source whose work
+  // isn't finished when capture starts: a window handoff is still waiting
+  // on the desktop's picker at that point.
   async function startSource(
     kind: string,
     target: string | null,
     generation = operationGeneration,
     expectedSession = sessionDir,
-  ) {
-    if (busy || !isCurrent(generation, expectedSession)) return;
+    hold = false,
+  ): Promise<string> {
+    if (busy || !isCurrent(generation, expectedSession)) return "stale";
     busy = true;
     try {
       const res = await invoke<string>("start_screen_source", {
@@ -247,23 +269,40 @@
         kind,
         target,
       });
-      if (!isCurrent(generation, expectedSession)) return;
+      if (!isCurrent(generation, expectedSession)) return "stale";
       if (res === "started") {
-        close();
+        if (!hold) close();
       } else if (res === "unavailable") {
-        errorLine = "Screen recording isn't available right now.";
+        errorLine = "Screen recording couldn't start, so this call is audio only.";
         mode = "error";
       } else {
         // cancelled (call already stopped / stale) → audio-only.
         close();
       }
+      return res;
     } catch {
-      if (!isCurrent(generation, expectedSession)) return;
-      errorLine = "Couldn't start screen recording.";
+      if (!isCurrent(generation, expectedSession)) return "stale";
+      errorLine = "Screen recording couldn't start, so this call is audio only.";
       mode = "error";
+      return "error";
     } finally {
       if (isCurrent(generation, expectedSession)) busy = false;
     }
+  }
+
+  // Abandon a capture that started but never produced video. The audio call
+  // keeps running; without this a handoff that hangs would leave a capture
+  // process alive and invisible until the user hits Stop.
+  async function cancelPendingCapture(expectedSession: string) {
+    try {
+      await invoke("cancel_screen_source", { sessionDir: expectedSession });
+    } catch {
+      // Best-effort — Stop finalizes whatever is left either way.
+    }
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // ── Screen ──────────────────────────────────────────────────────────
@@ -293,12 +332,74 @@
     }
   }
 
-  // A friendly label for a monitor (Windows device names like \\.\DISPLAY1
-  // read poorly; fall back to positional numbering).
-  function screenLabel(d: DisplayInfo, i: number): string {
-    const dims = d.width ? ` · ${d.width}×${d.height}` : "";
-    const name = d.name && !d.name.startsWith("\\\\") ? d.name : `Screen ${i + 1}`;
-    return `${name}${dims}${d.is_primary ? " · main" : ""}`;
+  // Naming a screen. A connector name — "DP-1", "HDMI-A-1", "\\.\DISPLAY2" —
+  // names a socket on the graphics card, so a list of them asks the user to
+  // guess which is which. Lead with whatever actually identifies the panel:
+  // its model when the desktop reports one, otherwise its place on the desk.
+  function screenTitle(d: DisplayInfo, i: number): string {
+    if (d.description) return d.description;
+    if (d.name && !d.name.startsWith("\\\\")) return d.name;
+    return `Screen ${i + 1}`;
+  }
+
+  // Where each screen sits. The list arrives already ordered left to right,
+  // so the hint just names each row's place in it — which is what actually
+  // separates three identical panels on one desk.
+  //
+  // Real desks are not tidy grids (a portrait panel nudged down to centre it,
+  // an ultrawide on a lower shelf), so this deliberately does not require a
+  // clean row: distinct horizontal positions are enough. It falls back to a
+  // vertical reading for a stacked pair, and says nothing at all when the
+  // desktop reported no coordinates — a wrong "left" is worse than no hint.
+  let positionHints = $derived.by<(string | null)[]>(() => {
+    const count = displays.length;
+    const none = displays.map(() => null);
+    if (count < 2) return none;
+
+    if (new Set(displays.map((d) => d.x)).size === count) {
+      if (count === 2) return ["left", "right"];
+      return displays.map((_, i) => {
+        if (i === 0) return "leftmost";
+        if (i === count - 1) return "rightmost";
+        return `${ordinal(i + 1)} from left`;
+      });
+    }
+    if (new Set(displays.map((d) => d.y)).size === count) {
+      if (count === 2) return ["top", "bottom"];
+      return displays.map((_, i) => {
+        if (i === 0) return "topmost";
+        if (i === count - 1) return "bottom";
+        return `${ordinal(i + 1)} from top`;
+      });
+    }
+    return none;
+  });
+
+  function ordinal(n: number): string {
+    const tens = n % 100;
+    if (tens >= 11 && tens <= 13) return `${n}th`;
+    switch (n % 10) {
+      case 1:
+        return `${n}st`;
+      case 2:
+        return `${n}nd`;
+      case 3:
+        return `${n}rd`;
+      default:
+        return `${n}th`;
+    }
+  }
+
+  // The supporting line: the connector name (only when it isn't already the
+  // title), the resolution, where it sits, and whether it's the main screen.
+  function screenMeta(d: DisplayInfo, i: number): string {
+    const parts: string[] = [];
+    if (d.description && d.name && !d.name.startsWith("\\\\")) parts.push(d.name);
+    if (d.width) parts.push(`${d.width}×${d.height}`);
+    const hint = positionHints[i];
+    if (hint) parts.push(hint);
+    if (d.is_primary) parts.push("main");
+    return parts.join(" · ");
   }
 
   // ── Window ──────────────────────────────────────────────────────────
@@ -319,11 +420,75 @@
       windowsList = next;
       mode = "window-list";
     } else {
-      // Linux hands off to the compositor's native window picker.
-      resolvingLabel = "Choose a window to record…";
+      // Linux hands off to the desktop's own window picker. Capture starts
+      // immediately but records nothing until that picker comes back with a
+      // window, so the card stays up through the wait instead of closing on
+      // a "started" that hasn't produced a frame.
+      resolvingLabel = "Starting window recording…";
       mode = "resolving";
-      await startSource("window", null, generation, expectedSession);
+      const res = await startSource(
+        "window",
+        null,
+        generation,
+        expectedSession,
+        true,
+      );
+      if (res !== "started" || !isCurrent(generation, expectedSession)) return;
+      await awaitWindowPick(generation, expectedSession);
     }
+  }
+
+  // How long to wait for the desktop's window picker before calling it dead.
+  // Generous — the user may be hunting through a long window list — but
+  // finite, because the alternative is a call that silently records no video.
+  const WINDOW_PICK_TIMEOUT_MS = 90_000;
+
+  // Watch the capture until it is really recording. Three ways out: frames
+  // start arriving (done), the producer exits without a stream (the picker
+  // never opened, or the user dismissed it), or nobody picks anything.
+  async function awaitWindowPick(generation: number, expectedSession: string) {
+    mode = "waiting-window";
+    const deadline = Date.now() + WINDOW_PICK_TIMEOUT_MS;
+    while (isCurrent(generation, expectedSession)) {
+      let status: CaptureStatus | null = null;
+      try {
+        status = await invoke<CaptureStatus>("screen_capture_local_status");
+      } catch {
+        status = null;
+      }
+      if (!isCurrent(generation, expectedSession)) return;
+      if (status) {
+        if (status.producing) {
+          close();
+          return;
+        }
+        if (!status.capturing) {
+          errorLine =
+            "No window was shared, so this call is recording audio only.";
+          mode = "error";
+          return;
+        }
+      }
+      if (Date.now() >= deadline) {
+        await cancelPendingCapture(expectedSession);
+        if (!isCurrent(generation, expectedSession)) return;
+        errorLine =
+          "Your desktop never opened a window picker, so this call is recording audio only.";
+        mode = "error";
+        return;
+      }
+      await delay(600);
+    }
+  }
+
+  // "Just audio" while the window handoff is still pending: stop the capture
+  // that is waiting on a picker, and leave the call recording.
+  async function abandonWindowWait() {
+    const expectedSession = sessionDir;
+    // Retire this operation first so the polling loop above stands down.
+    operationGeneration += 1;
+    await cancelPendingCapture(expectedSession);
+    close();
   }
 
   // ── Region (area) ───────────────────────────────────────────────────
@@ -494,8 +659,11 @@
       <p class="src-title">Which screen?</p>
       <div class="src-list">
         {#each displays as d, i (d.name)}
-          <button type="button" class="src-row" onclick={() => startSource("screen", d.name)} disabled={busy}>
-            {screenLabel(d, i)}
+          <button type="button" class="src-row src-row-stacked" onclick={() => startSource("screen", d.name)} disabled={busy}>
+            <span class="src-row-title">{screenTitle(d, i)}</span>
+            {#if screenMeta(d, i)}
+              <span class="src-row-meta">{screenMeta(d, i)}</span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -517,9 +685,23 @@
     {:else if mode === "resolving"}
       <p class="src-title">{resolvingLabel}</p>
       <p class="src-sub">Follow the prompt on your screen.</p>
+    {:else if mode === "waiting-window"}
+      <!-- The desktop owns the window picker, so all this card can do is say
+           what to look for and stay reachable while the user looks. It holds
+           until frames actually arrive — closing on "capture started" is what
+           made a picker that never opened look like a working recording. -->
+      <p class="src-title">Waiting for you to pick a window</p>
+      <p class="src-sub">
+        Your desktop should be showing a picker. Nothing is recorded until you
+        choose.
+      </p>
+      <button type="button" class="src-dismiss" onclick={justAudio}>Just audio</button>
     {:else if mode === "error"}
       <p class="src-title src-title-warn">{errorLine}</p>
-      <button type="button" class="src-dismiss" onclick={justAudio}>Continue with audio</button>
+      <div class="src-error-actions">
+        <button type="button" class="src-dismiss" onclick={() => (mode = "choosing")}>Try another way</button>
+        <button type="button" class="src-dismiss" onclick={justAudio}>Continue with audio</button>
+      </div>
     {/if}
   </div>
 {/if}
@@ -645,6 +827,32 @@
   .src-row:disabled {
     opacity: 0.55;
     cursor: not-allowed;
+  }
+  /* A screen row carries two facts: which panel it is, and how to tell it
+     apart from the others. The second is support text, not a peer. */
+  .src-row-stacked {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    white-space: normal;
+  }
+  .src-row-title {
+    color: var(--bone-0);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .src-row-meta {
+    font-size: 0.74rem;
+    color: var(--bone-2);
+    font-family: var(--font-mono);
+  }
+
+  .src-error-actions {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
   }
 
   .src-dismiss {

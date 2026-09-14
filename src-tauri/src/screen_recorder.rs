@@ -22,7 +22,12 @@
 //!   binary (Screen via `-w <monitor>`, Window via the native picker
 //!   handoff `-w portal`, Region via `-w region -region <geo>` after a
 //!   `slurp` drag-select). Its lifetime is tied to the agent with
-//!   `PR_SET_PDEATHSIG` exactly like the `parec` children in `recorder.rs`.
+//!   `PR_SET_PDEATHSIG` exactly like the `parec` children in `recorder.rs`
+//!   — which means, as there, that it MUST be forked from a thread that
+//!   lives as long as the process. `PR_SET_PDEATHSIG` fires on the death of
+//!   the forking *thread*, not the process, so forking a capture from a
+//!   Tauri command thread kills it seconds later. See
+//!   [`spawn_capture_owned`]; do not call [`spawn_capture`] directly.
 //! * **Windows** drives the bundled media sidecar (`pipeline::ffmpeg_binary`)
 //!   with the `gdigrab` input (Screen/Region via a monitor-rect crop of
 //!   `-i desktop`, Window via `-i title=<title>`). The child is bound to a
@@ -109,6 +114,49 @@ pub fn source_kind_str(source: &CaptureSource) -> &'static str {
     }
 }
 
+/// The same kind as a word that belongs in a sentence shown to the user.
+/// Vendor-opaque and tool-opaque — "area", never the name of a select tool.
+pub fn human_source_kind(kind: &str) -> &'static str {
+    match kind {
+        "window" => "window",
+        "region" => "screen area",
+        _ => "screen",
+    }
+}
+
+/// Classify a capture producer's stderr into a cause the user can act on.
+///
+/// The producer's own words name the capture tool, its encoder, the desktop
+/// services it spoke to and the paths it touched. That text is precisely
+/// what support needs, and precisely what must not appear in the app — the
+/// stop report is user-facing copy, and hard rule 2 keeps it vendor- and
+/// tool-opaque (this module names no capture backend anywhere else either).
+/// So the raw line is logged and this returns the classified cause.
+///
+/// Matching is deliberately narrow: an unrecognised failure gets the honest
+/// general answer rather than a confident wrong one.
+fn describe_capture_failure(diagnostic: &str) -> &'static str {
+    let text = diagnostic.to_ascii_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+    if mentions(&["permission", "denied", "not authorized", "unauthorized"]) {
+        return "your computer refused permission to record the screen";
+    }
+    // Note: no "gpu" needle. The capture binary's own name contains it, so
+    // it appears in nearly every line and would swallow every other cause.
+    if mentions(&["portal", "screencast", "cursor mode", "selectsources"]) {
+        return "your desktop's screen-sharing service refused the request — \
+                restarting your computer usually clears this";
+    }
+    if mentions(&["encoder", "nvenc", "vaapi", "codec", "h264"]) {
+        return "this computer's video encoder could not be started";
+    }
+    if mentions(&["no such file", "no monitor", "no display", "invalid window"]) {
+        return "the screen or window being recorded could not be found";
+    }
+    "nothing was selected, or your desktop refused the recording"
+}
+
 // ── Persisted metadata (session_dir/screen/recording.json) ───────────
 
 /// Written at capture-stop; read by `upload::upload_screen_recording`.
@@ -151,13 +199,23 @@ pub struct DisplayInfo {
     pub height: u32,
     /// True for the compositor's focused/primary output when known.
     pub is_primary: bool,
-    /// Virtual-desktop rect origin. 0 on Linux (gsr targets by name); the
-    /// real offset on Windows where gdigrab needs `-offset_x/-offset_y`.
+    /// Virtual-desktop rect origin, in the compositor's layout coordinates.
+    /// Windows needs it for gdigrab's `-offset_x/-offset_y`; Linux targets
+    /// by name but still reports it, because left-to-right position is the
+    /// only thing that tells two identical panels apart in the chooser.
     /// Additive + `serde(default)` — old callers / payloads decode as 0.
     #[serde(default)]
     pub x: i32,
     #[serde(default)]
     pub y: i32,
+    /// The panel's own identity — make + model as the compositor reports it
+    /// ("DELL U2723QE"). `None` when only a connector name is knowable.
+    ///
+    /// Connector names (`DP-1`, `HDMI-A-1`, `\\.\DISPLAY2`) name a socket on
+    /// the graphics card, not a screen on the desk, so a list of them asks
+    /// the user to guess. The chooser leads with this whenever it exists.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// One selectable top-level window (Windows). Empty everywhere else — Linux
@@ -175,6 +233,16 @@ pub struct WindowInfo {
 /// `app.state::<ScreenRecorder>()`.
 pub struct ScreenRecorder {
     active: Mutex<Option<Active>>,
+}
+
+/// A live capture as the recording indicator needs to describe it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ActiveCapture {
+    /// "screen" | "window" | "region".
+    pub kind: String,
+    /// Whether frames have actually reached the file yet. `false` means the
+    /// producer is alive but still waiting on the user's pick.
+    pub producing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,18 +306,26 @@ impl ScreenRecorder {
         capture_available()
     }
 
-    /// The active capture's kind ("screen"/"window"/"region") IFF a capture
-    /// is running. Returns `None` when idle OR when the capture subprocess
-    /// has died (denied / closed / gdigrab black-window exit) so the floater
-    /// drops the cue mid-call. Uses a non-blocking `try_wait`.
-    pub fn active_source_kind(&self) -> Option<String> {
+    /// The live capture's state, or `None` when idle OR when the capture
+    /// subprocess has died (denied / closed / gdigrab black-window exit) so
+    /// the floater drops the cue mid-call. Uses a non-blocking `try_wait`.
+    pub fn active_status(&self) -> Option<ActiveCapture> {
         let mut guard = self.active.lock().unwrap();
         let active = guard.as_mut()?;
-        if active.backend.is_running() {
-            Some(active.source_kind.to_string())
-        } else {
-            None
+        if !active.backend.is_running() {
+            return None;
         }
+        // Bytes on disk are the only honest proof that frames are being
+        // recorded. A window handoff keeps the producer alive while the
+        // desktop's picker waits for the user, and during that stretch
+        // nothing is on tape — the indicator must not claim otherwise.
+        let producing = std::fs::metadata(&active.output_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
+        Some(ActiveCapture {
+            kind: active.source_kind.to_string(),
+            producing,
+        })
     }
 
     /// Best-effort start of a screen capture into
@@ -284,7 +360,7 @@ impl ScreenRecorder {
         let output_path = screen_dir.join(RECORDING_FILENAME);
         let kind = source_kind_str(&source);
 
-        match spawn_capture(&source, cfg, &output_path) {
+        match spawn_capture_owned(&source, cfg, &output_path) {
             Ok((backend, dims)) => {
                 // Capture start moment vs the audio recorder's start. On the
                 // ask-each-call path this also absorbs the user's pick
@@ -360,8 +436,15 @@ impl ScreenRecorder {
         let stop_requested_at_ms = chrono::Utc::now().timestamp_millis();
         let fallback_duration_ms = active.started_at.elapsed().as_millis() as i64;
         if let Err(e) = active.backend.finalize() {
-            let error = format!("screen capture finalize failed: {e:#}");
-            eprintln!("aftercalls: {error}");
+            // The full chain — producer stderr included — goes to the log,
+            // where support can read it. See `describe_capture_failure` for
+            // why it must not go any further than that.
+            eprintln!("aftercalls: screen capture finalize failed: {e:#}");
+            let error = format!(
+                "this {} capture could not be finished — {}",
+                human_source_kind(active.source_kind),
+                describe_capture_failure(&active.backend.diagnostic())
+            );
             return ScreenStopReport {
                 attempted: true,
                 published: false,
@@ -374,9 +457,19 @@ impl ScreenRecorder {
             .map(|meta| meta.len())
             .unwrap_or(0);
         if byte_size == 0 {
+            // The producer exited cleanly and wrote nothing. That is the
+            // shape of a picker nobody answered, a denied permission, or a
+            // capture that never opened — all indistinguishable from here
+            // without what the producer said on the way out. A bare
+            // filesystem path told the user nothing they could act on.
+            let detail = active.backend.diagnostic();
+            if !detail.is_empty() {
+                eprintln!("aftercalls: screen capture producer reported: {detail}");
+            }
             let error = format!(
-                "screen capture produced no usable file at {}",
-                active.output_path.display()
+                "no video was recorded for this {} capture — {}",
+                human_source_kind(active.source_kind),
+                describe_capture_failure(&detail)
             );
             eprintln!("aftercalls: {error}");
             return ScreenStopReport {
@@ -479,6 +572,14 @@ trait CaptureBackend: Send {
     /// Non-blocking liveness probe (`try_wait`). Lets `status` drop the cue
     /// for a capture that died mid-call (denied / closed / gdigrab exit).
     fn is_running(&mut self) -> bool;
+    /// Whatever the capture producer said on its way out, retained after
+    /// `finalize`. A producer can exit **successfully** and still write no
+    /// video — a portal request nobody answered, a denied permission, an
+    /// encoder that never opened — and in that case this line is the only
+    /// evidence of why. Empty when it said nothing.
+    fn diagnostic(&mut self) -> String {
+        String::new()
+    }
 }
 
 fn wait_capture_child(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
@@ -509,6 +610,80 @@ fn wait_capture_child(child: &mut std::process::Child, timeout: Duration) -> Res
             }
         }
     }
+}
+
+/// Spawn a capture from a thread that outlives it.
+///
+/// **`PR_SET_PDEATHSIG` is thread-scoped on Linux.** The kernel sends the
+/// parent-death signal when the thread that forked exits — not when the
+/// process does. Tauri runs commands on pooled threads that are reaped
+/// shortly after the command returns, so a capture forked directly inside
+/// `start_screen_source` was being SIGINT'd within about a second of
+/// starting: no picker for a window handoff, a truncated file for a screen
+/// or area, and no cue either way. Audio never had this problem because
+/// `recorder.rs` forks `parec` from its process-lifetime `worker_loop`.
+///
+/// So every capture is forked from one dedicated thread that lives for the
+/// life of the process. The privacy guarantee PDEATHSIG exists for — the
+/// recorder never outlives the agent — is preserved exactly, and now it is
+/// the *only* thing that can trigger it.
+#[cfg(target_os = "linux")]
+fn spawn_capture_owned(
+    source: &CaptureSource,
+    cfg: &StartConfig,
+    output_path: &Path,
+) -> Result<(Box<dyn CaptureBackend>, Option<(u32, u32)>)> {
+    use std::sync::mpsc;
+
+    struct SpawnRequest {
+        source: CaptureSource,
+        cfg: StartConfig,
+        output_path: PathBuf,
+        reply: mpsc::Sender<Result<(Box<dyn CaptureBackend>, Option<(u32, u32)>)>>,
+    }
+
+    static SPAWNER: std::sync::OnceLock<mpsc::Sender<SpawnRequest>> = std::sync::OnceLock::new();
+
+    let spawner = SPAWNER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<SpawnRequest>();
+        std::thread::Builder::new()
+            .name("aftercalls-capture-owner".into())
+            .spawn(move || {
+                // Never returns while the sender is alive, and the sender is
+                // a process-lifetime static — that is the whole point.
+                while let Ok(request) = rx.recv() {
+                    let result = spawn_capture(&request.source, &request.cfg, &request.output_path);
+                    let _ = request.reply.send(result);
+                }
+            })
+            .expect("spawn the capture owner thread");
+        tx
+    });
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    spawner
+        .send(SpawnRequest {
+            source: source.clone(),
+            cfg: cfg.clone(),
+            output_path: output_path.to_path_buf(),
+            reply: reply_tx,
+        })
+        .map_err(|_| anyhow::anyhow!("capture owner thread is gone"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("capture owner thread dropped the request"))?
+}
+
+/// Non-Linux backends bind the child's lifetime to the process itself
+/// (Windows uses a kill-on-close Job Object), so they have no thread to
+/// outlive and fork inline.
+#[cfg(not(target_os = "linux"))]
+fn spawn_capture_owned(
+    source: &CaptureSource,
+    cfg: &StartConfig,
+    output_path: &Path,
+) -> Result<(Box<dyn CaptureBackend>, Option<(u32, u32)>)> {
+    spawn_capture(source, cfg, output_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -638,16 +813,37 @@ fn spawn_capture(
 
     let mut child = command.spawn().context("spawn gpu-screen-recorder")?;
     let stderr_join = child.stderr.take().map(spawn_capture_stderr_drain);
-    Ok((
-        Box::new(GpuScreenRecorder { child, stderr_join }),
-        out_dims,
-    ))
+    let mut recorder = GpuScreenRecorder {
+        child,
+        stderr_join,
+        diagnostic: String::new(),
+    };
+
+    // A successful `spawn` only proves the binary exists. The recorder can
+    // still reject its arguments, fail to reach a GPU encoder, or find no
+    // capture permission — and it does that within milliseconds, long after
+    // this function would otherwise have reported "started". Hold the start
+    // open just long enough to see that death, and surface what it said.
+    // Windows gates the same way (`require_capture_startup`).
+    if let Err(error) = require_capture_startup(&mut recorder.child, CAPTURE_STARTUP_GRACE) {
+        recorder.collect_diagnostic();
+        let _ = std::fs::remove_file(output_path);
+        return match recorder.diagnostic.is_empty() {
+            true => Err(error),
+            false => Err(error).context(format!("screen capture stderr: {}", recorder.diagnostic)),
+        };
+    }
+
+    Ok((Box::new(recorder), out_dims))
 }
 
 #[cfg(target_os = "linux")]
 struct GpuScreenRecorder {
     child: std::process::Child,
     stderr_join: Option<JoinHandle<String>>,
+    /// The drained stderr, kept after the child is reaped so a clean exit
+    /// that produced no file can still be explained.
+    diagnostic: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -714,16 +910,28 @@ impl CaptureBackend for GpuScreenRecorder {
     fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    fn diagnostic(&mut self) -> String {
+        self.collect_diagnostic();
+        self.diagnostic.clone()
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl GpuScreenRecorder {
+    /// Join the drain thread once and keep what it read. Idempotent — the
+    /// handle is consumed on the first call and the text survives for every
+    /// later reader (the stop path asks for it after `finalize` already
+    /// joined).
+    fn collect_diagnostic(&mut self) {
+        if let Some(join) = self.stderr_join.take() {
+            self.diagnostic = join.join().unwrap_or_default();
+        }
+    }
+
     fn finish_with_stderr(&mut self, result: Result<()>) -> Result<()> {
-        let diagnostic = self
-            .stderr_join
-            .take()
-            .and_then(|join| join.join().ok())
-            .unwrap_or_default();
+        self.collect_diagnostic();
+        let diagnostic = self.diagnostic.clone();
         match (result, diagnostic.is_empty()) {
             (Ok(()), _) => Ok(()),
             (Err(error), true) => Err(error),
@@ -890,7 +1098,7 @@ fn spawn_capture(
             }
         };
         let mut recorder = FfmpegGdigrabRecorder { child, job };
-        match require_capture_startup(&mut recorder.child, Duration::from_millis(900)) {
+        match require_capture_startup(&mut recorder.child, CAPTURE_STARTUP_GRACE) {
             Ok(()) => return Ok((Box::new(recorder), dims)),
             Err(error) => {
                 failures.push(format!("{encoder}: {error:#}"));
@@ -905,7 +1113,14 @@ fn spawn_capture(
     )
 }
 
-#[cfg(windows)]
+/// How long a freshly spawned capture producer must survive before we call
+/// the start real. Long enough to catch an argument/encoder/permission
+/// rejection (those exit within a few ms), short enough that the user does
+/// not feel the Start button hang.
+const CAPTURE_STARTUP_GRACE: Duration = Duration::from_millis(700);
+
+/// Hold a just-spawned capture open for `grace` and fail if it dies inside
+/// that window. Shared by both platform backends.
 fn require_capture_startup(
     child: &mut std::process::Child,
     grace: Duration,
@@ -1662,13 +1877,108 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
 /// The chooser renders only these; an empty list hides the whole surface.
 #[cfg(target_os = "linux")]
 pub fn supported_source_kinds() -> Vec<&'static str> {
-    // Screen (always) + Window (native picker, always) + Region iff `slurp`
-    // is installed (the proven wlroots region tool).
-    let mut kinds = vec!["screen", "window"];
+    // Screen (always) + Window iff the desktop's screen-share picker answers
+    // + Region iff `slurp` is installed (the proven wlroots region tool).
+    //
+    // Window used to be advertised unconditionally. On a desktop whose
+    // screen-share service is missing or misconfigured that is a button that
+    // opens no picker and records nothing, and the user only finds out at
+    // the end of the call — so it is now gated on the same probe the capture
+    // itself depends on.
+    let mut kinds = vec!["screen"];
+    if portal_screencast_available() {
+        kinds.push("window");
+    }
     if locate_slurp().is_some() {
         kinds.push("region");
     }
     kinds
+}
+
+/// Whether the desktop's screen-share service (the freedesktop ScreenCast
+/// portal) is reachable on the session bus.
+///
+/// Window capture on Wayland is a handoff: the recorder asks the desktop to
+/// put up a picker and hand back a stream. If nothing is listening, the
+/// request never resolves — the recorder sits alive and silent with no
+/// picker on screen and no error, which is precisely the failure it is worth
+/// spending a probe to avoid.
+///
+/// Probed once per process and cached: the status poll asks for the source
+/// list every couple of seconds, and the session's portal does not come and
+/// go. When no probe tool is installed we answer `true` — an unknown answer
+/// must not hide a feature that may work fine.
+#[cfg(target_os = "linux")]
+pub fn portal_screencast_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(probe_portal_screencast)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_portal_screencast() -> bool {
+    use std::process::{Command, Stdio};
+
+    // Read the ScreenCast interface's `version` property. Success proves the
+    // portal is running AND exposes screen capture; a missing interface
+    // fails even when the portal itself answers.
+    let attempts: [(&str, Vec<&str>); 2] = [
+        (
+            "gdbus",
+            vec![
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.portal.Desktop",
+                "--object-path",
+                "/org/freedesktop/portal/desktop",
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.freedesktop.portal.ScreenCast",
+                "version",
+            ],
+        ),
+        (
+            "busctl",
+            vec![
+                "--user",
+                "get-property",
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.ScreenCast",
+                "version",
+            ],
+        ),
+    ];
+
+    for (tool, args) in attempts {
+        let Some(bin) = find_executable(tool) else {
+            continue;
+        };
+        let status = Command::new(&bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return match status {
+            Ok(status) => {
+                let ok = status.success();
+                if !ok {
+                    eprintln!(
+                        "aftercalls: window capture unavailable — the desktop screen-share service did not answer ({tool})"
+                    );
+                }
+                ok
+            }
+            // The tool is on PATH but would not run. Undecidable, not a no.
+            Err(_) => true,
+        };
+    }
+
+    // No probe tool installed — assume the portal is fine rather than
+    // hiding a working feature on a minimal system.
+    true
 }
 
 #[cfg(windows)]
@@ -1762,10 +2072,28 @@ pub fn resolve_region_via_slurp() -> Option<String> {
 }
 
 /// Whether a capture backend can run right now.
+///
+/// Enumeration shells out, and the recording indicator asks this every two
+/// seconds for the whole length of a call, so the answer is held briefly.
+/// Monitors are hot-pluggable, hence a short window rather than a
+/// process-lifetime cache — and re-spawning the recorder binary thirty times
+/// a minute while that same binary is capturing buys nothing.
 #[cfg(target_os = "linux")]
 pub fn capture_available() -> bool {
+    use std::sync::Mutex as StdMutex;
+    static CACHED: StdMutex<Option<(Instant, bool)>> = StdMutex::new(None);
+    const TTL: Duration = Duration::from_secs(10);
+
+    let mut guard = CACHED.lock().unwrap();
+    if let Some((checked_at, answer)) = *guard {
+        if checked_at.elapsed() < TTL {
+            return answer;
+        }
+    }
     // The binary is present AND at least one display enumerates.
-    locate_gsr().is_some() && !enumerate_displays().is_empty()
+    let answer = locate_gsr().is_some() && !enumerate_displays().is_empty();
+    *guard = Some((Instant::now(), answer));
+    answer
 }
 
 #[cfg(windows)]
@@ -1783,12 +2111,18 @@ pub fn capture_available() -> bool {
 }
 
 /// Enumerate selectable monitors for the chooser + Settings picker.
+///
+/// Two sources, deliberately: `gpu-screen-recorder --list-monitors` owns the
+/// capture *target names* (whatever it prints is what `-w` accepts), and the
+/// compositor owns the *human* facts — which panel this is and where it sits
+/// on the desk. Neither alone is enough to render a list a person can pick
+/// from, so the compositor's row is merged onto the capture name.
 #[cfg(target_os = "linux")]
 pub fn enumerate_displays() -> Vec<DisplayInfo> {
     use std::process::Command;
 
-    // Focused monitor name from Hyprland, if we're in a Hypr session.
-    let focused = hyprctl_focused_monitor();
+    // Compositor-side monitor facts (description, layout origin, focus).
+    let compositor = hyprctl_monitors();
 
     // Primary: gpu-screen-recorder --list-monitors (NAME|WxH per line).
     if let Some(bin) = locate_gsr() {
@@ -1799,33 +2133,47 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
                     .lines()
                     .filter_map(parse_gsr_monitor_line)
                     .map(|(name, width, height)| {
-                        let is_primary = focused.as_deref() == Some(name.as_str());
+                        let known = compositor.iter().find(|m| m.name == name);
                         DisplayInfo {
+                            is_primary: known.is_some_and(|m| m.is_primary),
+                            x: known.map_or(0, |m| m.x),
+                            y: known.map_or(0, |m| m.y),
+                            description: known.and_then(|m| m.description.clone()),
                             name,
                             width,
                             height,
-                            is_primary,
-                            // gsr targets by name on Linux; rect origin is
-                            // unused (0). Windows carries the real offset.
-                            x: 0,
-                            y: 0,
                         }
                     })
                     .collect();
-                // If nothing was flagged primary (non-Hypr compositor),
-                // mark the first as a sensible default.
-                if !list.is_empty() && !list.iter().any(|d| d.is_primary) {
-                    list[0].is_primary = true;
-                }
                 if !list.is_empty() {
+                    order_by_desk_position(&mut list);
+                    // If nothing was flagged primary (non-Hypr compositor),
+                    // mark the leftmost as a sensible default.
+                    if !list.iter().any(|d| d.is_primary) {
+                        list[0].is_primary = true;
+                    }
                     return list;
                 }
             }
         }
     }
 
-    // Fallback: Hyprland's own monitor list.
-    hyprctl_monitors()
+    // Fallback: the compositor's own monitor list.
+    let mut list = hyprctl_monitors();
+    order_by_desk_position(&mut list);
+    list
+}
+
+/// Sort monitors the way they sit in front of the user, left to right.
+///
+/// Left-to-right is the axis people actually navigate a desk by, and a real
+/// multi-monitor arrangement is rarely a tidy grid — a portrait panel nudged
+/// down to centre it, an ultrawide dropped onto a lower shelf. Sorting on `y`
+/// first shuffles such a desk into an order nobody would recognise, so `x`
+/// leads and `y` only breaks ties between stacked screens.
+#[cfg(target_os = "linux")]
+fn order_by_desk_position(list: &mut [DisplayInfo]) {
+    list.sort_by_key(|d| (d.x, d.y));
 }
 
 /// Enumerate monitors on Windows via `EnumDisplayMonitors` + `GetMonitorInfoW`
@@ -1865,6 +2213,10 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
                 is_primary,
                 x: r.left,
                 y: r.top,
+                // `szDevice` is all Windows offers here; the friendly panel
+                // name lives behind a separate display-config query. The
+                // chooser falls back to position + size, which is enough.
+                description: None,
             });
         }
         TRUE
@@ -1888,15 +2240,6 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn enumerate_displays() -> Vec<DisplayInfo> {
     Vec::new()
-}
-
-/// Name of Hyprland's focused monitor, if any.
-#[cfg(target_os = "linux")]
-fn hyprctl_focused_monitor() -> Option<String> {
-    hyprctl_monitors()
-        .into_iter()
-        .find(|d| d.is_primary)
-        .map(|d| d.name)
 }
 
 /// Parse `hyprctl monitors -j` → the monitor list (focused flag included).
@@ -1929,11 +2272,63 @@ fn hyprctl_monitors() -> Vec<DisplayInfo> {
                 width,
                 height,
                 is_primary,
-                x: 0,
-                y: 0,
+                x: m.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                y: m.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                description: monitor_description(m),
             })
         })
         .collect()
+}
+
+/// Human panel identity from one `hyprctl monitors -j` entry.
+///
+/// Hypr reports `make`/`model` separately and also a `description` that
+/// glues them to the serial ("Dell Inc. DELL U2723QE 8Y2K3D3"). Prefer the
+/// clean make+model pair; fall back to trimming the serial off the
+/// description. `None` when the panel reports nothing useful — a generic
+/// "Unknown" from EDID identifies a screen no better than `DP-1` does.
+#[cfg(target_os = "linux")]
+fn monitor_description(entry: &serde_json::Value) -> Option<String> {
+    let field = |key: &str| {
+        entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
+            .map(str::to_string)
+    };
+
+    let make = field("make");
+    let model = field("model");
+    let label = match (make, model) {
+        // "Dell Inc." + "DELL U2723QE" already carries the brand — don't
+        // stutter it back out as "Dell Inc. DELL U2723QE".
+        (Some(make), Some(model)) => {
+            let head = make.split_whitespace().next().unwrap_or(&make).to_string();
+            if model.to_lowercase().contains(&head.to_lowercase()) {
+                model
+            } else {
+                format!("{make} {model}")
+            }
+        }
+        (None, Some(model)) => model,
+        (Some(make), None) => make,
+        (None, None) => {
+            // Last resort: the description minus its trailing serial token.
+            let description = field("description")?;
+            let mut parts: Vec<&str> = description.split_whitespace().collect();
+            if parts.len() > 2 {
+                parts.pop();
+            }
+            parts.join(" ")
+        }
+    };
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
 }
 
 #[cfg(test)]
@@ -2266,6 +2661,7 @@ mod tests {
                 is_primary: false,
                 x: -1920,
                 y: 0,
+                description: None,
             },
             DisplayInfo {
                 name: "main".to_string(),
@@ -2274,6 +2670,7 @@ mod tests {
                 is_primary: true,
                 x: 0,
                 y: 0,
+                description: None,
             },
         ];
         assert!(region_within_any_display(
@@ -2299,8 +2696,8 @@ mod tests {
     #[test]
     fn resolve_monitor_prefers_saved_then_primary_then_first() {
         let displays = vec![
-            DisplayInfo { name: "DP-1".into(), width: 2560, height: 1440, is_primary: false, x: 0, y: 0 },
-            DisplayInfo { name: "DP-2".into(), width: 1920, height: 1080, is_primary: true, x: 0, y: 0 },
+            DisplayInfo { name: "DP-1".into(), width: 2560, height: 1440, is_primary: false, x: 0, y: 0, description: None },
+            DisplayInfo { name: "DP-2".into(), width: 1920, height: 1080, is_primary: true, x: 0, y: 0, description: None },
         ];
         // Saved name that still enumerates wins.
         assert_eq!(resolve_monitor(Some("DP-1"), &displays).as_deref(), Some("DP-1"));
@@ -2320,6 +2717,181 @@ mod tests {
         );
         assert_eq!(parse_gsr_monitor_line("garbage"), None);
         assert_eq!(parse_gsr_monitor_line("NoRes|"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn monitor_description_names_the_panel_not_the_socket() {
+        let entry = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+
+        // Make already appears inside model — don't stutter the brand.
+        assert_eq!(
+            monitor_description(&entry(
+                r#"{"make":"Dell Inc.","model":"DELL U2723QE","description":"Dell Inc. DELL U2723QE 8Y2K3D3"}"#
+            ))
+            .as_deref(),
+            Some("DELL U2723QE")
+        );
+        // Distinct make + model are joined.
+        assert_eq!(
+            monitor_description(&entry(r#"{"make":"LG Electronics","model":"27GP950"}"#))
+                .as_deref(),
+            Some("LG Electronics 27GP950")
+        );
+        // Only one half known.
+        assert_eq!(
+            monitor_description(&entry(r#"{"model":"U2723QE"}"#)).as_deref(),
+            Some("U2723QE")
+        );
+        // A panel that reports nothing identifies itself no better than the
+        // connector name does — say nothing rather than "Unknown".
+        assert_eq!(
+            monitor_description(&entry(
+                r#"{"make":"Unknown","model":"unknown","description":""}"#
+            )),
+            None
+        );
+        assert_eq!(monitor_description(&entry(r#"{"name":"DP-1"}"#)), None);
+        // No make/model at all → the description minus its serial tail.
+        assert_eq!(
+            monitor_description(&entry(r#"{"description":"Acme Widescreen ABC123"}"#)).as_deref(),
+            Some("Acme Widescreen")
+        );
+    }
+
+    /// A real desk, from the report that prompted this work: five panels,
+    /// three of them the same Acer model, a portrait screen nudged down to
+    /// centre it and an ultrawide on a lower shelf. Sorting on `y` first put
+    /// this in an order matching nothing the user could see; `x` first reads
+    /// left to right the way they'd point at them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_mixed_desk_reads_left_to_right() {
+        let panel = |name: &str, w: u32, h: u32, x: i32, y: i32, model: &str| DisplayInfo {
+            name: name.to_string(),
+            width: w,
+            height: h,
+            is_primary: name == "HDMI-A-2",
+            x,
+            y,
+            description: Some(model.to_string()),
+        };
+        let mut list = vec![
+            panel("DP-2", 3840, 1080, 2040, 1080, "Samsung C49HG9x"),
+            panel("DP-3", 1920, 1080, 4920, 0, "Acer VG240Y P"),
+            panel("HDMI-A-1", 1080, 1920, 0, 240, "Acer VG240Y P"),
+            panel("HDMI-A-2", 1920, 1080, 1080, 0, "Acer VG240Y P"),
+        ];
+        order_by_desk_position(&mut list);
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["HDMI-A-1", "HDMI-A-2", "DP-2", "DP-3"]);
+        // Every row is separable: identical models are told apart by their
+        // distinct horizontal positions, which is what the hints render from.
+        let xs: Vec<i32> = list.iter().map(|d| d.x).collect();
+        let unique: std::collections::HashSet<i32> = xs.iter().copied().collect();
+        assert_eq!(unique.len(), xs.len(), "hints need distinct x to be true");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn displays_are_ordered_the_way_they_sit_on_the_desk() {
+        let at = |name: &str, x: i32, y: i32| DisplayInfo {
+            name: name.to_string(),
+            width: 1920,
+            height: 1080,
+            is_primary: false,
+            x,
+            y,
+            description: None,
+        };
+        // Deliberately shuffled. `x` leads, so a screen on a lower shelf
+        // sorts by where it sits horizontally rather than into its own row.
+        let mut list = vec![
+            at("right", 1920, 0),
+            at("below", 900, 1080),
+            at("left", 0, 0),
+        ];
+        order_by_desk_position(&mut list);
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["left", "below", "right"]);
+    }
+
+    /// Hard rule 2: user-facing copy names no vendor, tool or backend. The
+    /// stop report is user-facing and its input is a capture binary's raw
+    /// stderr, which names all three — so the classifier is the boundary,
+    /// and this test attacks it with real producer output rather than
+    /// confirming the cases it was written against.
+    #[test]
+    fn a_capture_failure_never_leaks_the_tool_behind_it() {
+        // Verbatim from the desk that reported the bug: a screen-share
+        // service that had stopped advertising any cursor mode.
+        let real_portal_failure = "gsr info: gsr_capture_portal_setup_dbus: SelectSources\n\
+             gsr warning: gsr_dbus_screencast_select_sources: no cursors modes are available\n\
+             gsr error: gsr_dbus_call_screencast_method: failed with error: Unavailable cursor mode 1\n\
+             gsr error: gsr_capture_portal_setup_dbus: SelectSources failed\n\
+             gsr error: gsr_capture_start failed";
+        assert!(
+            describe_capture_failure(real_portal_failure).contains("screen-sharing service"),
+            "the portal refusal is the one cause a user can actually fix"
+        );
+
+        let samples = [
+            real_portal_failure,
+            "gsr error: gsr_kms_client_init: failed to connect to /usr/bin/gsr-kms-server: Permission denied",
+            "[h264_nvenc @ 0x55] Cannot load libnvidia-encode.so.1; no encoder available",
+            "gpu-screen-recorder: monitor \"DP-9\" not found, no such file or directory",
+            "gpu-screen-recorder exited with status 1",
+            "",
+        ];
+        // Anything that would identify what we shell out to, or where we run.
+        const FORBIDDEN: [&str; 12] = [
+            "gsr",
+            "gpu-screen-recorder",
+            "ffmpeg",
+            "gdigrab",
+            "slurp",
+            "nvenc",
+            "nvidia",
+            "vaapi",
+            "pipewire",
+            "wayland",
+            "hyprland",
+            "/usr/",
+        ];
+        for sample in samples {
+            let shown = describe_capture_failure(sample).to_ascii_lowercase();
+            for needle in FORBIDDEN {
+                assert!(
+                    !shown.contains(needle),
+                    "{needle:?} reached user-facing copy via {shown:?}"
+                );
+            }
+            assert!(
+                !shown.is_empty(),
+                "every failure still owes the user a cause"
+            );
+        }
+
+        // Each recognised class lands somewhere distinct, so the classifier
+        // is doing work rather than always returning the fallback.
+        assert!(describe_capture_failure(samples[1]).contains("permission"));
+        assert!(describe_capture_failure(samples[2]).contains("encoder"));
+        assert!(describe_capture_failure(samples[3]).contains("could not be found"));
+        assert!(describe_capture_failure(samples[4]).contains("nothing was selected"));
+        assert_eq!(
+            describe_capture_failure(""),
+            describe_capture_failure("something entirely unfamiliar"),
+            "an unknown cause gets the honest general answer, not a guess"
+        );
+    }
+
+    #[test]
+    fn human_source_kind_reads_as_plain_words() {
+        assert_eq!(human_source_kind("region"), "screen area");
+        assert_eq!(human_source_kind("window"), "window");
+        assert_eq!(human_source_kind("screen"), "screen");
+        // Anything unrecognised degrades to the general word.
+        assert_eq!(human_source_kind("whatever"), "screen");
     }
 
     #[cfg(target_os = "linux")]
@@ -2347,10 +2919,162 @@ mod tests {
         let mut recorder = GpuScreenRecorder {
             child,
             stderr_join: None,
+            diagnostic: String::new(),
         };
         recorder.child.wait().unwrap();
         recorder
             .finalize()
             .expect("must not signal a stale PID after status reaped the child");
+    }
+
+    /// The bug this whole seam exists for: `PR_SET_PDEATHSIG` fires when the
+    /// forking THREAD dies, not the process. A capture forked from a Tauri
+    /// command thread was therefore SIGINT'd about a second after it started.
+    /// This test reproduces the kill directly, so the reason the capture-owner
+    /// thread must never be bypassed stays written down and enforced.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pdeathsig_kills_a_child_forked_from_a_short_lived_thread() {
+        use std::os::unix::process::CommandExt;
+
+        let child = std::thread::spawn(|| {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command.arg("30").stdin(std::process::Stdio::null());
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        })
+        .join()
+        .unwrap();
+        // The forking thread has now exited, which is all it takes.
+        let mut child = child;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status),
+                None if Instant::now() >= deadline => break None,
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            status.is_some(),
+            "PDEATHSIG is thread-scoped: a child forked from a thread that \
+             exits must die. If this ever stops holding, spawn_capture_owned's \
+             dedicated thread is no longer load-bearing."
+        );
+    }
+
+    /// And the fix: the same fork, performed by a thread that stays alive,
+    /// survives the death of the thread that asked for it. This is the
+    /// arrangement `spawn_capture_owned` puts in place — asserted here on
+    /// `sleep` so it holds on any host, with or without a display.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_forked_by_a_living_owner_thread_outlives_its_requester() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::mpsc;
+
+        let (request_tx, request_rx) = mpsc::channel::<mpsc::Sender<std::process::Child>>();
+        let owner = std::thread::spawn(move || {
+            while let Ok(reply) = request_rx.recv() {
+                let mut command = std::process::Command::new("/bin/sleep");
+                command.arg("30").stdin(std::process::Stdio::null());
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let _ = reply.send(command.spawn().unwrap());
+            }
+        });
+
+        // A second handle keeps the owner loop blocked in recv() — and so
+        // alive — after the requesting thread and its sender are gone.
+        let keepalive = request_tx.clone();
+
+        // Ask from a thread that then exits: the shape that used to kill it.
+        let mut child = std::thread::spawn(move || {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            request_tx.send(reply_tx).unwrap();
+            reply_rx.recv().unwrap()
+        })
+        .join()
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "a child forked by a living owner thread must survive its requester"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(keepalive);
+        owner.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_capture_that_dies_at_startup_fails_the_start() {
+        // `false` stands in for a recorder that rejects its arguments or
+        // finds no encoder: it exits immediately. Reporting "started" for
+        // that is what let a call record no video and say nothing until Stop.
+        let mut child = std::process::Command::new("/bin/false").spawn().unwrap();
+        let error = require_capture_startup(&mut child, CAPTURE_STARTUP_GRACE)
+            .expect_err("a producer that exits during startup has not started");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_capture_that_survives_startup_is_accepted() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let outcome = require_capture_startup(&mut child, CAPTURE_STARTUP_GRACE);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(outcome.is_ok(), "a live producer must pass the gate");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn producer_stderr_survives_for_the_no_video_explanation() {
+        // A producer can exit 0 and still write nothing. What it said on
+        // stderr is then the only account of why, so it has to outlive
+        // finalize rather than being dropped with the join handle.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("echo 'no screen capture permission' >&2; exit 0")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr_join = child.stderr.take().map(spawn_capture_stderr_drain);
+        let mut recorder = GpuScreenRecorder {
+            child,
+            stderr_join,
+            diagnostic: String::new(),
+        };
+        // Let it finish on its own, as a producer that gives up on a picker
+        // does — the stop path then finds an already-exited clean child.
+        recorder.child.wait().unwrap();
+        recorder.finalize().expect("a clean exit finalizes cleanly");
+        assert_eq!(recorder.diagnostic(), "no screen capture permission");
+        // Still readable after the drain handle is gone.
+        assert_eq!(recorder.diagnostic(), "no screen capture permission");
     }
 }

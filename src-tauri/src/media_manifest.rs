@@ -182,18 +182,44 @@ impl LocalMediaManifest {
     /// still governs recovery terminality and the local-cleanup boundary, so a
     /// finalizing generation is revisited and driven to ready later.
     pub fn has_client_pending_media(&self) -> bool {
-        fn pending(state: ArtifactState) -> bool {
-            matches!(
-                state,
+        fn pending(item: &ArtifactCheckpoint) -> bool {
+            if matches!(
+                item.state,
                 ArtifactState::Recording
                     | ArtifactState::RawReady
                     | ArtifactState::EncodingFailed
                     | ArtifactState::Published
                     | ArtifactState::UploadPending
-            )
+            ) {
+                return true;
+            }
+            // `UploadedAwaitingBackendReady` is written by `persist_status`
+            // every time a backend status is mirrored — including a status that
+            // says `uploading` with parts still outstanding, and including the
+            // status left behind by an upload that failed partway. The name
+            // promises the client is done; the part ledger in the very same
+            // checkpoint is what actually knows.
+            //
+            // Trusting the label alone is what made a half-uploaded recording
+            // permanent: recovery only reconsiders a *completed* call on
+            // `has_client_pending_media`, so an upload that died after 3 of 97
+            // parts was never offered for resume again, while the backend row
+            // stayed `uploading` and every surface reported healthy progress.
+            //
+            // Only an incomplete part ledger counts. An artifact whose parts are
+            // all confirmed and is merely awaiting backend validation owes
+            // nothing — re-running the pipeline for those is the regression this
+            // predicate was narrowed to prevent, and it stays prevented.
+            if !matches!(item.state, ArtifactState::UploadedAwaitingBackendReady) {
+                return false;
+            }
+            item.upload.as_ref().is_some_and(|upload| {
+                upload
+                    .part_count
+                    .is_some_and(|total| (upload.confirmed_parts.len() as u32) < total)
+            })
         }
-        self.audio.values().any(|a| pending(a.state))
-            || self.screen.as_ref().map(|s| pending(s.state)).unwrap_or(false)
+        self.audio.values().any(pending) || self.screen.as_ref().is_some_and(pending)
     }
 }
 
@@ -1069,6 +1095,79 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
         .is_err());
+    }
+
+    /// A screen upload that died partway must stay recoverable.
+    ///
+    /// `sync_upload_status` stamps `UploadedAwaitingBackendReady` whenever a
+    /// backend status is mirrored — including `uploading` with most parts
+    /// outstanding — so the state label alone says "client owes nothing" for an
+    /// upload that owes almost everything. Recovery only reconsiders a
+    /// *completed* call on `has_client_pending_media`, so trusting that label
+    /// stranded a 3-of-97-part screen recording forever: the agent never
+    /// re-offered it, the backend row stayed `uploading`, and every surface
+    /// reported it as still on its way.
+    #[test]
+    fn a_part_ledger_with_bytes_outstanding_outranks_the_state_label() {
+        const CALL_ID: &str = "4da6e5c4-7ac1-45bb-bab6-8e269a2664c2";
+        const GENERATION_ID: &str = "9a0b77df-4391-407c-a1fb-b12bdaefa5dd";
+        const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let scratch = Scratch::new();
+        let video = scratch.0.join("screen").join("recording_fs.mp4");
+        std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+        std::fs::write(&video, b"video").unwrap();
+        // A fresh manifest seeds mic/system as `Recording`, which is pending on
+        // its own merits. Settle them so this asserts about the screen artifact.
+        mark_audio_not_present(&scratch.0, "mic").unwrap();
+        mark_audio_not_present(&scratch.0, "system").unwrap();
+        prepare_upload(&scratch.0, CALL_ID, "screen", None, &video, 5, HASH).unwrap();
+
+        // The exact shape the incident left on disk: 3 of 97 parts confirmed.
+        sync_upload_status(
+            &scratch.0,
+            "screen",
+            GENERATION_ID,
+            "uploading",
+            "calls/call/screen.mp4",
+            &[1, 2, 3],
+            97,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let manifest = read(&scratch.0).unwrap().unwrap();
+        assert_eq!(
+            manifest.screen.as_ref().unwrap().state,
+            ArtifactState::UploadedAwaitingBackendReady,
+            "precondition: the mirrored label claims the client is done"
+        );
+        assert!(
+            manifest.has_client_pending_media(),
+            "94 unconfirmed parts are bytes this client still owes"
+        );
+
+        // Every part confirmed and only backend validation outstanding: the
+        // client owes nothing, and re-running the pipeline for it is the
+        // regression this predicate was narrowed to prevent.
+        let all: Vec<u32> = (1..=97).collect();
+        sync_upload_status(
+            &scratch.0,
+            "screen",
+            GENERATION_ID,
+            "validating",
+            "calls/call/screen.mp4",
+            &all,
+            97,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !read(&scratch.0).unwrap().unwrap().has_client_pending_media(),
+            "a fully uploaded generation awaiting validation owes nothing"
+        );
     }
 
     #[test]

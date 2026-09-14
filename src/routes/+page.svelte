@@ -29,6 +29,7 @@
   } from "$lib/permissions";
   import { openBilling } from "$lib/billing";
   import { liveSession } from "$lib/stores/liveSession.svelte";
+  import { callRecording } from "$lib/stores/callRecording.svelte";
   import type {
     SzmPriorPush,
     SzmPushResponse,
@@ -1010,6 +1011,46 @@
   // screen so the disclosed consent covers video. Self-notes never
   // screen-capture, so their surfaces are untouched.
   let screenCaptureOn = $state(false);
+
+  // Whether the screen is ALSO being captured right now — the live truth,
+  // not the `screenCaptureOn` preference above. Owned by the callRecording
+  // store, which the floater keeps fresh off `screen_capture_local_status`
+  // while a call is live. Self-notes never screen-capture.
+  let screenLive = $derived(
+    callRecording.state === "recording" &&
+      callRecording.mode === "call" &&
+      callRecording.screenActive,
+  );
+
+  // The live row names every stream actually being captured. It used to
+  // read "Recording mic + system audio" flat — understating a call that was
+  // also on screen, and overstating a self-note that only ever gets the
+  // mic. The one row the user watches while live has to be exact.
+  let liveCaptureLabel = $derived.by(() => {
+    if (
+      callRecording.state === "recording" &&
+      callRecording.mode === "self_note"
+    ) {
+      return "Recording mic — self-note";
+    }
+    // Capture that started and then stopped on its own is the one case the
+    // row must not render as a plain audio call: the user picked a screen,
+    // saw the cue, and would otherwise discover the video ended early only
+    // at playback.
+    if (!screenLive) {
+      return callRecording.screenLost
+        ? "Recording mic + system audio — screen recording stopped"
+        : "Recording mic + system audio";
+    }
+    switch (callRecording.screenKind) {
+      case "window":
+        return "Recording mic + system audio + window";
+      case "region":
+        return "Recording mic + system audio + screen area";
+      default:
+        return "Recording mic + system audio + screen";
+    }
+  });
 
   // Copy-notice button UX (#45).
   let copiedNotice = $state(false);
@@ -2666,8 +2707,37 @@
   <section class="status" style="--i: 4">
     {#if recording}
       <div class="row row-live">
-        <span class="row-dot live"></span>
-        <span class="row-title">Recording mic + system audio</span>
+        <span class="row-cue">
+          <span class="row-dot live"></span>
+          {#if screenLive}
+            <svg
+              class="row-screen-glyph"
+              viewBox="0 0 20 20"
+              width="14"
+              height="14"
+              aria-hidden="true"
+            >
+              <rect
+                x="2.2"
+                y="3.5"
+                width="15.6"
+                height="10"
+                rx="1.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+              />
+              <path
+                d="M7.5 16.5 h5 M10 13.5 v3"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                fill="none"
+              />
+            </svg>
+          {/if}
+        </span>
+        <span class="row-title">{liveCaptureLabel}</span>
         <!-- #346 — inline notes toggle. Surfaces the panel without
              requiring a trip to Settings. Disabled once the session is
              off (the button becomes irrelevant after stop). -->
@@ -3443,6 +3513,18 @@
     height: 7px;
     border-radius: 50%;
     background: var(--bone-3);
+    flex-shrink: 0;
+  }
+  /* Dot + monitor glyph read as one on-air cue, tighter than the row's
+   * own gap would put them. */
+  .row-cue {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+  }
+  .row-screen-glyph {
+    color: var(--live);
     flex-shrink: 0;
   }
   .row-dot.live {

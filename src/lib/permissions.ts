@@ -50,10 +50,12 @@ export function requestScreenCaptureAccess(): Promise<boolean> {
  *  flip a denied grant. Non-fatal: opener failures reject, callers
  *  should swallow.
  *
- *  NOTE: the Rust command is registered but its body is still a stub
- *  (TODO #623 S-4) — this currently resolves without opening anything.
- *  Do not wire an "Open System Settings" affordance to it until S-4
- *  lands the deep-link body. */
+ *  The Rust body deep-links to the real pane
+ *  (`x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone`
+ *  / `?Privacy_ScreenCapture`) — shipped in #675, S-4. An earlier version
+ *  of this note said the body was a stub and told callers not to wire an
+ *  "Open System Settings" affordance to it; that has been false since
+ *  #675 and is exactly the affordance #680 needs. */
 export function openPrivacySettings(pane: PrivacyPane): Promise<void> {
   return invoke("open_privacy_settings", { pane });
 }

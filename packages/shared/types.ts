@@ -70,6 +70,10 @@ export type ScreenRecording = {
   codec?: string;
   byte_size?: number;
   expires_at?: string;
+  /** The upload is open but its client stopped pushing bytes long ago. Only
+   *  ever set alongside `status: "uploading"` — it exists so the UI can stop
+   *  calling a dead upload progress. Optional: older backends omit it. */
+  stalled?: boolean;
 };
 
 /** Short-lived playback credential minted only after a user expands a ready
