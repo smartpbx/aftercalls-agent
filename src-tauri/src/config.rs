@@ -533,15 +533,35 @@ pub fn write_auth_file(auth: &AuthFile) -> Result<()> {
         fs::create_dir_all(parent).context("mkdir config dir")?;
     }
     let json = serde_json::to_string_pretty(auth).context("serialize auth.json")?;
-    fs::write(&p, json).with_context(|| format!("write {}", p.display()))?;
-    // chmod 600 — keep tokens readable only by the user.
+    // Write a sibling then rename over, so a concurrent reader (every
+    // authed request reads this file) never sees a half-written token and
+    // a crash mid-write can't leave a truncated file that signs the user out.
+    let tmp = p.with_extension("json.tmp");
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    // 0600 from creation — keep tokens readable only by the user, with no
+    // window where the file exists under the default umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write as _;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("open {}", tmp.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+    }
+    // `mode` only applies when the file is created; a leftover .tmp from an
+    // older build keeps its perms, so tighten explicitly too.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&p)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&p, perms)?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     }
+    fs::rename(&tmp, &p).with_context(|| format!("replace {}", p.display()))?;
     Ok(())
 }
 

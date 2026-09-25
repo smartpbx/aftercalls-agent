@@ -130,6 +130,21 @@ struct MeResponse {
     // the AuthFile in `config.rs` at the same time.
 }
 
+/// Serializes every access-token refresh in the process.
+///
+/// The server rotates refresh tokens on use, so two callers that both saw
+/// an expiring token used to fire parallel refreshes with the same refresh
+/// token (resuming a batch of stuck calls did exactly that). Holders re-read
+/// auth.json after acquiring it, so waiters pick up the winner's tokens
+/// instead of refreshing again.
+static AUTH_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Treat any token with <60s left as expired so we don't hand out an
+/// access token that's about to fail mid-request.
+fn access_needs_refresh(auth: &AuthFile) -> bool {
+    auth.access_expires_at <= Utc::now() + chrono::Duration::seconds(60)
+}
+
 /// Returns an `Authorization: Bearer …` value, refreshing the JWT if it's
 /// within a minute of expiry. Falls back to the legacy static bearer
 /// token only if no auth.json is on disk.
@@ -137,19 +152,20 @@ struct MeResponse {
 /// Shared with upload.rs so post-call pipeline HTTP doesn't skip the
 /// refresh and 401 on a stale token that expired mid-recording.
 pub async fn build_auth_header(backend: &Backend) -> Result<String> {
-    if let Some(mut auth) = read_auth_file()? {
-        // Treat any token with <60s left as expired so we don't hand out
-        // an access token that's about to fail mid-request.
-        let needs_refresh =
-            auth.access_expires_at <= Utc::now() + chrono::Duration::seconds(60);
-        if needs_refresh {
-            if auth.refresh_expires_at <= Utc::now() {
-                return Err(anyhow!("refresh token expired — please log in again"));
-            }
-            let refreshed = do_refresh(backend, &auth.refresh_token).await?;
-            auth = merge_auth(refreshed);
-            write_auth_file(&auth).ok();
+    if let Some(auth) = read_auth_file()? {
+        if !access_needs_refresh(&auth) {
+            return Ok(format!("Bearer {}", auth.access_token));
         }
+        let _guard = AUTH_REFRESH_LOCK.lock().await;
+        // Whoever held the lock before us may already have refreshed, or
+        // the session may have ended while we waited.
+        let Some(auth) = read_auth_file()? else {
+            return Err(anyhow!("not logged in — please sign in to aftercalls"));
+        };
+        if !access_needs_refresh(&auth) {
+            return Ok(format!("Bearer {}", auth.access_token));
+        }
+        let auth = refresh_locked(backend, &auth).await?;
         return Ok(format!("Bearer {}", auth.access_token));
     }
     // Legacy path — a config.toml-supplied static token.
@@ -159,6 +175,39 @@ pub async fn build_auth_header(backend: &Backend) -> Result<String> {
         }
     }
     Err(anyhow!("not logged in — please sign in to aftercalls"))
+}
+
+/// Rotate `auth`'s refresh token and persist the result. Caller must hold
+/// `AUTH_REFRESH_LOCK`.
+///
+/// A definitive rejection signs the user out (see `signal_session_expired`).
+/// This used to happen only on the `retry_http` path; the lazy path in
+/// `build_auth_header` — which nearly every request takes — just bubbled
+/// "refresh failed (401 …)" into whatever page asked, leaving the app
+/// looking signed in with an empty archive and every Resume failing.
+async fn refresh_locked(backend: &Backend, auth: &AuthFile) -> Result<AuthFile> {
+    if auth.refresh_expires_at <= Utc::now() {
+        signal_session_expired();
+        return Err(anyhow!("refresh token expired — please log in again"));
+    }
+    let refreshed = match do_refresh(backend, &auth.refresh_token).await {
+        Ok(refreshed) => refreshed,
+        Err(e) => {
+            if refresh_was_rejected(&e) {
+                signal_session_expired();
+            }
+            return Err(e);
+        }
+    };
+    let merged = merge_auth(refreshed);
+    // The server has already rotated, so the new access token is good for
+    // this request even if persisting fails. The next refresh re-presents
+    // the old refresh token, which the server still accepts while its
+    // replacement is unused.
+    if let Err(e) = write_auth_file(&merged) {
+        eprintln!("aftercalls: could not persist refreshed auth.json: {e:#}");
+    }
+    Ok(merged)
 }
 
 async fn do_refresh(backend: &Backend, refresh_token: &str) -> Result<AuthResponsePayload> {
@@ -2950,14 +2999,6 @@ impl RetryGuard {
     }
 }
 
-/// Force a token refresh outside of the lazy `build_auth_header` flow.
-/// Used by `retry_http` when a step returned 401 — the cached
-/// `auth.json` might be syntactically not-yet-expired (so
-/// `build_auth_header` won't refresh on its own) but semantically
-/// revoked server-side (rotated by a parallel sign-in / explicit
-/// revoke). Reads the current `auth.json`, posts to `/v1/auth/refresh`
-/// via the existing `do_refresh` helper, persists the new bundle, and
-/// returns `Ok(())`. Errors bubble — the caller drops the retry.
 /// Whether a `do_refresh` failure means the session itself is dead rather
 /// than the network being unhappy. Only a rejected refresh token counts —
 /// a 5xx or a connect error must NOT sign the user out mid-call.
@@ -2982,26 +3023,28 @@ fn signal_session_expired() {
     crate::telemetry::emit_app_event("auth::session-expired", &serde_json::json!({}));
 }
 
+/// Force a token refresh outside of the lazy `build_auth_header` flow.
+/// Used by `retry_http` when a step returned 401 — the cached
+/// `auth.json` might be syntactically not-yet-expired (so
+/// `build_auth_header` won't refresh on its own) but semantically
+/// revoked server-side (rotated by a parallel sign-in / explicit
+/// revoke). Reads the current `auth.json`, posts to `/v1/auth/refresh`
+/// via the existing `do_refresh` helper, persists the new bundle, and
+/// returns `Ok(())`. Errors bubble — the caller drops the retry.
 pub(crate) async fn force_refresh_auth(backend: &Backend) -> Result<()> {
+    // The access token the caller was using when it got its 401. If it has
+    // changed by the time we hold the lock, a concurrent caller already
+    // refreshed and there is nothing left to do.
+    let seen = read_auth_file()?.map(|a| a.access_token);
+    let _guard = AUTH_REFRESH_LOCK.lock().await;
     let Some(auth) = read_auth_file()? else {
         signal_session_expired();
         return Err(anyhow!("not logged in — cannot refresh auth"));
     };
-    if auth.refresh_expires_at <= Utc::now() {
-        signal_session_expired();
-        return Err(anyhow!("refresh token expired — please log in again"));
+    if seen.as_deref() != Some(auth.access_token.as_str()) {
+        return Ok(());
     }
-    let refreshed = match do_refresh(backend, &auth.refresh_token).await {
-        Ok(refreshed) => refreshed,
-        Err(e) => {
-            if refresh_was_rejected(&e) {
-                signal_session_expired();
-            }
-            return Err(e);
-        }
-    };
-    let merged = merge_auth(refreshed);
-    write_auth_file(&merged)?;
+    refresh_locked(backend, &auth).await?;
     Ok(())
 }
 
