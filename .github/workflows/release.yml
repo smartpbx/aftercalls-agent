@@ -324,9 +324,12 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
-          # The upstream `continuous` asset is mutable. Never execute it
-          # unless it matches the exact artifact audited for this workflow.
-          APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+          # Pinned to the versioned 1.9.1 release, not `continuous`: that
+          # asset is rebuilt upstream (2026-10-04) and broke the v0.37.0
+          # Linux build on a checksum mismatch. Never execute a download
+          # that doesn't match this digest (verified locally and against
+          # GitHub's published asset digest).
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
@@ -350,7 +353,7 @@ jobs:
           # to linuxdeploy.
           curl --fail --show-error --location --retry 3 \
             --output appimagetool.AppImage \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
           printf '%s  %s\n' "$APPIMAGETOOL_SHA256" appimagetool.AppImage \
             | sha256sum --check --strict -
           chmod +x appimagetool.AppImage
