@@ -566,6 +566,76 @@ pub async fn get_call(backend: &Backend, id: &str) -> std::result::Result<Value,
     get_json_typed(backend, &format!("/v1/calls/{id}")).await
 }
 
+/// `GET /v1/calls/{id}?mark_read=false` — the call detail without the
+/// server's auto-mark-read, for background readers (vault sync) that must
+/// not clear the user's unread marker.
+pub async fn get_call_unread_preserving(
+    backend: &Backend,
+    id: &str,
+) -> std::result::Result<Value, PortalError> {
+    get_json_typed(backend, &format!("/v1/calls/{id}?mark_read=false")).await
+}
+
+/// `GET /v1/calls/vault-pending` — the signed-in user's completed,
+/// server-imported calls that have no vault note yet, oldest first.
+/// `after` is the keyset cursor `(recorded_at, id)` from the previous
+/// page. Used only by `vault_sync`.
+pub async fn list_vault_pending(
+    backend: &Backend,
+    since: DateTime<Utc>,
+    after: Option<(&str, &str)>,
+    limit: u32,
+) -> std::result::Result<Value, PortalError> {
+    let mut path = format!(
+        "/v1/calls/vault-pending?since={}&limit={limit}",
+        urlencoding_minimal(&since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    if let Some((recorded_at, id)) = after {
+        path.push_str(&format!(
+            "&after_recorded_at={}&after_id={}",
+            urlencoding_minimal(recorded_at),
+            urlencoding_minimal(id),
+        ));
+    }
+    get_json_typed(backend, &path).await
+}
+
+/// `POST /v1/calls/{id}/note-path` with `only_if_unset`. `Ok(true)` when
+/// this machine's path was recorded; `Ok(false)` when the call already had
+/// a note path (`409`), e.g. another machine got there first.
+pub async fn attach_note_path_if_unset(
+    backend: &Backend,
+    id: &str,
+    note_path: &std::path::Path,
+) -> std::result::Result<bool, PortalError> {
+    let auth = build_auth_header(backend).await?;
+    let c = client().map_err(PortalError::from)?;
+    let url = format!(
+        "{}/v1/calls/{}/note-path",
+        backend.url.trim_end_matches('/'),
+        id,
+    );
+    let resp = c
+        .post(&url)
+        .header("authorization", auth)
+        .json(&serde_json::json!({
+            "note_markdown_path": note_path.to_string_lossy(),
+            "only_if_unset": true,
+        }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(false);
+    }
+    let retry = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(from_status(status, body, retry))
+}
+
 /// Narrow lookup used by the orphan-recovery scanner (#63). Returns
 /// Some({id, status}) when the backend has a row for this session,
 /// None on 404 (no row — the session never finished the create_call

@@ -934,7 +934,7 @@
   // public site and in-app marketing surfaces, not to source chips
   // that signal the integration the candidate came from).
   function candidateSourceLabel(src: "smartpbx" | "zoho_meeting"): string {
-    return src === "smartpbx" ? "FusionPBX" : "Zoho Meeting";
+    return src === "smartpbx" ? "SmartPBX" : "Zoho Meeting";
   }
 
   // #595 — Import a candidate. Optimistic shape: replace the candidate

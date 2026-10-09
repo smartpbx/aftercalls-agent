@@ -28,6 +28,7 @@ mod telemetry;
 mod transcription;
 mod upload;
 mod vault;
+mod vault_sync;
 
 use auto_recorder::AutoRecorder;
 use detector::{Detector, UserDecision};
@@ -1386,6 +1387,7 @@ fn auto_record_settings_set_master(
     start: bool,
     stop: bool,
 ) -> Result<(), String> {
+    let _config_write = config::config_write_lock();
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.auto_record_start_enabled = start;
     cfg.auto_record_stop_enabled = stop;
@@ -2434,6 +2436,8 @@ struct VaultSettings {
     enabled: bool,
     path: String,
     clients_subpath: String,
+    /// "Also write notes for imported calls" (SmartPBX, Zoho Meeting, …).
+    imported_notes: bool,
 }
 
 #[tauri::command]
@@ -2444,11 +2448,13 @@ fn get_vault_settings() -> Result<VaultSettings, String> {
             enabled: true,
             path: v.path,
             clients_subpath: v.clients_subpath,
+            imported_notes: v.imported_notes,
         },
         None => VaultSettings {
             enabled: false,
             path: String::new(),
             clients_subpath: String::new(),
+            imported_notes: false,
         },
     })
 }
@@ -2480,7 +2486,14 @@ fn set_vault_settings(
     enabled: bool,
     path: String,
     clients_subpath: String,
+    // Optional so an older settings page that doesn't send it keeps the
+    // current value instead of failing the IPC call.
+    imported_notes: Option<bool>,
 ) -> Result<(), String> {
+    // The signed-in account the imported-notes window is stamped for.
+    // Read before taking the config lock (it's a separate file).
+    let account = config::read_auth_file().ok().flatten().map(|auth| auth.user_id);
+    let config_write = config::config_write_lock();
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     if enabled {
         let supplied = path.trim();
@@ -2498,14 +2511,29 @@ fn set_vault_settings(
             security.require_approved_dir(ipc_security::PathPurpose::VaultRoot, supplied)?;
         }
         let clients_subpath = ipc_security::normalize_relative_subpath(&clients_subpath)?;
+        let previous = cfg.vault.as_ref();
+        // Opt-in: absent from an older settings page means "keep".
+        let imported_notes = imported_notes.unwrap_or(previous.is_some_and(|v| v.imported_notes));
+        let (imported_notes_since, imported_notes_account) = vault_sync::window_after_settings_save(
+            previous,
+            imported_notes,
+            account,
+            chrono::Utc::now(),
+        );
         cfg.vault = Some(config::Vault {
             path: canonical.to_string_lossy().into_owned(),
             clients_subpath,
+            imported_notes,
+            imported_notes_since,
+            imported_notes_account,
         });
     } else {
         cfg.vault = None;
     }
-    cfg.save().map_err(|e| e.to_string())
+    cfg.save().map_err(|e| e.to_string())?;
+    drop(config_write);
+    vault_sync::nudge();
+    Ok(())
 }
 
 #[tauri::command]
@@ -2655,6 +2683,7 @@ fn set_app_prefs(
             return Err(format!("unrecognized shortcut: {s}"));
         }
     }
+    let config_write = config::config_write_lock();
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     let prev_self_note_shortcut = cfg.self_note_shortcut.clone();
     let prev_record_toggle_shortcut = cfg.record_toggle_shortcut.clone();
@@ -2675,6 +2704,7 @@ fn set_app_prefs(
     cfg.auto_record_stop_enabled = auto_record_stop_enabled;
     cfg.overlay_enabled = overlay_enabled;
     cfg.save().map_err(|e| e.to_string())?;
+    drop(config_write);
     // #149 — re-register the self-note hotkey in place if it changed.
     // Best-effort: a failure to bind (portal denied, combo in use)
     // is logged, not surfaced, because tray + button + CLI keep
@@ -2869,6 +2899,7 @@ fn set_screen_capture_prefs(
     // an absurd ceiling (0 would starve the encoder; the upper bound keeps
     // the storage cost bounded).
     let bitrate_kbps = bitrate_kbps.clamp(500, 20_000);
+    let config_write = config::config_write_lock();
     let mut cfg = config::Config::load().map_err(|e| e.to_string())?;
     cfg.screen_capture_enabled = enabled;
     cfg.screen_capture_display = display;
@@ -2877,6 +2908,7 @@ fn set_screen_capture_prefs(
     cfg.screen_capture_bitrate_kbps = bitrate_kbps;
     cfg.screen_capture_ask_each_call = ask_each_call;
     cfg.save().map_err(|e| e.to_string())?;
+    drop(config_write);
 
     // Disabling is a privacy action, not merely a preference for the next
     // call. Serialize against Start/Stop and finalize the current capture
@@ -5718,6 +5750,11 @@ pub fn run() {
             // yesterday, those temp bytes get cleaned up here rather
             // than sitting forever. Non-blocking and best-effort.
             support::sweep_stage_dir();
+
+            // Obsidian notes for server-imported calls (SmartPBX, Zoho
+            // Meeting, …). Background, bounded, no-op unless the vault and
+            // its "imported calls" setting are on. See `vault_sync`.
+            vault_sync::spawn(app.handle().clone());
 
             setup_tray(app.handle())?;
             setup_hotkey(app.handle())?;

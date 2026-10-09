@@ -1,4 +1,12 @@
 {
+  "0.37.0": {
+    "headline": "Phone calls from SmartPBX can now import themselves for the people who want them, imported calls can land in your Obsidian vault, and importing a recent phone call works again.",
+    "changes": [
+      "Phone calls can import automatically for chosen people. Admins can now tick <em>Import automatically</em> for any member on the SmartPBX integration page. That member's recorded phone calls then arrive in their call list with a transcript and summary, without anyone clicking Import. Everyone else keeps the current flow, where calls wait in the Importable list until they choose. Deleting any imported call, phone or meeting, now removes it for good. It no longer comes back to the Importable list.",
+      "Imported calls can be saved to your Obsidian vault. If you keep call notes in an Obsidian vault, the desktop app can now also write notes for calls that were imported rather than recorded on this computer, such as phone calls and meetings. Turn on <em>Also write notes for imported calls</em> under the Obsidian vault settings. It's off until you turn it on, it only writes your own calls from about a day before you switched it on, and it never overwrites a note that's already there. If your vault syncs between computers, each call still gets exactly one note.",
+      "Outbound phone calls can be matched to the right person. SmartPBX member mappings now accept a caller ID number with its leading + (for example +16475551234) as well as extension numbers, so a member's outbound calls are matched to them too, not just the calls that ring their extension."
+    ]
+  },
   "0.34.0": {
     "headline": "A finished call can no longer lose its transcript to an empty one, a new workspace arrives with a welcome email that takes its first owner straight to choosing a password, and a call that has already finished stops offering to finish itself.",
     "changes": [

@@ -252,6 +252,37 @@ pub struct Backend {
 pub struct Vault {
     pub path: String,
     pub clients_subpath: String,
+    /// Also write notes for calls imported server-side (SmartPBX, Zoho
+    /// Meeting, …), which never pass through this machine's local
+    /// pipeline. Default OFF (opt-in): a vault is often synced to other
+    /// devices, so transcripts must not start appearing there just
+    /// because the agent auto-updated.
+    #[serde(default)]
+    pub imported_notes: bool,
+    /// When imported-call notes took effect on this machine. Stamped when
+    /// the user turns the setting on (and re-stamped when the signed-in
+    /// account changes). The sync asks only for calls recorded after
+    /// this, minus a short grace window (`vault_sync::SINCE_GRACE`).
+    #[serde(default)]
+    pub imported_notes_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The aftercalls user id `imported_notes_since` was stamped for. A
+    /// different signed-in account restarts the window (and the sync's
+    /// failure state), so user B's calls never backfill into a vault set
+    /// up under user A.
+    #[serde(default)]
+    pub imported_notes_account: Option<String>,
+}
+
+/// Serializes every load-modify-save of config.toml. `Config::save`
+/// rewrites the whole file, so two writers that load before either saves
+/// would silently drop one change. Hold this from `load` through `save`;
+/// it is a std mutex, so never hold it across an `.await`.
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Config {
@@ -323,8 +354,16 @@ impl Config {
             fs::create_dir_all(parent).context("mkdir config dir")?;
         }
         let text = toml::to_string_pretty(self).context("serialize config")?;
-        fs::write(&path, text)
-            .with_context(|| format!("write {}", path.display()))?;
+        // Write a sibling temp file, then rename over config.toml, so a
+        // crash or full disk mid-write can't leave a truncated config.
+        // `rename` replaces the destination atomically on Unix and on
+        // Windows (MoveFileEx with REPLACE_EXISTING).
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        if let Err(error) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("replace {}", path.display()));
+        }
         Ok(())
     }
 }
@@ -342,6 +381,14 @@ fn profile_dir_name() -> String {
 fn config_path() -> Result<PathBuf> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no user config dir"))?;
     Ok(dir.join(profile_dir_name()).join("config.toml"))
+}
+
+/// Path to the imported-call vault sync's small state file (per-call
+/// failure counts, so its skip rule survives restarts). Machine-local,
+/// next to config.toml.
+pub fn vault_sync_state_file() -> Result<PathBuf> {
+    let dir = dirs::config_dir().ok_or_else(|| anyhow!("no user config dir"))?;
+    Ok(dir.join(profile_dir_name()).join("vault_sync_state.json"))
 }
 
 /// Path to auth.json — email/password login stashes access + refresh

@@ -998,11 +998,15 @@
     enabled: boolean;
     path: string;
     clients_subpath: string;
+    /** Also write notes for calls imported server-side (SmartPBX,
+     *  Zoho Meeting, …). Opt-in: absent → off. */
+    imported_notes?: boolean;
   };
   let vault = $state<VaultSettings>({
     enabled: false,
     path: "",
     clients_subpath: "",
+    imported_notes: false,
   });
   let vaultSaving = $state(false);
   let vaultSavedAt = $state(0);
@@ -1099,6 +1103,7 @@
         enabled: vault.enabled,
         path: vault.path,
         clientsSubpath: vault.clients_subpath,
+        importedNotes: vault.imported_notes ?? false,
       });
       vaultSavedAt = Date.now();
     } catch (e) {
@@ -2478,6 +2483,35 @@
           <code>{"{"}vault{"}"}/{"{"}subpath{"}"}/{"{"}matched-client{"}"}/</code>.
           Leave blank to drop all notes in the vault root.
         </p>
+      </div>
+
+      <div class="pref-row">
+        <div class="pref-label">
+          <span class="pref-title">Also write notes for imported calls</span>
+          <span class="pref-hint">
+            Off by default. When on, calls aftercalls imports for you —
+            from your phone system or meetings — get a note here too, in
+            the same client folders, including their transcript. If this
+            vault syncs to other devices, the notes go there too. Only
+            your own calls, only from when you turn this on (plus the day
+            before), and one note per call across your computers.
+          </span>
+        </div>
+        <label class="switch">
+          <input
+            type="checkbox"
+            checked={vault.imported_notes ?? false}
+            onchange={(e) => {
+              vault.imported_notes = (e.currentTarget as HTMLInputElement).checked;
+            }}
+          />
+          <span class="track" aria-hidden="true">
+            <span class="knob"></span>
+          </span>
+          <span class="switch-label">
+            {(vault.imported_notes ?? false) ? "On" : "Off"}
+          </span>
+        </label>
       </div>
 
       <div class="vault-actions">
