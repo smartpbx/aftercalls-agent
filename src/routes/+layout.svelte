@@ -1838,6 +1838,7 @@
       orphans = orphans.filter((o) => o.session_id !== id);
     } catch (e) {
       console.warn("discard_orphan_session failed", e);
+      toast.error("Couldn't discard this recording.", { duration: 8_000 });
     } finally {
       const next = new Set(orphanBusy);
       next.delete(id);

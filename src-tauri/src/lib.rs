@@ -4591,12 +4591,20 @@ async fn resume_orphan_session(app: AppHandle, session_id: String) -> Result<(),
 async fn discard_orphan_session(app: AppHandle, session_id: String) -> Result<(), String> {
     let path = recovery::resolve_session_dir(&app, &session_id)
         .ok_or_else(|| format!("session not found: {session_id}"))?;
-    // A local discard must not orphan a backend multipart upload. Keep the
-    // durable checkpoint/source if the abort cannot be acknowledged so a
-    // later retry can still release it.
-    media_upload::abort_checkpointed_generations(&path, "user_discarded_local_session")
-        .await
-        .map_err(|error| format!("abort pending media upload before discard: {error:#}"))?;
+    // Release any backend multipart upload first, best-effort. The abort must
+    // NOT gate the discard: a deleted call (404), a lost feature gate (403), a
+    // generation that already finished (409 -> ready) or a dead session all
+    // fail it permanently, which left Discard silently doing nothing. The
+    // backend's stalled-upload sweep (`ABANDONED_UPLOAD_AFTER`) reclaims any
+    // multipart this leaves behind, so the user's explicit discard wins.
+    if let Err(error) =
+        media_upload::abort_checkpointed_generations(&path, "user_discarded_local_session").await
+    {
+        eprintln!(
+            "aftercalls: discard {session_id}: media abort failed, discarding anyway \
+             (server sweep reclaims it): {error:#}"
+        );
+    }
     recovery::discard(&path).await
 }
 
