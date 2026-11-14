@@ -279,6 +279,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Browser DSNs are public identifiers. Replace this blocker before
+          # marking the PR ready; agent events must use the agent project.
+          VITE_SENTRY_DSN: REPLACE_WITH_AFTERCALLS_AGENT_BROWSER_DSN
+          VITE_SENTRY_RELEASE: ${{ inputs.tag || github.ref_name }}
         with:
           projectPath: .
           tagName: ${{ inputs.tag || github.ref_name }}
