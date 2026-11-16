@@ -5,7 +5,14 @@ let telemetryAllowed = false;
 
 export function setSentryTelemetryAllowed(enabled: boolean): void {
   telemetryAllowed = enabled;
-  if (enabled) initSentry(true);
+  if (enabled) {
+    initSentry(true);
+  } else if (initialized) {
+    // Opting out stops the client entirely, not just error events: session
+    // pings and client reports bypass beforeSend. Re-opting in re-inits.
+    initialized = false;
+    void Sentry.close();
+  }
 }
 
 export function initSentry(enabled: boolean): void {
@@ -18,15 +25,27 @@ export function initSentry(enabled: boolean): void {
     dsn,
     environment:
       import.meta.env.VITE_SENTRY_ENVIRONMENT ?? import.meta.env.MODE,
-    release:
-      import.meta.env.VITE_SENTRY_RELEASE ??
-      import.meta.env.VITE_BUILD_TAG ??
-      import.meta.env.VITE_BUILD_SHA,
+    release: sentryRelease(),
     sendDefaultPii: false,
+    // Nothing leaves the app except sanitized error events: no session
+    // pings and no dropped-event reports (neither passes beforeSend).
+    sendClientReports: false,
+    integrations: (defaults) =>
+      defaults.filter((integration) => integration.name !== "BrowserSession"),
     tracesSampleRate: 0,
     beforeBreadcrumb: () => null,
     beforeSend: (event) => (telemetryAllowed ? sanitizeEvent(event) : null),
   });
+}
+
+// Sentry release names are org-wide, so prefix the agent's to keep its
+// regressions apart from the portal's and backend's.
+function sentryRelease(): string | undefined {
+  const raw =
+    import.meta.env.VITE_SENTRY_RELEASE ??
+    import.meta.env.VITE_BUILD_TAG ??
+    import.meta.env.VITE_BUILD_SHA;
+  return raw ? `aftercalls-agent@${String(raw).replace(/^v/, "")}` : undefined;
 }
 
 function sanitizeEvent(event: any): any {

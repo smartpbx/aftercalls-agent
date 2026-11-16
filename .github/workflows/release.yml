@@ -279,6 +279,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Browser DSNs are public identifiers (they only allow sending
+          # events). This is the smartpbx.sentry.io aftercalls-agent (desktop)
+          # project that received aftercalls#627; never the backend DSN.
+          VITE_SENTRY_DSN: https://3ec37ab2a858905fbb94c90beaf47b19@o4511311082749952.ingest.us.sentry.io/4511311113617408
+          VITE_SENTRY_RELEASE: ${{ inputs.tag || github.ref_name }}
         with:
           projectPath: .
           tagName: ${{ inputs.tag || github.ref_name }}
